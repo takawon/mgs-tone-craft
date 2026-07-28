@@ -1,0 +1,7 @@
+#opll_mode 0
+#machine_id 2
+#tempo 120
+
+@e00 = { ,,f:4.d:4.8:4.4:4.0 }
+
+1 @e0 v15 o4 l4 c r1

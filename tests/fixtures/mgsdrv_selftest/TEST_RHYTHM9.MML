@@ -1,0 +1,11 @@
+#opll_mode 0
+#machine_id 2
+#tempo 120
+
+@e05 = { ,,f:2e:2.0 }
+@e06 = { ,,@3e:2@4d:2.0 }
+@e07 = { ,,@5c:2@6b:2.0 }
+
+F v0r2 y14,32 v0r2 y14,48 @0 @e5 v15 o4 l2 c
+G v0r2          v0r2          @3 @e6 v15 o4 l2 c
+H v0r2          v0r2          @5 @e7 v15 o4 l2 c
