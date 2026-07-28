@@ -1,0 +1,31 @@
+/build/
+/build-*/
+*.obj
+*.pdb
+*.ilk
+
+# ローカル開発ツールとパッケージキャッシュ
+/.pnpm-store/
+/.site-tools/
+
+# UIドラフトは動作検証専用のため、ディレクトリ全体を非公開
+/draft-ui/
+
+# Pythonキャッシュ
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.mypy_cache/
+
+# 調査用に取得した外部リポジトリ
+/.analysis_deps/
+
+# ローカル専用データ（外部バイナリや非公開素材を含み得るため全体を除外）
+/analysis/
+
+# ローカル専用ツール（公開対象外）
+/tools/analyze_mgs_vgm.py
+/tools/build_openmsx_mgs_harness.py
+/tools/disassemble_mgsdrv.py
+/tools/fat12_disk.py
+/tests/test_mgs_vgm_boundary.py
