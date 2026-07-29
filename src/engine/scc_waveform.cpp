@@ -28,8 +28,10 @@ double presetSample(
         return phase * 2.0 - 1.0;
     case SccWavePreset::SawDown:
         return 1.0 - phase * 2.0;
-    case SccWavePreset::Pulse:
+    case SccWavePreset::Pulse25:
         return phase < 0.25 ? 1.0 : -1.0;
+    case SccWavePreset::Pulse12_5:
+        return phase < 0.125 ? 1.0 : -1.0;
     }
     return 0.0;
 }
@@ -105,6 +107,30 @@ SccWaveform quantize(WorkingWave waveform) noexcept {
     return result;
 }
 
+SccWaveform quantizeFullRange(const WorkingWave& waveform) noexcept {
+    const auto [minimum_it, maximum_it] =
+        std::minmax_element(waveform.begin(), waveform.end());
+    const double minimum = *minimum_it;
+    const double maximum = *maximum_it;
+    const double range = maximum - minimum;
+    if (range <= kSilence) {
+        return {};
+    }
+
+    SccWaveform result{};
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        if (std::abs(waveform[index]) <= kSilence) {
+            result[index] = 0;
+            continue;
+        }
+        const double scaled =
+            -128.0 + (waveform[index] - minimum) * 255.0 / range;
+        result[index] = static_cast<std::int8_t>(
+            std::clamp<long>(std::lround(scaled), -128, 127));
+    }
+    return result;
+}
+
 WorkingWave shifted(
     const WorkingWave& waveform,
     std::size_t amount,
@@ -146,18 +172,24 @@ SccWaveform generateSccPreset(
             waveform[index] = (one[index] + two[index]) * 0.5;
         }
     } else {
-        waveform = generateWorking(
-            preset,
-            harmonic == SccHarmonic::Two ? 2.0 : 1.0);
+        double cycles = 1.0;
+        switch (harmonic) {
+        case SccHarmonic::Two:
+            cycles = 2.0;
+            break;
+        case SccHarmonic::Three:
+            cycles = 3.0;
+            break;
+        case SccHarmonic::Four:
+            cycles = 4.0;
+            break;
+        default:
+            break;
+        }
+        waveform = generateWorking(preset, cycles);
     }
     removeDc(waveform);
-    const double maximum = peak(waveform);
-    if (maximum > kSilence) {
-        for (double& sample : waveform) {
-            sample *= 127.0 / maximum;
-        }
-    }
-    return quantize(waveform);
+    return quantizeFullRange(waveform);
 }
 
 SccMergeResult mergeSccWaveforms(
@@ -192,6 +224,25 @@ SccMergeResult mergeSccWaveforms(
         }
     }
     right = shifted(right, best_shift, best_inverted);
+    const auto aligned_original = shifted(
+        toWorking(added),
+        best_shift,
+        best_inverted);
+    const auto current_original = toWorking(current);
+    const bool identical_after_alignment = std::equal(
+        current_original.begin(),
+        current_original.end(),
+        aligned_original.begin(),
+        [](double left_sample, double right_sample) {
+            return std::abs(left_sample - right_sample) <= kSilence;
+        });
+    if (identical_after_alignment) {
+        return {
+            .waveform = current,
+            .circular_shift = best_shift,
+            .polarity_inverted = best_inverted,
+        };
+    }
 
     const double left_rms = rms(left);
     const double right_rms = rms(right);
@@ -283,6 +334,61 @@ SccWaveform rotateSccWaveform(
         result[static_cast<std::size_t>(index)] =
             waveform[static_cast<std::size_t>(
                 (index - normalized + size) % size)];
+    }
+    return result;
+}
+
+SccWaveform shiftSccWaveformVertically(
+    const SccWaveform& waveform,
+    int amount) noexcept {
+    const auto [minimum, maximum] = std::minmax_element(
+        waveform.begin(),
+        waveform.end());
+    const int limited = std::clamp(
+        amount,
+        -128 - static_cast<int>(*minimum),
+        127 - static_cast<int>(*maximum));
+    SccWaveform result{};
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        result[index] = static_cast<std::int8_t>(
+            static_cast<int>(waveform[index]) + limited);
+    }
+    return result;
+}
+
+SccWaveform applySccWaveformRange(
+    const SccWaveform& current,
+    const SccWaveform& candidate,
+    SccApplyRange range) noexcept {
+    if (range == SccApplyRange::All) {
+        return candidate;
+    }
+    SccWaveform result = current;
+    const std::size_t first =
+        range == SccApplyRange::LeftHalf ? 0 : result.size() / 2;
+    const std::size_t last =
+        range == SccApplyRange::LeftHalf
+        ? result.size() / 2
+        : result.size();
+    std::copy(
+        candidate.begin() + static_cast<std::ptrdiff_t>(first),
+        candidate.begin() + static_cast<std::ptrdiff_t>(last),
+        result.begin() + static_cast<std::ptrdiff_t>(first));
+    return result;
+}
+
+SccWaveform scaleSccWaveformVertically(
+    const SccWaveform& waveform,
+    int percent) noexcept {
+    const int clamped_percent = std::clamp(percent, 0, 200);
+    SccWaveform result{};
+    for (std::size_t index = 0; index < waveform.size(); ++index) {
+        const double scaled =
+            static_cast<double>(waveform[index])
+            * static_cast<double>(clamped_percent)
+            / 100.0;
+        result[index] = static_cast<std::int8_t>(
+            std::clamp<long>(std::lround(scaled), -128, 127));
     }
     return result;
 }

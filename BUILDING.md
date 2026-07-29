@@ -12,31 +12,49 @@
 現在の開発環境では、Visual Studio 2026、MSVC 19.51、Windows SDK
 10.0.26100.0、CMake 4.2で動作確認している。
 
-## 構成
+## 推奨: 通常のPowerShellから一括実行
 
-Visual StudioのDeveloper PowerShellでプロジェクトのルートへ移動し、次を
+プロジェクトのルートで次を実行する。
+
+```powershell
+.\tools\build.cmd
+```
+
+このスクリプトはVisual Studio C++環境を自動検出し、通常のPowerShellへ
+MSVC／Windows SDK／Ninjaの環境を読み込んでから、CMake構成、ビルド、テストを
+順に実行する。実行環境に`Path`と`PATH`が重複している場合も、MSBuildが失敗
+しないようプロセス内で正規化する。`.cmd`ラッパーから実行するため、ユーザーの
+PowerShell実行ポリシーを変更する必要はない。初回ビルドの過負荷とローカライズ
+された依存関係ログの大量出力を避けるため、既定は4並列かつ英語ツール診断で
 実行する。
 
+Releaseビルド:
+
 ```powershell
-cmake -S . -B build -G Ninja
+.\tools\build.cmd -Configuration Release
 ```
 
-## ビルド
+テストを省略する場合:
 
 ```powershell
+.\tools\build.cmd -SkipTests
+```
+
+並列数を変更する場合:
+
+```powershell
+.\tools\build.cmd -Jobs 8
+```
+
+## Developer PowerShellでの手動実行
+
+Visual StudioのDeveloper PowerShellを既に使用している場合は、従来どおり
+個別に実行できる。
+
+```powershell
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
-```
-
-## テスト
-
-```powershell
 ctest --test-dir build --output-on-failure
-```
-
-テスト実行ファイルを直接起動する場合:
-
-```powershell
-.\build\mgstc_engine_tests.exe
 ```
 
 ## 現在のターゲット

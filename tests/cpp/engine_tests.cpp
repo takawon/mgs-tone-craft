@@ -67,6 +67,7 @@ using mgstc::engine::RegisterWrite;
 using mgstc::engine::RegisterWriteBuffer;
 using mgstc::engine::RuntimeSession;
 using mgstc::engine::SccHarmonic;
+using mgstc::engine::SccApplyRange;
 using mgstc::engine::SccMergeOptions;
 using mgstc::engine::SccWavePreset;
 using mgstc::engine::SccWaveform;
@@ -81,6 +82,7 @@ using mgstc::engine::decodeOpllPatch;
 using mgstc::engine::defaultOpllPatch;
 using mgstc::engine::encodeOpllPatch;
 using mgstc::engine::averageSccWaveform;
+using mgstc::engine::applySccWaveformRange;
 using mgstc::engine::generateSccPreset;
 using mgstc::engine::formatMgsOpllDefinition;
 using mgstc::engine::formatMgsSccDefinition;
@@ -90,10 +92,14 @@ using mgstc::engine::normalizeSccWaveform;
 using mgstc::engine::parseMgsOpllDefinition;
 using mgstc::engine::parseMgsSccDefinition;
 using mgstc::engine::rotateSccWaveform;
+using mgstc::engine::scaleSccWaveformVertically;
+using mgstc::engine::shiftSccWaveformVertically;
 using mgstc::engine::traceOpllEnvelope;
 using mgstc::engine::ym2413RomPatch;
 using mgstc::engine::analyzeWaveCycle;
 using mgstc::engine::approximateWaveCycleWithOpll;
+using mgstc::engine::approximateWavePcmCandidatesWithOpll;
+using mgstc::engine::approximateWavePcmWithOpll;
 using mgstc::engine::parseWavePcm;
 using mgstc::engine::waveCycleToScc;
 #ifdef _WIN32
@@ -723,17 +729,62 @@ void testSccPresetGenerationIncludesDocumentedHarmonics() {
     const auto two = generateSccPreset(
         SccWavePreset::Sine,
         SccHarmonic::Two);
+    const auto three = generateSccPreset(
+        SccWavePreset::Sine,
+        SccHarmonic::Three);
+    const auto four = generateSccPreset(
+        SccWavePreset::Sine,
+        SccHarmonic::Four);
+    const auto pulse_25 = generateSccPreset(
+        SccWavePreset::Pulse25,
+        SccHarmonic::One);
+    const auto pulse_12_5 = generateSccPreset(
+        SccWavePreset::Pulse12_5,
+        SccHarmonic::One);
 
     REQUIRE_EQ(one[0], static_cast<std::int8_t>(0));
     REQUIRE_EQ(two[0], static_cast<std::int8_t>(0));
     REQUIRE_EQ(two[8], static_cast<std::int8_t>(0));
     REQUIRE_EQ(one_and_half == one, false);
     REQUIRE_EQ(one_and_half == two, false);
+    REQUIRE_EQ(three == two, false);
+    REQUIRE_EQ(four == three, false);
+    REQUIRE_EQ(pulse_25 == pulse_12_5, false);
+    REQUIRE_EQ(static_cast<int>(pulse_25[0]) > 0, true);
+    REQUIRE_EQ(static_cast<int>(pulse_12_5[4]) < 0, true);
     REQUIRE_EQ(
         *std::max_element(
             one_and_half.begin(),
             one_and_half.end()),
         static_cast<std::int8_t>(127));
+
+    constexpr std::array presets{
+        SccWavePreset::Sine,
+        SccWavePreset::Square,
+        SccWavePreset::Triangle,
+        SccWavePreset::SawUp,
+        SccWavePreset::SawDown,
+        SccWavePreset::Pulse25,
+        SccWavePreset::Pulse12_5,
+    };
+    constexpr std::array harmonics{
+        SccHarmonic::One,
+        SccHarmonic::OneAndHalf,
+        SccHarmonic::Two,
+        SccHarmonic::Three,
+        SccHarmonic::Four,
+    };
+    for (const auto preset : presets) {
+        for (const auto harmonic : harmonics) {
+            const auto waveform = generateSccPreset(preset, harmonic);
+            REQUIRE_EQ(
+                *std::min_element(waveform.begin(), waveform.end()),
+                static_cast<std::int8_t>(-128));
+            REQUIRE_EQ(
+                *std::max_element(waveform.begin(), waveform.end()),
+                static_cast<std::int8_t>(127));
+        }
+    }
 }
 
 void testSccAverageUsesCircularThreeSampleWindow() {
@@ -776,6 +827,48 @@ void testSccWaveformUtilityTransforms() {
     const auto rotated = rotateSccWaveform(waveform, 1);
     REQUIRE_EQ(rotated[1], waveform[0]);
     REQUIRE_EQ(rotated[2], waveform[1]);
+
+    const auto shifted_up = shiftSccWaveformVertically(waveform, 1);
+    REQUIRE_EQ(shifted_up[0], static_cast<std::int8_t>(-127));
+    REQUIRE_EQ(shifted_up[1], static_cast<std::int8_t>(65));
+
+    auto near_ceiling = waveform;
+    near_ceiling[4] = 127;
+    const auto ceiling_limited =
+        shiftSccWaveformVertically(near_ceiling, 1);
+    REQUIRE_EQ(ceiling_limited, near_ceiling);
+
+    const auto floor_limited =
+        shiftSccWaveformVertically(waveform, -1);
+    REQUIRE_EQ(floor_limited, waveform);
+
+    const auto compressed =
+        scaleSccWaveformVertically(waveform, 50);
+    REQUIRE_EQ(compressed[0], static_cast<std::int8_t>(-64));
+    REQUIRE_EQ(compressed[1], static_cast<std::int8_t>(32));
+    const auto expanded =
+        scaleSccWaveformVertically(waveform, 200);
+    REQUIRE_EQ(expanded[0], static_cast<std::int8_t>(-128));
+    REQUIRE_EQ(expanded[1], static_cast<std::int8_t>(127));
+
+    SccWaveform candidate{};
+    candidate.fill(42);
+    const auto left = applySccWaveformRange(
+        waveform,
+        candidate,
+        SccApplyRange::LeftHalf);
+    const auto right = applySccWaveformRange(
+        waveform,
+        candidate,
+        SccApplyRange::RightHalf);
+    for (std::size_t index = 0; index < waveform.size(); ++index) {
+        REQUIRE_EQ(
+            left[index],
+            index < 16 ? candidate[index] : waveform[index]);
+        REQUIRE_EQ(
+            right[index],
+            index < 16 ? waveform[index] : candidate[index]);
+    }
 
     const auto normalized = normalizeSccWaveform(waveform);
     const auto peak = std::max_element(
@@ -1672,6 +1765,58 @@ void testWaveCycleProducesValidOpllApproximation() {
     REQUIRE_EQ(patch.feedback <= 7, true);
 }
 
+void testWavePcmProducesDeterministicTimedOpllApproximation() {
+    mgstc::engine::WavePcm pcm;
+    pcm.sample_rate = 8000;
+    pcm.mono_samples.resize(800);
+    for (std::size_t index = 0; index < pcm.mono_samples.size(); ++index) {
+        const float time = static_cast<float>(index) / pcm.sample_rate;
+        const float attack = std::min(1.0F, time / 0.012F);
+        const float decay = std::exp(-time * 7.0F);
+        pcm.mono_samples[index] =
+            attack * decay
+            * static_cast<float>(
+                std::sin(2.0 * std::numbers::pi * 200.0 * time)
+                + 0.28 * std::sin(
+                    2.0 * std::numbers::pi * 400.0 * time));
+    }
+    const auto first_candidates =
+        approximateWavePcmCandidatesWithOpll(pcm);
+    const auto second_candidates =
+        approximateWavePcmCandidatesWithOpll(pcm);
+    REQUIRE_EQ(first_candidates.empty(), false);
+    REQUIRE_EQ(first_candidates, second_candidates);
+    REQUIRE_EQ(first_candidates.size() <= 6, true);
+    for (std::size_t first_index = 0;
+         first_index < first_candidates.size();
+         ++first_index) {
+        for (std::size_t second_index = first_index + 1;
+             second_index < first_candidates.size();
+             ++second_index) {
+            REQUIRE_EQ(
+                encodeOpllPatch(first_candidates[first_index])
+                    == encodeOpllPatch(first_candidates[second_index]),
+                false);
+        }
+    }
+    const auto& first = first_candidates.front();
+    const auto second = approximateWavePcmWithOpll(
+        mgstc::engine::WavePcm{});
+    REQUIRE_EQ(second, defaultOpllPatch());
+    REQUIRE_EQ(first.modulator.multiplier <= 15, true);
+    REQUIRE_EQ(first.carrier.multiplier <= 15, true);
+    REQUIRE_EQ(first.modulator.total_level <= 63, true);
+    REQUIRE_EQ(first.feedback <= 7, true);
+    REQUIRE_EQ(first.modulator.attack_rate <= 15, true);
+    REQUIRE_EQ(first.modulator.decay_rate <= 15, true);
+    REQUIRE_EQ(first.modulator.sustain_level <= 15, true);
+    REQUIRE_EQ(first.modulator.release_rate <= 15, true);
+    REQUIRE_EQ(first.carrier.attack_rate <= 15, true);
+    REQUIRE_EQ(first.carrier.decay_rate <= 15, true);
+    REQUIRE_EQ(first.carrier.sustain_level <= 15, true);
+    REQUIRE_EQ(first.carrier.release_rate <= 15, true);
+}
+
 #ifdef _WIN32
 void testWasapiSinkConstructsWithoutOpeningDevice() {
     WasapiAudioSink sink;
@@ -1742,6 +1887,7 @@ int main() {
         {"TimbreLibrarySelectedExportAndNonDestructiveImport", testTimbreLibrarySelectedExportAndNonDestructiveImport},
         {"WavePcmCycleConvertsToScc", testWavePcmCycleConvertsToScc},
         {"WaveCycleProducesValidOpllApproximation", testWaveCycleProducesValidOpllApproximation},
+        {"WavePcmProducesDeterministicTimedOpllApproximation", testWavePcmProducesDeterministicTimedOpllApproximation},
 #ifdef _WIN32
         {"WasapiSinkConstructsWithoutOpeningDevice", testWasapiSinkConstructsWithoutOpeningDevice},
 #endif

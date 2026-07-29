@@ -34,4 +34,15 @@ struct WaveCycleAnalysis {
 [[nodiscard]] OpllPatchParameters approximateWaveCycleWithOpll(
     std::span<const float> cycle) noexcept;
 
+// Uses the complete audible portion of a WAV to fit both the steady-state
+// spectrum and the YM2413 hardware envelope. The search is deterministic:
+// identical PCM and emu2413 versions produce identical register values.
+[[nodiscard]] OpllPatchParameters approximateWavePcmWithOpll(
+    const WavePcm& pcm);
+
+// Returns the deterministic ranked alternatives retained by the search.
+// The first entry is the same patch returned by approximateWavePcmWithOpll.
+[[nodiscard]] std::vector<OpllPatchParameters>
+approximateWavePcmCandidatesWithOpll(const WavePcm& pcm);
+
 }  // namespace mgstc::engine
