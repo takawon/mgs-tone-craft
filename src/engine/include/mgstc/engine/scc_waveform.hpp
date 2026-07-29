@@ -14,13 +14,22 @@ enum class SccWavePreset {
     Triangle,
     SawUp,
     SawDown,
-    Pulse,
+    Pulse25,
+    Pulse12_5,
 };
 
 enum class SccHarmonic {
     One,
     OneAndHalf,
     Two,
+    Three,
+    Four,
+};
+
+enum class SccApplyRange {
+    All,
+    LeftHalf,
+    RightHalf,
 };
 
 struct SccMergeOptions {
@@ -57,5 +66,18 @@ struct SccMergeResult {
 [[nodiscard]] SccWaveform rotateSccWaveform(
     const SccWaveform& waveform,
     int samples) noexcept;
+
+[[nodiscard]] SccWaveform shiftSccWaveformVertically(
+    const SccWaveform& waveform,
+    int amount) noexcept;
+
+[[nodiscard]] SccWaveform scaleSccWaveformVertically(
+    const SccWaveform& waveform,
+    int percent) noexcept;
+
+[[nodiscard]] SccWaveform applySccWaveformRange(
+    const SccWaveform& current,
+    const SccWaveform& candidate,
+    SccApplyRange range) noexcept;
 
 }  // namespace mgstc::engine

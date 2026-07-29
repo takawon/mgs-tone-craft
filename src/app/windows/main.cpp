@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cwctype>
@@ -15,6 +16,7 @@
 #include <CommCtrl.h>
 #include <commdlg.h>
 #include <mmsystem.h>
+#include <ole2.h>
 #include <shellapi.h>
 #include <wincodec.h>
 #include <windowsx.h>
@@ -42,6 +44,7 @@ constexpr UINT kTimbreChangedMessage = WM_APP + 5;
 constexpr UINT_PTR kAudioStatusTimer = 1;
 constexpr UINT_PTR kImmediateAuditionTimer = 2;
 constexpr UINT_PTR kOpllScopeTimer = 3;
+constexpr UINT_PTR kEditorIconTooltipTimer = 4;
 constexpr int kOpllButton = 1001;
 constexpr int kSccButton = 1002;
 constexpr int kStopButton = 1003;
@@ -94,6 +97,7 @@ constexpr int kSccOperationStatus = 2525;
 constexpr int kSccCancelPreset = 2526;
 constexpr int kSccHarmonicLabel = 2527;
 constexpr int kSccToggleAudition = 2528;
+constexpr int kSccApplyRange = 2530;
 constexpr int kTimbreImport = 2600;
 constexpr int kTimbreExport = 2601;
 constexpr int kTimbreExportNumber = 2602;
@@ -122,7 +126,17 @@ constexpr int kEditorAuditionButton = 2641;
 constexpr int kEditorUndo = 2642;
 constexpr int kEditorRedo = 2643;
 constexpr int kWaveConvert = 2644;
+constexpr int kOpllWaveCandidatePrevious = 2645;
+constexpr int kOpllWaveCandidateNext = 2646;
+constexpr int kOpllWaveCandidateLabel = 2647;
+constexpr int kOpllScopeSync = 2648;
+constexpr int kAudacityConvert = 2649;
 constexpr int kSccBackgroundSliderBase = 2650;
+constexpr int kSccShiftUp = 2660;
+constexpr int kSccShiftDown = 2661;
+constexpr int kSccVerticalScale = 2662;
+constexpr int kSccVerticalScaleLabel = 2663;
+constexpr std::size_t kOpllScopeHistorySampleCount = 4096;
 
 struct TimbreHistorySnapshot {
     std::array<std::uint8_t, 8> opll{};
@@ -157,15 +171,31 @@ struct EditorState {
     int scc_background_height{262};
     int scc_background_opacity{112};
     bool scc_background_visible{true};
+    HWND icon_tooltip_popup{};
+    HWND icon_hover_control{};
+    int icon_hover_ticks{};
+    HFONT scc_value_font{};
     std::vector<TimbreHistorySnapshot> history;
     std::size_t history_cursor{};
     bool history_suspended{};
     mgstc::engine::SccWaveform scc_preview_wave{};
     bool scc_preview_active{};
     bool scc_preview_hearing_candidate{true};
+    bool scc_scale_preview_active{};
+    mgstc::engine::SccWaveform scc_scale_source{};
+    int scc_scale_percent{100};
     mgstc::engine::OpllEnvelopeTrace opll_envelope_trace{};
     mgstc::engine::OpllScopeFrame opll_scope{};
     bool opll_scope_available{};
+    std::array<float, kOpllScopeHistorySampleCount> opll_scope_history{};
+    std::size_t opll_scope_history_size{};
+    std::size_t opll_scope_history_write{};
+    std::array<float, mgstc::engine::OpllScopeFrame::kSampleCount>
+        opll_scope_display{};
+    bool opll_scope_display_available{};
+    std::uint8_t opll_scope_display_note{60};
+    std::vector<mgstc::engine::OpllPatchParameters> opll_wave_candidates;
+    std::size_t opll_wave_candidate_index{};
     std::optional<std::uint64_t> selected_library_id;
     mgstc::engine::TimbreLibraryEntry edit_baseline{};
     std::optional<std::uint64_t> baseline_library_id;
@@ -198,6 +228,7 @@ struct AppState {
     mgstc::engine::TimbreLibrary timbre_library;
     bool opll_immediate_audition{true};
     bool scc_immediate_audition{true};
+    bool opll_scope_sync{true};
     bool audio_started{};
     HMIDIIN midi_input{};
     bool immediate_audition_pending{};
@@ -313,6 +344,34 @@ struct AppState {
         setStatus(
             std::wstring(opll ? L"OPLL" : L"SCC")
             + (retrigger ? L" 音色を更新して再発声" : L" 音色を更新"));
+    }
+
+    void auditionOpllPatch(
+        const mgstc::engine::OpllPatchParameters& patch,
+        const std::wstring& label) {
+        const auto saved_patch = opll_patch;
+        opll_patch = patch;
+        mouse_audition_active = false;
+        audition_track = 8;
+        CheckRadioButton(
+            main_window,
+            kPsgSourceButton,
+            kOpllSourceButton,
+            kOpllSourceButton);
+        const bool submitted = submitCurrentProgram(true);
+        opll_patch = saved_patch;
+        if (!submitted) {
+            setStatus(L"固定音色の試聴待ちです");
+            return;
+        }
+        sounding_note = last_note;
+        immediate_audition_pending = true;
+        SetTimer(
+            main_window,
+            kImmediateAuditionTimer,
+            1000,
+            nullptr);
+        setStatus(L"固定音色 " + label + L" を試聴");
     }
 
     [[nodiscard]] const wchar_t* sourceName() const noexcept {
@@ -517,23 +576,49 @@ void CALLBACK midiInputCallback(
         0);
 }
 
-std::optional<std::uint8_t> pcKeyNote(WPARAM key, int octave) {
+std::optional<std::uint8_t> pcKeyNote(LPARAM key_message_data, int octave) {
     const auto base = static_cast<std::uint8_t>((octave + 1) * 12);
+    const auto scan_code = static_cast<unsigned>(
+        (key_message_data >> 16) & 0xFF);
     int offset = -1;
-    switch (key) {
-    case 'A': offset = 0; break;
-    case 'W': offset = 1; break;
-    case 'S': offset = 2; break;
-    case 'E': offset = 3; break;
-    case 'D': offset = 4; break;
-    case 'F': offset = 5; break;
-    case 'T': offset = 6; break;
-    case 'G': offset = 7; break;
-    case 'Y': offset = 8; break;
-    case 'H': offset = 9; break;
-    case 'U': offset = 10; break;
-    case 'J': offset = 11; break;
-    case 'K': offset = 12; break;
+    switch (scan_code) {
+    // Lower row: Z S X D C V G B H N J M (C through B).
+    case 0x2C: offset = 0; break;
+    case 0x1F: offset = 1; break;
+    case 0x2D: offset = 2; break;
+    case 0x20: offset = 3; break;
+    case 0x2E: offset = 4; break;
+    case 0x2F: offset = 5; break;
+    case 0x22: offset = 6; break;
+    case 0x30: offset = 7; break;
+    case 0x23: offset = 8; break;
+    case 0x31: offset = 9; break;
+    case 0x24: offset = 10; break;
+    case 0x32: offset = 11; break;
+
+    // Upper rows: Q starts C one octave above the lower row. Scan codes keep
+    // the pictured physical layout stable across Japanese/US key labels.
+    case 0x10: offset = 12; break;  // Q
+    case 0x03: offset = 13; break;  // 2
+    case 0x11: offset = 14; break;  // W
+    case 0x04: offset = 15; break;  // 3
+    case 0x12: offset = 16; break;  // E
+    case 0x13: offset = 17; break;  // R
+    case 0x06: offset = 18; break;  // 5
+    case 0x14: offset = 19; break;  // T
+    case 0x07: offset = 20; break;  // 6
+    case 0x15: offset = 21; break;  // Y
+    case 0x08: offset = 22; break;  // 7
+    case 0x16: offset = 23; break;  // U
+    case 0x17: offset = 24; break;  // I
+    case 0x0A: offset = 25; break;  // 9
+    case 0x18: offset = 26; break;  // O
+    case 0x0B: offset = 27; break;  // 0
+    case 0x19: offset = 28; break;  // P
+    case 0x1A: offset = 29; break;  // @ / [
+    case 0x0D: offset = 30; break;  // ^ / =
+    case 0x1B: offset = 31; break;  // [ / ]
+    case 0x7D: offset = 32; break;  // Yen (JIS)
     default: break;
     }
     const int note = static_cast<int>(base) + offset;
@@ -600,8 +685,12 @@ void paintKeyboard(HWND window, KeyboardState* state) {
     GetClientRect(window, &client);
     FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
     constexpr std::array<int, 7> white_offsets{0, 2, 4, 5, 7, 9, 11};
-    constexpr std::array<wchar_t, 7> white_labels{
-        L'A', L'S', L'D', L'F', L'G', L'H', L'J'};
+    constexpr std::array<wchar_t, 7> lower_white_labels{
+        L'Z', L'X', L'C', L'V', L'B', L'N', L'M'};
+    constexpr std::array<wchar_t, 7> upper_white_labels{
+        L'Q', L'W', L'E', L'R', L'T', L'Y', L'U'};
+    constexpr std::array<wchar_t, 5> upper_tail_white_labels{
+        L'I', L'O', L'P', L'@', L'['};
     const auto* app = reinterpret_cast<AppState*>(
         GetWindowLongPtrW(GetParent(window), GWLP_USERDATA));
     for (int index = 0; index < 56; ++index) {
@@ -619,18 +708,21 @@ void paintKeyboard(HWND window, KeyboardState* state) {
         FrameRect(dc, &key, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         RECT label = key;
         label.top = label.bottom - 28;
-        const bool pc_octave_key =
-            app && index / 7 == app->pc_octave - 1;
-        const bool pc_top_c =
-            app && app->pc_octave < 8
-            && index / 7 == app->pc_octave
-            && index % 7 == 0;
-        if (pc_octave_key || pc_top_c) {
-            wchar_t text[]{
-                pc_top_c
-                    ? L'K'
-                    : white_labels[static_cast<std::size_t>(index % 7)],
-                L'\0'};
+        wchar_t pc_label = L'\0';
+        const int keyboard_octave = index / 7;
+        const auto white_index = static_cast<std::size_t>(index % 7);
+        if (app && keyboard_octave == app->pc_octave - 1) {
+            pc_label = lower_white_labels[white_index];
+        } else if (app && keyboard_octave == app->pc_octave) {
+            pc_label = upper_white_labels[white_index];
+        } else if (
+            app
+            && keyboard_octave == app->pc_octave + 1
+            && white_index < upper_tail_white_labels.size()) {
+            pc_label = upper_tail_white_labels[white_index];
+        }
+        if (pc_label != L'\0') {
+            wchar_t text[]{pc_label, L'\0'};
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, RGB(30, 30, 30));
             DrawTextW(
@@ -642,8 +734,12 @@ void paintKeyboard(HWND window, KeyboardState* state) {
     const int white_width = (client.right - client.left) / 56;
     constexpr std::array<int, 5> boundaries{1, 2, 4, 5, 6};
     constexpr std::array<int, 5> black_offsets{1, 3, 6, 8, 10};
-    constexpr std::array<wchar_t, 5> black_labels{
-        L'W', L'E', L'T', L'Y', L'U'};
+    constexpr std::array<wchar_t, 5> lower_black_labels{
+        L'S', L'D', L'G', L'H', L'J'};
+    constexpr std::array<wchar_t, 5> upper_black_labels{
+        L'2', L'3', L'5', L'6', L'7'};
+    constexpr std::array<wchar_t, 4> upper_tail_black_labels{
+        L'9', L'0', L'^', L'¥'};
     const int black_width = std::max(8, white_width * 3 / 5);
     const int black_height = (client.bottom - client.top) * 2 / 3;
     for (int octave = 0; octave < 8; ++octave) {
@@ -668,8 +764,19 @@ void paintKeyboard(HWND window, KeyboardState* state) {
             FrameRect(
                 dc, &key,
                 static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            wchar_t pc_label = L'\0';
             if (app && octave == app->pc_octave - 1) {
-                wchar_t text[]{black_labels[index], L'\0'};
+                pc_label = lower_black_labels[index];
+            } else if (app && octave == app->pc_octave) {
+                pc_label = upper_black_labels[index];
+            } else if (
+                app
+                && octave == app->pc_octave + 1
+                && index < upper_tail_black_labels.size()) {
+                pc_label = upper_tail_black_labels[index];
+            }
+            if (pc_label != L'\0') {
+                wchar_t text[]{pc_label, L'\0'};
                 SetBkMode(dc, TRANSPARENT);
                 SetTextColor(dc, RGB(240, 240, 240));
                 DrawTextW(
@@ -945,9 +1052,178 @@ RECT opllScopeGraphRect() {
     return RECT{24, 656, 750, 810};
 }
 
+float sampleOpllScopeHistory(
+    const EditorState& state,
+    double position) {
+    if (state.opll_scope_history_size == 0) {
+        return 0.0F;
+    }
+    position = std::clamp(
+        position,
+        0.0,
+        static_cast<double>(state.opll_scope_history_size - 1));
+    const auto left = static_cast<std::size_t>(position);
+    const auto right = std::min(
+        left + 1,
+        state.opll_scope_history_size - 1);
+    const std::size_t oldest =
+        (state.opll_scope_history_write
+         + state.opll_scope_history.size()
+         - state.opll_scope_history_size)
+        % state.opll_scope_history.size();
+    const auto history_sample = [&](std::size_t index) {
+        return state.opll_scope_history[
+            (oldest + index) % state.opll_scope_history.size()];
+    };
+    const float fraction = static_cast<float>(
+        position - static_cast<double>(left));
+    return history_sample(left)
+        + (history_sample(right) - history_sample(left)) * fraction;
+}
+
+void sampleOpllScopeWindow(
+    const EditorState& state,
+    double start,
+    double sample_span,
+    std::array<float, mgstc::engine::OpllScopeFrame::kSampleCount>&
+        output) {
+    const double step = sample_span
+        / static_cast<double>(output.size() - 1);
+    for (std::size_t index = 0; index < output.size(); ++index) {
+        output[index] = sampleOpllScopeHistory(
+            state,
+            start + static_cast<double>(index) * step);
+    }
+}
+
+double normalizedWaveCorrelation(
+    const std::array<float, mgstc::engine::OpllScopeFrame::kSampleCount>&
+        left,
+    const std::array<float, mgstc::engine::OpllScopeFrame::kSampleCount>&
+        right) {
+    double left_mean{};
+    double right_mean{};
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        left_mean += left[index];
+        right_mean += right[index];
+    }
+    left_mean /= static_cast<double>(left.size());
+    right_mean /= static_cast<double>(right.size());
+    double dot{};
+    double left_energy{};
+    double right_energy{};
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        const double a = static_cast<double>(left[index]) - left_mean;
+        const double b = static_cast<double>(right[index]) - right_mean;
+        dot += a * b;
+        left_energy += a * a;
+        right_energy += b * b;
+    }
+    const double scale = std::sqrt(left_energy * right_energy);
+    return scale > 1.0e-12 ? dot / scale : -1.0;
+}
+
+void rebuildSynchronizedOpllScope(EditorState& state) {
+    constexpr double sample_rate = 48000.0;
+    const double frequency = 440.0 * std::pow(
+        2.0,
+        (static_cast<double>(state.app->last_note) - 69.0) / 12.0);
+    const double period = sample_rate / frequency;
+    const double sample_span = period * 2.0;
+    if (state.opll_scope_history_size
+        < static_cast<std::size_t>(std::ceil(sample_span)) + 2) {
+        state.opll_scope_display_available = false;
+        return;
+    }
+
+    const double maximum_start =
+        static_cast<double>(state.opll_scope_history_size - 1)
+        - sample_span;
+    const std::size_t search_first = static_cast<std::size_t>(
+        std::max(1.0, maximum_start - period * 2.5));
+    const std::size_t search_last = static_cast<std::size_t>(
+        std::floor(maximum_start));
+    std::vector<double> candidates;
+    for (std::size_t index = search_first;
+         index <= search_last;
+         ++index) {
+        const float previous = sampleOpllScopeHistory(
+            state,
+            static_cast<double>(index - 1));
+        const float current = sampleOpllScopeHistory(
+            state,
+            static_cast<double>(index));
+        if (previous <= 0.0F && current > 0.0F) {
+            const double denominator =
+                static_cast<double>(current - previous);
+            const double fraction = denominator > 1.0e-12
+                ? -static_cast<double>(previous) / denominator
+                : 0.0;
+            candidates.push_back(
+                static_cast<double>(index - 1) + fraction);
+        }
+    }
+    if (candidates.empty()) {
+        candidates.push_back(maximum_start);
+    }
+
+    const bool compare_previous =
+        state.opll_scope_display_available
+        && state.opll_scope_display_note == state.app->last_note;
+    double best_start = candidates.back();
+    double best_score = -std::numeric_limits<double>::infinity();
+    std::array<float, mgstc::engine::OpllScopeFrame::kSampleCount>
+        candidate{};
+    for (const double start : candidates) {
+        sampleOpllScopeWindow(state, start, sample_span, candidate);
+        const double correlation = compare_previous
+            ? normalizedWaveCorrelation(
+                candidate,
+                state.opll_scope_display)
+            : 0.0;
+        const double recency =
+            maximum_start > 0.0 ? start / maximum_start : 0.0;
+        const double score = correlation + recency * 1.0e-4;
+        if (score > best_score) {
+            best_score = score;
+            best_start = start;
+        }
+    }
+    sampleOpllScopeWindow(
+        state,
+        best_start,
+        sample_span,
+        state.opll_scope_display);
+    state.opll_scope_display_available = true;
+    state.opll_scope_display_note = state.app->last_note;
+}
+
+void appendOpllScopeFrame(
+    EditorState& state,
+    const mgstc::engine::OpllScopeFrame& frame) {
+    if (state.opll_scope_display_note != state.app->last_note) {
+        state.opll_scope_history_size = 0;
+        state.opll_scope_history_write = 0;
+        state.opll_scope_display_available = false;
+        state.opll_scope_display_note = state.app->last_note;
+    }
+    for (const float sample : frame.samples) {
+        state.opll_scope_history[state.opll_scope_history_write] = sample;
+        state.opll_scope_history_write =
+            (state.opll_scope_history_write + 1)
+            % state.opll_scope_history.size();
+        state.opll_scope_history_size = std::min(
+            state.opll_scope_history_size + 1,
+            state.opll_scope_history.size());
+    }
+    rebuildSynchronizedOpllScope(state);
+}
+
 void paintOpllScope(
     HDC dc,
-    const mgstc::engine::OpllScopeFrame& frame,
+    const std::array<
+        float,
+        mgstc::engine::OpllScopeFrame::kSampleCount>& samples,
     bool available) {
     const auto graph = opllScopeGraphRect();
     HBRUSH background = CreateSolidBrush(RGB(20, 25, 30));
@@ -987,22 +1263,22 @@ void paintOpllScope(
     const int width = graph.right - graph.left - 2;
     const int half_height = (graph.bottom - graph.top - 4) / 2;
     float peak{};
-    for (const float sample : frame.samples) {
+    for (const float sample : samples) {
         peak = std::max(peak, std::abs(sample));
     }
     const float display_gain = peak > 0.0001F
         ? 0.9F / peak
         : 1.0F;
-    for (std::size_t index = 0; index < frame.samples.size(); ++index) {
+    for (std::size_t index = 0; index < samples.size(); ++index) {
         const float sample = std::clamp(
-            frame.samples[index] * display_gain,
+            samples[index] * display_gain,
             -1.0F,
             1.0F);
         points[index] = {
             graph.left + 1
                 + static_cast<int>(
                     index * static_cast<std::size_t>(width)
-                    / (frame.samples.size() - 1)),
+                    / (samples.size() - 1)),
             middle - static_cast<int>(sample * half_height),
         };
     }
@@ -1083,6 +1359,18 @@ bool updateOpllEnvelopeFromGraph(
 
 RECT sccWaveGraphRect() {
     return RECT{24, 88, 792, 350};
+}
+
+constexpr int kSccWaveSamplePitch = 24;
+
+int sccWaveSampleX(const RECT& graph, int index) noexcept {
+    return graph.left + kSccWaveSamplePitch / 2
+        + index * kSccWaveSamplePitch;
+}
+
+int sccWaveSampleY(const RECT& graph, int sample) noexcept {
+    return graph.top
+        + ((127 - sample) * (graph.bottom - graph.top - 1)) / 255;
 }
 
 HBITMAP loadBackgroundBitmap(
@@ -1371,14 +1659,326 @@ void setSccOperationStatus(
     SetDlgItemTextW(window, kSccOperationStatus, text.c_str());
 }
 
+HWND createTooltipWindow(
+    HWND owner,
+    int maximum_width) {
+    HWND tooltip = CreateWindowExW(
+        WS_EX_TOPMOST,
+        TOOLTIPS_CLASSW,
+        nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        owner,
+        nullptr,
+        GetModuleHandleW(nullptr),
+        nullptr);
+    if (!tooltip) {
+        return nullptr;
+    }
+    SetWindowPos(
+        tooltip,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, maximum_width);
+    SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
+    SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 8000);
+    SendMessageW(tooltip, TTM_ACTIVATE, TRUE, 0);
+    return tooltip;
+}
+
+bool addControlTooltip(
+    HWND tooltip,
+    HWND control,
+    const wchar_t* text) {
+    if (!tooltip || !control || !text) {
+        return false;
+    }
+    TTTOOLINFOW info{};
+    info.cbSize = sizeof(info);
+    info.uFlags = TTF_IDISHWND | TTF_SUBCLASS | TTF_TRANSPARENT;
+    info.hwnd = GetParent(control);
+    info.uId = reinterpret_cast<UINT_PTR>(control);
+    info.lpszText = const_cast<LPWSTR>(text);
+    return SendMessageW(
+               tooltip,
+               TTM_ADDTOOLW,
+               0,
+               reinterpret_cast<LPARAM>(&info))
+        != FALSE;
+}
+
+bool isEditorIconButton(UINT id) {
+    switch (id) {
+    case kTimbreImport:
+    case kTimbreExport:
+    case kTimbreClipboardPaste:
+    case kTimbreClipboardCopy:
+    case kEditorUndo:
+    case kEditorRedo:
+    case kSccAverage:
+    case kSccNormalize:
+    case kSccInvert:
+    case kSccRotateLeft:
+    case kSccRotateRight:
+    case kSccUndo:
+    case kSccRedo:
+    case kSccToggleAudition:
+    case kSccShiftUp:
+    case kSccShiftDown:
+        return true;
+    default:
+        return false;
+    }
+}
+
+const wchar_t* editorIconGlyph(UINT id) {
+    switch (id) {
+    case kTimbreImport:
+        return L"▣←";
+    case kTimbreExport:
+        return L"▣→";
+    case kTimbreClipboardPaste:
+        return L"▤↓";
+    case kTimbreClipboardCopy:
+        return L"▤↑";
+    case kEditorUndo:
+    case kSccAverage:
+        if (id == kEditorUndo) {
+            return L"↶";
+        }
+        return L"≋";
+    case kEditorRedo:
+        return L"↷";
+    case kSccNormalize:
+        return L"↕";
+    case kSccInvert:
+        return L"⇅";
+    case kSccRotateLeft:
+        return L"←";
+    case kSccRotateRight:
+        return L"→";
+    case kSccUndo:
+        return L"↶";
+    case kSccRedo:
+        return L"↷";
+    case kSccToggleAudition:
+        return L"A↔B";
+    case kSccShiftUp:
+        return L"↑";
+    case kSccShiftDown:
+        return L"↓";
+    default:
+        return L"?";
+    }
+}
+
+const wchar_t* editorIconName(UINT id) {
+    switch (id) {
+    case kTimbreImport:
+        return L"ファイル読込";
+    case kTimbreExport:
+        return L"ファイル保存";
+    case kTimbreClipboardPaste:
+        return L"貼り付け";
+    case kTimbreClipboardCopy:
+        return L"コピー";
+    case kEditorUndo:
+    case kSccUndo:
+        return L"Undo";
+    case kEditorRedo:
+    case kSccRedo:
+        return L"Redo";
+    case kSccAverage:
+        return L"平均化";
+    case kSccNormalize:
+        return L"正規化";
+    case kSccInvert:
+        return L"反転";
+    case kSccRotateLeft:
+        return L"位相 -1";
+    case kSccRotateRight:
+        return L"位相 +1";
+    case kSccToggleAudition:
+        return L"A/B試聴";
+    case kSccShiftUp:
+        return L"上移動";
+    case kSccShiftDown:
+        return L"下移動";
+    default:
+        return L"";
+    }
+}
+
+void updateEditorIconTooltip(
+    EditorState& state,
+    HWND window) {
+    if (!state.icon_tooltip_popup) {
+        return;
+    }
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)
+        || GetForegroundWindow() != window) {
+        state.icon_hover_control = nullptr;
+        state.icon_hover_ticks = 0;
+        ShowWindow(state.icon_tooltip_popup, SW_HIDE);
+        return;
+    }
+    HWND hovered = WindowFromPoint(cursor);
+    if (!hovered
+        || !IsChild(window, hovered)
+        || !isEditorIconButton(
+            static_cast<UINT>(GetDlgCtrlID(hovered)))) {
+        state.icon_hover_control = nullptr;
+        state.icon_hover_ticks = 0;
+        ShowWindow(state.icon_tooltip_popup, SW_HIDE);
+        return;
+    }
+    if (hovered != state.icon_hover_control) {
+        state.icon_hover_control = hovered;
+        state.icon_hover_ticks = 0;
+        ShowWindow(state.icon_tooltip_popup, SW_HIDE);
+        return;
+    }
+    if (state.icon_hover_ticks < 4) {
+        ++state.icon_hover_ticks;
+        return;
+    }
+
+    const wchar_t* name = editorIconName(
+        static_cast<UINT>(GetDlgCtrlID(hovered)));
+    SetWindowTextW(state.icon_tooltip_popup, name);
+    HDC dc = GetDC(state.icon_tooltip_popup);
+    SIZE text_size{};
+    GetTextExtentPoint32W(
+        dc,
+        name,
+        static_cast<int>(wcslen(name)),
+        &text_size);
+    ReleaseDC(state.icon_tooltip_popup, dc);
+    const int width = std::max(
+        72,
+        static_cast<int>(text_size.cx) + 24);
+    const int height = std::max(
+        28,
+        static_cast<int>(text_size.cy) + 10);
+    int x = cursor.x + 14;
+    int y = cursor.y + 20;
+    MONITORINFO monitor_info{sizeof(MONITORINFO)};
+    if (GetMonitorInfoW(
+            MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST),
+            &monitor_info)) {
+        x = std::clamp(
+            x,
+            static_cast<int>(monitor_info.rcWork.left),
+            static_cast<int>(monitor_info.rcWork.right) - width);
+        y = std::clamp(
+            y,
+            static_cast<int>(monitor_info.rcWork.top),
+            static_cast<int>(monitor_info.rcWork.bottom) - height);
+    }
+    SetWindowPos(
+        state.icon_tooltip_popup,
+        HWND_TOPMOST,
+        x,
+        y,
+        width,
+        height,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+void drawEditorIconButton(const DRAWITEMSTRUCT& item) {
+    RECT rect = item.rcItem;
+    UINT frame_state = DFCS_BUTTONPUSH;
+    if (item.itemState & ODS_SELECTED) {
+        frame_state |= DFCS_PUSHED;
+    }
+    if (item.itemState & ODS_DISABLED) {
+        frame_state |= DFCS_INACTIVE;
+    }
+    DrawFrameControl(
+        item.hDC,
+        &rect,
+        DFC_BUTTON,
+        frame_state);
+    if (item.itemState & ODS_SELECTED) {
+        OffsetRect(&rect, 1, 1);
+    }
+    SetBkMode(item.hDC, TRANSPARENT);
+    SetTextColor(
+        item.hDC,
+        GetSysColor(
+            item.itemState & ODS_DISABLED
+                ? COLOR_GRAYTEXT
+                : COLOR_BTNTEXT));
+    const int font_height =
+        item.CtlID == kSccToggleAudition ? -17 : -23;
+    HFONT font = CreateFontW(
+        font_height,
+        0,
+        0,
+        0,
+        FW_NORMAL,
+        FALSE,
+        FALSE,
+        FALSE,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        DEFAULT_PITCH,
+        L"Segoe UI Symbol");
+    const auto previous_font = SelectObject(item.hDC, font);
+    DrawTextW(
+        item.hDC,
+        editorIconGlyph(item.CtlID),
+        -1,
+        &rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(item.hDC, previous_font);
+    DeleteObject(font);
+    if (item.itemState & ODS_FOCUS) {
+        InflateRect(&rect, -3, -3);
+        DrawFocusRect(item.hDC, &rect);
+    }
+}
+
 mgstc::engine::SccWavePreset selectedSccPreset(
     HWND window) {
     const int selection = std::clamp<int>(
         static_cast<int>(SendDlgItemMessageW(
             window, kSccPresetCombo, CB_GETCURSEL, 0, 0)),
         0,
-        5);
+        6);
     return static_cast<mgstc::engine::SccWavePreset>(selection);
+}
+
+mgstc::engine::SccApplyRange selectedSccApplyRange(
+    HWND window) {
+    const int selection = std::clamp<int>(
+        static_cast<int>(SendDlgItemMessageW(
+            window, kSccApplyRange, CB_GETCURSEL, 0, 0)),
+        0,
+        2);
+    return static_cast<mgstc::engine::SccApplyRange>(selection);
+}
+
+const wchar_t* sccApplyRangeName(
+    mgstc::engine::SccApplyRange range) {
+    switch (range) {
+    case mgstc::engine::SccApplyRange::LeftHalf:
+        return L"左半分";
+    case mgstc::engine::SccApplyRange::RightHalf:
+        return L"右半分";
+    default:
+        return L"全体";
+    }
 }
 
 mgstc::engine::SccHarmonic selectedSccHarmonic(
@@ -1387,7 +1987,7 @@ mgstc::engine::SccHarmonic selectedSccHarmonic(
         static_cast<int>(SendDlgItemMessageW(
             window, kSccHarmonicCombo, TBM_GETPOS, 0, 0)),
         0,
-        2);
+        4);
     return static_cast<mgstc::engine::SccHarmonic>(selection);
 }
 
@@ -1431,11 +2031,13 @@ void refreshSccPresetPreview(
         mgstc::engine::generateSccPreset(
             selectedSccPreset(window),
             selectedSccHarmonic(window));
+    const auto current = currentSccWaveform(*state.app);
+    const auto apply_range = selectedSccApplyRange(window);
     if (IsDlgButtonChecked(window, kSccMergeCheck) == BST_CHECKED) {
         const int amount = static_cast<int>(SendDlgItemMessageW(
             window, kSccMergeAmount, TBM_GETPOS, 0, 0));
         const auto merged = mgstc::engine::mergeSccWaveforms(
-            currentSccWaveform(*state.app),
+            current,
             preset,
             {
                 .amount = amount / 100.0,
@@ -1449,18 +2051,31 @@ void refreshSccPresetPreview(
                     IsDlgButtonChecked(
                         window, kSccPreserveVolumeCheck) == BST_CHECKED,
             });
-        state.scc_preview_wave = merged.waveform;
+        state.scc_preview_wave =
+            mgstc::engine::applySccWaveformRange(
+                current,
+                merged.waveform,
+                apply_range);
         setSccOperationStatus(
             window,
-            std::wstring(L"プレビュー: 位相 ")
+            std::wstring(L"プレビュー: ")
+                + sccApplyRangeName(apply_range)
+                + L" / 位相 "
                 + std::to_wstring(merged.circular_shift)
                 + (merged.polarity_inverted
                     ? L" / 極性反転"
                     : L" / 正極性"));
     } else {
-        state.scc_preview_wave = preset;
+        state.scc_preview_wave =
+            mgstc::engine::applySccWaveformRange(
+                current,
+                preset,
+                apply_range);
         setSccOperationStatus(
-            window, L"プレビュー: プリセットで置換");
+            window,
+            std::wstring(L"プレビュー: ")
+                + sccApplyRangeName(apply_range)
+                + L"をプリセットで置換");
     }
     state.scc_preview_active = true;
     state.scc_preview_hearing_candidate = true;
@@ -1469,6 +2084,50 @@ void refreshSccPresetPreview(
     if (audition) {
         auditionSccPreview(state, state.scc_preview_wave);
     }
+}
+
+void previewSccVerticalScale(
+    EditorState& state,
+    HWND window,
+    int percent) {
+    if (!state.scc_scale_preview_active) {
+        state.scc_scale_source = currentSccWaveform(*state.app);
+    }
+    state.scc_preview_active = false;
+    state.scc_preview_hearing_candidate = true;
+    state.scc_scale_preview_active = true;
+    state.scc_scale_percent = std::clamp(percent, 0, 200);
+    state.scc_preview_wave =
+        mgstc::engine::scaleSccWaveformVertically(
+            state.scc_scale_source,
+            state.scc_scale_percent);
+    updateSccPreviewAuditionButton(state, window);
+    wchar_t label[16]{};
+    swprintf_s(label, L"%d%%", state.scc_scale_percent);
+    SetDlgItemTextW(window, kSccVerticalScaleLabel, label);
+    setSccOperationStatus(
+        window,
+        std::wstring(L"縦倍率プレビュー: ")
+            + label
+            + L"（バーを離すと確定）");
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+void commitSccVerticalScale(
+    EditorState& state,
+    HWND window) {
+    if (!state.scc_scale_preview_active) {
+        return;
+    }
+    const auto scaled = state.scc_preview_wave;
+    state.scc_scale_preview_active = false;
+    captureSccUndo(state);
+    applySccWaveform(state, window, scaled);
+    setSccOperationStatus(
+        window,
+        std::wstring(L"縦倍率 ")
+            + std::to_wstring(state.scc_scale_percent)
+            + L"% を適用");
 }
 
 std::optional<std::vector<std::uint8_t>> readWaveFileBytes(
@@ -1525,31 +2184,110 @@ std::optional<std::vector<std::uint8_t>> openWaveFile(HWND window) {
     return readWaveFileBytes(path);
 }
 
-std::optional<std::vector<std::uint8_t>> clipboardWaveBytes(
-    HWND window) {
-    if (!IsClipboardFormatAvailable(CF_WAVE)
-        && !IsClipboardFormatAvailable(CF_RIFF)
-        && !IsClipboardFormatAvailable(CF_HDROP)) {
+std::optional<std::vector<std::uint8_t>> waveBytesFromBuffer(
+    const std::uint8_t* data,
+    std::size_t size,
+    bool require_riff_wave) {
+    if (!data || size < 12 || size > 64 * 1024 * 1024) {
         return std::nullopt;
     }
+    std::size_t riff_offset{};
+    if (require_riff_wave) {
+        bool found{};
+        const std::size_t search_end =
+            std::min<std::size_t>(size - 12, 4096);
+        for (; riff_offset <= search_end; ++riff_offset) {
+            if (data[riff_offset] == 'R'
+                && data[riff_offset + 1] == 'I'
+                && data[riff_offset + 2] == 'F'
+                && data[riff_offset + 3] == 'F'
+                && data[riff_offset + 8] == 'W'
+                && data[riff_offset + 9] == 'A'
+                && data[riff_offset + 10] == 'V'
+                && data[riff_offset + 11] == 'E') {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return std::nullopt;
+        }
+    }
+    std::size_t copy_size = size - riff_offset;
+    if (copy_size >= 12
+        && data[riff_offset] == 'R'
+        && data[riff_offset + 1] == 'I'
+        && data[riff_offset + 2] == 'F'
+        && data[riff_offset + 3] == 'F') {
+        const std::uint32_t riff_size =
+            static_cast<std::uint32_t>(data[riff_offset + 4])
+            | (static_cast<std::uint32_t>(
+                   data[riff_offset + 5]) << 8)
+            | (static_cast<std::uint32_t>(
+                   data[riff_offset + 6]) << 16)
+            | (static_cast<std::uint32_t>(
+                   data[riff_offset + 7]) << 24);
+        const std::size_t declared_size =
+            static_cast<std::size_t>(riff_size) + 8;
+        if (declared_size >= 12 && declared_size <= copy_size) {
+            copy_size = declared_size;
+        }
+    }
+    return std::vector<std::uint8_t>(
+        data + riff_offset,
+        data + riff_offset + copy_size);
+}
+
+std::optional<std::vector<std::uint8_t>> waveBytesFromGlobal(
+    HGLOBAL memory,
+    bool require_riff_wave) {
+    if (!memory) {
+        return std::nullopt;
+    }
+    const std::size_t size = GlobalSize(memory);
+    const auto* data = static_cast<const std::uint8_t*>(
+        GlobalLock(memory));
+    if (!data) {
+        return std::nullopt;
+    }
+    auto result =
+        waveBytesFromBuffer(data, size, require_riff_wave);
+    GlobalUnlock(memory);
+    return result;
+}
+
+std::optional<std::vector<std::uint8_t>> clipboardWaveBytes(
+    HWND window) {
     if (!OpenClipboard(window)) {
         return std::nullopt;
     }
     std::optional<std::vector<std::uint8_t>> result;
-    const UINT memory_format =
-        IsClipboardFormatAvailable(CF_WAVE) ? CF_WAVE : CF_RIFF;
-    if (IsClipboardFormatAvailable(memory_format)) {
-        if (HGLOBAL memory = GetClipboardData(memory_format)) {
-            const std::size_t size = GlobalSize(memory);
-            if (size >= 12 && size <= 64 * 1024 * 1024) {
-                if (const auto* data = static_cast<const std::uint8_t*>(
-                        GlobalLock(memory))) {
-                    result = std::vector<std::uint8_t>(data, data + size);
-                    GlobalUnlock(memory);
-                }
-            }
+    const auto memory_bytes = [](
+        UINT format,
+        bool require_riff_wave)
+        -> std::optional<std::vector<std::uint8_t>> {
+        return waveBytesFromGlobal(
+            GetClipboardData(format),
+            require_riff_wave);
+    };
+
+    for (const UINT format : {CF_WAVE, CF_RIFF}) {
+        if (!result && IsClipboardFormatAvailable(format)) {
+            result = memory_bytes(format, false);
         }
     }
+    // Audio editors frequently publish RIFF/WAVE data through a registered
+    // MIME-named format instead of CF_WAVE. Enumerate every HGLOBAL-backed
+    // format and accept only a validated RIFF....WAVE payload.
+    for (UINT format = 0;
+         !result && (format = EnumClipboardFormats(format)) != 0;) {
+        if (format != CF_WAVE
+            && format != CF_RIFF
+            && format != CF_HDROP) {
+            result = memory_bytes(format, true);
+        }
+    }
+
     std::wstring dropped_path;
     if (!result && IsClipboardFormatAvailable(CF_HDROP)) {
         if (HDROP drop = static_cast<HDROP>(
@@ -1565,6 +2303,85 @@ std::optional<std::vector<std::uint8_t>> clipboardWaveBytes(
         }
     }
     CloseClipboard();
+
+    // Some applications expose clipboard audio through OLE IDataObject
+    // storage instead of a Win32 HGLOBAL. Accept both HGLOBAL and IStream.
+    if (!result) {
+        IDataObject* data_object{};
+        if (SUCCEEDED(OleGetClipboard(&data_object)) && data_object) {
+            IEnumFORMATETC* formats{};
+            if (SUCCEEDED(data_object->EnumFormatEtc(
+                    DATADIR_GET,
+                    &formats))
+                && formats) {
+                FORMATETC available{};
+                ULONG fetched{};
+                while (!result
+                    && formats->Next(
+                           1,
+                           &available,
+                           &fetched) == S_OK) {
+                    const bool require_riff_wave =
+                        available.cfFormat != CF_WAVE
+                        && available.cfFormat != CF_RIFF;
+                    FORMATETC request{
+                        available.cfFormat,
+                        nullptr,
+                        DVASPECT_CONTENT,
+                        -1,
+                        TYMED_HGLOBAL | TYMED_ISTREAM};
+                    STGMEDIUM medium{};
+                    if (SUCCEEDED(data_object->GetData(
+                            &request,
+                            &medium))) {
+                        if (medium.tymed == TYMED_HGLOBAL) {
+                            result = waveBytesFromGlobal(
+                                medium.hGlobal,
+                                require_riff_wave);
+                        } else if (medium.tymed == TYMED_ISTREAM
+                            && medium.pstm) {
+                            STATSTG stat{};
+                            if (SUCCEEDED(medium.pstm->Stat(
+                                    &stat,
+                                    STATFLAG_NONAME))
+                                && stat.cbSize.QuadPart >= 12
+                                && stat.cbSize.QuadPart
+                                    <= 64 * 1024 * 1024) {
+                                LARGE_INTEGER start{};
+                                static_cast<void>(
+                                    medium.pstm->Seek(
+                                        start,
+                                        STREAM_SEEK_SET,
+                                        nullptr));
+                                std::vector<std::uint8_t> bytes(
+                                    static_cast<std::size_t>(
+                                        stat.cbSize.QuadPart));
+                                ULONG read{};
+                                if (SUCCEEDED(medium.pstm->Read(
+                                        bytes.data(),
+                                        static_cast<ULONG>(
+                                            bytes.size()),
+                                        &read))
+                                    && read == bytes.size()) {
+                                    result = waveBytesFromBuffer(
+                                        bytes.data(),
+                                        bytes.size(),
+                                        require_riff_wave);
+                                }
+                            }
+                        }
+                        ReleaseStgMedium(&medium);
+                    }
+                    if (available.ptd) {
+                        CoTaskMemFree(available.ptd);
+                    }
+                }
+                formats->Release();
+            }
+            data_object->Release();
+        }
+    }
+
     if (!result && !dropped_path.empty()) {
         const auto extension =
             dropped_path.size() >= 4
@@ -1575,6 +2392,46 @@ std::optional<std::vector<std::uint8_t>> clipboardWaveBytes(
         }
     }
     return result;
+}
+
+void updateOpllWaveCandidateControls(
+    const EditorState& state,
+    HWND window) {
+    const std::size_t count = state.opll_wave_candidates.size();
+    const bool multiple = count > 1;
+    EnableWindow(
+        GetDlgItem(window, kOpllWaveCandidatePrevious),
+        multiple);
+    EnableWindow(
+        GetDlgItem(window, kOpllWaveCandidateNext),
+        multiple);
+    std::wstring label = L"WAV候補 --/--";
+    if (count != 0) {
+        label =
+            L"WAV候補 "
+            + std::to_wstring(state.opll_wave_candidate_index + 1)
+            + L"/" + std::to_wstring(count);
+    }
+    SetDlgItemTextW(window, kOpllWaveCandidateLabel, label.c_str());
+}
+
+void applyOpllWaveCandidate(
+    EditorState& state,
+    HWND window,
+    std::size_t index) {
+    if (index >= state.opll_wave_candidates.size()) {
+        return;
+    }
+    state.opll_wave_candidate_index = index;
+    state.app->opll_patch = state.opll_wave_candidates[index];
+    syncOpllEditorControls(state, window);
+    updateOpllWaveCandidateControls(state, window);
+    state.app->auditionEditedProgram(true);
+    state.app->setStatus(
+        L"WAV変換 OPLL候補 "
+        + std::to_wstring(index + 1)
+        + L"/"
+        + std::to_wstring(state.opll_wave_candidates.size()));
 }
 
 bool applyWaveConversion(
@@ -1605,11 +2462,10 @@ bool applyWaveConversion(
     SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     captureSccUndo(state);
     if (state.opll) {
-        state.app->opll_patch =
-            mgstc::engine::approximateWaveCycleWithOpll(
-                analysis.cycle);
-        syncOpllEditorControls(state, window);
-        state.app->auditionEditedProgram(true);
+        state.opll_wave_candidates =
+            mgstc::engine::approximateWavePcmCandidatesWithOpll(pcm);
+        state.opll_wave_candidate_index = 0;
+        applyOpllWaveCandidate(state, window, 0);
     } else {
         applySccWaveform(
             state,
@@ -1621,7 +2477,7 @@ bool applyWaveConversion(
     swprintf_s(
         status,
         state.opll
-            ? L"WAV解析完了: 約 %.1f Hz / OPLL近似音色を生成"
+            ? L"WAV全区間解析完了: 約 %.1f Hz / OPLL近似音色を生成"
             : L"WAV解析完了: 約 %.1f Hz / SCC 32サンプルへ変換",
         analysis.estimated_frequency_hz);
     state.app->setStatus(status);
@@ -2022,6 +2878,179 @@ std::wstring utf8ToWide(std::string_view text) {
     return result;
 }
 
+struct AudacityWaveImportResult {
+    std::optional<std::vector<std::uint8_t>> wave;
+    std::wstring error;
+};
+
+AudacityWaveImportResult exportAudacitySelectionToWave() {
+    constexpr wchar_t kToAudacityPipe[] =
+        L"\\\\.\\pipe\\ToSrvPipe";
+    constexpr wchar_t kFromAudacityPipe[] =
+        L"\\\\.\\pipe\\FromSrvPipe";
+
+    if (!WaitNamedPipeW(kToAudacityPipe, 1500)) {
+        return {
+            std::nullopt,
+            L"Audacityのスクリプト接続を検出できませんでした。\n\n"
+            L"Audacityの「編集」→「環境設定」→「モジュール」で"
+            L"mod-script-pipeを有効にし、Audacityを再起動してから"
+            L"音声範囲を選択してください。\n\n"
+            L"注意: mod-script-pipeを有効にすると、同じPC上の"
+            L"他のプログラムからAudacityを操作できる状態になります。"
+            L"信頼できないプログラムを実行する環境では無効にしてください。"};
+    }
+
+    HANDLE to_audacity = CreateFileW(
+        kToAudacityPipe,
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        0,
+        nullptr);
+    if (to_audacity == INVALID_HANDLE_VALUE) {
+        return {
+            std::nullopt,
+            L"Audacityへの書き込み接続を開けませんでした。"
+            L"Audacityを再起動してから、もう一度お試しください。"};
+    }
+
+    if (!WaitNamedPipeW(kFromAudacityPipe, 1500)) {
+        CloseHandle(to_audacity);
+        return {
+            std::nullopt,
+            L"Audacityからの応答接続を検出できませんでした。"
+            L"Audacityを再起動してから、もう一度お試しください。"};
+    }
+    HANDLE from_audacity = CreateFileW(
+        kFromAudacityPipe,
+        GENERIC_READ,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        0,
+        nullptr);
+    if (from_audacity == INVALID_HANDLE_VALUE) {
+        CloseHandle(to_audacity);
+        return {
+            std::nullopt,
+            L"Audacityからの応答接続を開けませんでした。"
+            L"Audacityを再起動してから、もう一度お試しください。"};
+    }
+
+    wchar_t temporary_directory[MAX_PATH]{};
+    wchar_t reservation_path[MAX_PATH]{};
+    if (GetTempPathW(
+            static_cast<DWORD>(std::size(temporary_directory)),
+            temporary_directory) == 0
+        || GetTempFileNameW(
+               temporary_directory,
+               L"MGS",
+               0,
+               reservation_path) == 0) {
+        CloseHandle(from_audacity);
+        CloseHandle(to_audacity);
+        return {
+            std::nullopt,
+            L"Audacity変換用の一時ファイルを作成できませんでした。"};
+    }
+    const std::wstring wave_path =
+        std::wstring(reservation_path) + L".wav";
+    const auto cleanup = [&]() {
+        DeleteFileW(wave_path.c_str());
+        DeleteFileW(reservation_path);
+    };
+
+    std::string command =
+        "Export2: Filename=\""
+        + wideToUtf8(wave_path)
+        + "\" NumChannels=1";
+    command.append("\r\n", 2);
+    command.push_back('\0');
+    DWORD written{};
+    const bool sent = WriteFile(
+        to_audacity,
+        command.data(),
+        static_cast<DWORD>(command.size()),
+        &written,
+        nullptr)
+        && written == command.size();
+    if (!sent) {
+        cleanup();
+        CloseHandle(from_audacity);
+        CloseHandle(to_audacity);
+        return {
+            std::nullopt,
+            L"Audacityへ書き出し命令を送信できませんでした。"};
+    }
+
+    std::string response;
+    const ULONGLONG deadline = GetTickCount64() + 30000;
+    while (GetTickCount64() < deadline) {
+        DWORD available{};
+        if (!PeekNamedPipe(
+                from_audacity,
+                nullptr,
+                0,
+                nullptr,
+                &available,
+                nullptr)) {
+            break;
+        }
+        if (available != 0) {
+            std::array<char, 4096> buffer{};
+            DWORD read{};
+            if (!ReadFile(
+                    from_audacity,
+                    buffer.data(),
+                    static_cast<DWORD>(
+                        std::min<std::size_t>(
+                            buffer.size(),
+                            available)),
+                    &read,
+                    nullptr)) {
+                break;
+            }
+            response.append(buffer.data(), read);
+            if (response.find("\r\n\0\r\n\0", 0, 6)
+                    != std::string::npos
+                || response.find("\n\n") != std::string::npos
+                || response.find("\r\n\r\n")
+                    != std::string::npos) {
+                break;
+            }
+        } else {
+            Sleep(20);
+        }
+    }
+
+    CloseHandle(from_audacity);
+    CloseHandle(to_audacity);
+
+    const bool failed =
+        response.find("Failed") != std::string::npos
+        || response.find("Error") != std::string::npos;
+    auto wave = failed
+        ? std::optional<std::vector<std::uint8_t>>{}
+        : readWaveFileBytes(wave_path.c_str());
+    cleanup();
+    if (wave) {
+        return {std::move(wave), {}};
+    }
+    if (response.empty()) {
+        return {
+            std::nullopt,
+            L"Audacityから30秒以内に応答がありませんでした。"
+            L"Audacityが停止または録音中でないことを確認してください。"};
+    }
+    return {
+        std::nullopt,
+        L"Audacityで選択範囲をWAVへ書き出せませんでした。\n\n"
+        L"音声トラック上で時間範囲を選択し、再生・録音を停止してから"
+        L"もう一度お試しください。"};
+}
+
 std::wstring dialogText(HWND window, int id) {
     const HWND control = GetDlgItem(window, id);
     const int length = control ? GetWindowTextLengthW(control) : 0;
@@ -2205,11 +3234,14 @@ void loadApplicationSettings(AppState& app) {
     app.scc_immediate_audition =
         GetPrivateProfileIntW(
             section, L"SccImmediateAudition", 1, path.c_str()) != 0;
+    app.opll_scope_sync =
+        GetPrivateProfileIntW(
+            section, L"OpllScopeSync", 1, path.c_str()) != 0;
     app.pc_octave = std::clamp(
         static_cast<int>(GetPrivateProfileIntW(
             section, L"PcKeyboardOctave", 4, path.c_str())),
         1,
-        8);
+        6);
 }
 
 bool saveApplicationSettings(const AppState& app) {
@@ -2231,6 +3263,9 @@ bool saveApplicationSettings(const AppState& app) {
         && write_value(
             L"SccImmediateAudition",
             app.scc_immediate_audition ? 1 : 0)
+        && write_value(
+            L"OpllScopeSync",
+            app.opll_scope_sync ? 1 : 0)
         && write_value(L"PcKeyboardOctave", app.pc_octave)
         && WritePrivateProfileStringW(
             nullptr, nullptr, nullptr, path.c_str()) != FALSE;
@@ -2707,9 +3742,6 @@ bool pasteClipboardImageAsSccBackground(
 
 std::pair<int, int> sccSampleFromPoint(POINT point) {
     const auto graph = sccWaveGraphRect();
-    const int width = std::max<int>(
-        1,
-        static_cast<int>(graph.right - graph.left - 1));
     const int height = std::max<int>(
         1,
         static_cast<int>(graph.bottom - graph.top - 1));
@@ -2722,7 +3754,7 @@ std::pair<int, int> sccSampleFromPoint(POINT point) {
         graph.top,
         graph.bottom - 1);
     const int index = std::clamp<int>(
-        ((x - graph.left) * 31 + width / 2) / width,
+        (x - graph.left) / kSccWaveSamplePitch,
         0,
         31);
     const int value = std::clamp<int>(
@@ -2831,46 +3863,55 @@ void paintSccWave(
     const auto old_pen = SelectObject(dc, grid_pen);
     const int zero_y =
         graph.top + ((graph.bottom - graph.top) * 127) / 255;
-    MoveToEx(dc, graph.left + 1, zero_y, nullptr);
-    LineTo(dc, graph.right - 1, zero_y);
     for (int index = 0; index < 32; ++index) {
-        const int x = graph.left
-            + (index * (graph.right - graph.left - 1)) / 31;
+        const int x = sccWaveSampleX(graph, index);
         MoveToEx(dc, x, graph.top + 1, nullptr);
         LineTo(dc, x, graph.bottom - 1);
     }
     SelectObject(dc, old_pen);
     DeleteObject(grid_pen);
 
-    std::array<POINT, 32> points{};
+    const RECT center_line{
+        graph.left + 1,
+        zero_y - 1,
+        graph.right - 1,
+        zero_y + 2,
+    };
+    HBRUSH center_brush = CreateSolidBrush(RGB(96, 104, 114));
+    FillRect(dc, &center_line, center_brush);
+    DeleteObject(center_brush);
+
+    std::array<POINT, 34> points{};
     for (int index = 0; index < 32; ++index) {
         const int sample = static_cast<std::int8_t>(
             state.app->scc_wave[static_cast<std::size_t>(index)]);
-        points[static_cast<std::size_t>(index)] = {
-            graph.left
-                + (index * (graph.right - graph.left - 1)) / 31,
-            graph.top
-                + ((127 - sample) * (graph.bottom - graph.top - 1))
-                    / 255,
+        points[static_cast<std::size_t>(index + 1)] = {
+            sccWaveSampleX(graph, index),
+            sccWaveSampleY(graph, sample),
         };
     }
+    const int boundary_y =
+        (points[1].y + points[32].y) / 2;
+    points[0] = {graph.left, boundary_y};
+    points[33] = {graph.right - 1, boundary_y};
     HPEN wave_pen = CreatePen(PS_SOLID, 2, RGB(40, 150, 128));
     const auto previous = SelectObject(dc, wave_pen);
     Polyline(dc, points.data(), static_cast<int>(points.size()));
     SelectObject(dc, previous);
     DeleteObject(wave_pen);
 
-    if (state.scc_preview_active) {
+    if (state.scc_preview_active || state.scc_scale_preview_active) {
         for (int index = 0; index < 32; ++index) {
             const int sample = static_cast<int>(
                 state.scc_preview_wave[
                     static_cast<std::size_t>(index)]);
-            points[static_cast<std::size_t>(index)].y =
-                graph.top
-                + ((127 - sample)
-                    * (graph.bottom - graph.top - 1))
-                    / 255;
+            points[static_cast<std::size_t>(index + 1)].y =
+                sccWaveSampleY(graph, sample);
         }
+        const int preview_boundary_y =
+            (points[1].y + points[32].y) / 2;
+        points[0].y = preview_boundary_y;
+        points[33].y = preview_boundary_y;
         HPEN preview_pen =
             CreatePen(PS_DASH, 1, RGB(224, 104, 55));
         const auto old_preview = SelectObject(dc, preview_pen);
@@ -2900,6 +3941,15 @@ LRESULT CALLBACK editorProcedure(
     }
     case WM_NCDESTROY:
         KillTimer(window, kOpllScopeTimer);
+        KillTimer(window, kEditorIconTooltipTimer);
+        if (state && state->icon_tooltip_popup) {
+            DestroyWindow(state->icon_tooltip_popup);
+            state->icon_tooltip_popup = nullptr;
+        }
+        if (state && state->scc_value_font) {
+            DeleteObject(state->scc_value_font);
+            state->scc_value_font = nullptr;
+        }
         if (state && !state->opll && state->scc_background) {
             DeleteObject(state->scc_background);
             state->scc_background = nullptr;
@@ -2908,6 +3958,21 @@ LRESULT CALLBACK editorProcedure(
         break;
     case WM_CREATE: {
         const auto instance = GetModuleHandleW(nullptr);
+        state->icon_tooltip_popup = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+                | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            L"STATIC",
+            L"",
+            WS_POPUP | WS_BORDER | SS_CENTER | SS_CENTERIMAGE,
+            0,
+            0,
+            0,
+            0,
+            window,
+            nullptr,
+            instance,
+            nullptr);
+        SetTimer(window, kEditorIconTooltipTimer, 100, nullptr);
         CreateWindowExW(
             0, L"STATIC",
             state->opll
@@ -2932,42 +3997,44 @@ LRESULT CALLBACK editorProcedure(
                 static_cast<INT_PTR>(kTimbreExportNumber)),
             instance,
             nullptr);
-        CreateWindowExW(
-            0, L"BUTTON", L"ファイル読込",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            438, 14, 70, 30,
-            window,
-            reinterpret_cast<HMENU>(
-                static_cast<INT_PTR>(kTimbreImport)),
-            instance,
-            nullptr);
-        CreateWindowExW(
-            0, L"BUTTON", L"ファイル保存",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            512, 14, 70, 30,
-            window,
-            reinterpret_cast<HMENU>(
-                static_cast<INT_PTR>(kTimbreExport)),
-            instance,
-            nullptr);
-        CreateWindowExW(
-            0, L"BUTTON", L"貼り付け",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            586, 14, 58, 30,
-            window,
-            reinterpret_cast<HMENU>(
-                static_cast<INT_PTR>(kTimbreClipboardPaste)),
-            instance,
-            nullptr);
-        CreateWindowExW(
-            0, L"BUTTON", L"コピー",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            648, 14, 58, 30,
-            window,
-            reinterpret_cast<HMENU>(
-                static_cast<INT_PTR>(kTimbreClipboardCopy)),
-            instance,
-            nullptr);
+        constexpr std::array<const wchar_t*, 6> common_tool_names{
+            L"ファイル読込",
+            L"ファイル保存",
+            L"貼り付け",
+            L"コピー",
+            L"Undo",
+            L"Redo",
+        };
+        constexpr std::array<int, 6> common_tool_ids{
+            kTimbreImport,
+            kTimbreExport,
+            kTimbreClipboardPaste,
+            kTimbreClipboardCopy,
+            kEditorUndo,
+            kEditorRedo,
+        };
+        for (int index = 0; index < 6; ++index) {
+            HWND button = CreateWindowExW(
+                0,
+                L"BUTTON",
+                common_tool_names[static_cast<std::size_t>(index)],
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                438 + index * 44,
+                8,
+                40,
+                40,
+                window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(
+                    common_tool_ids[static_cast<std::size_t>(index)])),
+                instance,
+                nullptr);
+            if (common_tool_ids[static_cast<std::size_t>(index)]
+                    == kEditorUndo
+                || common_tool_ids[static_cast<std::size_t>(index)]
+                    == kEditorRedo) {
+                EnableWindow(button, FALSE);
+            }
+        }
         CreateWindowExW(
             0,
             L"BUTTON",
@@ -2982,6 +4049,30 @@ LRESULT CALLBACK editorProcedure(
                 static_cast<INT_PTR>(kWaveConvert)),
             instance,
             nullptr);
+        HWND audacity_convert = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Audacityから変換",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            794,
+            14,
+            142,
+            30,
+            window,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(kAudacityConvert)),
+            instance,
+            nullptr);
+        HWND audacity_tooltip = createTooltipWindow(window, 460);
+        addControlTooltip(
+            audacity_tooltip,
+            audacity_convert,
+            L"Audacityから変換\n"
+            L"事前にAudacityの「編集」→「環境設定」→"
+            L"「モジュール」でmod-script-pipeを有効にして"
+            L"Audacityを再起動してください。\n"
+            L"注意: 有効化中は同じPC上の他のプログラムから"
+            L"Audacityを操作できるため、信頼できる環境で使用してください。");
         CreateWindowExW(
             0, L"BUTTON", L"変更時に最後の音程で即時発声",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
@@ -2999,22 +4090,36 @@ LRESULT CALLBACK editorProcedure(
                 : state->app->scc_immediate_audition)
                 ? BST_CHECKED
                 : BST_UNCHECKED);
-        for (int index = 0; index < 2; ++index) {
-            HWND history_button = CreateWindowExW(
-                0,
-                L"BUTTON",
-                index == 0 ? L"Undo" : L"Redo",
+        if (state->opll) {
+            HWND previous = CreateWindowExW(
+                0, L"BUTTON", L"前候補",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                298 + index * 58,
-                46,
-                54,
-                26,
+                414, 46, 64, 26,
                 window,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(
-                    index == 0 ? kEditorUndo : kEditorRedo)),
+                    kOpllWaveCandidatePrevious)),
                 instance,
                 nullptr);
-            EnableWindow(history_button, FALSE);
+            CreateWindowExW(
+                0, L"STATIC", L"WAV候補 --/--",
+                WS_CHILD | WS_VISIBLE | SS_CENTER,
+                482, 51, 104, 20,
+                window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(
+                    kOpllWaveCandidateLabel)),
+                instance,
+                nullptr);
+            HWND next = CreateWindowExW(
+                0, L"BUTTON", L"次候補",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                590, 46, 64, 26,
+                window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(
+                    kOpllWaveCandidateNext)),
+                instance,
+                nullptr);
+            EnableWindow(previous, FALSE);
+            EnableWindow(next, FALSE);
         }
 
         CreateWindowExW(
@@ -3186,6 +4291,24 @@ LRESULT CALLBACK editorProcedure(
             instance,
             nullptr);
         if (state->opll) {
+            state->opll_scope_history_size = 0;
+            state->opll_scope_history_write = 0;
+            state->opll_scope_display_available = false;
+            CreateWindowExW(
+                0, L"BUTTON", L"周期同期表示",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                610, 628, 140, 24,
+                window,
+                reinterpret_cast<HMENU>(
+                    static_cast<INT_PTR>(kOpllScopeSync)),
+                instance,
+                nullptr);
+            CheckDlgButton(
+                window,
+                kOpllScopeSync,
+                state->app->opll_scope_sync
+                    ? BST_CHECKED
+                    : BST_UNCHECKED);
             SetTimer(window, kOpllScopeTimer, 16, nullptr);
         }
 
@@ -3413,6 +4536,21 @@ LRESULT CALLBACK editorProcedure(
                 }
             }
         } else {
+            state->scc_value_font = CreateFontW(
+                -10,
+                0,
+                0,
+                0,
+                FW_NORMAL,
+                FALSE,
+                FALSE,
+                FALSE,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                DEFAULT_PITCH | FF_DONTCARE,
+                L"Segoe UI");
             CreateWindowExW(
                 0, L"STATIC",
                 L"波形をなぞって描画 / 各列 上段DEC・下段HEX",
@@ -3425,15 +4563,25 @@ LRESULT CALLBACK editorProcedure(
                     state->app->scc_wave[static_cast<std::size_t>(index)]);
                 wchar_t value[8]{};
                 swprintf_s(value, L"%d", static_cast<int>(sample));
-                CreateWindowExW(
+                HWND decimal = CreateWindowExW(
                     WS_EX_CLIENTEDGE, L"EDIT", value,
-                    WS_CHILD | WS_VISIBLE | ES_CENTER,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP
+                        | ES_CENTER | ES_AUTOHSCROLL,
                     x - 1, 364, 25, 24,
                     window,
                     reinterpret_cast<HMENU>(
                         static_cast<INT_PTR>(kSccValueBase + index)),
                     instance,
                     nullptr);
+                if (state->scc_value_font) {
+                    SendMessageW(
+                        decimal,
+                        WM_SETFONT,
+                        reinterpret_cast<WPARAM>(
+                            state->scc_value_font),
+                        TRUE);
+                }
+                SendMessageW(decimal, EM_SETLIMITTEXT, 4, 0);
                 wchar_t hexadecimal[4]{};
                 swprintf_s(
                     hexadecimal,
@@ -3443,7 +4591,8 @@ LRESULT CALLBACK editorProcedure(
                             static_cast<std::size_t>(index)]));
                 CreateWindowExW(
                     WS_EX_CLIENTEDGE, L"EDIT", hexadecimal,
-                    WS_CHILD | WS_VISIBLE | ES_CENTER | ES_UPPERCASE,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_CENTER
+                        | ES_UPPERCASE | ES_AUTOHSCROLL,
                     x - 1, 394, 25, 24,
                     window,
                     reinterpret_cast<HMENU>(
@@ -3570,15 +4719,16 @@ LRESULT CALLBACK editorProcedure(
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP
                     | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED
                     | CBS_HASSTRINGS,
-                90, 558, 150, 240,
+                90, 558, 150, 340,
                 window,
                 reinterpret_cast<HMENU>(
                     static_cast<INT_PTR>(kSccPresetCombo)),
                 instance,
                 nullptr);
-            constexpr std::array<const wchar_t*, 6> preset_names{
+            constexpr std::array<const wchar_t*, 7> preset_names{
                 L"Sine", L"Square", L"Triangle",
-                L"Saw Up", L"Saw Down", L"Pulse"};
+                L"Saw Up", L"Saw Down",
+                L"Pulse 25%", L"Pulse 12.5%"};
             for (const auto* name : preset_names) {
                 SendMessageW(
                     preset,
@@ -3602,20 +4752,20 @@ LRESULT CALLBACK editorProcedure(
             HWND harmonic = CreateWindowExW(
                 0, TRACKBAR_CLASSW, L"",
                 WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
-                290, 560, 72, 34,
+                290, 560, 104, 34,
                 window,
                 reinterpret_cast<HMENU>(
                     static_cast<INT_PTR>(kSccHarmonicCombo)),
                 instance,
                 nullptr);
             SendMessageW(
-                harmonic, TBM_SETRANGE, TRUE, MAKELONG(0, 2));
+                harmonic, TBM_SETRANGE, TRUE, MAKELONG(0, 4));
             SendMessageW(harmonic, TBM_SETTICFREQ, 1, 0);
             SendMessageW(harmonic, TBM_SETPOS, TRUE, 0);
             CreateWindowExW(
                 0, L"STATIC", L"1.0x",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                360, 568, 38, 22,
+                394, 568, 38, 22,
                 window,
                 reinterpret_cast<HMENU>(
                     static_cast<INT_PTR>(kSccHarmonicLabel)),
@@ -3623,9 +4773,34 @@ LRESULT CALLBACK editorProcedure(
                 nullptr);
 
             CreateWindowExW(
+                0, L"STATIC", L"適用範囲",
+                WS_CHILD | WS_VISIBLE,
+                438, 568, 58, 22,
+                window, nullptr, instance, nullptr);
+            HWND apply_range = CreateWindowExW(
+                0, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP
+                    | CBS_DROPDOWNLIST,
+                498, 562, 80, 120,
+                window,
+                reinterpret_cast<HMENU>(
+                    static_cast<INT_PTR>(kSccApplyRange)),
+                instance,
+                nullptr);
+            for (const auto* name :
+                 {L"全体", L"左半分", L"右半分"}) {
+                SendMessageW(
+                    apply_range,
+                    CB_ADDSTRING,
+                    0,
+                    reinterpret_cast<LPARAM>(name));
+            }
+            SendMessageW(apply_range, CB_SETCURSEL, 0, 0);
+
+            CreateWindowExW(
                 0, L"BUTTON", L"現在波形とマージ",
                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                402, 566, 152, 24,
+                590, 566, 152, 24,
                 window,
                 reinterpret_cast<HMENU>(
                     static_cast<INT_PTR>(kSccMergeCheck)),
@@ -3634,7 +4809,7 @@ LRESULT CALLBACK editorProcedure(
             CreateWindowExW(
                 0, L"BUTTON", L"プレビュー取消",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                558, 562, 114, 30,
+                558, 636, 114, 30,
                 window,
                 reinterpret_cast<HMENU>(
                     static_cast<INT_PTR>(kSccCancelPreset)),
@@ -3643,7 +4818,7 @@ LRESULT CALLBACK editorProcedure(
             CreateWindowExW(
                 0, L"BUTTON", L"適用",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                680, 562, 108, 30,
+                680, 636, 108, 30,
                 window,
                 reinterpret_cast<HMENU>(
                     static_cast<INT_PTR>(kSccApplyPreset)),
@@ -3698,39 +4873,114 @@ LRESULT CALLBACK editorProcedure(
                     BST_CHECKED);
             }
 
-            constexpr std::array<const wchar_t*, 7> tool_names{
-                L"平均化", L"正規化", L"反転",
-                L"位相 -1", L"位相 +1", L"Undo", L""};
-            constexpr std::array<int, 7> tool_ids{
+            constexpr std::array<const wchar_t*, 3> tool_names{
+                L"平均化", L"正規化", L"反転"};
+            constexpr std::array<int, 3> tool_ids{
                 kSccAverage,
                 kSccNormalize,
-                kSccInvert,
-                kSccRotateLeft,
-                kSccRotateRight,
-                kSccUndo,
-                kSccRedo};
-            for (int index = 0; index < 7; ++index) {
-                HWND button = CreateWindowExW(
+                kSccInvert};
+            constexpr std::array<POINT, 3> tool_positions{{
+                {24, 694},
+                {68, 694},
+                {112, 694},
+            }};
+            for (int index = 0; index < 3; ++index) {
+                CreateWindowExW(
                     0, L"BUTTON", tool_names[index],
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                    24 + index * 96, 644, 88, 30,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                    tool_positions[index].x,
+                    tool_positions[index].y,
+                    40, 40,
                     window,
                     reinterpret_cast<HMENU>(
                         static_cast<INT_PTR>(tool_ids[index])),
                     instance,
                     nullptr);
-                if (tool_ids[index] == kSccUndo
-                    || tool_ids[index] == kSccRedo) {
-                    EnableWindow(button, FALSE);
-                }
-                if (tool_ids[index] == kSccRedo) {
-                    SetWindowTextW(button, L"Redo");
-                }
             }
+            constexpr std::array<const wchar_t*, 4> direction_names{
+                L"上移動", L"位相 -1", L"位相 +1", L"下移動"};
+            constexpr std::array<int, 4> direction_ids{
+                kSccShiftUp,
+                kSccRotateLeft,
+                kSccRotateRight,
+                kSccShiftDown};
+            constexpr std::array<POINT, 4> direction_positions{{
+                {500, 650},
+                {456, 694},
+                {544, 694},
+                {500, 738},
+            }};
+            for (int index = 0; index < 4; ++index) {
+                CreateWindowExW(
+                    0, L"BUTTON", direction_names[index],
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                    direction_positions[index].x,
+                    direction_positions[index].y,
+                    40, 40,
+                    window,
+                    reinterpret_cast<HMENU>(
+                        static_cast<INT_PTR>(direction_ids[index])),
+                    instance,
+                    nullptr);
+            }
+            state->scc_scale_percent = 100;
+            state->scc_scale_preview_active = false;
+            CreateWindowExW(
+                0,
+                L"STATIC",
+                L"縦倍率",
+                WS_CHILD | WS_VISIBLE | SS_CENTER,
+                604,
+                650,
+                64,
+                20,
+                window,
+                nullptr,
+                instance,
+                nullptr);
+            HWND vertical_scale = CreateWindowExW(
+                0,
+                TRACKBAR_CLASSW,
+                L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP
+                    | TBS_VERT | TBS_NOTICKS,
+                616,
+                670,
+                36,
+                108,
+                window,
+                reinterpret_cast<HMENU>(
+                    static_cast<INT_PTR>(kSccVerticalScale)),
+                instance,
+                nullptr);
+            SendMessageW(
+                vertical_scale,
+                TBM_SETRANGE,
+                TRUE,
+                MAKELONG(0, 200));
+            SendMessageW(
+                vertical_scale,
+                TBM_SETPOS,
+                TRUE,
+                100);
+            CreateWindowExW(
+                0,
+                L"STATIC",
+                L"100%",
+                WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOTIFY,
+                660,
+                712,
+                58,
+                22,
+                window,
+                reinterpret_cast<HMENU>(
+                    static_cast<INT_PTR>(kSccVerticalScaleLabel)),
+                instance,
+                nullptr);
             HWND ab_audition = CreateWindowExW(
                 0, L"BUTTON", L"A/B試聴",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                696, 644, 92, 30,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                156, 694, 40, 40,
                 window,
                 reinterpret_cast<HMENU>(
                     static_cast<INT_PTR>(kSccToggleAudition)),
@@ -3741,12 +4991,12 @@ LRESULT CALLBACK editorProcedure(
                 0, L"STATIC",
                 L"1.5xは1.0xと2.0xを同位相で50%ずつブレンド",
                 WS_CHILD | WS_VISIBLE,
-                24, 688, 390, 22,
+                24, 782, 390, 22,
                 window, nullptr, instance, nullptr);
             CreateWindowExW(
                 0, L"STATIC", L"",
                 WS_CHILD | WS_VISIBLE,
-                430, 688, 358, 22,
+                430, 782, 358, 22,
                 window,
                 reinterpret_cast<HMENU>(
                     static_cast<INT_PTR>(kSccOperationStatus)),
@@ -3885,14 +5135,24 @@ LRESULT CALLBACK editorProcedure(
         const int position = static_cast<int>(
             SendMessageW(control, TBM_GETPOS, 0, 0));
         wchar_t value[16]{};
+        if (!state->opll && id == kSccVerticalScale) {
+            previewSccVerticalScale(
+                *state,
+                window,
+                200 - position);
+            if (LOWORD(wparam) == TB_ENDTRACK) {
+                commitSccVerticalScale(*state, window);
+            }
+            return 0;
+        }
         if (!state->opll && id == kSccHarmonicCombo) {
-            constexpr std::array<const wchar_t*, 3> labels{
-                L"1.0x", L"1.5x", L"2.0x"};
+            constexpr std::array<const wchar_t*, 5> labels{
+                L"1.0x", L"1.5x", L"2.0x", L"3.0x", L"4.0x"};
             SetDlgItemTextW(
                 window,
                 kSccHarmonicLabel,
                 labels[static_cast<std::size_t>(
-                    std::clamp(position, 0, 2))]);
+                    std::clamp(position, 0, 4))]);
             refreshSccPresetPreview(*state, window, true);
             return 0;
         }
@@ -4021,6 +5281,27 @@ LRESULT CALLBACK editorProcedure(
             break;
         }
         const int id = LOWORD(wparam);
+        if (!state->opll
+            && id == kSccVerticalScaleLabel
+            && HIWORD(wparam) == STN_CLICKED) {
+            state->scc_scale_preview_active = false;
+            state->scc_scale_percent = 100;
+            SendDlgItemMessageW(
+                window,
+                kSccVerticalScale,
+                TBM_SETPOS,
+                TRUE,
+                100);
+            SetDlgItemTextW(
+                window,
+                kSccVerticalScaleLabel,
+                L"100%");
+            setSccOperationStatus(
+                window,
+                L"縦倍率を100%へ戻しました（波形は変更していません）");
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
         if ((id == kEditorUndo || id == kEditorRedo)
             && HIWORD(wparam) == BN_CLICKED) {
             if (id == kEditorUndo) {
@@ -4030,12 +5311,52 @@ LRESULT CALLBACK editorProcedure(
             }
             return 0;
         }
+        if ((id == kOpllWaveCandidatePrevious
+             || id == kOpllWaveCandidateNext)
+            && HIWORD(wparam) == BN_CLICKED
+            && !state->opll_wave_candidates.empty()) {
+            const std::size_t count =
+                state->opll_wave_candidates.size();
+            const std::size_t next =
+                id == kOpllWaveCandidatePrevious
+                    ? (state->opll_wave_candidate_index + count - 1) % count
+                    : (state->opll_wave_candidate_index + 1) % count;
+            applyOpllWaveCandidate(*state, window, next);
+            return 0;
+        }
         if (id == kWaveConvert
             && HIWORD(wparam) == BN_CLICKED) {
             const auto bytes = openWaveFile(window);
             if (bytes) {
                 static_cast<void>(
                     applyWaveConversion(*state, window, *bytes));
+            }
+            return 0;
+        }
+        if (id == kAudacityConvert
+            && HIWORD(wparam) == BN_CLICKED) {
+            HWND button = GetDlgItem(window, kAudacityConvert);
+            EnableWindow(button, FALSE);
+            SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+            auto imported = exportAudacitySelectionToWave();
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            EnableWindow(button, TRUE);
+            if (!imported.wave) {
+                MessageBoxW(
+                    window,
+                    imported.error.c_str(),
+                    L"Audacityから変換",
+                    MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            if (applyWaveConversion(
+                    *state,
+                    window,
+                    *imported.wave)) {
+                state->app->setStatus(
+                    state->opll
+                        ? L"Audacityの選択範囲をOPLL音色へ変換しました"
+                        : L"Audacityの選択範囲をSCC音色へ変換しました");
             }
             return 0;
         }
@@ -4359,12 +5680,28 @@ LRESULT CALLBACK editorProcedure(
         }
         if (id == kTimbreClipboardPaste
             && HIWORD(wparam) == BN_CLICKED) {
+            if (const auto wave = clipboardWaveBytes(window)) {
+                static_cast<void>(
+                    applyWaveConversion(*state, window, *wave));
+                return 0;
+            }
+            if (!state->opll
+                && pasteClipboardImageAsSccBackground(*state, window)) {
+                return 0;
+            }
             const auto contents =
                 pasteMgsTimbreTextFromClipboard(window);
             if (!contents) {
                 MessageBoxW(
                     window,
-                    L"クリップボードにテキストがありません。",
+                    L"Windowsクリップボードに貼り付け可能な"
+                    L"WAV音声または音色テキストがありません。\n\n"
+                    L"AudacityのCtrl+CはAudacity内部の"
+                    L"クリップボードを使用するため、"
+                    L"他のアプリから直接取得できません。"
+                    L"選択範囲をWAVへ書き出して「WAV変換」で"
+                    L"開くか、WAVファイルをコピーして"
+                    L"貼り付けてください。",
                     L"音色貼り付け",
                     MB_OK | MB_ICONINFORMATION);
                 return 0;
@@ -4464,7 +5801,8 @@ LRESULT CALLBACK editorProcedure(
             return 0;
         }
         if (!state->opll
-            && id == kSccPresetCombo
+            && (id == kSccPresetCombo
+                || id == kSccApplyRange)
             && HIWORD(wparam) == CBN_SELCHANGE) {
             refreshSccPresetPreview(*state, window, true);
             return 0;
@@ -4533,7 +5871,9 @@ LRESULT CALLBACK editorProcedure(
         }
         if (!state->opll
             && ((id >= kSccAverage && id <= kSccUndo)
-                || id == kSccRedo)
+                || id == kSccRedo
+                || id == kSccShiftUp
+                || id == kSccShiftDown)
             && HIWORD(wparam) == BN_CLICKED) {
             const auto current = currentSccWaveform(*state->app);
             if (id == kSccUndo) {
@@ -4570,10 +5910,20 @@ LRESULT CALLBACK editorProcedure(
                     mgstc::engine::rotateSccWaveform(current, -1);
                 description = L"位相を左へ1サンプル";
                 break;
-            default:
+            case kSccRotateRight:
                 result =
                     mgstc::engine::rotateSccWaveform(current, 1);
                 description = L"位相を右へ1サンプル";
+                break;
+            case kSccShiftUp:
+                result =
+                    mgstc::engine::shiftSccWaveformVertically(current, 1);
+                description = L"波形全体を上へ1";
+                break;
+            default:
+                result =
+                    mgstc::engine::shiftSccWaveformVertically(current, -1);
+                description = L"波形全体を下へ1";
                 break;
             }
             applySccWaveform(*state, window, result);
@@ -4590,6 +5940,46 @@ LRESULT CALLBACK editorProcedure(
             }
             static_cast<void>(
                 saveApplicationSettings(*state->app));
+            return 0;
+        }
+        if (state->opll && id == kOpllScopeSync
+            && HIWORD(wparam) == BN_CLICKED) {
+            state->app->opll_scope_sync =
+                IsDlgButtonChecked(window, id) == BST_CHECKED;
+            if (state->app->opll_scope_sync) {
+                rebuildSynchronizedOpllScope(*state);
+            }
+            static_cast<void>(
+                saveApplicationSettings(*state->app));
+            const auto graph = opllScopeGraphRect();
+            InvalidateRect(window, &graph, FALSE);
+            const RECT label{24, 632, 590, 652};
+            InvalidateRect(window, &label, FALSE);
+            return 0;
+        }
+        if (state->opll
+            && id == kOpllRomPresetCombo
+            && HIWORD(wparam) == CBN_SELCHANGE) {
+            const int selection = static_cast<int>(
+                SendDlgItemMessageW(
+                    window,
+                    kOpllRomPresetCombo,
+                    CB_GETCURSEL,
+                    0,
+                    0));
+            const auto patch =
+                mgstc::engine::ym2413RomPatch(
+                    static_cast<std::uint8_t>(selection + 1));
+            if (!patch) {
+                return 0;
+            }
+            wchar_t selected_name[64]{};
+            GetDlgItemTextW(
+                window,
+                kOpllRomPresetCombo,
+                selected_name,
+                static_cast<int>(std::size(selected_name)));
+            state->app->auditionOpllPatch(*patch, selected_name);
             return 0;
         }
         if (state->opll
@@ -4874,11 +6264,16 @@ LRESULT CALLBACK editorProcedure(
         }
         break;
     case WM_TIMER:
+        if (state && wparam == kEditorIconTooltipTimer) {
+            updateEditorIconTooltip(*state, window);
+            return 0;
+        }
         if (state && state->opll && wparam == kOpllScopeTimer) {
             mgstc::engine::OpllScopeFrame frame{};
             bool received{};
             while (state->app->engine.pollOpllScope(frame)) {
                 state->opll_scope = frame;
+                appendOpllScopeFrame(*state, frame);
                 received = true;
             }
             if (received) {
@@ -4891,6 +6286,12 @@ LRESULT CALLBACK editorProcedure(
         break;
     case WM_DRAWITEM: {
         const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
+        if (state && item
+            && item->CtlType == ODT_BUTTON
+            && isEditorIconButton(item->CtlID)) {
+            drawEditorIconButton(*item);
+            return TRUE;
+        }
         if (!state || state->opll || !item
             || item->CtlID != kSccPresetCombo
             || item->itemID == static_cast<UINT>(-1)) {
@@ -5004,16 +6405,25 @@ LRESULT CALLBACK editorProcedure(
             SelectObject(dc, old_pen);
             DeleteObject(guides);
             RECT scope_label{24, 632, 750, 652};
+            const bool synchronized =
+                state->app->opll_scope_sync
+                && state->opll_scope_display_available;
             DrawTextW(
                 dc,
-                L"emu2413 OPLL waveform — 800 samples / 1⁄60 sec / auto scale",
+                synchronized
+                    ? L"emu2413 OPLL waveform — 2 periods / synchronized / auto scale"
+                    : state->app->opll_scope_sync
+                        ? L"emu2413 OPLL waveform — preparing synchronized history"
+                        : L"emu2413 OPLL waveform — 800 samples / 1⁄60 sec / auto scale",
                 -1,
                 &scope_label,
                 DT_LEFT | DT_SINGLELINE);
             paintOpllScope(
                 dc,
-                state->opll_scope,
-                state->opll_scope_available);
+                synchronized
+                    ? state->opll_scope_display
+                    : state->opll_scope.samples,
+                synchronized || state->opll_scope_available);
         } else if (state) {
             paintSccWave(dc, *state);
         }
@@ -5079,19 +6489,6 @@ bool isEditControl(HWND control) {
     return _wcsicmp(class_name, L"EDIT") == 0;
 }
 
-bool editConsumesPcPerformance(HWND control) {
-    if (!isEditControl(control)) {
-        return false;
-    }
-    const int id = GetDlgCtrlID(control);
-    return id == kLibraryFilter
-        || id == kLibraryName
-        || id == kLibraryTags
-        || id == kLibraryMemo
-        || id == kTimbreDefinitionPreview
-        || (id >= kSccHexValueBase && id < kSccHexValueBase + 32);
-}
-
 bool isNumericEditorControl(HWND control) {
     if (!isEditControl(control)) {
         return false;
@@ -5105,6 +6502,32 @@ bool isNumericEditorControl(HWND control) {
             && id < kOpllEnvelopeValueBase + 8)
         || (id >= kSccBackgroundX && id <= kSccBackgroundHeight)
         || (id >= kOpllMultiValueBase && id <= kOpllFeedbackValue);
+}
+
+bool isUnassignedPrintablePcKey(WPARAM key) {
+    if ((key >= '0' && key <= '9')
+        || (key >= 'A' && key <= 'Z')
+        || (key >= VK_NUMPAD0 && key <= VK_NUMPAD9)) {
+        return true;
+    }
+    switch (key) {
+    case VK_OEM_1:
+    case VK_OEM_PLUS:
+    case VK_OEM_COMMA:
+    case VK_OEM_MINUS:
+    case VK_OEM_PERIOD:
+    case VK_OEM_2:
+    case VK_OEM_3:
+    case VK_OEM_4:
+    case VK_OEM_5:
+    case VK_OEM_6:
+    case VK_OEM_7:
+    case VK_OEM_8:
+    case VK_OEM_102:
+        return true;
+    default:
+        return false;
+    }
 }
 
 EditorState* activeEditorState(AppState& app, HWND focus) {
@@ -5456,7 +6879,8 @@ int WINAPI wWinMain(
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     INITCOMMONCONTROLSEX controls{
         .dwSize = sizeof(INITCOMMONCONTROLSEX),
-        .dwICC = ICC_STANDARD_CLASSES | ICC_BAR_CLASSES,
+        .dwICC =
+            ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_WIN95_CLASSES,
     };
     InitCommonControlsEx(&controls);
     if (!registerClasses(instance)) {
@@ -5509,8 +6933,6 @@ int WINAPI wWinMain(
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         HWND focus = GetFocus();
         const bool edit_focused = isEditControl(focus);
-        const bool text_edit_focused =
-            editConsumesPcPerformance(focus);
         EditorState* active_editor = activeEditorState(app, focus);
         const bool control_down =
             (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -5542,20 +6964,6 @@ int WINAPI wWinMain(
                 continue;
             }
             if (key == 'V') {
-                if (const auto wave =
-                        clipboardWaveBytes(editor_window)) {
-                    static_cast<void>(applyWaveConversion(
-                        *active_editor,
-                        editor_window,
-                        *wave));
-                    continue;
-                }
-                if (!active_editor->opll
-                    && pasteClipboardImageAsSccBackground(
-                        *active_editor,
-                        editor_window)) {
-                    continue;
-                }
                 SendMessageW(
                     editor_window,
                     WM_COMMAND,
@@ -5568,11 +6976,9 @@ int WINAPI wWinMain(
         if ((message.message == WM_KEYDOWN
              || message.message == WM_SYSKEYDOWN)
             && edit_focused) {
-            if (text_edit_focused) {
-                app.noteOff();
-            }
             if (message.wParam == VK_RETURN
                 && isNumericEditorControl(focus)) {
+                app.noteOff();
                 HWND parent = GetParent(focus);
                 SendMessageW(
                     parent,
@@ -5582,7 +6988,8 @@ int WINAPI wWinMain(
                 continue;
             }
         }
-        if (text_edit_focused) {
+        if (edit_focused) {
+            app.noteOff();
             if ((app.opll_editor
                  && IsWindowVisible(app.opll_editor)
                  && IsDialogMessageW(app.opll_editor, &message))
@@ -5596,24 +7003,26 @@ int WINAPI wWinMain(
             continue;
         }
         if (message.message == WM_KEYDOWN
-            && (message.wParam == 'Z' || message.wParam == 'X')) {
+            && (message.wParam == VK_OEM_COMMA
+                || message.wParam == VK_OEM_PERIOD)) {
             const bool repeat = (message.lParam & (1LL << 30)) != 0;
             if (!repeat) {
                 app.noteOff();
                 app.pc_octave = std::clamp(
-                    app.pc_octave + (message.wParam == 'Z' ? -1 : 1),
+                    app.pc_octave
+                        + (message.wParam == VK_OEM_COMMA ? -1 : 1),
                     1,
-                    8);
+                    6);
                 static_cast<void>(saveApplicationSettings(app));
                 app.setStatus(
                     L"PC演奏オクターブ: "
                     + std::to_wstring(app.pc_octave)
-                    + L"  (Z:下 / X:上)");
+                    + L"  (,:下 / .:上)");
                 InvalidateRect(app.keyboard, nullptr, FALSE);
             }
             continue;
         }
-        const auto pc_note = pcKeyNote(message.wParam, app.pc_octave);
+        const auto pc_note = pcKeyNote(message.lParam, app.pc_octave);
         if ((message.message == WM_KEYDOWN || message.message == WM_KEYUP)
             && pc_note) {
             const auto note = *pc_note;
@@ -5626,6 +7035,17 @@ int WINAPI wWinMain(
             } else {
                 app.noteOff(note);
             }
+            continue;
+        }
+        const bool alt_down =
+            (GetKeyState(VK_MENU) & 0x8000) != 0;
+        if ((message.message == WM_KEYDOWN
+             || message.message == WM_KEYUP)
+            && !control_down
+            && !alt_down
+            && isUnassignedPrintablePcKey(message.wParam)) {
+            // Performance mode owns printable keys. Consuming unused ones
+            // prevents dialog/default-window processing from emitting a beep.
             continue;
         }
         if ((app.opll_editor
