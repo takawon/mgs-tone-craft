@@ -24,13 +24,14 @@ struct TimbreLibraryEntry {
     std::int64_t created_unix_seconds{};
     std::int64_t updated_unix_seconds{};
     std::uint32_t data_version{1};
+    std::uint32_t revision{1};
     std::array<std::uint8_t, 8> opll_registers{};
     std::array<std::uint8_t, 32> scc_waveform{};
 };
 
 class TimbreLibrary {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 1;
+    static constexpr std::uint32_t kSchemaVersion = 2;
 
     [[nodiscard]] const std::vector<TimbreLibraryEntry>& entries() const
         noexcept;

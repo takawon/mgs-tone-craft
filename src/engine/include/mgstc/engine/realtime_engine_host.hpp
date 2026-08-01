@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 
 #include "mgstc/engine/engine_command.hpp"
@@ -84,8 +85,9 @@ private:
 
     SpscQueue<EngineCommand, kCommandCapacity> commands_{};
     SpscQueue<EngineNotice, kNoticeCapacity> notices_{};
-    SpscQueue<OpllScopeFrame, kOpllScopeCapacity> opll_scope_frames_{};
-    std::array<ProgramSlot, kProgramSlotCount> programs_{};
+    std::unique_ptr<SpscQueue<OpllScopeFrame, kOpllScopeCapacity>>
+        opll_scope_frames_;
+    std::unique_ptr<ProgramSlot[]> programs_;
     std::uint8_t active_program_{};
     MixerGains current_gains_{};
     bool clipping_{};

@@ -88,14 +88,8 @@ WorkingWave toWorking(const SccWaveform& waveform) noexcept {
     return result;
 }
 
-SccWaveform quantize(WorkingWave waveform) noexcept {
-    const double maximum = peak(waveform);
-    if (maximum > 127.0) {
-        const double scale = 127.0 / maximum;
-        for (double& sample : waveform) {
-            sample *= scale;
-        }
-    }
+SccWaveform quantizeClamped(
+    const WorkingWave& waveform) noexcept {
     SccWaveform result{};
     for (std::size_t index = 0; index < result.size(); ++index) {
         result[index] = static_cast<std::int8_t>(
@@ -105,6 +99,17 @@ SccWaveform quantize(WorkingWave waveform) noexcept {
                 127));
     }
     return result;
+}
+
+SccWaveform quantize(WorkingWave waveform) noexcept {
+    const double maximum = peak(waveform);
+    if (maximum > 127.0) {
+        const double scale = 127.0 / maximum;
+        for (double& sample : waveform) {
+            sample *= scale;
+        }
+    }
+    return quantizeClamped(waveform);
 }
 
 SccWaveform quantizeFullRange(const WorkingWave& waveform) noexcept {
@@ -302,13 +307,18 @@ SccWaveform normalizeSccWaveform(
     const SccWaveform& waveform) noexcept {
     WorkingWave result = toWorking(waveform);
     removeDc(result);
-    const double maximum = peak(result);
-    if (maximum > kSilence) {
-        for (double& sample : result) {
-            sample *= 127.0 / maximum;
-        }
+    const auto [minimum, maximum] = std::minmax_element(
+        result.begin(), result.end());
+    const double low = *minimum;
+    const double high = *maximum;
+    const double span = high - low;
+    if (span <= kSilence) {
+        return quantize(result);
     }
-    return quantize(result);
+    for (double& sample : result) {
+        sample = -128.0 + (sample - low) * 255.0 / span;
+    }
+    return quantizeClamped(result);
 }
 
 SccWaveform invertSccWaveform(

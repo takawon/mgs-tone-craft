@@ -18,11 +18,14 @@
 #include "mgstc/engine/envelope_rate.hpp"
 #include "mgstc/engine/envelope_sequence.hpp"
 #include "mgstc/engine/chip_rack.hpp"
+#include "mgstc/engine/composite_timbre.hpp"
+#include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/mgs_timbre_io.hpp"
 #include "mgstc/engine/note_pitch.hpp"
 #include "mgstc/engine/opll_envelope_trace.hpp"
 #include "mgstc/engine/opll_patch.hpp"
+#include "mgstc/engine/pc_keyboard.hpp"
 #include "mgstc/engine/register_mapper.hpp"
 #include "mgstc/engine/realtime_engine_host.hpp"
 #include "mgstc/engine/runtime_session.hpp"
@@ -32,6 +35,7 @@
 #include "mgstc/engine/shared_state.hpp"
 #include "mgstc/engine/tick_clock.hpp"
 #include "mgstc/engine/volume.hpp"
+#include "mgstc/engine/voice_allocator.hpp"
 #include "mgstc/engine/wave_import.hpp"
 #ifdef _WIN32
 #include "mgstc/audio/wasapi_audio_sink.hpp"
@@ -105,6 +109,10 @@ using mgstc::engine::waveCycleToScc;
 #ifdef _WIN32
 using mgstc::audio::WasapiAudioSink;
 #endif
+
+static_assert(
+    sizeof(RealtimeEngineHost) < 128 * 1024,
+    "RealtimeEngineHost must remain safe to create on the UI stack");
 
 template <typename Actual, typename Expected>
 void requireEqual(
@@ -716,6 +724,14 @@ void testEngineCorePublishesOneSixtiethOpllScope() {
                 return std::abs(sample) > 0.00001F;
             }),
         true);
+    REQUIRE_EQ(
+        std::any_of(
+            scope.mixed_samples.begin(),
+            scope.mixed_samples.end(),
+            [](float sample) {
+                return std::abs(sample) > 0.00001F;
+            }),
+        true);
     REQUIRE_EQ(engine.takeOpllScopeFrame(scope), false);
 }
 
@@ -871,16 +887,31 @@ void testSccWaveformUtilityTransforms() {
     }
 
     const auto normalized = normalizeSccWaveform(waveform);
-    const auto peak = std::max_element(
-        normalized.begin(),
-        normalized.end(),
-        [](std::int8_t left, std::int8_t right) {
-            return std::abs(static_cast<int>(left))
-                < std::abs(static_cast<int>(right));
-        });
     REQUIRE_EQ(
-        std::abs(static_cast<int>(*peak)),
-        127);
+        *std::min_element(normalized.begin(), normalized.end()),
+        static_cast<std::int8_t>(-128));
+    REQUIRE_EQ(
+        *std::max_element(normalized.begin(), normalized.end()),
+        static_cast<std::int8_t>(127));
+
+    SccWaveform positive_offset{};
+    positive_offset.fill(40);
+    positive_offset[0] = 10;
+    positive_offset[1] = 80;
+    const auto offset_normalized =
+        normalizeSccWaveform(positive_offset);
+    REQUIRE_EQ(
+        *std::min_element(
+            offset_normalized.begin(), offset_normalized.end()),
+        static_cast<std::int8_t>(-128));
+    REQUIRE_EQ(
+        *std::max_element(
+            offset_normalized.begin(), offset_normalized.end()),
+        static_cast<std::int8_t>(127));
+
+    SccWaveform constant{};
+    constant.fill(42);
+    REQUIRE_EQ(normalizeSccWaveform(constant), SccWaveform{});
 }
 
 void testRuntimeUsesMgsTrackOrder() {
@@ -1413,6 +1444,14 @@ void testRealtimeHostPublishesOpllScopeToUiQueue() {
                 return std::abs(sample) > 0.00001F;
             }),
         true);
+    REQUIRE_EQ(
+        std::any_of(
+            scope.mixed_samples.begin(),
+            scope.mixed_samples.end(),
+            [](float sample) {
+                return std::abs(sample) > 0.00001F;
+            }),
+        true);
     REQUIRE_EQ(host.pollOpllScope(scope), false);
 }
 
@@ -1608,6 +1647,9 @@ void testTimbreLibraryCrudAndVersionedRoundTrip() {
     REQUIRE_EQ(library.update(opll_id, replacement, 200), true);
     REQUIRE_EQ(library.find(opll_id)->created_unix_seconds, 100);
     REQUIRE_EQ(library.find(opll_id)->updated_unix_seconds, 200);
+    REQUIRE_EQ(
+        library.find(opll_id)->revision,
+        static_cast<std::uint32_t>(2));
 
     std::string error;
     const auto restored =
@@ -1618,6 +1660,9 @@ void testTimbreLibraryCrudAndVersionedRoundTrip() {
     REQUIRE_EQ(restored->entries().size(), static_cast<std::size_t>(2));
     REQUIRE_EQ(restored->find(opll_id)->name, std::string("Updated"));
     REQUIRE_EQ(restored->find(opll_id)->memo, opll.memo);
+    REQUIRE_EQ(
+        restored->find(opll_id)->revision,
+        static_cast<std::uint32_t>(2));
     REQUIRE_EQ(
         restored->find(opll_id)->opll_registers,
         opll.opll_registers);
@@ -1633,8 +1678,12 @@ void testTimbreLibraryCrudAndVersionedRoundTrip() {
 
     REQUIRE_EQ(
         mgstc::engine::TimbreLibrary::deserialize(
-            "MGSTC_TIMBRE_LIBRARY\t2\r\n", &error).has_value(),
+            "MGSTC_TIMBRE_LIBRARY\t3\r\n", &error).has_value(),
         false);
+    const auto legacy =
+        mgstc::engine::TimbreLibrary::deserialize(
+            "MGSTC_TIMBRE_LIBRARY\t1\r\n", &error);
+    REQUIRE_EQ(legacy.has_value(), true);
     REQUIRE_EQ(
         mgstc::engine::TimbreLibrary::deserialize(
             "MGSTC_TIMBRE_LIBRARY\t1\r\nO\tbroken\r\n",
@@ -1817,6 +1866,353 @@ void testWavePcmProducesDeterministicTimedOpllApproximation() {
     REQUIRE_EQ(first.carrier.release_rate <= 15, true);
 }
 
+void testDefaultCompositeTimbreHasThreeAudibleSources() {
+    const auto timbre = mgstc::engine::defaultCompositeTimbre();
+    REQUIRE_EQ(timbre.layers.size(), 3U);
+    REQUIRE_EQ(
+        timbre.layers[0].source,
+        mgstc::engine::TimbreSource::Psg);
+    REQUIRE_EQ(
+        timbre.layers[1].source,
+        mgstc::engine::TimbreSource::Scc);
+    REQUIRE_EQ(
+        timbre.layers[2].source,
+        mgstc::engine::TimbreSource::Opll);
+    REQUIRE_EQ(
+        mgstc::engine::layerIsAudible(timbre, 0), true);
+    REQUIRE_EQ(
+        mgstc::engine::layerIsAudible(timbre, 1), true);
+    REQUIRE_EQ(
+        mgstc::engine::layerIsAudible(timbre, 2), true);
+
+    const auto validation =
+        mgstc::engine::validateCompositeTimbre(timbre);
+    REQUIRE_EQ(validation.valid(), true);
+    REQUIRE_EQ(validation.psg_channels, 1);
+    REQUIRE_EQ(validation.scc_channels, 1);
+    REQUIRE_EQ(validation.opll_channels, 1);
+}
+
+void testCompositeSoloPitchAndChannelValidation() {
+    auto timbre = mgstc::engine::defaultCompositeTimbre();
+    timbre.layers[1].solo = true;
+    REQUIRE_EQ(
+        mgstc::engine::layerIsAudible(timbre, 0), false);
+    REQUIRE_EQ(
+        mgstc::engine::layerIsAudible(timbre, 1), true);
+
+    timbre.layers[1].relative_semitones = 12;
+    REQUIRE_EQ(
+        mgstc::engine::layerMidiNote(timbre.layers[1], 60),
+        std::optional<std::uint8_t>{
+            static_cast<std::uint8_t>(72)});
+    timbre.layers[1].relative_semitones = 80;
+    REQUIRE_EQ(
+        mgstc::engine::layerMidiNote(timbre.layers[1], 60)
+            .has_value(),
+        false);
+
+    auto duplicate = timbre.layers[0];
+    duplicate.name = "Duplicate PSG";
+    timbre.layers.push_back(duplicate);
+    const auto validation =
+        mgstc::engine::validateCompositeTimbre(timbre);
+    REQUIRE_EQ(validation.valid(), false);
+    REQUIRE_EQ(validation.warnings.empty(), false);
+}
+
+void testCompositeSavedTimbreRevisionAndNumberAssignment() {
+    using namespace mgstc::engine;
+
+    TimbreLibrary library;
+    TimbreLibraryEntry scc;
+    scc.category = TimbreCategory::Scc;
+    scc.name = "SCC Lead";
+    scc.scc_waveform[0] = 0x7F;
+    const auto scc_id = library.add(scc, 10);
+    TimbreLibraryEntry opll;
+    opll.category = TimbreCategory::Opll;
+    opll.name = "OPLL Lead";
+    opll.opll_registers[0] = 0x31;
+    const auto opll_id = library.add(opll, 11);
+
+    auto composite = defaultCompositeTimbre();
+    composite.layers[1].base_timbre =
+        makeSavedTimbreReference(*library.find(scc_id));
+    composite.layers[1].base_timbre->number_mode =
+        TimbreNumberMode::Manual;
+    composite.layers[1].base_timbre->manual_number =
+        static_cast<std::uint8_t>(25);
+    composite.layers[2].base_timbre =
+        makeSavedTimbreReference(*library.find(opll_id));
+
+    auto duplicate_scc = composite.layers[1];
+    duplicate_scc.name = "SCC Echo";
+    duplicate_scc.channel = 1;
+    composite.layers.push_back(duplicate_scc);
+
+    const auto numbers = resolveTimbreNumbers(composite);
+    REQUIRE_EQ(numbers.valid(), true);
+    REQUIRE_EQ(numbers.assignments.size(), static_cast<std::size_t>(3));
+    REQUIRE_EQ(numbers.assignments[0].number, static_cast<std::uint8_t>(25));
+    REQUIRE_EQ(numbers.assignments[1].number, static_cast<std::uint8_t>(15));
+    REQUIRE_EQ(numbers.assignments[2].number, static_cast<std::uint8_t>(25));
+    REQUIRE_EQ(numbers.assignments[0].manually_assigned, true);
+    REQUIRE_EQ(numbers.assignments[1].manually_assigned, false);
+
+    auto second_scc = duplicate_scc;
+    TimbreLibraryEntry other_scc = scc;
+    other_scc.name = "Other SCC";
+    const auto other_id = library.add(other_scc, 12);
+    second_scc.base_timbre =
+        makeSavedTimbreReference(*library.find(other_id));
+    second_scc.base_timbre->number_mode =
+        TimbreNumberMode::Manual;
+    second_scc.base_timbre->manual_number =
+        static_cast<std::uint8_t>(25);
+    composite.layers.push_back(second_scc);
+    REQUIRE_EQ(resolveTimbreNumbers(composite).valid(), false);
+}
+
+void testCompositeTimbreDependencyUpdatePreservesAssignment() {
+    using namespace mgstc::engine;
+
+    TimbreLibrary library;
+    TimbreLibraryEntry scc;
+    scc.category = TimbreCategory::Scc;
+    scc.name = "Bass";
+    scc.scc_waveform[0] = 1;
+    const auto id = library.add(scc, 10);
+    auto composite = defaultCompositeTimbre();
+    composite.name = "Layered Bass";
+    composite.layers[1].base_timbre =
+        makeSavedTimbreReference(*library.find(id));
+    composite.layers[1].base_timbre->number_mode =
+        TimbreNumberMode::Manual;
+    composite.layers[1].base_timbre->manual_number =
+        static_cast<std::uint8_t>(19);
+    std::vector<CompositeTimbre> composites{composite};
+
+    const auto uses = findTimbreUses(composites, id);
+    REQUIRE_EQ(uses.size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(uses[0].composite_name, std::string("Layered Bass"));
+    REQUIRE_EQ(uses[0].layer_name, std::string("SCC Layer"));
+
+    auto updated = *library.find(id);
+    updated.scc_waveform[0] = 0x7F;
+    REQUIRE_EQ(library.update(id, updated, 20), true);
+    REQUIRE_EQ(
+        updateTimbreReferences(composites, *library.find(id)),
+        static_cast<std::size_t>(1));
+    const auto& reference =
+        *composites[0].layers[1].base_timbre;
+    REQUIRE_EQ(reference.revision, static_cast<std::uint32_t>(2));
+    REQUIRE_EQ(reference.scc_waveform[0], static_cast<std::uint8_t>(0x7F));
+    REQUIRE_EQ(reference.number_mode, TimbreNumberMode::Manual);
+    REQUIRE_EQ(
+        reference.manual_number,
+        std::optional<std::uint8_t>{
+            static_cast<std::uint8_t>(19)});
+}
+
+void testCompositeTimbreLibraryRoundTripAndRevision() {
+    using namespace mgstc::engine;
+
+    TimbreLibrary timbres;
+    TimbreLibraryEntry scc;
+    scc.category = TimbreCategory::Scc;
+    scc.name = "Library SCC";
+    scc.scc_waveform[0] = 0x80;
+    const auto scc_id = timbres.add(scc, 10);
+
+    auto composite = defaultCompositeTimbre();
+    composite.name = "Unicode Composite";
+    composite.tags = "lead layered";
+    composite.memo = "round-trip\nmemo";
+    composite.layers[1].base_timbre =
+        makeSavedTimbreReference(*timbres.find(scc_id));
+    composite.layers[1].base_timbre->number_mode =
+        TimbreNumberMode::Manual;
+    composite.layers[1].base_timbre->manual_number =
+        static_cast<std::uint8_t>(22);
+    composite.layers[1].relative_semitones = -12;
+    composite.layers[1].detune = -37;
+    composite.layers[1].pitch_envelope.events = {
+        {
+            .kind = EnvelopeEventKind::Pitch,
+            .value = -5,
+            .secondary = 7,
+            .count = 12,
+        },
+    };
+    composite.layers[1].timbre_automation = {
+        {
+            .kind = EnvelopeEventKind::Timbre,
+            .value = 17,
+            .count = 30,
+        },
+    };
+
+    CompositeTimbreLibrary library;
+    const auto id = library.add(composite, 100);
+    REQUIRE_EQ(id, static_cast<std::uint64_t>(1));
+    REQUIRE_EQ(
+        library.uniqueName(composite.name),
+        std::string("Unicode Composite(1)"));
+
+    const auto serialized = library.serialize();
+    std::string error;
+    auto loaded =
+        CompositeTimbreLibrary::deserialize(serialized, &error);
+    REQUIRE_EQ(loaded.has_value(), true);
+    REQUIRE_EQ(error.empty(), true);
+    REQUIRE_EQ(loaded->entries().size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(loaded->find(id)->timbre, composite);
+    REQUIRE_EQ(
+        loaded->find(id)->revision,
+        static_cast<std::uint32_t>(1));
+
+    auto renamed = composite;
+    renamed.name = "Updated Composite";
+    REQUIRE_EQ(loaded->update(id, renamed, 120), true);
+    REQUIRE_EQ(
+        loaded->find(id)->revision,
+        static_cast<std::uint32_t>(2));
+    REQUIRE_EQ(
+        loaded->find(id)->created_unix_seconds,
+        static_cast<std::int64_t>(100));
+    REQUIRE_EQ(
+        loaded->find(id)->updated_unix_seconds,
+        static_cast<std::int64_t>(120));
+
+    REQUIRE_EQ(
+        CompositeTimbreLibrary::deserialize(
+            "MGSTC_COMPOSITE_TIMBRE_LIBRARY\t2\r\n",
+            &error)
+            .has_value(),
+        false);
+    REQUIRE_EQ(
+        CompositeTimbreLibrary::deserialize(
+            "MGSTC_COMPOSITE_TIMBRE_LIBRARY\t1\r\n"
+            "C\t1\t2\t3\t1\t0Z\r\n",
+            &error)
+            .has_value(),
+        false);
+}
+
+void testCompositeLibraryDependencyIndexAndPropagation() {
+    using namespace mgstc::engine;
+
+    TimbreLibrary timbres;
+    TimbreLibraryEntry scc;
+    scc.category = TimbreCategory::Scc;
+    scc.name = "Shared SCC";
+    scc.scc_waveform[0] = 1;
+    const auto timbre_id = timbres.add(scc, 10);
+
+    auto first = defaultCompositeTimbre();
+    first.name = "First Composite";
+    first.layers[1].base_timbre =
+        makeSavedTimbreReference(*timbres.find(timbre_id));
+    auto second = defaultCompositeTimbre();
+    second.name = "Second Composite";
+    second.layers[1].base_timbre =
+        makeSavedTimbreReference(*timbres.find(timbre_id));
+    second.layers.push_back(second.layers[1]);
+    second.layers.back().name = "Second SCC Echo";
+    second.layers.back().channel = 1;
+
+    CompositeTimbreLibrary composites;
+    const auto first_id = composites.add(first, 20);
+    const auto second_id = composites.add(second, 21);
+    const auto uses = composites.findTimbreUses(timbre_id);
+    REQUIRE_EQ(uses.size(), static_cast<std::size_t>(3));
+    REQUIRE_EQ(uses[0].composite_name, std::string("First Composite"));
+    REQUIRE_EQ(uses[2].layer_name, std::string("Second SCC Echo"));
+
+    auto replacement = *timbres.find(timbre_id);
+    replacement.scc_waveform[0] = 0x7F;
+    REQUIRE_EQ(timbres.update(timbre_id, replacement, 30), true);
+    REQUIRE_EQ(
+        composites.updateTimbreReferences(
+            *timbres.find(timbre_id), 31),
+        static_cast<std::size_t>(3));
+    REQUIRE_EQ(
+        composites.find(first_id)->revision,
+        static_cast<std::uint32_t>(2));
+    REQUIRE_EQ(
+        composites.find(second_id)->revision,
+        static_cast<std::uint32_t>(2));
+    REQUIRE_EQ(
+        composites.find(second_id)
+            ->timbre.layers.back()
+            .base_timbre
+            ->revision,
+        static_cast<std::uint32_t>(2));
+    REQUIRE_EQ(
+        composites.find(first_id)
+            ->timbre.layers[1]
+            .base_timbre
+            ->scc_waveform[0],
+        static_cast<std::uint8_t>(0x7F));
+}
+
+void testPcKeyboardPhysicalLayoutAndOctaveSlide() {
+    using mgstc::engine::pcKeyboardMidiNoteFromScanCode;
+
+    REQUIRE_EQ(
+        pcKeyboardMidiNoteFromScanCode(0x2C, 4),
+        std::optional<std::uint8_t>{
+            static_cast<std::uint8_t>(60)});
+    REQUIRE_EQ(
+        pcKeyboardMidiNoteFromScanCode(0x10, 4),
+        std::optional<std::uint8_t>{
+            static_cast<std::uint8_t>(72)});
+    REQUIRE_EQ(
+        pcKeyboardMidiNoteFromScanCode(0x03, 4),
+        std::optional<std::uint8_t>{
+            static_cast<std::uint8_t>(73)});
+    REQUIRE_EQ(
+        pcKeyboardMidiNoteFromScanCode(0x10, 5),
+        std::optional<std::uint8_t>{
+            static_cast<std::uint8_t>(84)});
+    REQUIRE_EQ(
+        pcKeyboardMidiNoteFromScanCode(0x03, 5),
+        std::optional<std::uint8_t>{
+            static_cast<std::uint8_t>(85)});
+    REQUIRE_EQ(
+        pcKeyboardMidiNoteFromScanCode(0x01, 4).has_value(),
+        false);
+}
+
+void testSequentialVoiceAllocatorPolyMonoAndStealing() {
+    mgstc::engine::SequentialVoiceAllocator voices(3);
+    const auto first = voices.noteOn(60);
+    const auto second = voices.noteOn(64);
+    const auto third = voices.noteOn(67);
+    REQUIRE_EQ(first.channel, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(second.channel, static_cast<std::uint8_t>(1));
+    REQUIRE_EQ(third.channel, static_cast<std::uint8_t>(2));
+    REQUIRE_EQ(voices.activeVoiceCount(), static_cast<std::size_t>(3));
+
+    const auto stolen = voices.noteOn(69);
+    REQUIRE_EQ(stolen.channel, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(stolen.stolen_note, std::optional<std::uint8_t>{60});
+    REQUIRE_EQ(voices.noteOff(64), std::optional<std::uint8_t>{1});
+    REQUIRE_EQ(voices.noteOn(71).channel, static_cast<std::uint8_t>(1));
+
+    voices.setPolyphonic(false);
+    REQUIRE_EQ(voices.activeVoiceCount(), static_cast<std::size_t>(0));
+    REQUIRE_EQ(voices.noteOn(72).channel, static_cast<std::uint8_t>(0));
+    const auto mono_replacement = voices.noteOn(74);
+    REQUIRE_EQ(mono_replacement.channel, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(
+        mono_replacement.stolen_note,
+        std::optional<std::uint8_t>{72});
+    REQUIRE_EQ(voices.noteOff(72).has_value(), false);
+    REQUIRE_EQ(voices.noteOff(74), std::optional<std::uint8_t>{0});
+}
+
 #ifdef _WIN32
 void testWasapiSinkConstructsWithoutOpeningDevice() {
     WasapiAudioSink sink;
@@ -1888,6 +2284,14 @@ int main() {
         {"WavePcmCycleConvertsToScc", testWavePcmCycleConvertsToScc},
         {"WaveCycleProducesValidOpllApproximation", testWaveCycleProducesValidOpllApproximation},
         {"WavePcmProducesDeterministicTimedOpllApproximation", testWavePcmProducesDeterministicTimedOpllApproximation},
+        {"DefaultCompositeTimbreHasThreeAudibleSources", testDefaultCompositeTimbreHasThreeAudibleSources},
+        {"CompositeSoloPitchAndChannelValidation", testCompositeSoloPitchAndChannelValidation},
+        {"CompositeSavedTimbreRevisionAndNumberAssignment", testCompositeSavedTimbreRevisionAndNumberAssignment},
+        {"CompositeTimbreDependencyUpdatePreservesAssignment", testCompositeTimbreDependencyUpdatePreservesAssignment},
+        {"CompositeTimbreLibraryRoundTripAndRevision", testCompositeTimbreLibraryRoundTripAndRevision},
+        {"CompositeLibraryDependencyIndexAndPropagation", testCompositeLibraryDependencyIndexAndPropagation},
+        {"PcKeyboardPhysicalLayoutAndOctaveSlide", testPcKeyboardPhysicalLayoutAndOctaveSlide},
+        {"SequentialVoiceAllocatorPolyMonoAndStealing", testSequentialVoiceAllocatorPolyMonoAndStealing},
 #ifdef _WIN32
         {"WasapiSinkConstructsWithoutOpeningDevice", testWasapiSinkConstructsWithoutOpeningDevice},
 #endif
@@ -1897,10 +2301,11 @@ int main() {
     for (const auto& [name, body] : tests) {
         try {
             body();
-            std::cout << "[PASS] " << name << '\n';
+            std::cout << "[PASS] " << name << std::endl;
         } catch (const std::exception& error) {
             ++failures;
-            std::cerr << "[FAIL] " << name << ": " << error.what() << '\n';
+            std::cerr << "[FAIL] " << name << ": " << error.what()
+                      << std::endl;
         }
     }
     std::cout << tests.size() - failures << '/' << tests.size()
