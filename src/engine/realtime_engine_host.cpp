@@ -7,7 +7,11 @@ namespace mgstc::engine {
 
 static_assert(std::is_nothrow_move_assignable_v<EngineCore>);
 
-RealtimeEngineHost::RealtimeEngineHost() {
+RealtimeEngineHost::RealtimeEngineHost()
+    : opll_scope_frames_(
+          std::make_unique<
+              SpscQueue<OpllScopeFrame, kOpllScopeCapacity>>()),
+      programs_(std::make_unique<ProgramSlot[]>(kProgramSlotCount)) {
     programs_[0].state.store(
         ProgramSlotState::Active,
         std::memory_order_relaxed);
@@ -103,7 +107,7 @@ bool RealtimeEngineHost::pollNotice(EngineNotice& notice) noexcept {
 
 bool RealtimeEngineHost::pollOpllScope(
     OpllScopeFrame& frame) noexcept {
-    return opll_scope_frames_.tryPop(frame);
+    return opll_scope_frames_->tryPop(frame);
 }
 
 void RealtimeEngineHost::notify(const EngineNotice& notice) noexcept {
@@ -199,7 +203,7 @@ RenderResult RealtimeEngineHost::render(
         programs_[active_program_].engine.render(interleaved_stereo);
     OpllScopeFrame scope{};
     if (programs_[active_program_].engine.takeOpllScopeFrame(scope)) {
-        static_cast<void>(opll_scope_frames_.tryPush(scope));
+        static_cast<void>(opll_scope_frames_->tryPush(scope));
     }
     if (!result.ok()) {
         notify({

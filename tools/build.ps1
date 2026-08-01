@@ -3,7 +3,7 @@ param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Debug",
 
-    [string]$BuildDirectory = "build",
+    [string]$BuildDirectory = "",
 
     [ValidateRange(1, 32)]
     [int]$Jobs = 4,
@@ -143,35 +143,84 @@ try {
     Write-Host "CMake: $cmakeExecutable"
     Write-Host "Ninja: $ninjaExecutable"
 
+    $runtimeOutputDirectory = Join-Path $projectRoot "build"
     $resolvedBuildDirectory = if (
-        [System.IO.Path]::IsPathRooted($BuildDirectory)
+        -not [string]::IsNullOrWhiteSpace($BuildDirectory)
     ) {
-        $BuildDirectory
+        if ([System.IO.Path]::IsPathRooted($BuildDirectory)) {
+            $BuildDirectory
+        } else {
+            Join-Path $projectRoot $BuildDirectory
+        }
+    } elseif ($projectRoot -match "[^\x00-\x7F]") {
+        if (-not $env:LOCALAPPDATA) {
+            throw "LOCALAPPDATA is required for the ASCII build path."
+        }
+        Join-Path $env:LOCALAPPDATA `
+            "MgsToneCraft\cmake-build-$($Configuration.ToLowerInvariant())"
     } else {
-        Join-Path $projectRoot $BuildDirectory
+        $runtimeOutputDirectory
     }
+
+    Write-Host "Build tree: $resolvedBuildDirectory"
+    Write-Host "Executables: $runtimeOutputDirectory"
+
+    # CMake can misdecode localized MSVC /showIncludes output, leaving Ninja
+    # unaware that a public header changed.  Detect project-header updates
+    # independently and clean only in that case so stale ABI layouts can
+    # never be linked into an otherwise incremental build.
+    $headerDependencyStamp = Join-Path `
+        $resolvedBuildDirectory ".mgstc-header-deps.stamp"
+    $headerStampTime = if (
+        Test-Path -LiteralPath $headerDependencyStamp -PathType Leaf
+    ) {
+        (Get-Item -LiteralPath $headerDependencyStamp).LastWriteTimeUtc
+    } else {
+        [DateTime]::MinValue
+    }
+    $projectHeadersChanged = @(
+        Get-ChildItem `
+            -LiteralPath (Join-Path $projectRoot "src") `
+            -Recurse `
+            -File `
+            -ErrorAction Stop |
+            Where-Object {
+                $_.Extension -in @(".h", ".hpp", ".inl") -and
+                $_.LastWriteTimeUtc -gt $headerStampTime
+            }
+    ).Count -gt 0
 
     & $cmakeExecutable `
         -S $projectRoot `
         -B $resolvedBuildDirectory `
         -G Ninja `
         "-DCMAKE_MAKE_PROGRAM=$ninjaExecutable" `
+        "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$runtimeOutputDirectory" `
         "-DCMAKE_BUILD_TYPE=$Configuration"
     if ($LASTEXITCODE -ne 0) {
         throw "CMake configuration failed with exit code $LASTEXITCODE."
     }
 
-    $targetExecutable = [System.IO.Path]::GetFullPath(
-        (Join-Path $resolvedBuildDirectory "mgstc.exe")
-    )
+    $targetExecutables = @("mgstc.exe") | ForEach-Object {
+        [System.IO.Path]::GetFullPath(
+            (Join-Path $runtimeOutputDirectory $_))
+    }
     $runningTargets = @(
-        Get-Process -Name "mgstc" -ErrorAction SilentlyContinue |
+        Get-Process -Name "mgstc" `
+            -ErrorAction SilentlyContinue |
             Where-Object {
-                $_.Path -and [string]::Equals(
-                    [System.IO.Path]::GetFullPath($_.Path),
-                    $targetExecutable,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                )
+                $processPath = if ($_.Path) {
+                    [System.IO.Path]::GetFullPath($_.Path)
+                }
+                $_.Path -and @(
+                    $targetExecutables |
+                        Where-Object {
+                            [string]::Equals(
+                                $processPath,
+                                $_,
+                                [System.StringComparison]::OrdinalIgnoreCase)
+                        }
+                ).Count -gt 0
             }
     )
     if ($runningTargets.Count -gt 0) {
@@ -180,6 +229,17 @@ try {
             Write-Host "  PID $($process.Id): $($process.Path)"
             Stop-Process -Id $process.Id -Force
             Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($projectHeadersChanged) {
+        Write-Host `
+            "Project header change detected: cleaning stale Ninja objects."
+        & $cmakeExecutable `
+            --build $resolvedBuildDirectory `
+            --target clean
+        if ($LASTEXITCODE -ne 0) {
+            throw "Clean step failed with exit code $LASTEXITCODE."
         }
     }
 
@@ -198,6 +258,10 @@ try {
             throw "Tests failed with exit code $LASTEXITCODE."
         }
     }
+
+    [IO.File]::WriteAllText(
+        $headerDependencyStamp,
+        [DateTime]::UtcNow.ToString("O"))
 } finally {
     Pop-Location
 }

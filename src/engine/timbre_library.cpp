@@ -9,7 +9,8 @@
 namespace mgstc::engine {
 namespace {
 
-constexpr std::string_view kHeader{"MGSTC_TIMBRE_LIBRARY\t1"};
+constexpr std::string_view kHeaderV1{"MGSTC_TIMBRE_LIBRARY\t1"};
+constexpr std::string_view kHeaderV2{"MGSTC_TIMBRE_LIBRARY\t2"};
 
 char hexDigit(std::uint8_t value) {
     return value < 10
@@ -121,6 +122,7 @@ void writeEntry(
         << '\t' << entry.updated_unix_seconds
         << '\t' << (entry.favorite ? 1 : 0)
         << '\t' << entry.data_version
+        << '\t' << entry.revision
         << '\t' << encodeBytes(entry.name)
         << '\t' << encodeBytes(entry.tags)
         << '\t' << encodeBytes(entry.memo)
@@ -156,6 +158,7 @@ std::uint64_t TimbreLibrary::add(
     entry.created_unix_seconds = now_unix_seconds;
     entry.updated_unix_seconds = now_unix_seconds;
     entry.data_version = 1;
+    entry.revision = 1;
     entries_.push_back(std::move(entry));
     return entries_.back().id;
 }
@@ -173,6 +176,10 @@ bool TimbreLibrary::update(
     updated.created_unix_seconds = current->created_unix_seconds;
     updated.updated_unix_seconds = now_unix_seconds;
     updated.data_version = 1;
+    updated.revision = current->revision
+        == std::numeric_limits<std::uint32_t>::max()
+        ? current->revision
+        : current->revision + 1;
     *current = std::move(updated);
     return true;
 }
@@ -186,7 +193,7 @@ bool TimbreLibrary::erase(std::uint64_t id) {
 
 std::string TimbreLibrary::serialize() const {
     std::ostringstream output;
-    output << kHeader << "\r\n";
+    output << kHeaderV2 << "\r\n";
     for (const auto& entry : entries_) {
         writeEntry(output, entry);
     }
@@ -200,7 +207,7 @@ std::optional<std::string> TimbreLibrary::serializeEntry(
         return std::nullopt;
     }
     std::ostringstream output;
-    output << kHeader << "\r\n";
+    output << kHeaderV2 << "\r\n";
     writeEntry(output, *entry);
     return output.str();
 }
@@ -257,6 +264,7 @@ std::optional<TimbreLibrary> TimbreLibrary::deserialize(
     std::string_view text,
     std::string* error) {
     TimbreLibrary library;
+    std::uint32_t schema_version{};
     std::size_t line_begin = 0;
     std::size_t line_number = 0;
     while (line_begin <= text.size()) {
@@ -271,13 +279,19 @@ std::optional<TimbreLibrary> TimbreLibrary::deserialize(
         }
         ++line_number;
         if (line_number == 1) {
-            if (line != kHeader) {
+            if (line == kHeaderV1) {
+                schema_version = 1;
+            } else if (line == kHeaderV2) {
+                schema_version = 2;
+            } else {
                 setError(error, "unsupported timbre library header");
                 return std::nullopt;
             }
         } else if (!line.empty()) {
             const auto fields = splitTabs(line);
-            if (fields.size() != 11
+            const std::size_t expected_fields =
+                schema_version == 1 ? 11 : 12;
+            if (fields.size() != expected_fields
                 || (fields[0] != "O" && fields[0] != "S")) {
                 setError(error, "invalid timbre library record");
                 return std::nullopt;
@@ -295,16 +309,31 @@ std::optional<TimbreLibrary> TimbreLibrary::deserialize(
                 || !parseInteger(fields[4], favorite)
                 || favorite > 1
                 || !parseInteger(fields[5], entry.data_version)
-                || entry.data_version != 1) {
+                || entry.data_version != 1
+                || (schema_version == 2
+                    && (!parseInteger(fields[6], entry.revision)
+                        || entry.revision == 0))) {
                 setError(error, "invalid timbre library metadata");
                 return std::nullopt;
             }
-            const auto name = decodeString(fields[6]);
-            const auto tags = decodeString(fields[7]);
-            const auto memo = decodeString(fields[8]);
+            if (schema_version == 1) {
+                entry.revision = 1;
+            }
+            const std::size_t payload_offset =
+                schema_version == 1 ? 6 : 7;
+            const auto name =
+                decodeString(fields[payload_offset]);
+            const auto tags =
+                decodeString(fields[payload_offset + 1]);
+            const auto memo =
+                decodeString(fields[payload_offset + 2]);
             if (!name || !tags || !memo
-                || !decodeArray(fields[9], entry.opll_registers)
-                || !decodeArray(fields[10], entry.scc_waveform)
+                || !decodeArray(
+                    fields[payload_offset + 3],
+                    entry.opll_registers)
+                || !decodeArray(
+                    fields[payload_offset + 4],
+                    entry.scc_waveform)
                 || library.find(entry.id)) {
                 setError(error, "invalid timbre library payload");
                 return std::nullopt;

@@ -28,6 +28,49 @@ PowerShell実行ポリシーを変更する必要はない。初回ビルドの�
 された依存関係ログの大量出力を避けるため、既定は4並列かつ英語ツール診断で
 実行する。
 
+JUCEのWindowsリソース生成ツールは日本語を含む出力パスを処理できないため、
+プロジェクトパスに非ASCII文字がある場合、スクリプトはCMakeの中間Build treeを
+`%LOCALAPPDATA%\MgsToneCraft\cmake-build-<configuration>`へ自動配置する。
+完成した実行ファイルは従来どおりプロジェクト直下の`build`へ出力する。
+
+通常のBuildでは現行UIを正式な`build\mgstc.exe`として生成する。従来の
+Win32 GUI版はビルド対象に含めない。JUCEは8.0.15の公式コミット
+`91ad83ae34a81e0833b1a2b0866f54846370ae53`へ固定し、初回構成時に
+公式GitHubリポジトリから取得する。
+
+### 画面のPNG目視検査
+
+Windowsの画面キャプチャAPIに依存せず、JUCE自身にクライアント領域を描画させて
+PNGを生成できる。通常のBuild後に次を実行する。
+
+```powershell
+.\tools\capture-ui.cmd
+.\tools\capture-ui.cmd -Editor opll
+```
+
+既定の出力先はSCCが`build\ui-captures\scc-editor.png`、OPLLが
+`build\ui-captures\opll-editor.png`。別の出力先を指定する場合:
+
+```powershell
+.\tools\capture-ui.cmd -OutputPath build\ui-captures\custom.png
+```
+
+この検査モードは`mgstc.exe --editor=<scc|opll> --capture-ui="<path>"`
+を内部で使用する。SCCでは
+現在波形を灰色、未確定のプリセット候補を緑色で重ねた検査状態を描画して、
+PNG生成後に自動終了する。Windows 10で利用できない
+`GraphicsCaptureSession.IsBorderRequired`は呼び出さない。
+
+同一プロセス内の画面切替と補助ウィンドウ再利用は、次のセルフテストで
+確認できる。終了コード`0`が成功、`16`が画面切替検証失敗を表す。
+
+```powershell
+$process = Start-Process -FilePath .\build\mgstc.exe `
+    -ArgumentList '--verify-window-routing' -WindowStyle Hidden `
+    -Wait -PassThru
+$process.ExitCode
+```
+
 Releaseビルド:
 
 ```powershell
@@ -70,7 +113,7 @@ ctest --test-dir build --output-on-failure
 - `mgstc_windows_audio`
   - Windows共有モード・イベント駆動WASAPI出力
 - `mgstc`
-  - Win32ネイティブアプリ本体
+  - 既存エンジンとWASAPI出力を使用するアプリ本体
 
 ネイティブアプリを起動する場合:
 
