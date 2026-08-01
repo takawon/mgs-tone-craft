@@ -39,7 +39,10 @@ struct RenderResult {
 struct OpllScopeFrame {
     static constexpr std::size_t kSampleCount = 800;
 
+    std::array<float, kSampleCount> psg_samples{};
+    std::array<float, kSampleCount> scc_samples{};
     std::array<float, kSampleCount> samples{};
+    std::array<float, kSampleCount> mixed_samples{};
     std::uint64_t sequence{};
 };
 
@@ -84,7 +87,10 @@ private:
     ChipRack chips_{};
     TickClock clock_{};
     MixerGains gains_{};
+    std::array<float, OpllScopeFrame::kSampleCount> psg_scope_work_{};
+    std::array<float, OpllScopeFrame::kSampleCount> scc_scope_work_{};
     std::array<float, OpllScopeFrame::kSampleCount> opll_scope_work_{};
+    std::array<float, OpllScopeFrame::kSampleCount> mixed_scope_work_{};
     OpllScopeFrame opll_scope_completed_{};
     std::size_t opll_scope_position_{};
     std::uint64_t opll_scope_sequence_{};

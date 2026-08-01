@@ -24,7 +24,10 @@ void EngineCore::hardReset() noexcept {
     session_.resetForKeyOn();
     chips_.reset();
     clock_.reset();
+    psg_scope_work_.fill(0.0F);
+    scc_scope_work_.fill(0.0F);
     opll_scope_work_.fill(0.0F);
+    mixed_scope_work_.fill(0.0F);
     opll_scope_completed_ = {};
     opll_scope_position_ = 0;
     opll_scope_sequence_ = 0;
@@ -78,18 +81,25 @@ RenderResult EngineCore::render(
         }
 
         const auto chips = chips_.renderSample();
-        opll_scope_work_[opll_scope_position_++] = chips.opll;
-        if (opll_scope_position_ == opll_scope_work_.size()) {
-            opll_scope_completed_.samples = opll_scope_work_;
-            opll_scope_completed_.sequence = ++opll_scope_sequence_;
-            opll_scope_position_ = 0;
-            opll_scope_ready_ = true;
-        }
         const auto raw = gains_.master * (
             chips.psg * gains_.psg
             + chips.scc * gains_.scc
             + chips.opll * gains_.opll);
         const auto mixed = std::clamp(raw, -1.0F, 1.0F);
+        const auto scope_index = opll_scope_position_++;
+        psg_scope_work_[scope_index] = chips.psg;
+        scc_scope_work_[scope_index] = chips.scc;
+        opll_scope_work_[scope_index] = chips.opll;
+        mixed_scope_work_[scope_index] = mixed;
+        if (opll_scope_position_ == opll_scope_work_.size()) {
+            opll_scope_completed_.psg_samples = psg_scope_work_;
+            opll_scope_completed_.scc_samples = scc_scope_work_;
+            opll_scope_completed_.samples = opll_scope_work_;
+            opll_scope_completed_.mixed_samples = mixed_scope_work_;
+            opll_scope_completed_.sequence = ++opll_scope_sequence_;
+            opll_scope_position_ = 0;
+            opll_scope_ready_ = true;
+        }
         result.clipped = result.clipped || mixed != raw;
         interleaved_stereo[frame * 2] = mixed;
         interleaved_stereo[frame * 2 + 1] = mixed;
