@@ -113,7 +113,7 @@ ctest --test-dir build --output-on-failure
 - `mgstc_windows_audio`
   - Windows共有モード・イベント駆動WASAPI出力
 - `mgstc`
-  - 既存エンジンとWASAPI出力を使用するアプリ本体
+  - 1組の共有エンジン・WASAPI出力・MIDI入力を使用するアプリ本体
 
 ネイティブアプリを起動する場合:
 

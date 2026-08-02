@@ -39,6 +39,11 @@ public:
     [[nodiscard]] bool setSequenceEnvelope(
         std::uint8_t track,
         std::vector<std::uint8_t> bytecode);
+    [[nodiscard]] bool setCompositeSequenceEnvelopes(
+        std::uint8_t track,
+        std::vector<std::uint8_t> volume_bytecode,
+        std::vector<std::uint8_t> pitch_bytecode,
+        std::vector<std::uint8_t> timbre_bytecode);
     [[nodiscard]] bool setRateEnvelope(
         std::uint8_t track,
         RateEnvelopeDefinition definition,

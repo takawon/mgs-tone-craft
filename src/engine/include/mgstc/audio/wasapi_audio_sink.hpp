@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 
 #include "mgstc/audio/audio_sink.hpp"
@@ -19,6 +20,9 @@ public:
     [[nodiscard]] bool running() const noexcept override;
     [[nodiscard]] bool pollStatus(
         AudioSinkStatus& status) noexcept override;
+
+    void setMasterVolumePercent(std::uint32_t percent) noexcept;
+    [[nodiscard]] std::uint32_t masterVolumePercent() const noexcept;
 
 private:
     struct Impl;

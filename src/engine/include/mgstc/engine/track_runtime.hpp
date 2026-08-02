@@ -9,10 +9,30 @@
 
 namespace mgstc::engine {
 
+class CompositeSequenceRuntime {
+public:
+    CompositeSequenceRuntime(
+        std::vector<std::uint8_t> volume_bytecode,
+        std::vector<std::uint8_t> pitch_bytecode,
+        std::vector<std::uint8_t> timbre_bytecode);
+
+    void resetForKeyOn() noexcept;
+    [[nodiscard]] SequenceError processTick(EventBuffer& output);
+
+private:
+    SequenceEnvelopeRuntime timbre_;
+    SequenceEnvelopeRuntime pitch_;
+    SequenceEnvelopeRuntime volume_;
+};
+
 class TrackRuntime {
 public:
     [[nodiscard]] bool setSequenceEnvelope(
         std::vector<std::uint8_t> bytecode);
+    [[nodiscard]] bool setCompositeSequenceEnvelopes(
+        std::vector<std::uint8_t> volume_bytecode,
+        std::vector<std::uint8_t> pitch_bytecode,
+        std::vector<std::uint8_t> timbre_bytecode);
     [[nodiscard]] bool setRateEnvelope(
         RateEnvelopeDefinition definition,
         std::uint8_t track_volume = 15);
@@ -40,6 +60,7 @@ private:
     using EnvelopeRuntime = std::variant<
         std::monostate,
         SequenceEnvelopeRuntime,
+        CompositeSequenceRuntime,
         RateEnvelopeRuntime>;
 
     EnvelopeRuntime envelope_{};

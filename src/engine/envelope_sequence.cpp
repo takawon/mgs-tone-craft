@@ -7,14 +7,18 @@
 namespace mgstc::engine {
 
 SequenceEnvelopeRuntime::SequenceEnvelopeRuntime(
-    std::vector<std::uint8_t> bytecode)
-    : bytecode_(std::move(bytecode)) {}
+    std::vector<std::uint8_t> bytecode,
+    bool emit_volume_events)
+    : bytecode_(std::move(bytecode)),
+      emit_volume_events_(emit_volume_events) {}
 
 void SequenceEnvelopeRuntime::resetForKeyOn() noexcept {
     wait_ = 1;
     ramp_total_ = 0;
     position_ = 0;
+    loop_position_ = 0;
     volume_ = 0;
+    tick_ = 0;
 }
 
 bool SequenceEnvelopeRuntime::emit(
@@ -22,6 +26,9 @@ bool SequenceEnvelopeRuntime::emit(
     MeaningEventKind kind,
     std::int32_t arg0,
     std::int32_t arg1) const {
+    if (kind == MeaningEventKind::Volume && !emit_volume_events_) {
+        return true;
+    }
     return output.push(MeaningEvent{tick_, kind, arg0, arg1});
 }
 
