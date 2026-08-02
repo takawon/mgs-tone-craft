@@ -43,6 +43,7 @@ add_library(mgstc_engine STATIC
     src/engine/engine_core.cpp
     src/engine/envelope_rate.cpp
     src/engine/envelope_sequence.cpp
+    src/engine/mgs_envelope_io.cpp
     src/engine/mgs_timbre_io.cpp
     src/engine/note_pitch.cpp
     src/engine/opll_envelope_trace.cpp
