@@ -126,6 +126,14 @@ public:
         unsignedInteger(value.count, 4);
     }
 
+    void timeline(const EnvelopeTimeline& value) {
+        unsignedInteger(value.length_counts, 4);
+        boolean(value.loop_start_count.has_value());
+        unsignedInteger(value.loop_start_count.value_or(0), 4);
+        boolean(value.loop_end_count.has_value());
+        unsignedInteger(value.loop_end_count.value_or(0), 4);
+    }
+
     void envelope(const SoftwareEnvelope& value) {
         enumeration(value.kind);
         unsignedInteger(value.rate.attack_level, 1);
@@ -134,6 +142,7 @@ public:
         unsignedInteger(value.rate.sustain_level, 1);
         unsignedInteger(value.rate.sustain_rate, 1);
         unsignedInteger(value.rate.release_rate, 1);
+        timeline(value.timeline);
         unsignedInteger(value.events.size(), 4);
         for (const auto& event_value : value.events) {
             event(event_value);
@@ -157,7 +166,7 @@ public:
     }
 
     void timbre(const CompositeTimbre& value) {
-        unsignedInteger(value.format_version, 4);
+        unsignedInteger(CompositeTimbre::kFormatVersion, 4);
         string(value.name);
         string(value.tags);
         string(value.memo);
@@ -189,6 +198,7 @@ public:
                  layer.timbre_automation) {
                 event(event_value);
             }
+            timeline(layer.timbre_timeline);
         }
     }
 
@@ -269,6 +279,35 @@ public:
             && integer(value.count, 4);
     }
 
+    bool timeline(EnvelopeTimeline& value) {
+        bool has_loop_start{};
+        bool has_loop_end{};
+        std::uint32_t loop_start{};
+        std::uint32_t loop_end{};
+        if (!integer(value.length_counts, 4)
+            || value.length_counts == 0
+            || value.length_counts
+                > EnvelopeTimeline::kMaximumLengthCounts
+            || !boolean(has_loop_start)
+            || !integer(loop_start, 4)
+            || !boolean(has_loop_end)
+            || !integer(loop_end, 4)) {
+            return false;
+        }
+        value.loop_start_count = has_loop_start
+            ? std::optional<std::uint32_t>{loop_start}
+            : std::nullopt;
+        value.loop_end_count = has_loop_end
+            ? std::optional<std::uint32_t>{loop_end}
+            : std::nullopt;
+        return (!value.loop_start_count
+                || *value.loop_start_count <= value.length_counts)
+            && (!value.loop_end_count
+                || *value.loop_end_count <= value.length_counts)
+            && (!value.loop_start_count || !value.loop_end_count
+                || *value.loop_start_count <= *value.loop_end_count);
+    }
+
     bool envelope(SoftwareEnvelope& value) {
         std::uint32_t count{};
         if (!enumeration(value.kind, 1)
@@ -278,6 +317,7 @@ public:
             || !integer(value.rate.sustain_level, 1)
             || !integer(value.rate.sustain_rate, 1)
             || !integer(value.rate.release_rate, 1)
+            || (format_version_ >= 2 && !timeline(value.timeline))
             || !integer(count, 4)
             || count > kMaximumCollectionSize) {
             return false;
@@ -323,9 +363,9 @@ public:
 
     bool timbre(CompositeTimbre& value) {
         std::uint32_t layer_count{};
-        if (!integer(value.format_version, 4)
-            || value.format_version
-                != CompositeTimbre::kFormatVersion
+        if (!integer(format_version_, 4)
+            || format_version_ < 1
+            || format_version_ > CompositeTimbre::kFormatVersion
             || !string(value.name)
             || !string(value.tags)
             || !string(value.memo)
@@ -379,13 +419,19 @@ public:
                     })) {
                 return false;
             }
+            if (format_version_ >= 2
+                && !timeline(layer.timbre_timeline)) {
+                return false;
+            }
         }
+        value.format_version = CompositeTimbre::kFormatVersion;
         return position_ == data_.size();
     }
 
 private:
     std::string_view data_;
     std::size_t position_{};
+    std::uint32_t format_version_{};
 };
 
 std::string encodeTimbre(const CompositeTimbre& timbre) {

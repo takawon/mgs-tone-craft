@@ -25,6 +25,20 @@ bool RuntimeSession::setSequenceEnvelope(
     return tracks_[track].setSequenceEnvelope(std::move(bytecode));
 }
 
+bool RuntimeSession::setCompositeSequenceEnvelopes(
+    std::uint8_t track,
+    std::vector<std::uint8_t> volume_bytecode,
+    std::vector<std::uint8_t> pitch_bytecode,
+    std::vector<std::uint8_t> timbre_bytecode) {
+    if (track >= kTrackCount) {
+        return false;
+    }
+    return tracks_[track].setCompositeSequenceEnvelopes(
+        std::move(volume_bytecode),
+        std::move(pitch_bytecode),
+        std::move(timbre_bytecode));
+}
+
 bool RuntimeSession::setRateEnvelope(
     std::uint8_t track,
     RateEnvelopeDefinition definition,

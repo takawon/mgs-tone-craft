@@ -23,7 +23,9 @@ class SequenceEnvelopeRuntime {
 public:
     static constexpr std::size_t kDefaultInstructionBudget = 8'192;
 
-    explicit SequenceEnvelopeRuntime(std::vector<std::uint8_t> bytecode);
+    explicit SequenceEnvelopeRuntime(
+        std::vector<std::uint8_t> bytecode,
+        bool emit_volume_events = true);
 
     void resetForKeyOn() noexcept;
 
@@ -53,6 +55,7 @@ private:
     [[nodiscard]] bool readByte(std::uint8_t& value) noexcept;
 
     std::vector<std::uint8_t> bytecode_;
+    bool emit_volume_events_{true};
     std::size_t position_{};
     std::size_t loop_position_{};
     std::uint16_t wait_{1};
