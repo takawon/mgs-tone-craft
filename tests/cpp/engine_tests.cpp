@@ -21,6 +21,7 @@
 #include "mgstc/engine/composite_timbre.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/engine_core.hpp"
+#include "mgstc/engine/mgs_envelope_io.hpp"
 #include "mgstc/engine/mgs_timbre_io.hpp"
 #include "mgstc/engine/note_pitch.hpp"
 #include "mgstc/engine/opll_envelope_trace.hpp"
@@ -1999,6 +2000,73 @@ void testEnvelopeTimelineInspectorRangeNormalization() {
     REQUIRE_EQ(timeline.loop_end_count.has_value(), false);
 }
 
+void testCompositeEnvelopeFormatsOneSharedMgscLoop() {
+    using namespace mgstc::engine;
+
+    auto layer = defaultCompositeTimbre().layers[1];
+    layer.volume = 15;
+    layer.envelope_timeline = {
+        .length_counts = 10,
+    };
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {EnvelopeEventKind::Volume, 8, 0, 10},
+    };
+    layer.pitch_envelope.events = {
+        {EnvelopeEventKind::Pitch, -3, 0, 4},
+    };
+    layer.timbre_automation = {
+        {EnvelopeEventKind::Timbre, 17, 0, 4},
+    };
+
+    const auto linear = formatMgsCompositeEnvelope(layer, 3);
+    REQUIRE_EQ(linear.valid(), true);
+    REQUIRE_EQ(
+        linear.body,
+        std::string(",,f:4.@17.\\-3.f:6.8"));
+    REQUIRE_EQ(
+        linear.definition,
+        std::string("@e3 = { ,,f:4.@17.\\-3.f:6.8 }\r\n"));
+
+    layer.envelope_timeline = {
+        .length_counts = 8,
+        .loop_start_count = 2,
+        .loop_end_count = 6,
+    };
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {EnvelopeEventKind::Volume, 12, 0, 2},
+    };
+    layer.pitch_envelope.events = {
+        {EnvelopeEventKind::Pitch, 2, 0, 3},
+    };
+    layer.timbre_automation = {
+        {EnvelopeEventKind::Timbre, 4, 0, 5},
+    };
+    const auto looped = formatMgsCompositeEnvelope(layer, 4);
+    REQUIRE_EQ(looped.valid(), true);
+    REQUIRE_EQ(looped.body.find('[') != std::string::npos, true);
+    REQUIRE_EQ(looped.body.find(']') != std::string::npos, true);
+    REQUIRE_EQ(
+        std::count(looped.body.begin(), looped.body.end(), '['),
+        static_cast<std::ptrdiff_t>(1));
+    REQUIRE_EQ(
+        std::count(looped.body.begin(), looped.body.end(), ']'),
+        static_cast<std::ptrdiff_t>(1));
+
+    const auto too_long = formatMgsCompositeEnvelope(layer, 4, 8);
+    REQUIRE_EQ(
+        too_long.hasIssue(
+            MgsEnvelopeIssue::DefinitionLengthExceeded),
+        true);
+
+    layer.envelope_timeline.loop_end_count.reset();
+    const auto incomplete = formatMgsCompositeEnvelope(layer, 4);
+    REQUIRE_EQ(
+        incomplete.hasIssue(MgsEnvelopeIssue::IncompleteLoop),
+        true);
+}
+
 void testCompositeSoloPitchAndChannelValidation() {
     auto timbre = mgstc::engine::defaultCompositeTimbre();
     timbre.layers[1].solo = true;
@@ -2159,12 +2227,7 @@ void testCompositeTimbreLibraryRoundTripAndRevision() {
             .count = 12,
         },
     };
-    composite.layers[1].volume_envelope.timeline = {
-        .length_counts = 2048,
-        .loop_start_count = 64,
-        .loop_end_count = 1536,
-    };
-    composite.layers[1].pitch_envelope.timeline = {
+    composite.layers[1].envelope_timeline = {
         .length_counts = 4096,
         .loop_start_count = 128,
         .loop_end_count = 3072,
@@ -2175,11 +2238,6 @@ void testCompositeTimbreLibraryRoundTripAndRevision() {
             .value = 17,
             .count = 30,
         },
-    };
-    composite.layers[1].timbre_timeline = {
-        .length_counts = 65'535,
-        .loop_start_count = 256,
-        .loop_end_count = 60'000,
     };
 
     CompositeTimbreLibrary library;
@@ -2422,6 +2480,7 @@ int main() {
         {"DefaultCompositeTimbreHasThreeAudibleSources", testDefaultCompositeTimbreHasThreeAudibleSources},
         {"CompositeLayerRemovalReusesFreedChannel", testCompositeLayerRemovalReusesFreedChannel},
         {"EnvelopeTimelineInspectorRangeNormalization", testEnvelopeTimelineInspectorRangeNormalization},
+        {"CompositeEnvelopeFormatsOneSharedMgscLoop", testCompositeEnvelopeFormatsOneSharedMgscLoop},
         {"CompositeSoloPitchAndChannelValidation", testCompositeSoloPitchAndChannelValidation},
         {"CompositeSavedTimbreRevisionAndNumberAssignment", testCompositeSavedTimbreRevisionAndNumberAssignment},
         {"CompositeTimbreDependencyUpdatePreservesAssignment", testCompositeTimbreDependencyUpdatePreservesAssignment},
