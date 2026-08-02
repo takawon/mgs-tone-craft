@@ -93,10 +93,71 @@ std::optional<std::uint8_t> layerMidiNote(
     return static_cast<std::uint8_t>(note);
 }
 
+std::optional<std::uint8_t> firstAvailableChannel(
+    const CompositeTimbre& timbre,
+    TimbreSource source) noexcept {
+    constexpr std::array<std::uint8_t, 3> capacities{3, 5, 9};
+    const auto capacity = capacities[sourceIndex(source)];
+    std::array<bool, 9> used_channels{};
+    for (const auto& layer : timbre.layers) {
+        if (layer.source == source && layer.channel < capacity) {
+            used_channels[layer.channel] = true;
+        }
+    }
+    const auto available = std::find(
+        used_channels.begin(),
+        used_channels.begin() + capacity,
+        false);
+    if (available == used_channels.begin() + capacity) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint8_t>(
+        std::distance(used_channels.begin(), available));
+}
+
+bool removeCompositeLayer(
+    CompositeTimbre& timbre,
+    std::size_t layer_index) noexcept {
+    if (layer_index >= timbre.layers.size()) {
+        return false;
+    }
+    timbre.layers.erase(
+        timbre.layers.begin() + static_cast<std::ptrdiff_t>(layer_index));
+    return true;
+}
+
+void setEnvelopeTimelineRange(
+    EnvelopeTimeline& timeline,
+    std::uint32_t length_counts,
+    std::optional<std::uint32_t> loop_start_count,
+    std::optional<std::uint32_t> loop_end_count) noexcept {
+    timeline.length_counts = std::clamp(
+        length_counts,
+        std::uint32_t{1},
+        EnvelopeTimeline::kMaximumLengthCounts);
+    const auto clamp_marker = [&timeline](
+        std::optional<std::uint32_t> marker) {
+        if (marker) {
+            *marker = std::min(*marker, timeline.length_counts);
+        }
+        return marker;
+    };
+    timeline.loop_start_count = clamp_marker(loop_start_count);
+    timeline.loop_end_count = clamp_marker(loop_end_count);
+    if (timeline.loop_start_count
+        && timeline.loop_end_count
+        && *timeline.loop_start_count > *timeline.loop_end_count) {
+        std::swap(
+            timeline.loop_start_count,
+            timeline.loop_end_count);
+    }
+}
+
 CompositeValidation validateCompositeTimbre(
     const CompositeTimbre& timbre) {
     CompositeValidation result;
     std::array<std::array<bool, 16>, 3> used{};
+    constexpr std::array<std::uint8_t, 3> capacities{3, 5, 9};
     for (const auto& layer : timbre.layers) {
         if (!layer.enabled) {
             continue;
@@ -113,7 +174,7 @@ CompositeValidation validateCompositeTimbre(
             break;
         }
         const auto source = sourceIndex(layer.source);
-        if (layer.channel >= used[source].size()) {
+        if (layer.channel >= capacities[source]) {
             result.warnings.push_back(
                 std::string(sourceName(layer.source))
                 + " layer uses an unsupported channel");

@@ -74,10 +74,24 @@ struct RateEnvelope {
         = default;
 };
 
+struct EnvelopeTimeline {
+    static constexpr std::uint32_t kDefaultLengthCounts = 120;
+    static constexpr std::uint32_t kMaximumLengthCounts = 65'535;
+
+    std::uint32_t length_counts{kDefaultLengthCounts};
+    std::optional<std::uint32_t> loop_start_count;
+    std::optional<std::uint32_t> loop_end_count;
+
+    friend bool operator==(
+        const EnvelopeTimeline&,
+        const EnvelopeTimeline&) = default;
+};
+
 struct SoftwareEnvelope {
     EnvelopeKind kind{EnvelopeKind::Sequence};
     std::vector<EnvelopeEvent> events;
     RateEnvelope rate;
+    EnvelopeTimeline timeline;
 
     friend bool operator==(
         const SoftwareEnvelope&,
@@ -96,6 +110,7 @@ struct CompositeLayer {
     SoftwareEnvelope volume_envelope;
     SoftwareEnvelope pitch_envelope;
     std::vector<EnvelopeEvent> timbre_automation;
+    EnvelopeTimeline timbre_timeline;
     bool enabled{true};
     bool muted{};
     bool solo{};
@@ -105,7 +120,7 @@ struct CompositeLayer {
 };
 
 struct CompositeTimbre {
-    static constexpr std::uint32_t kFormatVersion = 1;
+    static constexpr std::uint32_t kFormatVersion = 2;
 
     std::uint32_t format_version{kFormatVersion};
     std::string name;
@@ -164,6 +179,20 @@ struct TimbreUse {
 [[nodiscard]] std::optional<std::uint8_t> layerMidiNote(
     const CompositeLayer& layer,
     std::uint8_t root_midi_note) noexcept;
+
+[[nodiscard]] std::optional<std::uint8_t> firstAvailableChannel(
+    const CompositeTimbre& timbre,
+    TimbreSource source) noexcept;
+
+bool removeCompositeLayer(
+    CompositeTimbre& timbre,
+    std::size_t layer_index) noexcept;
+
+void setEnvelopeTimelineRange(
+    EnvelopeTimeline& timeline,
+    std::uint32_t length_counts,
+    std::optional<std::uint32_t> loop_start_count,
+    std::optional<std::uint32_t> loop_end_count) noexcept;
 
 [[nodiscard]] CompositeValidation validateCompositeTimbre(
     const CompositeTimbre& timbre);

@@ -80,6 +80,7 @@ using mgstc::engine::RenderError;
 using mgstc::engine::SequenceEnvelopeRuntime;
 using mgstc::engine::SequenceError;
 using mgstc::engine::TickClock;
+using mgstc::engine::TrackRuntime;
 using mgstc::engine::WriteReason;
 using mgstc::engine::notePitch;
 using mgstc::engine::decodeOpllPatch;
@@ -349,6 +350,47 @@ void testNoWaitLoopHitsInstructionBudget() {
     REQUIRE_EQ(
         runtime.processTick(buffer, 32),
         SequenceError::InstructionBudgetExceeded);
+}
+
+void testCompositeSequenceLanesLoopIndependently() {
+    TrackRuntime runtime;
+    REQUIRE_EQ(
+        runtime.setCompositeSequenceEnvelopes(
+            {0x40, 0x01, 0xE1, 0x01, 0x02, 0x60},
+            {0x40, 0x12, 0x01, 0xE0, 0x02, 0x60},
+            {0x40, 0x10, 0x02, 0xE0, 0x03, 0x60}),
+        true);
+    runtime.resetForKeyOn();
+    EventBuffer events(32);
+
+    REQUIRE_EQ(runtime.processTick(events), SequenceError::None);
+    REQUIRE_EQ(events.size(), static_cast<std::size_t>(3));
+    REQUIRE_EQ(events.events()[0].kind, MeaningEventKind::Patch);
+    REQUIRE_EQ(events.events()[0].arg0, 2);
+    REQUIRE_EQ(events.events()[1].kind, MeaningEventKind::FrequencyDelta);
+    REQUIRE_EQ(events.events()[1].arg0, 1);
+    REQUIRE_EQ(events.events()[2].kind, MeaningEventKind::Volume);
+    REQUIRE_EQ(events.events()[2].arg0, 1);
+
+    events.clear();
+    REQUIRE_EQ(runtime.processTick(events), SequenceError::None);
+    REQUIRE_EQ(events.size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(events.events()[0].kind, MeaningEventKind::Volume);
+    REQUIRE_EQ(events.events()[0].arg0, 1);
+
+    events.clear();
+    REQUIRE_EQ(runtime.processTick(events), SequenceError::None);
+    REQUIRE_EQ(events.size(), static_cast<std::size_t>(2));
+    REQUIRE_EQ(events.events()[0].kind, MeaningEventKind::FrequencyDelta);
+    REQUIRE_EQ(events.events()[1].kind, MeaningEventKind::Volume);
+    REQUIRE_EQ(events.events()[1].arg0, 2);
+
+    events.clear();
+    REQUIRE_EQ(runtime.processTick(events), SequenceError::None);
+    REQUIRE_EQ(events.size(), static_cast<std::size_t>(2));
+    REQUIRE_EQ(events.events()[0].kind, MeaningEventKind::Patch);
+    REQUIRE_EQ(events.events()[1].kind, MeaningEventKind::Volume);
+    REQUIRE_EQ(events.events()[1].arg0, 1);
 }
 
 void testRateEnvelopeNativePhases() {
@@ -1893,6 +1935,70 @@ void testDefaultCompositeTimbreHasThreeAudibleSources() {
     REQUIRE_EQ(validation.opll_channels, 1);
 }
 
+void testCompositeLayerRemovalReusesFreedChannel() {
+    using namespace mgstc::engine;
+
+    auto timbre = defaultCompositeTimbre();
+    auto second_scc = timbre.layers[1];
+    second_scc.name = "SCC Ch.2";
+    second_scc.channel = 1;
+    timbre.layers.push_back(second_scc);
+
+    REQUIRE_EQ(
+        firstAvailableChannel(timbre, TimbreSource::Scc),
+        std::optional<std::uint8_t>{2});
+    REQUIRE_EQ(removeCompositeLayer(timbre, 3), true);
+    REQUIRE_EQ(timbre.layers.size(), 3U);
+    REQUIRE_EQ(
+        firstAvailableChannel(timbre, TimbreSource::Scc),
+        std::optional<std::uint8_t>{1});
+
+    const auto unchanged_size = timbre.layers.size();
+    REQUIRE_EQ(removeCompositeLayer(timbre, 99), false);
+    REQUIRE_EQ(timbre.layers.size(), unchanged_size);
+
+    auto second_psg = timbre.layers[0];
+    second_psg.channel = 1;
+    timbre.layers.push_back(second_psg);
+    auto third_psg = second_psg;
+    third_psg.channel = 2;
+    timbre.layers.push_back(third_psg);
+    REQUIRE_EQ(
+        firstAvailableChannel(timbre, TimbreSource::Psg).has_value(),
+        false);
+}
+
+void testEnvelopeTimelineInspectorRangeNormalization() {
+    using namespace mgstc::engine;
+
+    EnvelopeTimeline timeline;
+    setEnvelopeTimelineRange(timeline, 200, 150, 40);
+    REQUIRE_EQ(timeline.length_counts, std::uint32_t{200});
+    REQUIRE_EQ(
+        timeline.loop_start_count,
+        std::optional<std::uint32_t>{40});
+    REQUIRE_EQ(
+        timeline.loop_end_count,
+        std::optional<std::uint32_t>{150});
+
+    setEnvelopeTimelineRange(timeline, 0, std::nullopt, 10);
+    REQUIRE_EQ(timeline.length_counts, std::uint32_t{1});
+    REQUIRE_EQ(timeline.loop_start_count.has_value(), false);
+    REQUIRE_EQ(
+        timeline.loop_end_count,
+        std::optional<std::uint32_t>{1});
+
+    setEnvelopeTimelineRange(timeline, 70'000, 70'000, std::nullopt);
+    REQUIRE_EQ(
+        timeline.length_counts,
+        EnvelopeTimeline::kMaximumLengthCounts);
+    REQUIRE_EQ(
+        timeline.loop_start_count,
+        std::optional<std::uint32_t>{
+            EnvelopeTimeline::kMaximumLengthCounts});
+    REQUIRE_EQ(timeline.loop_end_count.has_value(), false);
+}
+
 void testCompositeSoloPitchAndChannelValidation() {
     auto timbre = mgstc::engine::defaultCompositeTimbre();
     timbre.layers[1].solo = true;
@@ -1919,6 +2025,14 @@ void testCompositeSoloPitchAndChannelValidation() {
         mgstc::engine::validateCompositeTimbre(timbre);
     REQUIRE_EQ(validation.valid(), false);
     REQUIRE_EQ(validation.warnings.empty(), false);
+
+    auto out_of_range = mgstc::engine::defaultCompositeTimbre();
+    out_of_range.layers[0].channel = 3;
+    out_of_range.layers[1].channel = 5;
+    out_of_range.layers[2].channel = 9;
+    REQUIRE_EQ(
+        mgstc::engine::validateCompositeTimbre(out_of_range).valid(),
+        false);
 }
 
 void testCompositeSavedTimbreRevisionAndNumberAssignment() {
@@ -2045,12 +2159,27 @@ void testCompositeTimbreLibraryRoundTripAndRevision() {
             .count = 12,
         },
     };
+    composite.layers[1].volume_envelope.timeline = {
+        .length_counts = 2048,
+        .loop_start_count = 64,
+        .loop_end_count = 1536,
+    };
+    composite.layers[1].pitch_envelope.timeline = {
+        .length_counts = 4096,
+        .loop_start_count = 128,
+        .loop_end_count = 3072,
+    };
     composite.layers[1].timbre_automation = {
         {
             .kind = EnvelopeEventKind::Timbre,
             .value = 17,
             .count = 30,
         },
+    };
+    composite.layers[1].timbre_timeline = {
+        .length_counts = 65'535,
+        .loop_start_count = 256,
+        .loop_end_count = 60'000,
     };
 
     CompositeTimbreLibrary library;
@@ -2217,6 +2346,11 @@ void testSequentialVoiceAllocatorPolyMonoAndStealing() {
 void testWasapiSinkConstructsWithoutOpeningDevice() {
     WasapiAudioSink sink;
     REQUIRE_EQ(sink.running(), false);
+    REQUIRE_EQ(sink.masterVolumePercent(), std::uint32_t{100});
+    sink.setMasterVolumePercent(37);
+    REQUIRE_EQ(sink.masterVolumePercent(), std::uint32_t{37});
+    sink.setMasterVolumePercent(101);
+    REQUIRE_EQ(sink.masterVolumePercent(), std::uint32_t{100});
     mgstc::audio::AudioSinkStatus status{};
     REQUIRE_EQ(sink.pollStatus(status), false);
     sink.stop();
@@ -2234,6 +2368,7 @@ int main() {
         {"RampUsesIntegerRemainderDistribution", testRampUsesIntegerRemainderDistribution},
         {"FrequencyDeltasAreSignedAndCumulativeEvents", testFrequencyDeltasAreSignedAndCumulativeEvents},
         {"NoWaitLoopHitsInstructionBudget", testNoWaitLoopHitsInstructionBudget},
+        {"CompositeSequenceLanesLoopIndependently", testCompositeSequenceLanesLoopIndependently},
         {"RateEnvelopeNativePhases", testRateEnvelopeNativePhases},
         {"OpllKeyOffDoesNotStartSoftwareRelease", testOpllKeyOffDoesNotStartSoftwareRelease},
         {"VolumeCombination", testVolumeCombination},
@@ -2285,6 +2420,8 @@ int main() {
         {"WaveCycleProducesValidOpllApproximation", testWaveCycleProducesValidOpllApproximation},
         {"WavePcmProducesDeterministicTimedOpllApproximation", testWavePcmProducesDeterministicTimedOpllApproximation},
         {"DefaultCompositeTimbreHasThreeAudibleSources", testDefaultCompositeTimbreHasThreeAudibleSources},
+        {"CompositeLayerRemovalReusesFreedChannel", testCompositeLayerRemovalReusesFreedChannel},
+        {"EnvelopeTimelineInspectorRangeNormalization", testEnvelopeTimelineInspectorRangeNormalization},
         {"CompositeSoloPitchAndChannelValidation", testCompositeSoloPitchAndChannelValidation},
         {"CompositeSavedTimbreRevisionAndNumberAssignment", testCompositeSavedTimbreRevisionAndNumberAssignment},
         {"CompositeTimbreDependencyUpdatePreservesAssignment", testCompositeTimbreDependencyUpdatePreservesAssignment},

@@ -1,6 +1,7 @@
 #include "mgstc/audio/wasapi_audio_sink.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <span>
 #include <thread>
@@ -47,6 +48,16 @@ struct WasapiAudioSink::Impl {
     HANDLE stop_event{};
     HANDLE ready_event{};
     engine::RealtimeEngineHost* engine{};
+    std::atomic<std::uint32_t> master_volume_percent{100};
+
+    void applyMasterVolume(std::span<float> samples) const noexcept {
+        const auto percent = master_volume_percent.load(
+            std::memory_order_relaxed);
+        const auto gain = static_cast<float>(percent) / 100.0F;
+        for (auto& sample : samples) {
+            sample *= gain;
+        }
+    }
 
     void push(
         AudioSinkStatusType type,
@@ -129,9 +140,11 @@ struct WasapiAudioSink::Impl {
             result = render_client->GetBuffer(buffer_frames, &buffer);
         }
         if (SUCCEEDED(result)) {
-            const auto rendered = engine->render(std::span<float>(
+            auto samples = std::span<float>(
                 reinterpret_cast<float*>(buffer),
-                static_cast<std::size_t>(buffer_frames) * 2));
+                static_cast<std::size_t>(buffer_frames) * 2);
+            const auto rendered = engine->render(samples);
+            applyMasterVolume(samples);
             result = render_client->ReleaseBuffer(buffer_frames, 0);
             if (!rendered.ok() && SUCCEEDED(result)) {
                 result = E_FAIL;
@@ -192,9 +205,11 @@ struct WasapiAudioSink::Impl {
                 push(AudioSinkStatusType::DeviceError, result);
                 break;
             }
-            const auto rendered = engine->render(std::span<float>(
+            auto samples = std::span<float>(
                 reinterpret_cast<float*>(buffer),
-                static_cast<std::size_t>(available) * 2));
+                static_cast<std::size_t>(available) * 2);
+            const auto rendered = engine->render(samples);
+            applyMasterVolume(samples);
             result = render_client->ReleaseBuffer(available, 0);
             if (FAILED(result) || !rendered.ok()) {
                 push(
@@ -274,6 +289,17 @@ bool WasapiAudioSink::running() const noexcept {
 bool WasapiAudioSink::pollStatus(
     AudioSinkStatus& status) noexcept {
     return impl_->statuses.tryPop(status);
+}
+
+void WasapiAudioSink::setMasterVolumePercent(
+    std::uint32_t percent) noexcept {
+    impl_->master_volume_percent.store(
+        std::min(percent, 100U), std::memory_order_relaxed);
+}
+
+std::uint32_t WasapiAudioSink::masterVolumePercent() const noexcept {
+    return impl_->master_volume_percent.load(
+        std::memory_order_relaxed);
 }
 
 }  // namespace mgstc::audio
