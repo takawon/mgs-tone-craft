@@ -142,7 +142,6 @@ public:
         unsignedInteger(value.rate.sustain_level, 1);
         unsignedInteger(value.rate.sustain_rate, 1);
         unsignedInteger(value.rate.release_rate, 1);
-        timeline(value.timeline);
         unsignedInteger(value.events.size(), 4);
         for (const auto& event_value : value.events) {
             event(event_value);
@@ -198,7 +197,7 @@ public:
                  layer.timbre_automation) {
                 event(event_value);
             }
-            timeline(layer.timbre_timeline);
+            timeline(layer.envelope_timeline);
         }
     }
 
@@ -308,7 +307,9 @@ public:
                 || *value.loop_start_count <= *value.loop_end_count);
     }
 
-    bool envelope(SoftwareEnvelope& value) {
+    bool envelope(
+        SoftwareEnvelope& value,
+        EnvelopeTimeline* legacy_timeline) {
         std::uint32_t count{};
         if (!enumeration(value.kind, 1)
             || !integer(value.rate.attack_level, 1)
@@ -317,7 +318,9 @@ public:
             || !integer(value.rate.sustain_level, 1)
             || !integer(value.rate.sustain_rate, 1)
             || !integer(value.rate.release_rate, 1)
-            || (format_version_ >= 2 && !timeline(value.timeline))
+            || (format_version_ == 2
+                && (legacy_timeline == nullptr
+                    || !timeline(*legacy_timeline)))
             || !integer(count, 4)
             || count > kMaximumCollectionSize) {
             return false;
@@ -375,6 +378,9 @@ public:
         }
         value.layers.resize(layer_count);
         for (auto& layer : value.layers) {
+            EnvelopeTimeline legacy_volume_timeline;
+            EnvelopeTimeline legacy_pitch_timeline;
+            EnvelopeTimeline legacy_timbre_timeline;
             bool has_reference{};
             std::uint8_t relative{};
             std::uint16_t detune{};
@@ -404,8 +410,12 @@ public:
             } else {
                 layer.base_timbre.reset();
             }
-            if (!envelope(layer.volume_envelope)
-                || !envelope(layer.pitch_envelope)
+            if (!envelope(
+                    layer.volume_envelope,
+                    &legacy_volume_timeline)
+                || !envelope(
+                    layer.pitch_envelope,
+                    &legacy_pitch_timeline)
                 || !integer(automation_count, 4)
                 || automation_count > kMaximumCollectionSize) {
                 return false;
@@ -419,8 +429,13 @@ public:
                     })) {
                 return false;
             }
-            if (format_version_ >= 2
-                && !timeline(layer.timbre_timeline)) {
+            if (format_version_ == 2) {
+                if (!timeline(legacy_timbre_timeline)) {
+                    return false;
+                }
+                layer.envelope_timeline = legacy_volume_timeline;
+            } else if (format_version_ >= 3
+                       && !timeline(layer.envelope_timeline)) {
                 return false;
             }
         }

@@ -2239,7 +2239,7 @@ enum class CompositeEnvelopeLane : std::uint8_t {
     const mgstc::engine::EnvelopeTimeline* timeline{};
     switch (lane) {
     case CompositeEnvelopeLane::Volume:
-        timeline = &layer.volume_envelope.timeline;
+        timeline = &layer.envelope_timeline;
         collect(
             layer.volume_envelope.events,
             mgstc::engine::EnvelopeEventKind::Volume);
@@ -2256,13 +2256,13 @@ enum class CompositeEnvelopeLane : std::uint8_t {
         }
         break;
     case CompositeEnvelopeLane::Pitch:
-        timeline = &layer.pitch_envelope.timeline;
+        timeline = &layer.envelope_timeline;
         collect(
             layer.pitch_envelope.events,
             mgstc::engine::EnvelopeEventKind::Pitch);
         break;
     case CompositeEnvelopeLane::Timbre:
-        timeline = &layer.timbre_timeline;
+        timeline = &layer.envelope_timeline;
         if (layer.source == mgstc::engine::TimbreSource::Scc) {
             events.push_back({
                 0,
@@ -2865,10 +2865,10 @@ private:
 
         const auto& layer =
             timbre_.layers[static_cast<std::size_t>(selected_layer_)];
-        const auto& timeline = selectedTimeline(layer);
+        const auto& timeline = layer.envelope_timeline;
         inspector_selection_.setText(
             juce::String::fromUTF8(layer.name.c_str())
-                + " / " + selectedParameterName(),
+                + juce::String::fromUTF8(" / ソフトウェアEG"),
             juce::dontSendNotification);
         length_editor_.setText(
             juce::String(static_cast<int>(timeline.length_counts)), false);
@@ -2957,13 +2957,7 @@ private:
 
     [[nodiscard]] const mgstc::engine::EnvelopeTimeline& selectedTimeline(
         const mgstc::engine::CompositeLayer& layer) const {
-        if (selectedParameter() == Parameter::Volume) {
-            return layer.volume_envelope.timeline;
-        }
-        if (selectedParameter() == Parameter::Pitch) {
-            return layer.pitch_envelope.timeline;
-        }
-        return layer.timbre_timeline;
+        return layer.envelope_timeline;
     }
 
     [[nodiscard]] mgstc::engine::EnvelopeTimeline& selectedTimeline(
