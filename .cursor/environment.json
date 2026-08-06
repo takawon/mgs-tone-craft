@@ -1,0 +1,4 @@
+{
+  "name": "MGS Tone Craft",
+  "install": "bash .cursor/install.sh"
+}
