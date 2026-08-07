@@ -12,8 +12,7 @@ enum class SccWavePreset {
     Sine,
     Square,
     Triangle,
-    SawUp,
-    SawDown,
+    Saw,
     Pulse25,
     Pulse12_5,
 };
@@ -61,6 +60,9 @@ struct SccMergeResult {
     const SccWaveform& waveform) noexcept;
 
 [[nodiscard]] SccWaveform invertSccWaveform(
+    const SccWaveform& waveform) noexcept;
+
+[[nodiscard]] SccWaveform mirrorSccWaveform(
     const SccWaveform& waveform) noexcept;
 
 [[nodiscard]] SccWaveform rotateSccWaveform(

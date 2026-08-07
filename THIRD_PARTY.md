@@ -23,6 +23,24 @@ emu2413には、エディタのプレビュー同期に必要なエンベロー�
 プロジェクト側で追加している。変更箇所にも元のMITライセンスが適用され、
 著作権表示とライセンス全文を保持する。
 
+## MAmidiMEmo RPCクライアント（rpclib）
+
+MSX実機への試聴出力では、MAmidiMEmoの`-chip_server`（msgpack-RPC）へ接続する。
+クライアント実装には[rpclib](https://github.com/rpclib/rpclib)を使用する。
+
+| 項目 | 値 |
+|---|---|
+| 取得方法 | CMake `FetchContent`（ソースツリーへvendorしない） |
+| 固定タグ | `v2.3.0` |
+| ライセンス | MIT |
+| 用途 | `DirectAccessToChip`の同期プローブと非同期書き込み |
+
+現行MSVCでは同梱`format.h`の`stdext::checked_array_iterator`が使えないため、
+構成時にvcpkgと同趣旨のガード（`_MSC_VER < 1951`）を適用する。
+
+MAmidiMEmo本体は本製品に同梱・リンクしない。利用者が別途起動する外部プロセスであり、
+そのライセンスと配布は公式リリースに従う。
+
 ## 参照実装
 
 既定の音量バランスは`msxplay-js` 1.9.1と`libkss-js` 2.2.1の動作を
@@ -33,3 +51,6 @@ emu2413には、エディタのプレビュー同期に必要なエンベロー�
 MGSDRV/MGSC互換の挙動は、入出力および実機相当の動作観察から独立に実装した
 ものである。
 
+
+openMSX等の外部実装は、MAmidiMEmo RPCのワイヤ事実確認に限り参照し得るが、
+コード・クラス構成・スレッド処理の移植は行わない（仕様§4.6）。

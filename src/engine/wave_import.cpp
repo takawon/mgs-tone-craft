@@ -12,6 +12,7 @@
 #include <numbers>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "emu2413.h"
 #include "mgstc/engine/note_pitch.hpp"
@@ -110,6 +111,20 @@ float periodicDifference(
         : std::numeric_limits<float>::max();
 }
 
+constexpr std::uint32_t kChipClock = 3'579'545;
+constexpr std::uint32_t kAuditionSampleRate = 48'000;
+constexpr std::uint8_t kAuditionMidiNote = 60;
+constexpr std::size_t kAuditionWarmup = 1'024;
+constexpr std::size_t kAuditionSamples = 4'096;
+
+void removeDcAndNormalize(std::vector<float>& samples);
+
+float sccFrequencyHz(std::uint16_t period) noexcept {
+    return static_cast<float>(
+        static_cast<double>(kChipClock)
+        / ((static_cast<double>(period) + 1.0) * 32.0));
+}
+
 std::array<float, 16> spectrum(std::span<const float> cycle) {
     std::array<float, 16> result{};
     if (cycle.empty()) {
@@ -169,18 +184,46 @@ struct OpllDeleter {
     }
 };
 
-std::array<float, 32> renderOpllCycle(
-    const OpllPatchParameters& patch) {
-    constexpr std::uint32_t clock = 3'579'545;
-    constexpr std::uint32_t sample_rate = 48'000;
-    constexpr std::uint8_t midi_note = 60;
-    std::array<float, 32> result{};
+std::vector<float> synthesizePeriodicAudition(
+    std::span<const float> cycle,
+    float frequency_hz,
+    std::size_t sample_count) {
+    std::vector<float> result(sample_count, 0.0F);
+    if (cycle.size() < 2 || !(frequency_hz > 0.0F)) {
+        return result;
+    }
+    double phase = 0.0;
+    const double step =
+        static_cast<double>(frequency_hz) * static_cast<double>(cycle.size())
+        / static_cast<double>(kAuditionSampleRate);
+    for (float& sample : result) {
+        const auto first =
+            static_cast<std::size_t>(phase) % cycle.size();
+        const auto second = (first + 1) % cycle.size();
+        const float fraction = static_cast<float>(
+            phase - std::floor(phase));
+        sample = cycle[first] * (1.0F - fraction)
+            + cycle[second] * fraction;
+        phase += step;
+        while (phase >= static_cast<double>(cycle.size())) {
+            phase -= static_cast<double>(cycle.size());
+        }
+    }
+    removeDcAndNormalize(result);
+    return result;
+}
+
+std::vector<float> renderOpllAudition(
+    const OpllPatchParameters& patch,
+    std::uint8_t midi_note,
+    std::size_t sample_count) {
+    std::vector<float> result(sample_count, 0.0F);
     NotePitch pitch{};
     if (!notePitch(midi_note, pitch)) {
         return result;
     }
     std::unique_ptr<OPLL, OpllDeleter> chip(
-        OPLL_new(clock, sample_rate));
+        OPLL_new(kChipClock, kAuditionSampleRate));
     if (!chip) {
         return result;
     }
@@ -195,7 +238,8 @@ std::array<float, 32> renderOpllCycle(
             registers[index]);
     }
     OPLL_writeReg(
-        chip.get(), 0x10,
+        chip.get(),
+        0x10,
         static_cast<std::uint8_t>(pitch.opll.f_number & 0xFF));
     OPLL_writeReg(chip.get(), 0x30, 0x00);
     const auto pitch_register = static_cast<std::uint8_t>(
@@ -203,35 +247,22 @@ std::array<float, 32> renderOpllCycle(
         | ((pitch.opll.block & 7) << 1)
         | 0x10);
     OPLL_writeReg(chip.get(), 0x20, pitch_register);
-    constexpr std::size_t warmup = 768;
-    constexpr double period = 48000.0 / 261.625565;
-    std::array<float, 192> source{};
-    for (std::size_t index = 0; index < warmup + source.size(); ++index) {
+    for (std::size_t index = 0;
+         index < kAuditionWarmup + sample_count;
+         ++index) {
         const float sample = static_cast<float>(OPLL_calc(chip.get()));
-        if (index >= warmup) {
-            source[index - warmup] = sample;
+        if (index >= kAuditionWarmup) {
+            result[index - kAuditionWarmup] = sample;
         }
     }
-    for (std::size_t index = 0; index < result.size(); ++index) {
-        const double position =
-            static_cast<double>(index) * period / result.size();
-        const auto first = static_cast<std::size_t>(position);
-        const auto second = std::min(first + 1, source.size() - 1);
-        const float fraction =
-            static_cast<float>(position - static_cast<double>(first));
-        result[index] =
-            source[first] * (1.0F - fraction) + source[second] * fraction;
-    }
-    const auto normalized = normalizedCycle(result);
-    std::copy(normalized.begin(), normalized.end(), result.begin());
+    removeDcAndNormalize(result);
     return result;
 }
 
-float candidateDistance(
-    const std::array<float, 16>& target_spectrum,
+float cyclePairDistance(
     const std::array<float, 32>& target_cycle,
-    const OpllPatchParameters& patch) {
-    const auto generated_cycle = renderOpllCycle(patch);
+    const std::array<float, 32>& generated_cycle) {
+    const auto target_spectrum = spectrum(target_cycle);
     const auto generated_spectrum = spectrum(generated_cycle);
     float distance{};
     float cumulative{};
@@ -267,8 +298,43 @@ float candidateDistance(
     return distance;
 }
 
-constexpr std::uint32_t kOpllClock = 3'579'545;
-constexpr std::uint32_t kOpllFitSampleRate = 48'000;
+// Compare target vs generated using one SCC-period-length window. An octave
+// error packs 2 (or 1/2) cycles into that window and scores poorly.
+float periodWindowDistance(
+    std::span<const float> target,
+    std::span<const float> generated,
+    std::size_t period_samples) {
+    if (target.size() < period_samples * 2
+        || generated.size() < period_samples * 2
+        || period_samples < 8) {
+        return 0.0F;
+    }
+    const std::size_t target_begin =
+        (target.size() - period_samples) / 2;
+    std::vector<float> target_period(
+        target.begin() + static_cast<std::ptrdiff_t>(target_begin),
+        target.begin()
+            + static_cast<std::ptrdiff_t>(target_begin + period_samples));
+    const auto target_cycle = resampleCycle32(target_period);
+    float best = std::numeric_limits<float>::max();
+    const std::size_t max_shift = std::min(period_samples, generated.size() / 2);
+    for (std::size_t shift = 0; shift < max_shift; ++shift) {
+        if (shift + period_samples > generated.size()) {
+            break;
+        }
+        std::vector<float> generated_period(
+            generated.begin() + static_cast<std::ptrdiff_t>(shift),
+            generated.begin()
+                + static_cast<std::ptrdiff_t>(shift + period_samples));
+        best = std::min(
+            best,
+            cyclePairDistance(target_cycle, resampleCycle32(generated_period)));
+    }
+    return best;
+}
+
+constexpr std::uint32_t kOpllClock = kChipClock;
+constexpr std::uint32_t kOpllFitSampleRate = kAuditionSampleRate;
 constexpr std::size_t kEnvelopeBins = 32;
 constexpr std::size_t kSpectralBins = 64;
 constexpr std::size_t kSpectralFrames = 3;
@@ -578,6 +644,58 @@ float featureDistance(
     return spectral + envelope * 0.7F;
 }
 
+// Score OPLL patches by rendering at the same MIDI note as the SCC/cycle
+// reference and comparing both broadband features and one SCC-period window.
+class SameMidiScoreContext {
+public:
+    SameMidiScoreContext(
+        std::span<const float> cycle,
+        float fundamental_hz,
+        std::uint8_t midi_note)
+        : fundamental_hz_(fundamental_hz),
+          midi_note_(midi_note),
+          period_samples_(std::clamp<std::size_t>(
+              static_cast<std::size_t>(std::llround(
+                  static_cast<double>(kAuditionSampleRate)
+                  / std::max(static_cast<double>(fundamental_hz), 1.0))),
+              16,
+              kAuditionSamples / 2)),
+          target_(synthesizePeriodicAudition(
+              cycle,
+              fundamental_hz,
+              kAuditionSamples)),
+          target_features_(timedFeatures(target_, fundamental_hz_)) {}
+
+    float score(const OpllPatchParameters& patch) {
+        const auto registers = encodeOpllPatch(patch);
+        if (const auto found = cache_.find(registers);
+            found != cache_.end()) {
+            return found->second;
+        }
+        const auto generated =
+            renderOpllAudition(patch, midi_note_, kAuditionSamples);
+        TimedFeatureWorkspace workspace;
+        float distance = featureDistance(
+            target_features_,
+            timedFeatures(generated, fundamental_hz_, workspace));
+        distance += periodWindowDistance(
+                        target_,
+                        generated,
+                        period_samples_)
+            * 1.25F;
+        cache_.emplace(registers, distance);
+        return distance;
+    }
+
+private:
+    float fundamental_hz_;
+    std::uint8_t midi_note_;
+    std::size_t period_samples_;
+    std::vector<float> target_;
+    TimedAudioFeatures target_features_;
+    std::map<std::array<std::uint8_t, 8>, float> cache_;
+};
+
 class OpllTimedRenderer {
 public:
     OpllTimedRenderer()
@@ -635,7 +753,7 @@ class TimedOpllScoreContext {
 public:
     explicit TimedOpllScoreContext(const OpllFitTarget& target)
         : target_(target),
-          fundamental_hz_(midiFrequency(target.midi_note)) {}
+          fundamental_hz_(target.fundamental_hz) {}
 
     void remember(
         const OpllPatchParameters& patch,
@@ -850,6 +968,19 @@ WaveCycleAnalysis analyzeWaveCycle(const WavePcm& pcm) {
                 period = lag;
             }
         }
+        // Non-integer periods often score 2T slightly better than T (sine).
+        // Collapse octave-up locks while the half-period remains competitive.
+        while (period / 2 >= minimum) {
+            const std::size_t half = period / 2;
+            const float half_difference = periodicDifference(probe, half);
+            if (half_difference
+                <= std::max(best * 1.08F, best + 0.002F)) {
+                period = half;
+                best = half_difference;
+            } else {
+                break;
+            }
+        }
     }
     period = std::clamp<std::size_t>(period, 2, samples.size());
     result.cycle.assign(period, 0.0F);
@@ -902,9 +1033,25 @@ SccWaveform waveCycleToScc(std::span<const float> cycle) noexcept {
 
 OpllPatchParameters approximateWaveCycleWithOpll(
     std::span<const float> cycle) noexcept {
+    const auto candidates = approximateWaveCycleCandidatesWithOpll(cycle);
+    return candidates.empty() ? defaultOpllPatch() : candidates.front();
+}
+
+std::vector<OpllPatchParameters> approximateWaveCycleCandidatesWithOpll(
+    std::span<const float> cycle) {
     const auto normalized = normalizedCycle(cycle);
-    const auto target_spectrum = spectrum(normalized);
-    const auto target_cycle = resampleCycle32(normalized);
+    if (normalized.size() < 2) {
+        return {defaultOpllPatch()};
+    }
+    NotePitch pitch{};
+    if (!notePitch(kAuditionMidiNote, pitch)) {
+        return {defaultOpllPatch()};
+    }
+    const float fundamental_hz = sccFrequencyHz(pitch.psg_scc_period);
+    SameMidiScoreContext scoring(
+        normalized,
+        fundamental_hz,
+        kAuditionMidiNote);
     const auto prepare = [](OpllPatchParameters patch) {
         patch.modulator.amplitude_modulation = false;
         patch.carrier.amplitude_modulation = false;
@@ -930,19 +1077,8 @@ OpllPatchParameters approximateWaveCycleWithOpll(
     };
     std::array<ScoredPatch, 8> leaders{};
     std::size_t leader_count{};
-    std::map<std::array<std::uint8_t, 8>, float> score_cache;
     const auto score = [&](const OpllPatchParameters& patch) {
-        const auto registers = encodeOpllPatch(patch);
-        if (const auto found = score_cache.find(registers);
-            found != score_cache.end()) {
-            return found->second;
-        }
-        const float distance = candidateDistance(
-            target_spectrum,
-            target_cycle,
-            patch);
-        score_cache.emplace(registers, distance);
-        return distance;
+        return scoring.score(patch);
     };
     auto consider = [&](const OpllPatchParameters& patch) {
         const ScoredPatch entry{score(patch), patch};
@@ -983,8 +1119,10 @@ OpllPatchParameters approximateWaveCycleWithOpll(
         std::uint32_t bits = next_random();
         candidate.modulator.multiplier =
             static_cast<std::uint8_t>(bits & 15);
+        // Prefer MULTI that can match SCC pitch on the shared keyboard;
+        // still allow the full legal set for timbre, scored by same-MIDI audio.
         candidate.carrier.multiplier =
-            static_cast<std::uint8_t>(1 + ((bits >> 4) % 15));
+            static_cast<std::uint8_t>(bits >> 4) & 15;
         candidate.feedback =
             static_cast<std::uint8_t>((bits >> 8) & 7);
         candidate.modulator.waveform = ((bits >> 11) & 1) != 0;
@@ -996,6 +1134,16 @@ OpllPatchParameters approximateWaveCycleWithOpll(
             ((bits >> 6) & 3) == 1;
         candidate.carrier.pitch_modulation =
             ((bits >> 8) & 3) == 1;
+        consider(candidate);
+    }
+
+    // Insurance: always evaluate MULTI 1 and 2 with quiet modulator.
+    for (const std::uint8_t car_mul : {1, 2}) {
+        auto candidate = prepare(defaultOpllPatch());
+        candidate.modulator.multiplier = 0;
+        candidate.carrier.multiplier = car_mul;
+        candidate.modulator.total_level = 63;
+        candidate.feedback = 0;
         consider(candidate);
     }
 
@@ -1019,7 +1167,7 @@ OpllPatchParameters approximateWaveCycleWithOpll(
                 candidate.modulator.multiplier = value;
                 improve(candidate);
             }
-            for (std::uint8_t value = 1; value < 16; ++value) {
+            for (std::uint8_t value = 0; value < 16; ++value) {
                 auto candidate = best;
                 candidate.carrier.multiplier = value;
                 improve(candidate);
@@ -1049,7 +1197,34 @@ OpllPatchParameters approximateWaveCycleWithOpll(
         }
         consider(best);
     }
-    return leaders[0].patch;
+
+    std::vector<OpllPatchParameters> result;
+    result.reserve(leader_count);
+    for (std::size_t index = 0; index < leader_count; ++index) {
+        const auto registers = encodeOpllPatch(leaders[index].patch);
+        const bool duplicate = std::any_of(
+            result.begin(),
+            result.end(),
+            [&](const OpllPatchParameters& existing) {
+                return encodeOpllPatch(existing) == registers;
+            });
+        if (!duplicate) {
+            result.push_back(leaders[index].patch);
+        }
+    }
+    if (result.empty()) {
+        result.push_back(defaultOpllPatch());
+    }
+    return result;
+}
+
+std::vector<OpllPatchParameters>
+approximateSccWaveformCandidatesWithOpll(const SccWaveform& waveform) {
+    std::array<float, 32> cycle{};
+    for (std::size_t index = 0; index < cycle.size(); ++index) {
+        cycle[index] = static_cast<float>(waveform[index]) / 128.0F;
+    }
+    return approximateWaveCycleCandidatesWithOpll(cycle);
 }
 
 std::vector<OpllPatchParameters> approximateWavePcmCandidatesWithOpll(
@@ -1099,11 +1274,14 @@ std::vector<OpllPatchParameters> approximateWavePcmCandidatesWithOpll(
         considerScored(ScoredPatch{score(patch), patch});
     };
 
-    consider(approximateWaveCycleWithOpll(cycle_analysis.cycle));
-    consider(defaultOpllPatch());
+    std::vector<OpllPatchParameters> seed_patches;
+    seed_patches.reserve(64);
+    seed_patches.push_back(
+        approximateWaveCycleWithOpll(cycle_analysis.cycle));
+    seed_patches.push_back(defaultOpllPatch());
     for (std::uint8_t instrument = 1; instrument <= 15; ++instrument) {
         if (const auto rom = ym2413RomPatch(instrument)) {
-            consider(*rom);
+            seed_patches.push_back(*rom);
         }
     }
 
@@ -1159,7 +1337,43 @@ std::vector<OpllPatchParameters> approximateWavePcmCandidatesWithOpll(
             static_cast<std::uint8_t>(bits & 15);
         candidate.carrier.release_rate =
             static_cast<std::uint8_t>((bits >> 4) & 15);
-        consider(candidate);
+        seed_patches.push_back(candidate);
+    }
+
+    // Score seeds in parallel, then merge in seed order so ties stay
+    // deterministic (identical to sequential consider() order).
+    std::vector<ScoredPatch> scored_seeds(seed_patches.size());
+    std::vector<std::future<void>> seed_jobs;
+    seed_jobs.reserve(seed_patches.size());
+    std::size_t launched = 0;
+    try {
+        for (std::size_t index = 0; index < seed_patches.size(); ++index) {
+            seed_jobs.push_back(std::async(
+                std::launch::async,
+                [&target, &seed_patches, &scored_seeds, index] {
+                    TimedOpllScoreContext local_scoring(target);
+                    scored_seeds[index] = ScoredPatch{
+                        local_scoring.score(seed_patches[index]),
+                        seed_patches[index]};
+                }));
+            ++launched;
+        }
+    } catch (const std::system_error&) {
+        // Keep already-launched jobs; remainder scored below.
+    }
+    for (auto& job : seed_jobs) {
+        job.get();
+    }
+    for (std::size_t index = 0; index < launched; ++index) {
+        considerScored(scored_seeds[index]);
+        initial_scoring.remember(
+            scored_seeds[index].patch,
+            scored_seeds[index].distance);
+    }
+    for (std::size_t index = launched;
+         index < seed_patches.size();
+         ++index) {
+        consider(seed_patches[index]);
     }
 
     const auto initial_leaders = leaders;

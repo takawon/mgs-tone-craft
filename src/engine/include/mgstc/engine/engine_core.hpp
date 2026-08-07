@@ -5,8 +5,9 @@
 #include <cstdint>
 #include <span>
 
-#include "mgstc/engine/chip_rack.hpp"
+#include "mgstc/engine/emulator_sound_output.hpp"
 #include "mgstc/engine/runtime_session.hpp"
+#include "mgstc/engine/sound_output_backend.hpp"
 #include "mgstc/engine/tick_clock.hpp"
 
 namespace mgstc::engine {
@@ -51,7 +52,33 @@ public:
     EngineCore() = default;
 
     [[nodiscard]] bool valid() const noexcept {
-        return chips_.valid();
+        return emulator_.valid();
+    }
+
+    // Non-owning. When null, writes and render use the local simulator.
+    // When set to MAmidiMemo, writes go to RPC; local mix stays silent.
+    void setOutputBackend(SoundOutputBackend* backend) noexcept {
+        output_backend_ = backend;
+    }
+
+    [[nodiscard]] SoundOutputBackend* outputBackend() const noexcept {
+        return output_backend_;
+    }
+
+    // When remote output is active, also drive the local simulator so
+    // scope/waveform views keep updating. Does not unmute PC speakers.
+    void setWaveformMonitor(bool enabled) noexcept {
+        waveform_monitor_ = enabled;
+    }
+
+    [[nodiscard]] bool waveformMonitor() const noexcept {
+        return waveform_monitor_;
+    }
+
+    [[nodiscard]] SoundOutputKind outputKind() const noexcept {
+        return output_backend_ != nullptr
+            ? output_backend_->kind()
+            : SoundOutputKind::Emulator;
     }
 
     [[nodiscard]] RuntimeSession& session() noexcept {
@@ -75,16 +102,24 @@ public:
     [[nodiscard]] bool takeOpllScopeFrame(
         OpllScopeFrame& frame) noexcept;
 
-    // Interleaved stereo: L, R, L, R... Both channels receive the same
-    // MGSDRV-compatible mono mix.
+    // Interleaved stereo: L, R, L, R... Audible mix is silent while a
+    // remote backend is selected; scope can still track the simulator.
     [[nodiscard]] RenderResult render(
         std::span<float> interleaved_stereo) noexcept;
 
 private:
     [[nodiscard]] static bool validGain(float value) noexcept;
+    [[nodiscard]] bool writeActiveRegisters(
+        std::span<const RegisterWrite> writes) noexcept;
+    [[nodiscard]] ChipSamples renderScopeSample() noexcept;
+    [[nodiscard]] static ChipSamples silentSample() noexcept {
+        return {};
+    }
 
     RuntimeSession session_{};
-    ChipRack chips_{};
+    EmulatorSoundOutput emulator_{};
+    SoundOutputBackend* output_backend_{nullptr};
+    bool waveform_monitor_{false};
     TickClock clock_{};
     MixerGains gains_{};
     std::array<float, OpllScopeFrame::kSampleCount> psg_scope_work_{};

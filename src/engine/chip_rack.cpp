@@ -13,7 +13,9 @@ namespace mgstc::engine {
 namespace {
 
 constexpr std::uint32_t kMasterClock = 3'579'545;
-constexpr std::uint32_t kSccClock = 1'789'773;
+// Konami SCC uses the MSX master clock; f = clock / (32 * (TP + 1)).
+// Using master/2 here drops every note by one octave vs MGSDRV period tables.
+constexpr std::uint32_t kSccClock = kMasterClock;
 constexpr std::uint32_t kSampleRate = 48'000;
 constexpr float kInt16Scale = 1.0F / 32768.0F;
 

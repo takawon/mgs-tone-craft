@@ -9,6 +9,30 @@ bool EngineCore::validGain(float value) noexcept {
     return std::isfinite(value) && value >= 0.0F;
 }
 
+bool EngineCore::writeActiveRegisters(
+    std::span<const RegisterWrite> writes) noexcept {
+    if (output_backend_ == nullptr) {
+        return emulator_.writeRegisters(writes);
+    }
+    if (!output_backend_->writeRegisters(writes)) {
+        return false;
+    }
+    if (waveform_monitor_) {
+        return emulator_.writeRegisters(writes);
+    }
+    return true;
+}
+
+ChipSamples EngineCore::renderScopeSample() noexcept {
+    if (output_backend_ == nullptr) {
+        return emulator_.renderSample();
+    }
+    if (waveform_monitor_) {
+        return emulator_.renderSample();
+    }
+    return silentSample();
+}
+
 bool EngineCore::setGains(MixerGains gains) noexcept {
     if (!validGain(gains.master)
         || !validGain(gains.psg)
@@ -22,7 +46,16 @@ bool EngineCore::setGains(MixerGains gains) noexcept {
 
 void EngineCore::hardReset() noexcept {
     session_.resetForKeyOn();
-    chips_.reset();
+    if (output_backend_ != nullptr) {
+        output_backend_->reset();
+        if (waveform_monitor_) {
+            emulator_.reset();
+        } else {
+            emulator_.allNotesOff();
+        }
+    } else {
+        emulator_.reset();
+    }
     clock_.reset();
     psg_scope_work_.fill(0.0F);
     scc_scope_work_.fill(0.0F);
@@ -53,6 +86,7 @@ RenderResult EngineCore::render(
         return result;
     }
 
+    const bool remote_output = output_backend_ != nullptr;
     const auto frame_count = interleaved_stereo.size() / 2;
     for (std::size_t frame = 0; frame < frame_count; ++frame) {
         if (clock_.tickDue()) {
@@ -67,7 +101,7 @@ RenderResult EngineCore::render(
                 result.frames = frame;
                 return result;
             }
-            if (!chips_.apply(session_.writes())) {
+            if (!writeActiveRegisters(session_.writes())) {
                 std::fill(
                     interleaved_stereo.begin()
                         + static_cast<std::ptrdiff_t>(frame * 2),
@@ -80,17 +114,17 @@ RenderResult EngineCore::render(
             static_cast<void>(clock_.beginTick());
         }
 
-        const auto chips = chips_.renderSample();
-        const auto raw = gains_.master * (
-            chips.psg * gains_.psg
-            + chips.scc * gains_.scc
-            + chips.opll * gains_.opll);
-        const auto mixed = std::clamp(raw, -1.0F, 1.0F);
+        const auto scope_chips = renderScopeSample();
+        const auto scope_raw = gains_.master * (
+            scope_chips.psg * gains_.psg
+            + scope_chips.scc * gains_.scc
+            + scope_chips.opll * gains_.opll);
+        const auto scope_mixed = std::clamp(scope_raw, -1.0F, 1.0F);
         const auto scope_index = opll_scope_position_++;
-        psg_scope_work_[scope_index] = chips.psg;
-        scc_scope_work_[scope_index] = chips.scc;
-        opll_scope_work_[scope_index] = chips.opll;
-        mixed_scope_work_[scope_index] = mixed;
+        psg_scope_work_[scope_index] = scope_chips.psg;
+        scc_scope_work_[scope_index] = scope_chips.scc;
+        opll_scope_work_[scope_index] = scope_chips.opll;
+        mixed_scope_work_[scope_index] = scope_mixed;
         if (opll_scope_position_ == opll_scope_work_.size()) {
             opll_scope_completed_.psg_samples = psg_scope_work_;
             opll_scope_completed_.scc_samples = scc_scope_work_;
@@ -100,7 +134,11 @@ RenderResult EngineCore::render(
             opll_scope_position_ = 0;
             opll_scope_ready_ = true;
         }
-        result.clipped = result.clipped || mixed != raw;
+
+        // Audible destination is the remote chip; keep PC mix silent.
+        const auto mixed = remote_output ? 0.0F : scope_mixed;
+        result.clipped =
+            result.clipped || (!remote_output && scope_mixed != scope_raw);
         interleaved_stereo[frame * 2] = mixed;
         interleaved_stereo[frame * 2 + 1] = mixed;
         static_cast<void>(clock_.consumeFrames(1));

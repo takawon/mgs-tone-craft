@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstring>
 #include <cwctype>
+#include <filesystem>
 #include <fstream>
 #include <span>
 #include <string_view>
@@ -111,6 +112,172 @@ std::optional<std::vector<std::uint8_t>> waveBytesFromGlobal(
     auto result =
         waveBytesFromBuffer(data, size, require_riff_wave);
     GlobalUnlock(memory);
+    return result;
+}
+
+[[nodiscard]] bool isLikelyImageExtension(
+    std::wstring extension) {
+    std::transform(
+        extension.begin(),
+        extension.end(),
+        extension.begin(),
+        [](wchar_t character) {
+            return static_cast<wchar_t>(std::towlower(character));
+        });
+    return extension == L".png"
+        || extension == L".jpg"
+        || extension == L".jpeg"
+        || extension == L".bmp"
+        || extension == L".gif"
+        || extension == L".tif"
+        || extension == L".tiff"
+        || extension == L".webp";
+}
+
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
+readBinaryFileBytes(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream) {
+        return std::nullopt;
+    }
+    const auto end = stream.tellg();
+    if (end <= 0 || end > static_cast<std::streamoff>(64 * 1024 * 1024)) {
+        return std::nullopt;
+    }
+    std::vector<std::uint8_t> bytes(
+        static_cast<std::size_t>(end));
+    stream.seekg(0);
+    stream.read(
+        reinterpret_cast<char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
+    return stream
+        ? std::optional<std::vector<std::uint8_t>>(std::move(bytes))
+        : std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
+bytesFromClipboardGlobal(HGLOBAL memory) {
+    if (memory == nullptr) {
+        return std::nullopt;
+    }
+    const auto size = GlobalSize(memory);
+    if (size == 0) {
+        return std::nullopt;
+    }
+    const auto* data = static_cast<const std::uint8_t*>(
+        GlobalLock(memory));
+    if (data == nullptr) {
+        return std::nullopt;
+    }
+    std::vector<std::uint8_t> result(data, data + size);
+    GlobalUnlock(memory);
+    return result;
+}
+
+[[nodiscard]] DWORD dibPixelOffset(
+    const BITMAPINFOHEADER& info) {
+    DWORD colors = info.biClrUsed;
+    if (colors == 0 && info.biBitCount <= 8) {
+        colors = 1u << info.biBitCount;
+    }
+    DWORD masks = 0;
+    // BI_BITFIELDS (3): 16/32bpp DIB はヘッダー直後に色マスクが付く。
+    if (info.biSize == sizeof(BITMAPINFOHEADER)
+        && info.biCompression == BI_BITFIELDS
+        && (info.biBitCount == 16 || info.biBitCount == 32)) {
+        masks = 12u;
+    }
+    return static_cast<DWORD>(
+        sizeof(BITMAPFILEHEADER) + info.biSize + masks
+        + colors * sizeof(RGBQUAD));
+}
+
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
+dibToBmpFileBytes(HGLOBAL memory) {
+    if (memory == nullptr) {
+        return std::nullopt;
+    }
+    const auto size = GlobalSize(memory);
+    if (size < sizeof(BITMAPINFOHEADER)) {
+        return std::nullopt;
+    }
+    const auto* locked = static_cast<const std::uint8_t*>(
+        GlobalLock(memory));
+    if (locked == nullptr) {
+        return std::nullopt;
+    }
+    const auto* info =
+        reinterpret_cast<const BITMAPINFOHEADER*>(locked);
+    if (info->biSize < sizeof(BITMAPINFOHEADER)
+        || size < info->biSize) {
+        GlobalUnlock(memory);
+        return std::nullopt;
+    }
+    std::vector<std::uint8_t> result(
+        sizeof(BITMAPFILEHEADER) + size);
+    auto* file_header =
+        reinterpret_cast<BITMAPFILEHEADER*>(result.data());
+    file_header->bfType = 0x4D42;
+    file_header->bfSize = static_cast<DWORD>(result.size());
+    file_header->bfReserved1 = 0;
+    file_header->bfReserved2 = 0;
+    file_header->bfOffBits = dibPixelOffset(*info);
+    std::memcpy(
+        result.data() + sizeof(BITMAPFILEHEADER),
+        locked,
+        size);
+    GlobalUnlock(memory);
+    return result;
+}
+
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
+hbitmapToBmpFileBytes(HBITMAP bitmap) {
+    BITMAP bm{};
+    if (bitmap == nullptr
+        || GetObject(bitmap, sizeof(bm), &bm) == 0
+        || bm.bmWidth <= 0
+        || bm.bmHeight <= 0) {
+        return std::nullopt;
+    }
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = bm.bmWidth;
+    info.bmiHeader.biHeight = -bm.bmHeight;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    const auto row_stride = static_cast<std::size_t>(
+        ((bm.bmWidth * 32 + 31) / 32) * 4);
+    const auto pixel_bytes =
+        row_stride * static_cast<std::size_t>(bm.bmHeight);
+    std::vector<std::uint8_t> result(
+        sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER)
+        + pixel_bytes);
+    auto* file_header =
+        reinterpret_cast<BITMAPFILEHEADER*>(result.data());
+    file_header->bfType = 0x4D42;
+    file_header->bfSize = static_cast<DWORD>(result.size());
+    file_header->bfOffBits = static_cast<DWORD>(
+        sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER));
+    auto* info_header = reinterpret_cast<BITMAPINFOHEADER*>(
+        result.data() + sizeof(BITMAPFILEHEADER));
+    *info_header = info.bmiHeader;
+    HDC dc = GetDC(nullptr);
+    if (dc == nullptr) {
+        return std::nullopt;
+    }
+    const auto copied = GetDIBits(
+        dc,
+        bitmap,
+        0,
+        static_cast<UINT>(bm.bmHeight),
+        result.data() + file_header->bfOffBits,
+        reinterpret_cast<BITMAPINFO*>(info_header),
+        DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    if (copied == 0) {
+        return std::nullopt;
+    }
     return result;
 }
 
@@ -321,62 +488,47 @@ AudacityWaveImportResult exportAudacitySelectionToWave() {
         CloseHandle(to_audacity);
         return {
             std::nullopt,
-            L"Audacityからの応答接続を開けませんでした。",
+            L"Audacityからの読み取り接続を開けませんでした。",
         };
     }
 
-    std::array<wchar_t, MAX_PATH> temporary_directory{};
-    std::array<wchar_t, MAX_PATH> reservation_path{};
-    if (GetTempPathW(
-            static_cast<DWORD>(temporary_directory.size()),
-            temporary_directory.data()) == 0
-        || GetTempFileNameW(
-            temporary_directory.data(),
-            L"MGS",
-            0,
-            reservation_path.data()) == 0) {
-        CloseHandle(from_audacity);
-        CloseHandle(to_audacity);
-        return {
-            std::nullopt,
-            L"Audacity変換用の一時ファイルを作成できませんでした。",
-        };
-    }
-
-    const std::wstring wave_path =
-        std::wstring(reservation_path.data()) + L".wav";
+    const auto temp_dir = std::filesystem::temp_directory_path();
+    const auto wave_path =
+        temp_dir / L"mgstc_audacity_selection.wav";
     const auto cleanup = [&] {
-        DeleteFileW(wave_path.c_str());
-        DeleteFileW(reservation_path.data());
+        std::error_code ignored;
+        std::filesystem::remove(wave_path, ignored);
     };
+    cleanup();
 
-    std::string command =
-        "Export2: Filename=\""
-        + wideToUtf8(wave_path)
-        + "\" NumChannels=1";
-    command.append("\r\n", 2);
-    command.push_back('\0');
+    const std::wstring command =
+        L"Export2: Filename=\""
+        + wave_path.wstring()
+        + L"\" NumChannels=1\n";
     DWORD written{};
-    const bool sent = WriteFile(
-        to_audacity,
-        command.data(),
-        static_cast<DWORD>(command.size()),
-        &written,
-        nullptr)
-        && written == command.size();
-    if (!sent) {
-        cleanup();
+    const auto utf8 = wideToUtf8(command);
+    if (!WriteFile(
+            to_audacity,
+            utf8.data(),
+            static_cast<DWORD>(utf8.size()),
+            &written,
+            nullptr)
+        || written != utf8.size()) {
         CloseHandle(from_audacity);
         CloseHandle(to_audacity);
+        cleanup();
         return {
             std::nullopt,
-            L"Audacityへ書き出し命令を送信できませんでした。",
+            L"Audacityへ書き出しコマンドを送れませんでした。",
         };
     }
 
     std::string response;
-    const auto deadline = GetTickCount64() + 30000;
+    response.reserve(4096);
+    const auto deadline =
+        GetTickCount64() + 30000ULL;
     while (GetTickCount64() < deadline) {
+        std::array<char, 1024> buffer{};
         DWORD available{};
         if (!PeekNamedPipe(
                 from_audacity,
@@ -391,14 +543,12 @@ AudacityWaveImportResult exportAudacitySelectionToWave() {
             Sleep(20);
             continue;
         }
-        std::array<char, 4096> buffer{};
         DWORD read{};
         if (!ReadFile(
                 from_audacity,
                 buffer.data(),
-                static_cast<DWORD>(
-                    std::min<std::size_t>(
-                        buffer.size(), available)),
+                static_cast<DWORD>(std::min<std::size_t>(
+                    buffer.size(), available)),
                 &read,
                 nullptr)) {
             break;
@@ -437,6 +587,123 @@ AudacityWaveImportResult exportAudacitySelectionToWave() {
         L"音声トラック上で時間範囲を選択し、"
         L"再生・録音を停止してからもう一度お試しください。",
     };
+}
+
+bool copyTextToClipboardUnicodeAndAnsi(
+    const std::wstring& unicode_text) {
+    if (!OpenClipboard(nullptr)) {
+        return false;
+    }
+    EmptyClipboard();
+
+    const auto unicode_bytes =
+        (unicode_text.size() + 1) * sizeof(wchar_t);
+    auto* unicode_global = GlobalAlloc(GMEM_MOVEABLE, unicode_bytes);
+    if (unicode_global == nullptr) {
+        CloseClipboard();
+        return false;
+    }
+    if (auto* locked = GlobalLock(unicode_global)) {
+        std::memcpy(
+            locked,
+            unicode_text.c_str(),
+            unicode_bytes);
+        GlobalUnlock(unicode_global);
+    } else {
+        GlobalFree(unicode_global);
+        CloseClipboard();
+        return false;
+    }
+    if (SetClipboardData(CF_UNICODETEXT, unicode_global)
+        == nullptr) {
+        GlobalFree(unicode_global);
+        CloseClipboard();
+        return false;
+    }
+
+    const int ansi_size = WideCharToMultiByte(
+        932,
+        0,
+        unicode_text.c_str(),
+        -1,
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (ansi_size > 0) {
+        auto* ansi_global = GlobalAlloc(
+            GMEM_MOVEABLE, static_cast<SIZE_T>(ansi_size));
+        if (ansi_global != nullptr) {
+            if (auto* locked = GlobalLock(ansi_global)) {
+                WideCharToMultiByte(
+                    932,
+                    0,
+                    unicode_text.c_str(),
+                    -1,
+                    static_cast<char*>(locked),
+                    ansi_size,
+                    nullptr,
+                    nullptr);
+                GlobalUnlock(ansi_global);
+                if (SetClipboardData(CF_TEXT, ansi_global)
+                    == nullptr) {
+                    GlobalFree(ansi_global);
+                }
+            } else {
+                GlobalFree(ansi_global);
+            }
+        }
+    }
+
+    CloseClipboard();
+    return true;
+}
+
+std::optional<std::vector<std::uint8_t>>
+clipboardImageBytes() {
+    if (!OpenClipboard(nullptr)) {
+        return std::nullopt;
+    }
+
+    std::optional<std::vector<std::uint8_t>> result;
+    const auto png_format = RegisterClipboardFormatW(L"PNG");
+    if (png_format != 0
+        && IsClipboardFormatAvailable(png_format)) {
+        result = bytesFromClipboardGlobal(
+            GetClipboardData(png_format));
+    }
+    if (!result && IsClipboardFormatAvailable(CF_DIBV5)) {
+        result = dibToBmpFileBytes(GetClipboardData(CF_DIBV5));
+    }
+    if (!result && IsClipboardFormatAvailable(CF_DIB)) {
+        result = dibToBmpFileBytes(GetClipboardData(CF_DIB));
+    }
+    if (!result && IsClipboardFormatAvailable(CF_BITMAP)) {
+        result = hbitmapToBmpFileBytes(
+            static_cast<HBITMAP>(GetClipboardData(CF_BITMAP)));
+    }
+
+    std::filesystem::path dropped_path;
+    if (!result && IsClipboardFormatAvailable(CF_HDROP)) {
+        if (const auto drop = static_cast<HDROP>(
+                GetClipboardData(CF_HDROP))) {
+            std::array<wchar_t, 32768> path{};
+            if (DragQueryFileW(
+                    drop,
+                    0,
+                    path.data(),
+                    static_cast<UINT>(path.size())) > 0) {
+                dropped_path = path.data();
+            }
+        }
+    }
+    CloseClipboard();
+
+    if (!result && !dropped_path.empty()
+        && isLikelyImageExtension(dropped_path.extension().wstring())) {
+        result = readBinaryFileBytes(dropped_path);
+    }
+    return result;
 }
 
 } // namespace mgstc::platform

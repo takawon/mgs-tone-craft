@@ -24,9 +24,7 @@ double presetSample(
         return phase < 0.5 ? 1.0 : -1.0;
     case SccWavePreset::Triangle:
         return 1.0 - 4.0 * std::abs(phase - 0.5);
-    case SccWavePreset::SawUp:
-        return phase * 2.0 - 1.0;
-    case SccWavePreset::SawDown:
+    case SccWavePreset::Saw:
         return 1.0 - phase * 2.0;
     case SccWavePreset::Pulse25:
         return phase < 0.25 ? 1.0 : -1.0;
@@ -330,6 +328,15 @@ SccWaveform invertSccWaveform(
                 -static_cast<int>(waveform[index]),
                 -128,
                 127));
+    }
+    return result;
+}
+
+SccWaveform mirrorSccWaveform(
+    const SccWaveform& waveform) noexcept {
+    SccWaveform result{};
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        result[index] = waveform[result.size() - 1 - index];
     }
     return result;
 }

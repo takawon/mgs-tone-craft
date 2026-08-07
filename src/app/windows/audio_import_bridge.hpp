@@ -19,6 +19,12 @@ readWaveFileBytes(const std::filesystem::path& path);
 [[nodiscard]] std::optional<std::vector<std::uint8_t>>
 clipboardWaveBytes();
 
+[[nodiscard]] bool copyTextToClipboardUnicodeAndAnsi(
+    const std::wstring& unicode_text);
+
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
+clipboardImageBytes();
+
 [[nodiscard]] AudacityWaveImportResult
 exportAudacitySelectionToWave();
 
