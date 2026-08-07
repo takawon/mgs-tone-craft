@@ -11,6 +11,54 @@ project(
 
 option(MGSTC_BUILD_TESTS "Build engine tests" ON)
 
+# MAmidiMEmo chip_server speaks msgpack-RPC (rpclib). Pin a published
+# release; protocol is compatible with the copy bundled in MAmidiMEmo.
+# Modern MSVC removed stdext::checked_array_iterator — apply the same
+# guard used by vcpkg (ports/rpclib/avoid-stdext-checked-array-iterator).
+set(RPCLIB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(RPCLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(RPCLIB_ENABLE_LOGGING OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    rpclib
+    GIT_REPOSITORY https://github.com/rpclib/rpclib.git
+    GIT_TAG v2.3.0
+    GIT_SHALLOW TRUE
+    GIT_PROGRESS TRUE
+)
+FetchContent_GetProperties(rpclib)
+if(NOT rpclib_POPULATED)
+    FetchContent_Populate(rpclib)
+
+    # Modern MSVC removed stdext::checked_array_iterator (vcpkg same fix).
+    set(_mgstc_rpclib_format_h
+        "${rpclib_SOURCE_DIR}/dependencies/include/format.h")
+    file(READ "${_mgstc_rpclib_format_h}" _mgstc_rpclib_format)
+    string(REGEX REPLACE
+        "#ifdef _SECURE_SCL\r?\n# define FMT_SECURE_SCL _SECURE_SCL"
+        "#if defined(_SECURE_SCL) && defined(_MSC_VER) && _MSC_VER < 1951\n# define FMT_SECURE_SCL _SECURE_SCL"
+        _mgstc_rpclib_format
+        "${_mgstc_rpclib_format}")
+    file(WRITE "${_mgstc_rpclib_format_h}" "${_mgstc_rpclib_format}")
+    unset(_mgstc_rpclib_format)
+    unset(_mgstc_rpclib_format_h)
+
+    # rpclib's CMakeLists sets CMAKE_CXX_STANDARD globally; keep ours.
+    set(_mgstc_saved_cxx_standard "${CMAKE_CXX_STANDARD}")
+    add_subdirectory(
+        "${rpclib_SOURCE_DIR}"
+        "${rpclib_BINARY_DIR}"
+        EXCLUDE_FROM_ALL)
+    if(_mgstc_saved_cxx_standard STREQUAL "")
+        unset(CMAKE_CXX_STANDARD)
+    else()
+        set(CMAKE_CXX_STANDARD "${_mgstc_saved_cxx_standard}")
+    endif()
+    unset(_mgstc_saved_cxx_standard)
+endif()
+if(TARGET rpc AND MSVC)
+    target_compile_options(rpc PRIVATE /W0)
+endif()
+
 add_library(emu2149 STATIC third_party/emu2149/emu2149.c)
 target_include_directories(
     emu2149 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/emu2149
@@ -40,9 +88,13 @@ add_library(mgstc_engine STATIC
     src/engine/chip_rack.cpp
     src/engine/composite_timbre.cpp
     src/engine/composite_timbre_library.cpp
+    src/engine/emulator_sound_output.cpp
     src/engine/engine_core.cpp
     src/engine/envelope_rate.cpp
     src/engine/envelope_sequence.cpp
+    src/engine/mamidi_memo_sound_output.cpp
+    src/engine/mamidi_register_map.cpp
+    src/engine/mamidi_rpc_client.cpp
     src/engine/mgs_envelope_io.cpp
     src/engine/mgs_timbre_io.cpp
     src/engine/note_pitch.cpp
@@ -60,8 +112,25 @@ add_library(mgstc_engine STATIC
     src/engine/wave_import.cpp
 )
 
+find_package(Threads REQUIRED)
 target_link_libraries(
-    mgstc_engine PRIVATE emu2149 emu2212 emu2413
+    mgstc_engine
+    PRIVATE
+        emu2149
+        emu2212
+        emu2413
+        rpc
+        Threads::Threads
+)
+if(WIN32)
+    target_link_libraries(mgstc_engine PRIVATE ws2_32)
+endif()
+# rpclib headers are only needed by mamidi_rpc_client.cpp; keep them
+# out of the public interface of mgstc_engine.
+target_include_directories(
+    mgstc_engine
+    SYSTEM PRIVATE
+        $<TARGET_PROPERTY:rpc,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
 target_include_directories(mgstc_engine
@@ -141,6 +210,15 @@ if(WIN32)
                         "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
             )
         endif()
+        juce_add_binary_data(
+            mgstc_binary_data
+            HEADER_NAME BinaryData.h
+            NAMESPACE BinaryData
+            SOURCES
+                assets/MGSTC_logo.png
+                assets/mgstc_spin.gif
+        )
+
         target_sources(
             mgstc PRIVATE
                 src/app/juce/main.cpp
@@ -148,9 +226,12 @@ if(WIN32)
         target_link_libraries(
             mgstc
             PRIVATE
+                mgstc_binary_data
                 mgstc_windows_audio
                 juce::juce_audio_utils
                 juce::juce_gui_extra
+                gdiplus
+                windowscodecs
         )
         target_compile_features(mgstc PRIVATE cxx_std_20)
         target_compile_definitions(
@@ -180,6 +261,16 @@ if(MGSTC_BUILD_TESTS)
             mgstc_engine_tests PRIVATE mgstc_windows_audio
         )
     endif()
+    # Mock chip_server in engine tests needs rpclib server headers.
+    target_link_libraries(mgstc_engine_tests PRIVATE rpc)
+    if(WIN32)
+        target_link_libraries(mgstc_engine_tests PRIVATE ws2_32)
+    endif()
+    target_include_directories(
+        mgstc_engine_tests
+        SYSTEM PRIVATE
+            $<TARGET_PROPERTY:rpc,INTERFACE_INCLUDE_DIRECTORIES>
+    )
     target_compile_definitions(
         mgstc_engine_tests
         PRIVATE MGSTC_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"

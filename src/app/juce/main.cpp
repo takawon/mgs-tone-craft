@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -14,14 +15,20 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <objidl.h>
+#include <gdiplus.h>
 
 #include <juce_gui_extra/juce_gui_extra.h>
 #include <juce_audio_utils/juce_audio_utils.h>
+
+#include "BinaryData.h"
 
 #include "mgstc/audio/wasapi_audio_sink.hpp"
 #include "mgstc/engine/engine_command.hpp"
@@ -31,6 +38,7 @@
 #include "mgstc/engine/mgs_timbre_io.hpp"
 #include "mgstc/engine/opll_envelope_trace.hpp"
 #include "mgstc/engine/opll_patch.hpp"
+#include "mgstc/engine/note_pitch.hpp"
 #include "mgstc/engine/pc_keyboard.hpp"
 #include "mgstc/engine/realtime_engine_host.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
@@ -267,15 +275,26 @@ using SccWaveform = mgstc::engine::SccWaveform;
     std::size_t start_sample) {
     constexpr std::uint32_t sample_rate = 48'000;
     constexpr std::size_t capture_samples = 8'192;
+    constexpr std::uint8_t kCaptureMidiNote = 60;
     mgstc::engine::Ym2413Adapter opll;
     const auto registers = mgstc::engine::encodeOpllPatch(patch);
     for (std::size_t index = 0; index < registers.size(); ++index) {
         static_cast<void>(opll.write(
             static_cast<std::uint8_t>(index), registers[index]));
     }
+    mgstc::engine::NotePitch pitch{};
+    if (!mgstc::engine::notePitch(kCaptureMidiNote, pitch)) {
+        return {};
+    }
     static_cast<void>(opll.write(0x30, 0x00));
-    static_cast<void>(opll.write(0x10, 0xAC));
-    static_cast<void>(opll.write(0x20, 0x16));
+    static_cast<void>(opll.write(
+        0x10, static_cast<std::uint8_t>(pitch.opll.f_number & 0xFF)));
+    static_cast<void>(opll.write(
+        0x20,
+        static_cast<std::uint8_t>(
+            0x10
+            | ((pitch.opll.block & 7) << 1)
+            | ((pitch.opll.f_number >> 8) & 1))));
     for (std::size_t index = 0; index < start_sample; ++index) {
         static_cast<void>(opll.renderSample());
     }
@@ -311,6 +330,8 @@ enum class EditorIcon {
     Convert,
     Audition,
     Settings,
+    AbAudition,
+    CancelPreview,
 };
 
 std::unique_ptr<juce::Drawable> makeEditorIcon(
@@ -442,6 +463,34 @@ std::unique_ptr<juce::Drawable> makeEditorIcon(
                 12.0F + std::sin(angle) * 11.0F);
         }
         break;
+    case EditorIcon::AbAudition:
+        // A / B を左右パネルで対比（試聴切替）
+        path.addRoundedRectangle(2.0F, 4.0F, 9.0F, 16.0F, 1.5F);
+        path.addRoundedRectangle(13.0F, 4.0F, 9.0F, 16.0F, 1.5F);
+        path.startNewSubPath(6.5F, 8.0F);
+        path.lineTo(4.5F, 16.0F);
+        path.startNewSubPath(6.5F, 8.0F);
+        path.lineTo(8.5F, 16.0F);
+        path.startNewSubPath(5.2F, 13.0F);
+        path.lineTo(7.8F, 13.0F);
+        path.startNewSubPath(15.5F, 8.0F);
+        path.lineTo(15.5F, 16.0F);
+        path.startNewSubPath(15.5F, 8.0F);
+        path.lineTo(18.5F, 8.0F);
+        path.cubicTo(20.2F, 8.0F, 20.2F, 11.0F, 18.5F, 11.0F);
+        path.lineTo(15.5F, 11.0F);
+        path.startNewSubPath(15.5F, 11.0F);
+        path.lineTo(18.8F, 11.0F);
+        path.cubicTo(20.5F, 11.0F, 20.5F, 16.0F, 18.5F, 16.0F);
+        path.lineTo(15.5F, 16.0F);
+        break;
+    case EditorIcon::CancelPreview:
+        path.startNewSubPath(5.0F, 5.0F);
+        path.lineTo(19.0F, 19.0F);
+        path.startNewSubPath(19.0F, 5.0F);
+        path.lineTo(5.0F, 19.0F);
+        path.addEllipse(3.0F, 3.0F, 18.0F, 18.0F);
+        break;
     case EditorIcon::Up:
     case EditorIcon::Down:
     case EditorIcon::Left:
@@ -507,6 +556,406 @@ void configureSettingsButton(
         juce::String::fromUTF8("アプリ設定を開きます"));
     button.onClick = std::move(action);
 }
+
+[[nodiscard]] juce::Image loadEmbeddedPng(
+    const char* data,
+    int size) {
+    return juce::ImageFileFormat::loadFrom(data, static_cast<size_t>(size));
+}
+
+struct AnimatedGifSupport final {
+    AnimatedGifSupport() {
+        Gdiplus::GdiplusStartupInput input;
+        Gdiplus::GdiplusStartup(&token_, &input, nullptr);
+    }
+
+    ~AnimatedGifSupport() {
+        if (token_ != 0) {
+            Gdiplus::GdiplusShutdown(token_);
+        }
+    }
+
+    AnimatedGifSupport(const AnimatedGifSupport&) = delete;
+    AnimatedGifSupport& operator=(const AnimatedGifSupport&) = delete;
+
+    ULONG_PTR token_ = 0;
+};
+
+[[nodiscard]] AnimatedGifSupport& ensureGdiplusInitialized() {
+    static AnimatedGifSupport runtime;
+    return runtime;
+}
+
+[[nodiscard]] juce::Image gdiplusBitmapToImage(
+    Gdiplus::Bitmap& bitmap) {
+    const auto width = static_cast<int>(bitmap.GetWidth());
+    const auto height = static_cast<int>(bitmap.GetHeight());
+    if (width <= 0 || height <= 0) {
+        return {};
+    }
+
+    Gdiplus::BitmapData data{};
+    const Gdiplus::Rect rect(0, 0, width, height);
+    if (bitmap.LockBits(
+            &rect,
+            Gdiplus::ImageLockModeRead,
+            PixelFormat32bppARGB,
+            &data)
+        != Gdiplus::Ok) {
+        return {};
+    }
+
+    juce::Image image(
+        juce::Image::ARGB, width, height, true);
+    {
+        juce::Image::BitmapData dest(
+            image,
+            juce::Image::BitmapData::writeOnly);
+        for (int y = 0; y < height; ++y) {
+            const auto* src = static_cast<const std::uint8_t*>(
+                data.Scan0)
+                + static_cast<std::ptrdiff_t>(y) * data.Stride;
+            auto* out = dest.getLinePointer(y);
+            for (int x = 0; x < width; ++x) {
+                const auto b = src[x * 4 + 0];
+                const auto g = src[x * 4 + 1];
+                const auto r = src[x * 4 + 2];
+                const auto a = src[x * 4 + 3];
+                juce::PixelARGB pixel(a, r, g, b);
+                pixel.premultiply();
+                reinterpret_cast<juce::PixelARGB*>(out)[x] = pixel;
+            }
+        }
+    }
+    bitmap.UnlockBits(&data);
+    return image;
+}
+
+[[nodiscard]] juce::Image loadImageFileForBackground(
+    const juce::File& file) {
+    if (!file.existsAsFile()) {
+        return {};
+    }
+    if (auto image = juce::ImageFileFormat::loadFrom(file);
+        image.isValid()) {
+        return image;
+    }
+    ensureGdiplusInitialized();
+    Gdiplus::Bitmap bitmap(file.getFullPathName().toWideCharPointer());
+    if (bitmap.GetLastStatus() != Gdiplus::Ok) {
+        return {};
+    }
+    return gdiplusBitmapToImage(bitmap);
+}
+
+[[nodiscard]] juce::Image loadImageBytesForBackground(
+    const std::vector<std::uint8_t>& bytes) {
+    if (bytes.empty()) {
+        return {};
+    }
+    if (auto image = juce::ImageFileFormat::loadFrom(
+            bytes.data(), bytes.size());
+        image.isValid()) {
+        return image;
+    }
+    ensureGdiplusInitialized();
+    const auto memory = ::GlobalAlloc(
+        GMEM_MOVEABLE, static_cast<SIZE_T>(bytes.size()));
+    if (memory == nullptr) {
+        return {};
+    }
+    if (auto* locked = ::GlobalLock(memory)) {
+        std::memcpy(locked, bytes.data(), bytes.size());
+        ::GlobalUnlock(memory);
+    } else {
+        ::GlobalFree(memory);
+        return {};
+    }
+    IStream* stream = nullptr;
+    if (::CreateStreamOnHGlobal(memory, TRUE, &stream) != S_OK
+        || stream == nullptr) {
+        ::GlobalFree(memory);
+        return {};
+    }
+    juce::Image image;
+    {
+        Gdiplus::Bitmap bitmap(stream);
+        if (bitmap.GetLastStatus() == Gdiplus::Ok) {
+            image = gdiplusBitmapToImage(bitmap);
+        }
+    }
+    stream->Release();
+    return image;
+}
+
+bool loadAnimatedGifFrames(
+    const void* data,
+    int size,
+    std::vector<juce::Image>& frames,
+    std::vector<int>& delays_ms) {
+    ensureGdiplusInitialized();
+    frames.clear();
+    delays_ms.clear();
+    if (data == nullptr || size <= 0) {
+        return false;
+    }
+
+    const auto bytes = static_cast<SIZE_T>(size);
+    const auto memory = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (memory == nullptr) {
+        return false;
+    }
+    if (auto* locked = ::GlobalLock(memory)) {
+        std::memcpy(locked, data, bytes);
+        ::GlobalUnlock(memory);
+    } else {
+        ::GlobalFree(memory);
+        return false;
+    }
+
+    IStream* stream = nullptr;
+    if (FAILED(::CreateStreamOnHGlobal(memory, TRUE, &stream))
+        || stream == nullptr) {
+        ::GlobalFree(memory);
+        return false;
+    }
+
+    Gdiplus::Bitmap bitmap(stream);
+    stream->Release();
+    if (bitmap.GetLastStatus() != Gdiplus::Ok) {
+        return false;
+    }
+
+    static const GUID dimension = { 0x6aedbd6d, 0x3fb5, 0x418a, { 0x83, 0xa6, 0x7f, 0x45, 0x22, 0x9d, 0xc8, 0x72 } };
+    const UINT frame_count = bitmap.GetFrameCount(&dimension);
+    if (frame_count == 0) {
+        return false;
+    }
+
+    frames.reserve(frame_count);
+    delays_ms.reserve(frame_count);
+    for (UINT frame = 0; frame < frame_count; ++frame) {
+        if (bitmap.SelectActiveFrame(&dimension, frame)
+            != Gdiplus::Ok) {
+            continue;
+        }
+        auto converted = gdiplusBitmapToImage(bitmap);
+        if (!converted.isValid()) {
+            continue;
+        }
+        frames.push_back(std::move(converted));
+        delays_ms.push_back(50);
+    }
+    return !frames.empty();
+}
+
+class AnimatedGifComponent final
+    : public juce::Component,
+      private juce::Timer {
+public:
+    void loadFromMemory(const void* data, int size) {
+        stopTimer();
+        frames_.clear();
+        delays_ms_.clear();
+        frame_index_ = 0;
+        static_cast<void>(
+            loadAnimatedGifFrames(data, size, frames_, delays_ms_));
+        if (!frames_.empty()) {
+            startTimer(delays_ms_.front());
+        }
+        repaint();
+    }
+
+    void setDisplaySize(int width, int height) {
+        display_width_ = juce::jmax(1, width);
+        display_height_ = juce::jmax(1, height);
+        setSize(display_width_, display_height_);
+    }
+
+    void paint(juce::Graphics& g) override {
+        g.fillAll(juce::Colours::transparentBlack);
+        if (frames_.empty()) {
+            return;
+        }
+        g.drawImageWithin(
+            frames_[static_cast<size_t>(frame_index_)],
+            0,
+            0,
+            getWidth(),
+            getHeight(),
+            juce::RectanglePlacement::centred
+                | juce::RectanglePlacement::onlyReduceInSize);
+    }
+
+private:
+    void timerCallback() override {
+        if (frames_.size() <= 1) {
+            return;
+        }
+        frame_index_ =
+            (frame_index_ + 1) % static_cast<int>(frames_.size());
+        repaint();
+        startTimer(
+            delays_ms_[static_cast<size_t>(frame_index_)]);
+    }
+
+    std::vector<juce::Image> frames_;
+    std::vector<int> delays_ms_;
+    int frame_index_{0};
+    int display_width_{256};
+    int display_height_{256};
+};
+
+class ConversionBusyContent final : public juce::Component {
+public:
+    ConversionBusyContent() {
+        label_.setText(
+            juce::String::fromUTF8("変換中…"),
+            juce::dontSendNotification);
+        label_.setJustificationType(juce::Justification::centred);
+        label_.setColour(
+            juce::Label::textColourId, juce::Colour(0xFFE6EDF3));
+        addAndMakeVisible(label_);
+
+        gif_.loadFromMemory(
+            BinaryData::mgstc_spin_gif,
+            BinaryData::mgstc_spin_gifSize);
+        // Source GIF is 512x512; show at about 50%.
+        gif_.setDisplaySize(256, 256);
+        addAndMakeVisible(gif_);
+        setSize(320, 330);
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(16);
+        label_.setBounds(area.removeFromTop(28));
+        area.removeFromTop(8);
+        gif_.setBounds(
+            area.withSizeKeepingCentre(256, 256));
+    }
+
+private:
+    juce::Label label_;
+    AnimatedGifComponent gif_;
+};
+
+class ConversionBusyDialog final : public juce::DialogWindow {
+public:
+    ConversionBusyDialog()
+        : juce::DialogWindow(
+              juce::String::fromUTF8("変換中"),
+              juce::Colour(0xFF1B222C),
+              false,
+              true) {
+        setUsingNativeTitleBar(true);
+        setResizable(false, false);
+        auto* content = new ConversionBusyContent();
+        setContentOwned(content, true);
+        centreWithSize(content->getWidth(), content->getHeight() + 32);
+    }
+
+    void closeButtonPressed() override {
+        // Conversion cannot be cancelled; ignore close.
+    }
+};
+
+template <typename Work, typename OnDone>
+void runWithConversionBusyDialog(
+    juce::Component* anchor,
+    Work work,
+    OnDone on_done) {
+    auto* dialog = new ConversionBusyDialog();
+    if (anchor != nullptr) {
+        dialog->centreAroundComponent(
+            anchor, dialog->getWidth(), dialog->getHeight());
+    }
+    dialog->enterModalState(true, nullptr, true);
+
+    juce::Component::SafePointer<ConversionBusyDialog> safe_dialog(
+        dialog);
+    std::thread(
+        [safe_dialog, work = std::move(work),
+         on_done = std::move(on_done)]() mutable {
+            auto result = work();
+            juce::MessageManager::callAsync(
+                [safe_dialog,
+                 result = std::move(result),
+                 on_done = std::move(on_done)]() mutable {
+                    if (safe_dialog != nullptr) {
+                        safe_dialog->exitModalState(1);
+                    }
+                    on_done(std::move(result));
+                });
+        })
+        .detach();
+}
+
+class AboutPanel final : public juce::Component {
+public:
+    AboutPanel() {
+        logo_ = loadEmbeddedPng(
+            BinaryData::MGSTC_logo_png,
+            BinaryData::MGSTC_logo_pngSize);
+        title_.setText(
+            "MGS Tone Craft", juce::dontSendNotification);
+        title_.setFont(
+            juce::FontOptions(22.0F, juce::Font::bold));
+        title_.setJustificationType(juce::Justification::centred);
+        title_.setColour(
+            juce::Label::textColourId, juce::Colour(0xFFE6EDF3));
+        addAndMakeVisible(title_);
+
+        subtitle_.setText(
+            "MGSTC", juce::dontSendNotification);
+        subtitle_.setFont(juce::FontOptions(16.0F));
+        subtitle_.setJustificationType(juce::Justification::centred);
+        subtitle_.setColour(
+            juce::Label::textColourId, juce::Colour(0xFF9AA8B5));
+        addAndMakeVisible(subtitle_);
+
+        detail_.setText(
+            juce::String::fromUTF8(
+                "MGSDRV向け複合音色エディタ\n"
+                "Version 0.1.0"),
+            juce::dontSendNotification);
+        detail_.setJustificationType(juce::Justification::centred);
+        detail_.setColour(
+            juce::Label::textColourId, juce::Colour(0xFF9AA8B5));
+        addAndMakeVisible(detail_);
+    }
+
+    void paint(juce::Graphics& g) override {
+        if (logo_.isValid()) {
+            // Source logo is 1024x1024; show at 25% (256x256).
+            g.drawImageWithin(
+                logo_,
+                logo_bounds_.getX(),
+                logo_bounds_.getY(),
+                logo_bounds_.getWidth(),
+                logo_bounds_.getHeight(),
+                juce::RectanglePlacement::centred
+                    | juce::RectanglePlacement::onlyReduceInSize);
+        }
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(12);
+        logo_bounds_ = area.removeFromTop(256)
+                           .withSizeKeepingCentre(256, 256);
+        area.removeFromTop(12);
+        title_.setBounds(area.removeFromTop(28));
+        subtitle_.setBounds(area.removeFromTop(24));
+        area.removeFromTop(8);
+        detail_.setBounds(area.removeFromTop(48));
+    }
+
+private:
+    juce::Image logo_;
+    juce::Rectangle<int> logo_bounds_;
+    juce::Label title_;
+    juce::Label subtitle_;
+    juce::Label detail_;
+};
 
 void configureImmediateAuditionButton(
     juce::DrawableButton& button,
@@ -594,6 +1043,20 @@ public:
         repaint();
     }
 
+    void clearPreviewOverlay() {
+        if (!reference_waveform_) {
+            return;
+        }
+        waveform_ = *reference_waveform_;
+        reference_waveform_.reset();
+        syncValueEditors(waveform_);
+        repaint();
+    }
+
+    [[nodiscard]] bool hasPreviewOverlay() const noexcept {
+        return reference_waveform_.has_value();
+    }
+
     [[nodiscard]] const SccWaveform& waveform() const noexcept {
         return waveform_;
     }
@@ -610,10 +1073,54 @@ public:
         on_value_commit_ = std::move(callback);
     }
 
+    void setPreviewClearedCallback(std::function<void()> callback) {
+        on_preview_cleared_ = std::move(callback);
+    }
+
+    void setBackgroundImage(
+        const juce::Image& image,
+        bool visible,
+        float opacity,
+        int offset_x,
+        int offset_y,
+        int display_width,
+        int display_height) {
+        background_image_ = image;
+        background_visible_ = visible;
+        background_opacity_ =
+            juce::jlimit(0.0F, 1.0F, opacity);
+        background_x_ = offset_x;
+        background_y_ = offset_y;
+        background_width_ = juce::jmax(1, display_width);
+        background_height_ = juce::jmax(1, display_height);
+        repaint();
+    }
+
+    void clearBackgroundImage() {
+        background_image_ = {};
+        repaint();
+    }
+
     void paint(juce::Graphics& graphics) override {
         const auto graph = graphBounds();
         graphics.setColour(juce::Colour(0xFF111820));
         graphics.fillRoundedRectangle(graph.toFloat(), 6.0F);
+
+        if (background_visible_
+            && background_image_.isValid()) {
+            juce::Graphics::ScopedSaveState clip(graphics);
+            graphics.reduceClipRegion(graph);
+            graphics.setOpacity(background_opacity_);
+            graphics.drawImageWithin(
+                background_image_,
+                graph.getX() + background_x_,
+                graph.getY() + background_y_,
+                background_width_,
+                background_height_,
+                juce::RectanglePlacement::stretchToFit,
+                false);
+            graphics.setOpacity(1.0F);
+        }
 
         graphics.setColour(juce::Colour(0xFF34404C));
         graphics.drawRoundedRectangle(graph.toFloat(), 6.0F, 1.0F);
@@ -659,39 +1166,59 @@ public:
                 return path;
             };
 
+        const auto confirmed_colour = juce::Colour(0xFF53E3A6);
+        const auto candidate_colour = juce::Colour(0xFFFF9F43);
+
         if (reference_waveform_) {
-            graphics.setColour(juce::Colour(0xFF6E7E8C));
+            graphics.setColour(confirmed_colour);
             graphics.strokePath(
                 make_path(*reference_waveform_),
                 juce::PathStrokeType(
-                    1.6F,
+                    2.0F,
                     juce::PathStrokeType::curved,
                     juce::PathStrokeType::rounded));
+
+            juce::Path dashed;
+            const float dash_lengths[] = {5.0F, 4.0F};
+            juce::PathStrokeType(1.8F).createDashedStroke(
+                dashed,
+                make_path(waveform_),
+                dash_lengths,
+                2);
+            graphics.setColour(candidate_colour);
+            graphics.strokePath(
+                dashed,
+                juce::PathStrokeType(
+                    1.8F,
+                    juce::PathStrokeType::curved,
+                    juce::PathStrokeType::rounded));
+
             graphics.setFont(juce::FontOptions(12.0F));
+            graphics.setColour(confirmed_colour);
             graphics.drawText(
-                juce::String::fromUTF8("現在"),
+                juce::String::fromUTF8("確定"),
                 8,
                 2,
                 42,
                 20,
                 juce::Justification::centredLeft);
-            graphics.setColour(juce::Colour(0xFF53E3A6));
+            graphics.setColour(candidate_colour);
             graphics.drawText(
-                juce::String::fromUTF8("変更後"),
+                juce::String::fromUTF8("候補"),
                 52,
                 2,
                 58,
                 20,
                 juce::Justification::centredLeft);
+        } else {
+            graphics.setColour(confirmed_colour);
+            graphics.strokePath(
+                make_path(waveform_),
+                juce::PathStrokeType(
+                    2.0F,
+                    juce::PathStrokeType::curved,
+                    juce::PathStrokeType::rounded));
         }
-
-        graphics.setColour(juce::Colour(0xFF53E3A6));
-        graphics.strokePath(
-            make_path(waveform_),
-            juce::PathStrokeType(
-                2.0F,
-                juce::PathStrokeType::curved,
-                juce::PathStrokeType::rounded));
 
         graphics.setColour(juce::Colours::white.withAlpha(0.82F));
         graphics.setFont(juce::FontOptions(9.0F, juce::Font::bold));
@@ -713,14 +1240,18 @@ public:
             1);
 
         if (selected_index_ >= 0) {
+            const auto& display_wave = reference_waveform_
+                ? *reference_waveform_
+                : waveform_;
             const auto text = juce::String::formatted(
                 "%02d : %d (0x%02X)",
                 selected_index_,
                 static_cast<int>(
-                    waveform_[static_cast<std::size_t>(selected_index_)]),
+                    display_wave[static_cast<std::size_t>(
+                        selected_index_)]),
                 static_cast<unsigned int>(
                     static_cast<std::uint8_t>(
-                        waveform_[static_cast<std::size_t>(
+                        display_wave[static_cast<std::size_t>(
                             selected_index_)])));
             graphics.setColour(juce::Colours::white);
             graphics.drawText(
@@ -735,6 +1266,9 @@ public:
             waveform_ = *reference_waveform_;
             reference_waveform_.reset();
             syncValueEditors(waveform_);
+            if (on_preview_cleared_) {
+                on_preview_cleared_();
+            }
         }
         drag_start_ = waveform_;
         updateFromMouse(event.position);
@@ -780,11 +1314,12 @@ private:
     static void configureValueEditor(
         juce::TextEditor& editor,
         bool hexadecimal) {
-        editor.setFont(juce::FontOptions(10.0F));
+        editor.setFont(juce::FontOptions(9.0F));
         editor.setJustification(juce::Justification::centred);
         editor.setBorder(juce::BorderSize<int>(1));
-        editor.setIndents(0, 0);
+        editor.setIndents(1, 0);
         editor.setSelectAllWhenFocused(true);
+        editor.setPopupMenuEnabled(false);
         editor.setInputRestrictions(
             hexadecimal ? 2 : 4,
             hexadecimal
@@ -795,7 +1330,8 @@ private:
                 ? juce::String::fromUTF8(
                     "8bit 16進数 00～FF。Enterで確定")
                 : juce::String::fromUTF8(
-                    "符号付き10進数 -128～127。Enterで確定"));
+                    "符号付き10進数 -128～127。Enterで確定。"
+                    "左右キーで桁を移動できます"));
     }
 
     static std::optional<int> parseEditorValue(
@@ -839,6 +1375,9 @@ private:
         if (reference_waveform_) {
             waveform_ = *reference_waveform_;
             reference_waveform_.reset();
+            if (on_preview_cleared_) {
+                on_preview_cleared_();
+            }
         }
         auto& editor = hexadecimal
             ? *hex_editors_[index]
@@ -930,6 +1469,14 @@ private:
     CommitCallback on_commit_;
     LiveEditCallback on_live_edit_;
     ValueCommitCallback on_value_commit_;
+    std::function<void()> on_preview_cleared_;
+    juce::Image background_image_;
+    bool background_visible_{true};
+    float background_opacity_{0.35F};
+    int background_x_{0};
+    int background_y_{0};
+    int background_width_{256};
+    int background_height_{128};
     std::array<std::unique_ptr<juce::TextEditor>, 32>
         decimal_editors_;
     std::array<std::unique_ptr<juce::TextEditor>, 32>
@@ -943,6 +1490,7 @@ public:
         master_volume_percent_ = loadMasterVolumePercent();
         audio_.setMasterVolumePercent(
             static_cast<std::uint32_t>(master_volume_percent_));
+        loadAndApplySoundOutputSettings();
         running_ = audio_.start(engine_);
     }
 
@@ -989,10 +1537,213 @@ public:
         }
     }
 
+    void setSharedSccWaveform(const SccWaveform& waveform) {
+        shared_scc_wave_ = waveform;
+    }
+
+    [[nodiscard]] const SccWaveform& sharedSccWaveform() const noexcept {
+        return shared_scc_wave_;
+    }
+
+    void setSharedOpllPatch(
+        const mgstc::engine::OpllPatchParameters& patch) {
+        shared_opll_patch_ = patch;
+    }
+
+    [[nodiscard]] const mgstc::engine::OpllPatchParameters&
+    sharedOpllPatch() const noexcept {
+        return shared_opll_patch_;
+    }
+
+    // SCC／OPLL単音色エディタ共通の試聴プログラムを構築する。
+    // 片方のエディタが再構成しても、もう一方の確定音色を消さない。
+    [[nodiscard]] bool submitSharedEditorProgram(
+        const SccWaveform& scc_wave,
+        const mgstc::engine::OpllPatchParameters& opll_patch,
+        bool retrigger,
+        std::uint8_t retrigger_track,
+        std::uint8_t midi_note) {
+        auto edit = engine_.beginProgramEdit();
+        if (!edit.valid()) {
+            return false;
+        }
+
+        std::array<std::uint8_t, 32> raw_wave{};
+        std::transform(
+            scc_wave.begin(),
+            scc_wave.end(),
+            raw_wave.begin(),
+            [](std::int8_t sample) {
+                return static_cast<std::uint8_t>(sample);
+            });
+        const auto opll_registers =
+            mgstc::engine::encodeOpllPatch(opll_patch);
+
+        bool configured =
+            edit.engine->session().setSequenceEnvelope(
+                kPsgTrack, {0x40, 0xEF, 0x01, 0x60})
+            && edit.engine->session().setPsgToneNoise(
+                kPsgTrack, 1, 0)
+            && edit.engine->session().setPsgFixedVolume(
+                kPsgTrack, 15)
+            && edit.engine->session().mapper().defineSccPatch(
+                0, raw_wave)
+                == mgstc::engine::MapError::None
+            && edit.engine->session().mapper().defineOpllOriginalPatch(
+                16, opll_registers)
+                == mgstc::engine::MapError::None;
+        for (std::uint8_t track = kSccTrack;
+             track < kSccTrack + 5;
+             ++track) {
+            configured = configured
+                && edit.engine->session().setSequenceEnvelope(
+                    track, {0x10, 0x00, 0x40, 0xEF, 0x01, 0x60})
+                && edit.engine->session().setTrackVolume(track, 15);
+        }
+        for (std::uint8_t track = kOpllTrack;
+             track < kOpllTrack + 9;
+             ++track) {
+            configured = configured
+                && edit.engine->session().setSequenceEnvelope(
+                    track, {0x10, 0x10, 0x40, 0xEF, 0x01, 0x60});
+        }
+        if (!configured) {
+            static_cast<void>(engine_.discardProgramEdit(edit));
+            return false;
+        }
+
+        const auto submitted = engine_.submitProgram(
+            edit,
+            {
+                .retrigger = retrigger,
+                .track = retrigger_track,
+                .midi_note = midi_note,
+            });
+        if (!submitted && edit.valid()) {
+            static_cast<void>(engine_.discardProgramEdit(edit));
+        }
+        return submitted;
+    }
+
+    void saveSoundOutputSettings() const {
+        const auto file = settingsFile();
+        if (file.getParentDirectory().createDirectory().failed()) {
+            return;
+        }
+        const auto path = file.getFullPathName();
+        const auto& settings = engine_.mamidiSettings();
+        const auto kind =
+            engine_.soundOutputKind()
+                    == mgstc::engine::SoundOutputKind::MAmidiMemo
+                ? L"MAmidiMemo"
+                : L"Emulator";
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SoundOutput",
+            L"Kind",
+            kind,
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SoundOutput",
+            L"Host",
+            juce::String(settings.host).toWideCharPointer(),
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SoundOutput",
+            L"Port",
+            juce::String(static_cast<int>(settings.port))
+                .toWideCharPointer(),
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SoundOutput",
+            L"UnitNo",
+            juce::String(static_cast<int>(settings.unit_no))
+                .toWideCharPointer(),
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SoundOutput",
+            L"SccPlus",
+            settings.scc_plus ? L"1" : L"0",
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SoundOutput",
+            L"WaveformMonitor",
+            settings.waveform_monitor ? L"1" : L"0",
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            nullptr,
+            nullptr,
+            nullptr,
+            path.toWideCharPointer()));
+    }
+
 private:
     [[nodiscard]] static juce::File settingsFile() {
         return applicationDataDirectory().getChildFile(
             "settings-v1.ini");
+    }
+
+    void loadAndApplySoundOutputSettings() {
+        const auto file = settingsFile();
+        mgstc::engine::MAmidiOutputSettings settings{};
+        wchar_t host_buffer[256]{};
+        if (file.existsAsFile()) {
+            static_cast<void>(GetPrivateProfileStringW(
+                L"SoundOutput",
+                L"Host",
+                L"localhost",
+                host_buffer,
+                static_cast<DWORD>(std::size(host_buffer)),
+                file.getFullPathName().toWideCharPointer()));
+            settings.host =
+                juce::String(host_buffer).toStdString();
+            settings.port = static_cast<std::uint16_t>(juce::jlimit(
+                1,
+                65535,
+                static_cast<int>(GetPrivateProfileIntW(
+                    L"SoundOutput",
+                    L"Port",
+                    30000,
+                    file.getFullPathName().toWideCharPointer()))));
+            settings.unit_no = static_cast<std::uint8_t>(juce::jlimit(
+                0,
+                255,
+                static_cast<int>(GetPrivateProfileIntW(
+                    L"SoundOutput",
+                    L"UnitNo",
+                    0,
+                    file.getFullPathName().toWideCharPointer()))));
+            settings.scc_plus =
+                GetPrivateProfileIntW(
+                    L"SoundOutput",
+                    L"SccPlus",
+                    0,
+                    file.getFullPathName().toWideCharPointer())
+                != 0;
+            settings.waveform_monitor =
+                GetPrivateProfileIntW(
+                    L"SoundOutput",
+                    L"WaveformMonitor",
+                    0,
+                    file.getFullPathName().toWideCharPointer())
+                != 0;
+        }
+        engine_.setMAmidiSettings(std::move(settings));
+
+        wchar_t kind_buffer[64]{};
+        if (file.existsAsFile()) {
+            static_cast<void>(GetPrivateProfileStringW(
+                L"SoundOutput",
+                L"Kind",
+                L"Emulator",
+                kind_buffer,
+                static_cast<DWORD>(std::size(kind_buffer)),
+                file.getFullPathName().toWideCharPointer()));
+        }
+        if (juce::String(kind_buffer) == "MAmidiMemo") {
+            // Connect if possible; keep Emulator if chip_server is down.
+            static_cast<void>(engine_.setSoundOutputKind(
+                mgstc::engine::SoundOutputKind::MAmidiMemo));
+        }
     }
 
     [[nodiscard]] static int loadMasterVolumePercent() {
@@ -1036,6 +1787,12 @@ private:
 
     mgstc::engine::RealtimeEngineHost engine_;
     mgstc::audio::WasapiAudioSink audio_;
+    SccWaveform shared_scc_wave_{
+        mgstc::engine::generateSccPreset(
+            mgstc::engine::SccWavePreset::Sine,
+            mgstc::engine::SccHarmonic::One)};
+    mgstc::engine::OpllPatchParameters shared_opll_patch_{
+        mgstc::engine::defaultOpllPatch()};
     bool running_{};
     int master_volume_percent_{100};
     std::uint64_t master_volume_revision_{1};
@@ -1090,8 +1847,7 @@ public:
         : engine_(audio_service.engine()),
           tooltip_window_(this, 500) {
         title_.setText(
-            juce::String::fromUTF8(
-                "MGS Tone Craft - JUCE移行プレビュー"),
+            juce::String::fromUTF8("MGS Tone Craft"),
             juce::dontSendNotification);
         title_.setFont(juce::FontOptions(22.0F, juce::Font::bold));
         title_.setJustificationType(juce::Justification::centredLeft);
@@ -1099,8 +1855,8 @@ public:
 
         description_.setText(
             juce::String::fromUTF8(
-                "既存の音源エンジンとWASAPI出力を維持したまま、"
-                "画面層をJUCEへ移行しています。"),
+                "音源エンジンとWASAPI出力を使い、"
+                "総合・SCC・OPLLの音色を編集します。"),
             juce::dontSendNotification);
         description_.setJustificationType(juce::Justification::topLeft);
         addAndMakeVisible(description_);
@@ -1536,7 +2292,7 @@ private:
         closeDevice();
         if (selected_identifier_.isEmpty()) {
             status_text_ = juce::String::fromUTF8(
-                "画面鍵盤 / PCキー Q=C・上段+1oct");
+                "画面鍵盤 / PCキー Z=C・上段+1oct");
             return;
         }
         const auto found = std::find_if(
@@ -1622,8 +2378,10 @@ public:
     using SuppressCallback = std::function<bool()>;
 
     explicit PerformanceKeyboard(
-        SharedMidiInputService& midi_service)
+        SharedMidiInputService& midi_service,
+        SharedAudioService& audio_service)
         : midi_service_(midi_service),
+          audio_service_(audio_service),
           keyboard_(
               keyboard_state_,
               juce::MidiKeyboardComponent::horizontalKeyboard) {
@@ -1635,6 +2393,10 @@ public:
         keyboard_.setColour(
             juce::MidiKeyboardComponent::keyDownOverlayColourId,
             juce::Colour(0xFF35C4ED));
+        // JUCE default is "awsedftgyhujkolp;" (home-row). Spec uses
+        // Z/S/X… + Q-row via pollPcKeyboard scan codes instead.
+        keyboard_.clearKeyMappings();
+        keyboard_.setWantsKeyboardFocus(false);
         addAndMakeVisible(keyboard_);
 
         midi_input_.setTextWhenNothingSelected(
@@ -1722,7 +2484,7 @@ public:
     }
 
     void showSettingsDialog() {
-        showMidiSettings();
+        showAppSettings();
     }
 
     [[nodiscard]] bool shouldConsumeKeyPress(
@@ -1780,8 +2542,6 @@ public:
     void resized() override {
         auto area = getLocalBounds();
         auto controls = area.removeFromTop(30);
-        midi_status_.setBounds(controls.removeFromLeft(300));
-        controls.removeFromLeft(10);
         mode_.setBounds(controls.removeFromLeft(68));
         controls.removeFromLeft(10);
         octave_down_.setBounds(controls.removeFromLeft(34));
@@ -1790,6 +2550,7 @@ public:
         controls.removeFromLeft(4);
         octave_up_.setBounds(controls.removeFromLeft(34));
         controls.removeFromLeft(12);
+        midi_status_.setBounds(controls);
         area.removeFromTop(5);
         keyboard_.setKeyWidth(
             static_cast<float>(area.getWidth()) / 56.0F);
@@ -1802,64 +2563,324 @@ private:
     static constexpr int kScreenMidiChannel = 15;
     static constexpr int kPcMidiChannel = 16;
 
-    void showMidiSettings() {
+    void showAppSettings(int initial_tab = 0) {
         syncMidiControls();
-        auto* dialog = new juce::AlertWindow(
-            juce::String::fromUTF8("MIDI設定"),
-            juce::String::fromUTF8(
-                "使用するMIDI入力機器を選択してください。\n"
-                "接続状態は鍵盤上部へ常時表示されます。"),
-            juce::MessageBoxIconType::NoIcon);
-        juce::StringArray devices;
-        devices.add(juce::String::fromUTF8("MIDI入力なし"));
-        for (const auto& device : midi_service_.devices()) {
-            devices.add(device.name);
-        }
-        dialog->addComboBox(
-            "midiInput", devices,
-            juce::String::fromUTF8("MIDI入力"));
-        if (auto* combo = dialog->getComboBoxComponent("midiInput")) {
-            combo->setSelectedId(
-                midi_input_.getSelectedId(),
-                juce::dontSendNotification);
-        }
-        dialog->addButton(
-            juce::String::fromUTF8("適用"), 1,
-            juce::KeyPress(juce::KeyPress::returnKey));
-        dialog->addButton(
-            juce::String::fromUTF8("一覧更新"), 2);
-        dialog->addButton(
-            juce::String::fromUTF8("キャンセル"), 0,
-            juce::KeyPress(juce::KeyPress::escapeKey));
-        juce::Component::SafePointer<PerformanceKeyboard> safe(this);
-        dialog->enterModalState(
+
+        class SettingsContent final : public juce::Component {
+        public:
+            SettingsContent(
+                SharedMidiInputService& midi_service,
+                SharedAudioService& audio_service,
+                int selected_midi_id,
+                int initial_tab)
+                : midi_service_(midi_service),
+                  audio_service_(audio_service) {
+                tabs_.setOutline(0);
+                addAndMakeVisible(tabs_);
+
+                auto* midi_page = new juce::Component();
+                midi_help_.setText(
+                    juce::String::fromUTF8(
+                        "使用するMIDI入力機器を選択してください。\n"
+                        "接続状態は鍵盤上部のオクターブ操作（.）の右側へ常時表示されます。"),
+                    juce::dontSendNotification);
+                midi_help_.setJustificationType(
+                    juce::Justification::topLeft);
+                midi_help_.setColour(
+                    juce::Label::textColourId,
+                    juce::Colour(0xFFE6EDF3));
+                midi_page->addAndMakeVisible(midi_help_);
+
+                juce::StringArray devices;
+                devices.add(juce::String::fromUTF8("MIDI入力なし"));
+                for (const auto& device : midi_service_.devices()) {
+                    devices.add(device.name);
+                }
+                midi_input_.addItemList(devices, 1);
+                midi_input_.setSelectedId(
+                    selected_midi_id, juce::dontSendNotification);
+                midi_page->addAndMakeVisible(midi_input_);
+
+                apply_midi_.setButtonText(
+                    juce::String::fromUTF8("適用"));
+                refresh_.setButtonText(
+                    juce::String::fromUTF8("一覧更新"));
+                midi_page->addAndMakeVisible(apply_midi_);
+                midi_page->addAndMakeVisible(refresh_);
+
+                auto* output_page = new juce::Component();
+                output_help_.setText(
+                    juce::String::fromUTF8(
+                        "音声の出力先を選びます。MAmidiMEmo は "
+                        "MAmidiMEmo.exe -chip_server 起動後に接続します。\n"
+                        "切断時はエミュレータへ自動切替しません。"),
+                    juce::dontSendNotification);
+                output_help_.setJustificationType(
+                    juce::Justification::topLeft);
+                output_help_.setColour(
+                    juce::Label::textColourId,
+                    juce::Colour(0xFFE6EDF3));
+                output_page->addAndMakeVisible(output_help_);
+
+                output_kind_.addItem(
+                    juce::String::fromUTF8("内蔵エミュレータ"), 1);
+                output_kind_.addItem("MAmidiMEmo RPC", 2);
+                output_kind_.setSelectedId(
+                    audio_service_.engine().soundOutputKind()
+                            == mgstc::engine::SoundOutputKind::MAmidiMemo
+                        ? 2
+                        : 1,
+                    juce::dontSendNotification);
+                output_page->addAndMakeVisible(output_kind_);
+
+                const auto& mamidi =
+                    audio_service_.engine().mamidiSettings();
+                host_.setText(mamidi.host, false);
+                port_.setInputRestrictions(5, "0123456789");
+                port_.setText(juce::String(mamidi.port), false);
+                unit_.setInputRestrictions(3, "0123456789");
+                unit_.setText(juce::String(mamidi.unit_no), false);
+                scc_plus_.setButtonText("SCC+");
+                scc_plus_.setToggleState(
+                    mamidi.scc_plus, juce::dontSendNotification);
+                waveform_monitor_.setButtonText(
+                    juce::String::fromUTF8("波形モニタ"));
+                waveform_monitor_.setTooltip(
+                    juce::String::fromUTF8(
+                        "MAmidiMEmo 経由で実機へ出力しているときも、"
+                        "画面の波形表示用に内蔵の音源シミュレーションで"
+                        "波形を生成します。"
+                        "パソコンのスピーカーからは鳴りません。"));
+                waveform_monitor_.setToggleState(
+                    mamidi.waveform_monitor,
+                    juce::dontSendNotification);
+                output_page->addAndMakeVisible(host_);
+                output_page->addAndMakeVisible(port_);
+                output_page->addAndMakeVisible(unit_);
+                output_page->addAndMakeVisible(scc_plus_);
+                output_page->addAndMakeVisible(waveform_monitor_);
+
+                apply_output_.setButtonText(
+                    juce::String::fromUTF8("適用"));
+                reconnect_.setButtonText(
+                    juce::String::fromUTF8("再接続"));
+                output_page->addAndMakeVisible(apply_output_);
+                output_page->addAndMakeVisible(reconnect_);
+
+                output_status_.setColour(
+                    juce::Label::textColourId,
+                    juce::Colour(0xFF9AA8B5));
+                output_status_.setText(
+                    juce::String::fromUTF8(
+                        audio_service_.engine()
+                            .soundOutputStatus()
+                            .c_str()),
+                    juce::dontSendNotification);
+                output_page->addAndMakeVisible(output_status_);
+
+                tabs_.addTab(
+                    "MIDI",
+                    juce::Colour(0xFF243040),
+                    midi_page,
+                    true);
+                tabs_.addTab(
+                    juce::String::fromUTF8("出力"),
+                    juce::Colour(0xFF243040),
+                    output_page,
+                    true);
+                tabs_.addTab(
+                    "About",
+                    juce::Colour(0xFF243040),
+                    new AboutPanel(),
+                    true);
+                tabs_.setCurrentTabIndex(
+                    juce::jlimit(0, 2, initial_tab),
+                    juce::dontSendNotification);
+
+                close_.setButtonText(
+                    juce::String::fromUTF8("閉じる"));
+                addAndMakeVisible(close_);
+                setSize(460, 560);
+            }
+
+            void resized() override {
+                auto area = getLocalBounds().reduced(10);
+                auto bottom = area.removeFromBottom(34);
+                close_.setBounds(bottom.removeFromRight(96));
+                area.removeFromBottom(8);
+                tabs_.setBounds(area);
+
+                if (auto* midi_page = tabs_.getTabContentComponent(0)) {
+                    auto page = midi_page->getLocalBounds().reduced(12);
+                    midi_help_.setBounds(page.removeFromTop(56));
+                    page.removeFromTop(8);
+                    midi_input_.setBounds(page.removeFromTop(28));
+                    page.removeFromTop(12);
+                    auto row = page.removeFromTop(30);
+                    apply_midi_.setBounds(row.removeFromLeft(96));
+                    row.removeFromLeft(8);
+                    refresh_.setBounds(row.removeFromLeft(96));
+                }
+                if (auto* output_page =
+                        tabs_.getTabContentComponent(1)) {
+                    auto page =
+                        output_page->getLocalBounds().reduced(12);
+                    output_help_.setBounds(page.removeFromTop(64));
+                    page.removeFromTop(8);
+                    output_kind_.setBounds(page.removeFromTop(28));
+                    page.removeFromTop(10);
+                    auto row = page.removeFromTop(28);
+                    host_.setBounds(row.removeFromLeft(180));
+                    row.removeFromLeft(8);
+                    port_.setBounds(row.removeFromLeft(72));
+                    row.removeFromLeft(8);
+                    unit_.setBounds(row.removeFromLeft(54));
+                    row.removeFromLeft(8);
+                    scc_plus_.setBounds(row.removeFromLeft(72));
+                    page.removeFromTop(10);
+                    waveform_monitor_.setBounds(page.removeFromTop(28));
+                    page.removeFromTop(12);
+                    auto buttons = page.removeFromTop(30);
+                    apply_output_.setBounds(buttons.removeFromLeft(96));
+                    buttons.removeFromLeft(8);
+                    reconnect_.setBounds(buttons.removeFromLeft(96));
+                    page.removeFromTop(12);
+                    output_status_.setBounds(page.removeFromTop(48));
+                }
+            }
+
+            void refreshOutputStatus() {
+                output_status_.setText(
+                    juce::String::fromUTF8(
+                        audio_service_.engine()
+                            .soundOutputStatus()
+                            .c_str()),
+                    juce::dontSendNotification);
+            }
+
+            juce::TabbedComponent tabs_{
+                juce::TabbedButtonBar::TabsAtTop};
+            juce::Label midi_help_;
+            juce::ComboBox midi_input_;
+            juce::TextButton apply_midi_;
+            juce::TextButton refresh_;
+            juce::Label output_help_;
+            juce::ComboBox output_kind_;
+            juce::TextEditor host_;
+            juce::TextEditor port_;
+            juce::TextEditor unit_;
+            juce::ToggleButton scc_plus_;
+            juce::ToggleButton waveform_monitor_;
+            juce::TextButton apply_output_;
+            juce::TextButton reconnect_;
+            juce::Label output_status_;
+            juce::TextButton close_;
+            SharedMidiInputService& midi_service_;
+            SharedAudioService& audio_service_;
+        };
+
+        auto* content = new SettingsContent(
+            midi_service_,
+            audio_service_,
+            midi_input_.getSelectedId(),
+            initial_tab);
+        auto* dialog = new juce::DialogWindow(
+            juce::String::fromUTF8("アプリ設定"),
+            juce::Colour(0xFF1B222C),
             true,
-            juce::ModalCallbackFunction::create(
-                [safe, dialog](int result) {
-                    if (safe == nullptr) {
-                        return;
-                    }
-                    if (result == 2) {
-                        safe->midi_service_.refreshDevices(false);
-                        safe->syncMidiControls();
-                        juce::MessageManager::callAsync([safe] {
-                            if (safe != nullptr) {
-                                safe->showMidiSettings();
-                            }
-                        });
-                        return;
-                    }
-                    if (result != 1) {
-                        return;
-                    }
-                    if (auto* combo =
-                            dialog->getComboBoxComponent("midiInput")) {
-                        safe->midi_input_.setSelectedId(
-                            combo->getSelectedId(),
-                            juce::sendNotificationSync);
-                    }
-                }),
             true);
+        dialog->setUsingNativeTitleBar(true);
+        dialog->setResizable(false, false);
+        dialog->setContentOwned(content, true);
+        dialog->centreAroundComponent(
+            this, content->getWidth(), content->getHeight() + 32);
+
+        juce::Component::SafePointer<PerformanceKeyboard> safe(this);
+        juce::Component::SafePointer<juce::DialogWindow> safe_dialog(
+            dialog);
+        juce::Component::SafePointer<SettingsContent> safe_content(
+            content);
+
+        content->apply_midi_.onClick = [safe, safe_content] {
+            if (safe == nullptr || safe_content == nullptr) {
+                return;
+            }
+            safe->midi_input_.setSelectedId(
+                safe_content->midi_input_.getSelectedId(),
+                juce::sendNotificationSync);
+            safe->syncMidiControls();
+        };
+        content->refresh_.onClick =
+            [safe, safe_dialog] {
+                if (safe == nullptr) {
+                    return;
+                }
+                safe->midi_service_.refreshDevices(false);
+                safe->syncMidiControls();
+                if (safe_dialog != nullptr) {
+                    safe_dialog->exitModalState(0);
+                }
+                juce::MessageManager::callAsync([safe] {
+                    if (safe != nullptr) {
+                        safe->showAppSettings(0);
+                    }
+                });
+            };
+        content->apply_output_.onClick = [safe, safe_content] {
+            if (safe == nullptr || safe_content == nullptr) {
+                return;
+            }
+            auto& engine = safe->audio_service_.engine();
+            mgstc::engine::MAmidiOutputSettings settings{};
+            settings.host = utf8String(
+                safe_content->host_.getText().trim());
+            if (settings.host.empty()) {
+                settings.host = "localhost";
+            }
+            settings.port = static_cast<std::uint16_t>(juce::jlimit(
+                1,
+                65535,
+                safe_content->port_.getText().getIntValue()));
+            settings.unit_no = static_cast<std::uint8_t>(juce::jlimit(
+                0,
+                255,
+                safe_content->unit_.getText().getIntValue()));
+            settings.scc_plus =
+                safe_content->scc_plus_.getToggleState();
+            settings.waveform_monitor =
+                safe_content->waveform_monitor_.getToggleState();
+            engine.setMAmidiSettings(std::move(settings));
+
+            const auto kind =
+                safe_content->output_kind_.getSelectedId() == 2
+                    ? mgstc::engine::SoundOutputKind::MAmidiMemo
+                    : mgstc::engine::SoundOutputKind::Emulator;
+            if (!engine.setSoundOutputKind(kind)
+                && kind
+                    == mgstc::engine::SoundOutputKind::MAmidiMemo) {
+                safe_content->output_kind_.setSelectedId(
+                    1, juce::dontSendNotification);
+            }
+            safe->audio_service_.saveSoundOutputSettings();
+            safe_content->refreshOutputStatus();
+            safe->syncMidiControls();
+        };
+        content->reconnect_.onClick = [safe, safe_content] {
+            if (safe == nullptr || safe_content == nullptr) {
+                return;
+            }
+            static_cast<void>(
+                safe->audio_service_.engine().reconnectMAmidi());
+            safe_content->refreshOutputStatus();
+            safe->syncMidiControls();
+        };
+        content->close_.onClick = [safe_dialog] {
+            if (safe_dialog != nullptr) {
+                safe_dialog->exitModalState(0);
+            }
+        };
+
+        dialog->enterModalState(true, nullptr, true);
     }
 
     struct HeldNote {
@@ -1936,7 +2957,12 @@ private:
             juce::dontSendNotification);
         syncing_midi_controls_ = false;
         midi_status_.setText(
-            midi_service_.statusText(),
+            midi_service_.statusText()
+                + " | "
+                + juce::String::fromUTF8(
+                    audio_service_.engine()
+                        .soundOutputStatus()
+                        .c_str()),
             juce::dontSendNotification);
     }
 
@@ -2150,7 +3176,7 @@ private:
         octave_label_.setText(
             juce::String::fromUTF8("PC Oct ")
                 + juce::String(pc_octave_)
-                + juce::String::fromUTF8("  Q=C"),
+                + juce::String::fromUTF8("  Z=C"),
             juce::dontSendNotification);
     }
 
@@ -2176,6 +3202,7 @@ private:
     }
 
     SharedMidiInputService& midi_service_;
+    SharedAudioService& audio_service_;
     juce::MidiKeyboardState keyboard_state_;
     MgscMidiKeyboardComponent keyboard_;
     juce::ComboBox midi_input_;
@@ -3465,7 +4492,7 @@ public:
           engine_(audio_service.engine()),
           tooltip_window_(this, 450),
           timbre_(mgstc::engine::defaultCompositeTimbre()),
-          performance_keyboard_(midi_service) {
+          performance_keyboard_(midi_service, audio_service_) {
         setWantsKeyboardFocus(true);
         last_audition_note_ = loadLastAuditionNoteSetting();
 
@@ -3760,7 +4787,7 @@ public:
         updateStatus(
             engine_ready_
                 ? juce::String::fromUTF8(
-                      "準備完了 / PC鍵盤 Q=C・上段+1oct・[,] [.]=oct移動")
+                      "準備完了 / PC鍵盤 Z=C・上段+1oct・[,] [.]=oct移動")
                 : juce::String::fromUTF8(
                       "音声出力を開始できませんでした"));
     }
@@ -5012,7 +6039,7 @@ public:
           audio_service_(audio_service),
           engine_(audio_service.engine()),
           tooltip_window_(this, 450),
-          performance_keyboard_(midi_service) {
+          performance_keyboard_(midi_service, audio_service_) {
         setWantsKeyboardFocus(true);
         scc_wave_ = mgstc::engine::generateSccPreset(
             mgstc::engine::SccWavePreset::Sine,
@@ -5071,7 +6098,7 @@ public:
             paste_,
             EditorIcon::Paste,
             juce::String::fromUTF8(
-                "貼り付け（音声、WAVファイル、SCC定義）"),
+                "貼り付け（音声、画像背景、WAV、SCC定義）"),
             [this] { pasteClipboard(); });
         configureIconButton(
             copy_,
@@ -5206,12 +6233,37 @@ public:
         }
         updateMergeControlState();
 
+        preset_flip_h_.setButtonText(
+            juce::String::fromUTF8("左右反転"));
+        preset_flip_h_.setTooltip(
+            juce::String::fromUTF8(
+                "プリセット候補を左右反転（サンプル順の反転）します"));
+        preset_flip_h_.setLookAndFeel(&switch_look_and_feel_);
+        preset_flip_h_.onClick = [this] { refreshPresetPreview(); };
+        addAndMakeVisible(preset_flip_h_);
+        preset_flip_v_.setButtonText(
+            juce::String::fromUTF8("上下反転"));
+        preset_flip_v_.setTooltip(
+            juce::String::fromUTF8(
+                "プリセット候補を上下反転（極性反転）します。"
+                "Saw の向き切替にも使えます"));
+        preset_flip_v_.setLookAndFeel(&switch_look_and_feel_);
+        preset_flip_v_.onClick = [this] { refreshPresetPreview(); };
+        addAndMakeVisible(preset_flip_v_);
+
         configureButton(
             apply_preset_,
             juce::String::fromUTF8("適用"),
             juce::String::fromUTF8(
                 "選択したプリセットを波形へ適用します"),
             [this] { applyPreset(); });
+        configureButton(
+            cancel_preview_,
+            juce::String::fromUTF8("取消"),
+            juce::String::fromUTF8(
+                "プレビュー候補を破棄し、確定波形へ戻します"),
+            [this] { cancelPreview(); });
+        cancel_preview_.setEnabled(false);
 
         configureIconButton(
             undo_,
@@ -5223,6 +6275,13 @@ public:
             EditorIcon::Redo,
             "Redo (Ctrl+Y)",
             [this] { redo(); });
+        configureButton(
+            ab_audition_,
+            "A/B",
+            juce::String::fromUTF8(
+                "候補があるとき、確定波形(A)と候補(B)を交互に試聴します"),
+            [this] { auditionAbCompare(); });
+        ab_audition_.setEnabled(false);
         configureIconButton(
             average_,
             EditorIcon::Average,
@@ -5293,19 +6352,41 @@ public:
             juce::String::fromUTF8(
                 "波形の縦倍率。バーを離した時点で適用します"));
         vertical_scale_.onDragStart = [this] {
+            if (preview_active_) {
+                dismissPreviewState(false);
+            }
             scale_source_ = scc_wave_;
+            scale_previewing_ = true;
         };
         vertical_scale_.onValueChange = [this] {
             scale_reset_.setButtonText(
                 juce::String(
                     juce::roundToInt(vertical_scale_.getValue()))
                 + "%");
-        };
-        vertical_scale_.onDragEnd = [this] {
-            commitWave(
+            if (!scale_previewing_
+                && !vertical_scale_.isMouseButtonDown()) {
+                return;
+            }
+            const auto scaled =
                 mgstc::engine::scaleSccWaveformVertically(
                     scale_source_,
-                    juce::roundToInt(vertical_scale_.getValue())));
+                    juce::roundToInt(vertical_scale_.getValue()));
+            graph_.setPreview(scc_wave_, scaled);
+            if (immediate_audition_.getToggleState()
+                && engine_ready_) {
+                static_cast<void>(auditionAfterEdit(&scaled));
+            }
+        };
+        vertical_scale_.onDragEnd = [this] {
+            scale_previewing_ = false;
+            const auto percent =
+                juce::roundToInt(vertical_scale_.getValue());
+            commitWave(
+                mgstc::engine::scaleSccWaveformVertically(
+                    scale_source_, percent));
+            vertical_scale_.setValue(
+                100.0, juce::dontSendNotification);
+            scale_reset_.setButtonText("100%");
         };
         addAndMakeVisible(vertical_scale_);
 
@@ -5319,6 +6400,9 @@ public:
                 vertical_scale_.setValue(
                     100.0, juce::dontSendNotification);
                 scale_reset_.setButtonText("100%");
+                if (scale_previewing_) {
+                    graph_.setPreview(scc_wave_, scale_source_);
+                }
             });
 
         graph_.setWaveform(scc_wave_);
@@ -5343,7 +6427,108 @@ public:
             [this](const SccWaveform& waveform) {
                 commitWave(waveform);
             });
+        graph_.setPreviewClearedCallback([this] {
+            dismissPreviewState(false);
+        });
         addAndMakeVisible(graph_);
+
+        background_load_.setButtonText(
+            juce::String::fromUTF8("背景…"));
+        background_load_.setTooltip(
+            juce::String::fromUTF8(
+                "波形トレース用の背景画像を読み込みます。"
+                "音色値は変更しません"));
+        background_load_.onClick = [this] { chooseBackgroundImage(); };
+        addAndMakeVisible(background_load_);
+        background_clear_.setButtonText(
+            juce::String::fromUTF8("背景消"));
+        background_clear_.setTooltip(
+            juce::String::fromUTF8(
+                "背景画像の参照をクリアします"));
+        background_clear_.onClick = [this] {
+            background_path_.clear();
+            background_image_ = {};
+            applyBackgroundToGraph();
+            saveBackgroundSettings();
+            updateStatus(
+                juce::String::fromUTF8("背景画像をクリアしました"));
+        };
+        addAndMakeVisible(background_clear_);
+        background_visible_.setButtonText(
+            juce::String::fromUTF8("背景表示"));
+        background_visible_.setToggleState(
+            true, juce::dontSendNotification);
+        background_visible_.onClick = [this] {
+            applyBackgroundToGraph();
+            saveBackgroundSettings();
+        };
+        addAndMakeVisible(background_visible_);
+        const auto configure_bg_slider = [this](
+            juce::Slider& slider,
+            double minimum,
+            double maximum,
+            double initial,
+            const juce::String& tip) {
+            slider.setRange(minimum, maximum, 1.0);
+            slider.setValue(initial, juce::dontSendNotification);
+            slider.setSliderStyle(juce::Slider::LinearHorizontal);
+            slider.setTextBoxStyle(
+                juce::Slider::TextBoxRight, false, 52, 22);
+            slider.setTooltip(tip);
+            slider.onValueChange = [this] {
+                applyBackgroundToGraph();
+            };
+            slider.onDragEnd = [this] {
+                saveBackgroundSettings();
+            };
+            addAndMakeVisible(slider);
+        };
+        configure_bg_slider(
+            background_opacity_,
+            0.0,
+            100.0,
+            35.0,
+            juce::String::fromUTF8("背景の不透明度 %"));
+        configure_bg_slider(
+            background_x_,
+            -512.0,
+            512.0,
+            0.0,
+            juce::String::fromUTF8("背景のX位置（px）"));
+        configure_bg_slider(
+            background_y_,
+            -512.0,
+            512.0,
+            0.0,
+            juce::String::fromUTF8("背景のY位置（px）"));
+        configure_bg_slider(
+            background_width_,
+            8.0,
+            2048.0,
+            320.0,
+            juce::String::fromUTF8("背景の表示幅（px）"));
+        configure_bg_slider(
+            background_height_,
+            8.0,
+            2048.0,
+            160.0,
+            juce::String::fromUTF8("背景の表示高さ（px）"));
+        background_opacity_label_.setText(
+            "Op%", juce::dontSendNotification);
+        background_x_label_.setText("X", juce::dontSendNotification);
+        background_y_label_.setText("Y", juce::dontSendNotification);
+        background_w_label_.setText("W", juce::dontSendNotification);
+        background_h_label_.setText("H", juce::dontSendNotification);
+        for (auto* label :
+             {&background_opacity_label_,
+              &background_x_label_,
+              &background_y_label_,
+              &background_w_label_,
+              &background_h_label_}) {
+            label->setJustificationType(
+                juce::Justification::centredRight);
+            addAndMakeVisible(*label);
+        }
 
         library_title_.setText(
             juce::String::fromUTF8("音色ライブラリ"),
@@ -5481,8 +6666,9 @@ public:
         loadLibrary();
         setEditorBaseline();
         updateDefinitionPreview();
+        loadBackgroundSettings();
         refreshPresetPreview(false);
-        setSize(1320, 850);
+        setSize(1360, 900);
         engine_ready_ = audio_service.running()
             && configureEngine(false);
         startTimerHz(60);
@@ -5491,7 +6677,7 @@ public:
                 ? juce::String::fromUTF8("準備完了")
                 : juce::String::fromUTF8(
                     "音声出力を開始できませんでした"));
-        consumePendingSccConversion();
+        static_cast<void>(consumePendingSccConversion());
     }
 
     void prepareVisualInspection() {
@@ -5499,27 +6685,35 @@ public:
         refreshPresetPreview(false);
         updateStatus(
             juce::String::fromUTF8(
-                "目視検査: 現在波形と変更後を重ね表示"));
+                "目視検査: 確定（緑）と候補（橙破線）を重ね表示"));
     }
 
     void refreshExternalState() {
         synchronizeMasterVolumeSlider(
             master_volume_, master_volume_revision_, audio_service_);
-        consumePendingSccConversion();
+        // pending取込が試聴を始めた直後に configureEngine(false) すると
+        // hardResetで音が消えるため、取込成功時は再構成しない。
+        if (!consumePendingSccConversion() && engine_ready_) {
+            static_cast<void>(configureEngine(false));
+        }
     }
 
     void deactivate() {
+        saveBackgroundSettings();
         performance_keyboard_.allNotesOff();
-        stopNote();
+        silenceAllVoices();
     }
 
     ~SccEditorComponent() override {
+        saveBackgroundSettings();
         stopTimer();
         performance_keyboard_.allNotesOff();
         merge_enabled_.setLookAndFeel(nullptr);
         auto_phase_.setLookAndFeel(nullptr);
         polarity_.setLookAndFeel(nullptr);
         preserve_volume_.setLookAndFeel(nullptr);
+        preset_flip_h_.setLookAndFeel(nullptr);
+        preset_flip_v_.setLookAndFeel(nullptr);
         favorite_.setLookAndFeel(nullptr);
     }
 
@@ -5531,7 +6725,7 @@ public:
         content.removeFromRight(8);
         auto panel = content
             .withTrimmedTop(216)
-            .withTrimmedBottom(24);
+            .withTrimmedBottom(64);
         graphics.setColour(juce::Colour(0xFF29323C));
         graphics.fillRoundedRectangle(panel.toFloat(), 9.0F);
         graphics.fillRoundedRectangle(
@@ -5594,7 +6788,11 @@ public:
         apply_range_.setBounds(preset_row.removeFromLeft(110));
         preset_row.removeFromLeft(8);
         apply_preset_.setBounds(preset_row.removeFromLeft(70));
-        preset_row.removeFromLeft(12);
+        preset_row.removeFromLeft(6);
+        cancel_preview_.setBounds(preset_row.removeFromLeft(56));
+        preset_row.removeFromLeft(8);
+        ab_audition_.setBounds(preset_row.removeFromLeft(52));
+        preset_row.removeFromLeft(8);
         average_.setBounds(preset_row.removeFromLeft(42));
         preset_row.removeFromLeft(6);
         normalize_.setBounds(preset_row.removeFromLeft(42));
@@ -5610,10 +6808,14 @@ public:
         auto_phase_.setBounds(merge_row.removeFromLeft(104));
         polarity_.setBounds(merge_row.removeFromLeft(112));
         preserve_volume_.setBounds(merge_row.removeFromLeft(104));
+        merge_row.removeFromLeft(12);
+        preset_flip_h_.setBounds(merge_row.removeFromLeft(88));
+        merge_row.removeFromLeft(6);
+        preset_flip_v_.setBounds(merge_row.removeFromLeft(88));
 
         area.removeFromTop(14);
         auto editor_row = area.removeFromTop(
-            juce::jmax(310, area.getHeight() - 86));
+            juce::jmax(240, area.getHeight() - 196));
         graph_.setBounds(editor_row.withTrimmedRight(220));
         auto tool_area = editor_row.removeFromRight(210);
         auto cursor_area = tool_area.removeFromLeft(86);
@@ -5642,7 +6844,44 @@ public:
         scale_reset_.setBounds(scale_area.removeFromBottom(34));
         scale_area.removeFromBottom(8);
         vertical_scale_.setBounds(scale_area);
-        area.removeFromTop(12);
+        area.removeFromTop(8);
+        auto background_tools = area.removeFromTop(30);
+        background_load_.setBounds(
+            background_tools.removeFromLeft(64));
+        background_tools.removeFromLeft(4);
+        background_clear_.setBounds(
+            background_tools.removeFromLeft(64));
+        background_tools.removeFromLeft(6);
+        background_visible_.setBounds(
+            background_tools.removeFromLeft(90));
+        background_tools.removeFromLeft(6);
+        background_opacity_label_.setBounds(
+            background_tools.removeFromLeft(28));
+        background_opacity_.setBounds(
+            background_tools.removeFromLeft(140));
+        area.removeFromTop(4);
+        auto background_pos = area.removeFromTop(30);
+        const auto pos_half =
+            (background_pos.getWidth() - 12) / 2;
+        auto x_area = background_pos.removeFromLeft(pos_half);
+        background_x_label_.setBounds(x_area.removeFromLeft(18));
+        background_x_.setBounds(x_area);
+        background_pos.removeFromLeft(12);
+        background_y_label_.setBounds(
+            background_pos.removeFromLeft(18));
+        background_y_.setBounds(background_pos);
+        area.removeFromTop(4);
+        auto background_size = area.removeFromTop(30);
+        const auto size_half =
+            (background_size.getWidth() - 12) / 2;
+        auto w_area = background_size.removeFromLeft(size_half);
+        background_w_label_.setBounds(w_area.removeFromLeft(18));
+        background_width_.setBounds(w_area);
+        background_size.removeFromLeft(12);
+        background_h_label_.setBounds(
+            background_size.removeFromLeft(18));
+        background_height_.setBounds(background_size);
+        area.removeFromTop(8);
         auto footer = area.removeFromTop(42);
         status_.setBounds(footer);
 
@@ -5764,10 +7003,10 @@ private:
     }
 
     void rebuildPresetMenu() {
-        constexpr std::array<const char*, 7> names{
-            "Sine", "Square", "Triangle", "Saw Up", "Saw Down",
+        constexpr std::array<const char*, 6> names{
+            "Sine", "Square", "Triangle", "Saw",
             "Pulse 25%", "Pulse 12.5%"};
-        const int selected = juce::jlimit(1, 7, preset_.getSelectedId());
+        const int selected = juce::jlimit(1, 6, preset_.getSelectedId());
         auto* menu = preset_.getRootMenu();
         menu->clear();
         const auto harmonic = selectedHarmonic();
@@ -5786,7 +7025,7 @@ private:
 
     [[nodiscard]] mgstc::engine::SccWavePreset
     selectedPreset() const noexcept {
-        const auto value = juce::jlimit(1, 7, preset_.getSelectedId());
+        const auto value = juce::jlimit(1, 6, preset_.getSelectedId());
         return static_cast<mgstc::engine::SccWavePreset>(value - 1);
     }
 
@@ -5929,29 +7168,34 @@ private:
             output_number_.grabKeyboardFocus();
             return;
         }
-        juce::SystemClipboard::copyTextToClipboard(definition);
+        if (!mgstc::platform::copyTextToClipboardUnicodeAndAnsi(
+                std::wstring(definition.toWideCharPointer()))) {
+            juce::SystemClipboard::copyTextToClipboard(definition);
+        }
         updateStatus(
             juce::String::fromUTF8(
                 "SCC音色定義をコピーしました"));
     }
 
-    void consumePendingSccConversion() {
+    [[nodiscard]] bool consumePendingSccConversion() {
         const auto file = pendingConversionFile("scc");
         if (!file.existsAsFile()) {
-            return;
+            return false;
         }
         const auto text = utf8Text(file.loadFileAsString());
         const auto parsed =
             mgstc::engine::parseMgsSccDefinition(text);
         if (!parsed) {
+            static_cast<void>(file.deleteFile());
             updateStatus(juce::String::fromUTF8(
                 "受信したSCC近似波形を読み込めませんでした"));
-            return;
+            return false;
         }
         static_cast<void>(file.deleteFile());
         commitWave(parsed->waveform);
         updateStatus(juce::String::fromUTF8(
             "OPLLから近似変換したSCC波形を読み込みました"));
+        return true;
     }
 
     bool importWaveBytes(
@@ -5999,6 +7243,34 @@ private:
             return;
         }
 
+        if (const auto image_bytes =
+                mgstc::platform::clipboardImageBytes()) {
+            auto image = loadImageBytesForBackground(*image_bytes);
+            if (image.isValid()) {
+                background_path_.clear();
+                background_image_ = std::move(image);
+                background_visible_.setToggleState(
+                    true, juce::dontSendNotification);
+                if (background_width_.getValue() < 8.0
+                    || background_height_.getValue() < 8.0) {
+                    background_width_.setValue(
+                        static_cast<double>(
+                            background_image_.getWidth()),
+                        juce::dontSendNotification);
+                    background_height_.setValue(
+                        static_cast<double>(
+                            background_image_.getHeight()),
+                        juce::dontSendNotification);
+                }
+                applyBackgroundToGraph();
+                saveBackgroundSettings();
+                updateStatus(
+                    juce::String::fromUTF8(
+                        "クリップボード画像を背景へ貼り付けました"));
+                return;
+            }
+        }
+
         const auto text =
             juce::SystemClipboard::getTextFromClipboard();
         const auto utf8 = text.toRawUTF8();
@@ -6010,7 +7282,7 @@ private:
             showError(
                 juce::String::fromUTF8("貼り付け"),
                 juce::String::fromUTF8(
-                    "クリップボードにWAV音声、WAVファイル、"
+                    "クリップボードにWAV音声、画像、"
                     "またはSCC音色定義がありません"));
             return;
         }
@@ -6022,30 +7294,231 @@ private:
                 "SCC音色定義を貼り付けました"));
     }
 
+    void chooseBackgroundImage() {
+        juce::FileChooser chooser(
+            juce::String::fromUTF8("背景画像を開く"),
+            juce::File(),
+            "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff");
+        if (!chooser.browseForFileToOpen()) {
+            return;
+        }
+        setBackgroundFromFile(chooser.getResult());
+    }
+
+    void setBackgroundFromFile(const juce::File& file) {
+        auto image = loadImageFileForBackground(file);
+        background_path_ = file.getFullPathName();
+        if (!image.isValid()) {
+            background_image_ = {};
+            applyBackgroundToGraph();
+            saveBackgroundSettings();
+            updateStatus(
+                juce::String::fromUTF8(
+                    "背景画像を開けませんでした（パスは保持）"));
+            return;
+        }
+        background_image_ = std::move(image);
+        background_visible_.setToggleState(
+            true, juce::dontSendNotification);
+        background_width_.setValue(
+            static_cast<double>(background_image_.getWidth()),
+            juce::dontSendNotification);
+        background_height_.setValue(
+            static_cast<double>(background_image_.getHeight()),
+            juce::dontSendNotification);
+        applyBackgroundToGraph();
+        saveBackgroundSettings();
+        updateStatus(
+            juce::String::fromUTF8("背景画像を読み込みました"));
+    }
+
+    void applyBackgroundToGraph() {
+        graph_.setBackgroundImage(
+            background_image_,
+            background_visible_.getToggleState(),
+            static_cast<float>(background_opacity_.getValue())
+                / 100.0F,
+            juce::roundToInt(background_x_.getValue()),
+            juce::roundToInt(background_y_.getValue()),
+            juce::roundToInt(background_width_.getValue()),
+            juce::roundToInt(background_height_.getValue()));
+    }
+
+    void loadBackgroundSettings() {
+        const auto file = settingsFile();
+        background_path_.clear();
+        background_image_ = {};
+        if (!file.existsAsFile()) {
+            applyBackgroundToGraph();
+            return;
+        }
+        const auto path = file.getFullPathName();
+        wchar_t path_buffer[1024]{};
+        static_cast<void>(GetPrivateProfileStringW(
+            L"SccBackground",
+            L"Path",
+            L"",
+            path_buffer,
+            static_cast<DWORD>(std::size(path_buffer)),
+            path.toWideCharPointer()));
+        background_path_ = juce::String(path_buffer);
+        background_visible_.setToggleState(
+            GetPrivateProfileIntW(
+                L"SccBackground",
+                L"Visible",
+                1,
+                path.toWideCharPointer())
+                != 0,
+            juce::dontSendNotification);
+        background_opacity_.setValue(
+            GetPrivateProfileIntW(
+                L"SccBackground",
+                L"Opacity",
+                35,
+                path.toWideCharPointer()),
+            juce::dontSendNotification);
+        background_x_.setValue(
+            static_cast<int>(GetPrivateProfileIntW(
+                L"SccBackground",
+                L"X",
+                0,
+                path.toWideCharPointer())),
+            juce::dontSendNotification);
+        background_y_.setValue(
+            static_cast<int>(GetPrivateProfileIntW(
+                L"SccBackground",
+                L"Y",
+                0,
+                path.toWideCharPointer())),
+            juce::dontSendNotification);
+        background_width_.setValue(
+            GetPrivateProfileIntW(
+                L"SccBackground",
+                L"Width",
+                320,
+                path.toWideCharPointer()),
+            juce::dontSendNotification);
+        background_height_.setValue(
+            GetPrivateProfileIntW(
+                L"SccBackground",
+                L"Height",
+                160,
+                path.toWideCharPointer()),
+            juce::dontSendNotification);
+
+        if (background_path_.isNotEmpty()) {
+            background_image_ = loadImageFileForBackground(
+                juce::File(background_path_));
+            if (!background_image_.isValid()) {
+                updateStatus(
+                    juce::String::fromUTF8(
+                        "背景画像ファイルが見つかりません"
+                        "（設定は保持）"));
+            }
+        }
+        applyBackgroundToGraph();
+    }
+
+    void saveBackgroundSettings() {
+        const auto file = settingsFile();
+        if (file.getParentDirectory()
+                .createDirectory()
+                .failed()) {
+            return;
+        }
+        const auto path = file.getFullPathName();
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SccBackground",
+            L"SchemaVersion",
+            L"1",
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SccBackground",
+            L"Path",
+            background_path_.toWideCharPointer(),
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SccBackground",
+            L"Visible",
+            background_visible_.getToggleState() ? L"1" : L"0",
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SccBackground",
+            L"Opacity",
+            juce::String(
+                juce::roundToInt(background_opacity_.getValue()))
+                .toWideCharPointer(),
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SccBackground",
+            L"X",
+            juce::String(
+                juce::roundToInt(background_x_.getValue()))
+                .toWideCharPointer(),
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SccBackground",
+            L"Y",
+            juce::String(
+                juce::roundToInt(background_y_.getValue()))
+                .toWideCharPointer(),
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SccBackground",
+            L"Width",
+            juce::String(
+                juce::roundToInt(background_width_.getValue()))
+                .toWideCharPointer(),
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"SccBackground",
+            L"Height",
+            juce::String(
+                juce::roundToInt(background_height_.getValue()))
+                .toWideCharPointer(),
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            nullptr, nullptr, nullptr, path.toWideCharPointer()));
+    }
+
     void convertToOpll() {
+        audio_service_.setSharedSccWaveform(scc_wave_);
+        static_cast<void>(configureEngine(false));
         updateStatus(juce::String::fromUTF8(
             "SCC音色をOPLLへ近似変換しています…"));
-        const auto pcm = makeSccReferencePcm(scc_wave_);
-        const auto candidates =
-            mgstc::engine::approximateWavePcmCandidatesWithOpll(pcm);
-        if (candidates.empty()) {
-            updateStatus(juce::String::fromUTF8(
-                "OPLL近似候補を生成できませんでした"));
-            return;
-        }
-        const auto definition =
-            mgstc::engine::formatMgsOpllDefinition(candidates.front(), 15);
-        const auto file = pendingConversionFile("opll");
-        if (!file.getParentDirectory().createDirectory()
-            || !file.replaceWithText(
-                juce::String::fromUTF8(definition.c_str()))) {
-            updateStatus(juce::String::fromUTF8(
-                "OPLL変換データを保存できませんでした"));
-            return;
-        }
-        open_editor_("opll");
-        updateStatus(juce::String::fromUTF8(
-            "OPLL近似音色を生成し、OPLLエディタへ送りました"));
+        juce::Component::SafePointer<SccEditorComponent> safe(this);
+        const auto waveform = scc_wave_;
+        runWithConversionBusyDialog(
+            this,
+            [waveform] {
+                return mgstc::engine::
+                    approximateSccWaveformCandidatesWithOpll(waveform);
+            },
+            [safe](std::vector<mgstc::engine::OpllPatchParameters>
+                       candidates) {
+                if (safe == nullptr) {
+                    return;
+                }
+                if (candidates.empty()) {
+                    safe->updateStatus(juce::String::fromUTF8(
+                        "OPLL近似候補を生成できませんでした"));
+                    return;
+                }
+                const auto definition =
+                    mgstc::engine::formatMgsOpllDefinition(
+                        candidates.front(), 15);
+                const auto file = pendingConversionFile("opll");
+                if (!file.getParentDirectory().createDirectory()
+                    || !file.replaceWithText(
+                        juce::String::fromUTF8(definition.c_str()))) {
+                    safe->updateStatus(juce::String::fromUTF8(
+                        "OPLL変換データを保存できませんでした"));
+                    return;
+                }
+                safe->open_editor_("opll");
+                safe->updateStatus(juce::String::fromUTF8(
+                    "OPLL近似音色を生成し、OPLLエディタへ送りました"));
+            });
     }
 
     void importWaveFile() {
@@ -6723,13 +8196,19 @@ private:
 
     void applyPreset() {
         const auto candidate = makePresetCandidate();
-        preview_active_ = false;
+        dismissPreviewState(false);
         commitWave(candidate);
     }
 
     [[nodiscard]] SccWaveform makePresetCandidate() const {
-        const auto generated = mgstc::engine::generateSccPreset(
+        auto generated = mgstc::engine::generateSccPreset(
             selectedPreset(), selectedHarmonic());
+        if (preset_flip_h_.getToggleState()) {
+            generated = mgstc::engine::mirrorSccWaveform(generated);
+        }
+        if (preset_flip_v_.getToggleState()) {
+            generated = mgstc::engine::invertSccWaveform(generated);
+        }
         if (!merge_enabled_.getToggleState()) {
             return mgstc::engine::applySccWaveformRange(
                 scc_wave_, generated, selectedApplyRange());
@@ -6749,12 +8228,26 @@ private:
             scc_wave_, merged.waveform, selectedApplyRange());
     }
 
+    [[nodiscard]] SccWaveform makePresetPreviewWave() const {
+        auto generated = mgstc::engine::generateSccPreset(
+            selectedPreset(), selectedHarmonic());
+        if (preset_flip_h_.getToggleState()) {
+            generated = mgstc::engine::mirrorSccWaveform(generated);
+        }
+        if (preset_flip_v_.getToggleState()) {
+            generated = mgstc::engine::invertSccWaveform(generated);
+        }
+        return generated;
+    }
+
     void refreshPresetPreview(bool audition = true) {
         preview_wave_ = makePresetCandidate();
         preview_active_ = true;
-        preset_preview_.setWaveform(
-            mgstc::engine::generateSccPreset(
-                selectedPreset(), selectedHarmonic()));
+        ab_next_plays_b_ = true;
+        cancel_preview_.setEnabled(true);
+        ab_audition_.setEnabled(true);
+        updateAbAuditionButton();
+        preset_preview_.setWaveform(makePresetPreviewWave());
         graph_.setPreview(scc_wave_, preview_wave_);
         if (audition && engine_ready_) {
             static_cast<void>(auditionAfterEdit(&preview_wave_));
@@ -6762,9 +8255,79 @@ private:
         updateStatus(
             merge_enabled_.getToggleState()
                 ? juce::String::fromUTF8(
-                    "マージ候補をプレビュー中（適用で確定）")
+                    "マージ候補をプレビュー中（適用／取消）")
                 : juce::String::fromUTF8(
-                    "プリセット候補をプレビュー中（適用で確定）"));
+                    "プリセット候補をプレビュー中（適用／取消）"));
+    }
+
+    void cancelPreview() {
+        if (!preview_active_) {
+            return;
+        }
+        dismissPreviewState(true);
+        graph_.setWaveform(scc_wave_);
+        updateDefinitionPreview();
+        if (immediate_audition_.getToggleState()) {
+            static_cast<void>(auditionAfterEdit());
+        } else {
+            stopNote();
+            static_cast<void>(configureEngine(false));
+        }
+        updateStatus(
+            juce::String::fromUTF8("プレビューを取り消しました"));
+    }
+
+    void auditionAbCompare() {
+        if (!preview_active_ || !engine_ready_) {
+            return;
+        }
+        const bool play_b = ab_next_plays_b_;
+        const SccWaveform* wave =
+            play_b ? &preview_wave_ : &scc_wave_;
+        if (!auditionOneSecond(wave)) {
+            updateStatus(
+                juce::String::fromUTF8(
+                    "A/B試聴を開始できませんでした"));
+            return;
+        }
+        ab_next_plays_b_ = !play_b;
+        updateAbAuditionButton();
+        updateStatus(
+            (play_b
+                 ? juce::String::fromUTF8("B 候補を試聴中: ")
+                 : juce::String::fromUTF8("A 原音を試聴中: "))
+            + midiNoteName(last_audition_note_));
+    }
+
+    void dismissPreviewState(bool keep_graph_overlay_clear) {
+        preview_active_ = false;
+        ab_next_plays_b_ = true;
+        cancel_preview_.setEnabled(false);
+        ab_audition_.setEnabled(false);
+        updateAbAuditionButton();
+        if (keep_graph_overlay_clear) {
+            graph_.clearPreviewOverlay();
+        }
+    }
+
+    void updateAbAuditionButton() {
+        const auto tip = !preview_active_
+            ? juce::String::fromUTF8(
+                  "候補があるとき、確定波形(A)と候補(B)を交互に試聴します")
+            : (ab_next_plays_b_
+                   ? juce::String::fromUTF8(
+                         "次は B（候補）を試聴します")
+                   : juce::String::fromUTF8(
+                         "次は A（確定）を試聴します"));
+        ab_audition_.setButtonText(
+            !preview_active_
+                ? "A/B"
+                : (ab_next_plays_b_
+                       ? juce::String::fromUTF8("▶B")
+                       : juce::String::fromUTF8("▶A")));
+        ab_audition_.setTooltip(tip);
+        ab_audition_.setTitle(tip);
+        ab_audition_.setDescription(tip);
     }
 
     void updateMergeControlState() {
@@ -6776,10 +8339,15 @@ private:
     }
 
     void commitWave(const SccWaveform& waveform) {
-        preview_active_ = false;
+        dismissPreviewState(false);
+        scale_previewing_ = false;
         if (waveform == scc_wave_) {
             graph_.setWaveform(scc_wave_);
             updateDefinitionPreview();
+            // 縦スケール100%でもドラッグ中の一時試聴を確定音色へ戻す。
+            if (engine_ready_) {
+                static_cast<void>(configureEngine(false));
+            }
             return;
         }
         scc_wave_ = waveform;
@@ -6796,7 +8364,11 @@ private:
             ++history_cursor_;
         }
         updateHistoryButtons();
-        const auto refreshed = auditionAfterEdit();
+        const bool audition = immediate_audition_.getToggleState();
+        const auto refreshed = configureEngine(audition);
+        if (audition && refreshed) {
+            armOneSecondPreview();
+        }
         updateStatus(
             refreshed
                 ? juce::String::fromUTF8("波形を更新しました")
@@ -6805,12 +8377,16 @@ private:
     }
 
     void restoreHistory() {
-        preview_active_ = false;
+        dismissPreviewState(false);
+        scale_previewing_ = false;
         scc_wave_ = history_[history_cursor_];
         graph_.setWaveform(scc_wave_);
         updateDefinitionPreview();
         updateHistoryButtons();
-        static_cast<void>(auditionAfterEdit());
+        const bool audition = immediate_audition_.getToggleState();
+        if (configureEngine(audition) && audition) {
+            armOneSecondPreview();
+        }
         updateStatus(
             juce::String::fromUTF8("履歴から波形を復元しました"));
     }
@@ -6836,70 +8412,54 @@ private:
         redo_.setEnabled(history_cursor_ + 1 < history_.size());
     }
 
+    void clearEngineVoices() {
+        for (std::uint8_t channel = 0; channel < 5; ++channel) {
+            static_cast<void>(engine_.submit(
+                mgstc::engine::EngineCommand::noteOff(
+                    static_cast<std::uint8_t>(
+                        kSccTrack + channel))));
+        }
+        static_cast<void>(voice_allocator_.allNotesOff());
+    }
+
+    void silenceAllVoices() {
+        audition_stop_time_ms_.reset();
+        performance_keyboard_.clearPreviewNote();
+        clearEngineVoices();
+    }
+
     bool configureEngine(
         bool retrigger,
         const SccWaveform* preview = nullptr) {
-        auto edit = engine_.beginProgramEdit();
-        if (!edit.valid()) {
-            return false;
-        }
-
+        // hardReset前にアロケータと実発音を揃え、Poly残留を防ぐ。
+        clearEngineVoices();
+        engine_holds_temporary_program_ = (preview != nullptr);
         const auto& waveform = preview ? *preview : scc_wave_;
-        std::array<std::uint8_t, 32> raw_wave{};
-        std::transform(
-            waveform.begin(),
-            waveform.end(),
-            raw_wave.begin(),
-            [](std::int8_t sample) {
-                return static_cast<std::uint8_t>(sample);
-            });
-        const auto opll_registers = mgstc::engine::encodeOpllPatch(
-            mgstc::engine::defaultOpllPatch());
-        bool configured =
-            edit.engine->session().setSequenceEnvelope(
-                kPsgTrack, {0x40, 0xEF, 0x01, 0x60})
-            && edit.engine->session().setSequenceEnvelope(
-                kOpllTrack, {0x10, 0x10, 0x40, 0xEF, 0x01, 0x60})
-            && edit.engine->session().setPsgToneNoise(
-                kPsgTrack, 1, 0)
-            && edit.engine->session().setPsgFixedVolume(
-                kPsgTrack, 15)
-            && edit.engine->session().mapper().defineSccPatch(
-                0, raw_wave) == mgstc::engine::MapError::None
-            && edit.engine->session().mapper().defineOpllOriginalPatch(
-                16, opll_registers)
-                == mgstc::engine::MapError::None;
-        for (std::uint8_t track = kSccTrack;
-             track < kSccTrack + 5;
-             ++track) {
-            configured = configured
-                && edit.engine->session().setSequenceEnvelope(
-                    track, {0x10, 0x00, 0x40, 0xEF, 0x01, 0x60})
-                && edit.engine->session().setTrackVolume(track, 15);
+        if (preview == nullptr) {
+            audio_service_.setSharedSccWaveform(scc_wave_);
         }
-        if (!configured) {
-            static_cast<void>(engine_.discardProgramEdit(edit));
-            return false;
-        }
-
-        const auto submitted = engine_.submitProgram(
-            edit,
-            {
-                .retrigger = retrigger,
-                .track = kSccTrack,
-                .midi_note = last_audition_note_,
-            });
-        if (!submitted && edit.valid()) {
-            static_cast<void>(engine_.discardProgramEdit(edit));
-        }
-        return submitted;
+        return audio_service_.submitSharedEditorProgram(
+            waveform,
+            audio_service_.sharedOpllPatch(),
+            retrigger,
+            kSccTrack,
+            last_audition_note_);
     }
 
     void startPerformanceNote(std::uint8_t note) {
         audition_stop_time_ms_.reset();
         performance_keyboard_.clearPreviewNote();
         last_audition_note_ = note;
+        saveLastAuditionNoteSetting(last_audition_note_);
         if (!engine_ready_) {
+            updateStatus(
+                juce::String::fromUTF8(
+                    "鍵盤演奏を開始できませんでした"));
+            return;
+        }
+        // 一時試聴が残っていると鍵盤が未確定音色を鳴らすため、確定へ戻す。
+        if (engine_holds_temporary_program_
+            && !configureEngine(false)) {
             updateStatus(
                 juce::String::fromUTF8(
                     "鍵盤演奏を開始できませんでした"));
@@ -6942,11 +8502,10 @@ private:
     }
 
     void stopNote() {
-        audition_stop_time_ms_.reset();
-        static_cast<void>(
-            engine_.submit(
-                mgstc::engine::EngineCommand::noteOff(kSccTrack)));
-        performance_keyboard_.clearPreviewNote();
+        silenceAllVoices();
+        if (engine_holds_temporary_program_) {
+            static_cast<void>(configureEngine(false));
+        }
         updateStatus(juce::String::fromUTF8("発音を停止しました"));
     }
 
@@ -6961,8 +8520,12 @@ private:
 
     [[nodiscard]] bool auditionAfterEdit(
         const SccWaveform* preview = nullptr) {
-        return !immediate_audition_.getToggleState()
-            || auditionOneSecond(preview);
+        if (immediate_audition_.getToggleState()) {
+            return auditionOneSecond(preview);
+        }
+        // 即時発声OFFでも共有プログラムへ確定波形を反映し、
+        // 他エディタの音色を消さない。
+        return preview != nullptr || configureEngine(false);
     }
 
     void armOneSecondPreview() {
@@ -6989,7 +8552,10 @@ private:
         if (audition_stop_time_ms_
             && juce::Time::getMillisecondCounterHiRes()
                 >= *audition_stop_time_ms_) {
-            stopNote();
+            silenceAllVoices();
+            if (engine_holds_temporary_program_) {
+                static_cast<void>(configureEngine(false));
+            }
             updateStatus(
                 juce::String::fromUTF8(
                     "1秒試聴が完了しました"));
@@ -7033,11 +8599,15 @@ private:
     juce::ToggleButton auto_phase_;
     juce::ToggleButton polarity_;
     juce::ToggleButton preserve_volume_;
+    juce::ToggleButton preset_flip_h_;
+    juce::ToggleButton preset_flip_v_;
     juce::TextButton apply_preset_;
+    juce::TextButton cancel_preview_;
     juce::DrawableButton undo_{
         "undo", juce::DrawableButton::ImageOnButtonBackground};
     juce::DrawableButton redo_{
         "redo", juce::DrawableButton::ImageOnButtonBackground};
+    juce::TextButton ab_audition_;
     juce::DrawableButton average_{
         "average", juce::DrawableButton::ImageOnButtonBackground};
     juce::DrawableButton normalize_{
@@ -7054,6 +8624,19 @@ private:
         "shift down", juce::DrawableButton::ImageOnButtonBackground};
     juce::Slider vertical_scale_;
     juce::TextButton scale_reset_;
+    juce::TextButton background_load_;
+    juce::TextButton background_clear_;
+    juce::ToggleButton background_visible_;
+    juce::Label background_opacity_label_;
+    juce::Slider background_opacity_;
+    juce::Label background_x_label_;
+    juce::Slider background_x_;
+    juce::Label background_y_label_;
+    juce::Slider background_y_;
+    juce::Label background_w_label_;
+    juce::Slider background_width_;
+    juce::Label background_h_label_;
+    juce::Slider background_height_;
     juce::DrawableButton immediate_audition_{
         "immediate audition",
         juce::DrawableButton::ImageOnButtonBackground};
@@ -7085,6 +8668,8 @@ private:
     mgstc::engine::SequentialVoiceAllocator voice_allocator_{5};
     SccWaveform scale_source_{};
     SccWaveform preview_wave_{};
+    juce::Image background_image_;
+    juce::String background_path_;
     mgstc::engine::TimbreLibrary library_;
     std::vector<std::uint64_t> library_ids_;
     std::optional<std::uint64_t> selected_library_id_;
@@ -7094,7 +8679,10 @@ private:
         "MgsToneCraftTimbreLibraryV1"};
     bool editor_baseline_valid_{};
     bool preview_active_{};
+    bool ab_next_plays_b_{true};
+    bool scale_previewing_{};
     bool engine_ready_{};
+    bool engine_holds_temporary_program_{};
     std::uint8_t last_audition_note_{kPreviewNote};
     int settings_poll_ticks_{};
     std::uint64_t master_volume_revision_{};
@@ -7428,6 +9016,7 @@ public:
         OpllEnvelopeParameter,
         std::uint8_t,
         bool)> onEdit;
+    std::function<std::uint8_t(OpllEnvelopeParameter)> getValue;
 
     void paint(juce::Graphics& graphics) override {
         const auto graph =
@@ -7590,6 +9179,36 @@ public:
         }
     }
 
+    void mouseWheelMove(
+        const juce::MouseEvent& event,
+        const juce::MouseWheelDetails& wheel) override {
+        if (drag_parameter_) {
+            return;
+        }
+        const auto parameter = parameterAt(event.position);
+        if (!getValue || !onEdit) {
+            return;
+        }
+        const float primary =
+            std::abs(wheel.deltaY) >= std::abs(wheel.deltaX)
+                ? wheel.deltaY
+                : wheel.deltaX;
+        if (std::abs(primary) < 1.0e-4F) {
+            return;
+        }
+        const int step = primary > 0.0F ? 1 : -1;
+        const auto current = getValue(parameter);
+        const auto next = static_cast<std::uint8_t>(juce::jlimit(
+            0,
+            15,
+            static_cast<int>(current) + step));
+        if (next == current) {
+            return;
+        }
+        onEdit(parameter, next, true);
+        repaint();
+    }
+
 private:
     [[nodiscard]] static std::size_t parameterIndex(
         OpllEnvelopeParameter parameter) {
@@ -7693,7 +9312,7 @@ public:
             flags_[index].setButtonText(flag_names[index]);
             flags_[index].setLookAndFeel(&switch_look_and_feel_);
             flags_[index].onClick = [this] {
-                notifyChanged();
+                notifyChanged(true);
             };
             addAndMakeVisible(flags_[index]);
         }
@@ -7716,7 +9335,8 @@ public:
         addAndMakeVisible(envelope_title_);
         envelope_graph_.setTooltip(
             juce::String::fromUTF8(
-                "AR / DR / SL / RR の区間をドラッグして編集します。"
+                "AR / DR / SL / RR の区間をドラッグまたは"
+                "マウスホイールで編集します。"
                 "AR・DRは右ほど遅く、RRは右ほど速く、"
                 "SLは下ほど減衰量が大きくなります。"
                 "赤い線は1秒地点のキーオフです"));
@@ -7730,6 +9350,13 @@ public:
                 if (onEnvelopeEdit) {
                     onEnvelopeEdit(parameter, value, commit);
                 }
+            };
+        envelope_graph_.getValue =
+            [this](OpllEnvelopeParameter parameter) {
+                return static_cast<std::uint8_t>(juce::jlimit(
+                    0.0,
+                    15.0,
+                    sliderFor(parameter).getValue()));
             };
         addAndMakeVisible(envelope_graph_);
     }
@@ -7877,7 +9504,7 @@ public:
         envelope_graph_.setBounds(graph_area);
     }
 
-    std::function<void()> onChange;
+    std::function<void(bool commit)> onChange;
     std::function<void(
         OpllEnvelopeParameter,
         std::uint8_t,
@@ -7926,8 +9553,14 @@ private:
             46,
             24);
         slider.setScrollWheelEnabled(true);
-        slider.onValueChange = [this] {
-            notifyChanged();
+        slider.onValueChange = [this, &slider] {
+            const bool dragging =
+                slider.isMouseButtonDown()
+                || slider.getThumbBeingDragged() >= 0;
+            notifyChanged(!dragging);
+        };
+        slider.onDragEnd = [this] {
+            notifyChanged(true);
         };
         addAndMakeVisible(slider);
     }
@@ -7951,9 +9584,9 @@ private:
         return &release_rate_label_;
     }
 
-    void notifyChanged() {
+    void notifyChanged(bool commit = true) {
         if (!syncing_ && onChange) {
-            onChange();
+            onChange(commit);
         }
     }
 
@@ -7994,7 +9627,7 @@ public:
               "MODULATOR", true, switch_look_and_feel_),
           carrier_(
               "CARRIER", false, switch_look_and_feel_),
-          performance_keyboard_(midi_service) {
+          performance_keyboard_(midi_service, audio_service_) {
         setWantsKeyboardFocus(true);
         patch_ = mgstc::engine::defaultOpllPatch();
         history_.push_back(patch_);
@@ -8123,7 +9756,15 @@ public:
             slider.setTextBoxStyle(
                 juce::Slider::TextBoxRight, false, 44, 24);
             slider.setScrollWheelEnabled(true);
-            slider.onValueChange = [this] { controlsChanged(); };
+            slider.onValueChange = [this, &slider] {
+                const bool dragging =
+                    slider.isMouseButtonDown()
+                    || slider.getThumbBeingDragged() >= 0;
+                controlsChanged(!dragging);
+            };
+            slider.onDragEnd = [this] {
+                controlsChanged(true);
+            };
             addAndMakeVisible(slider);
         };
         configure_common_slider(
@@ -8136,8 +9777,12 @@ public:
         feedback_.setTooltip(
             juce::String::fromUTF8(
                 "モジュレーターの自己帰還量 0～7"));
-        modulator_.onChange = [this] { controlsChanged(); };
-        carrier_.onChange = [this] { controlsChanged(); };
+        modulator_.onChange = [this](bool commit) {
+            controlsChanged(commit);
+        };
+        carrier_.onChange = [this](bool commit) {
+            controlsChanged(commit);
+        };
         modulator_.onEnvelopeEdit =
             [this](
                 OpllEnvelopeParameter,
@@ -8354,17 +9999,14 @@ public:
                 ? juce::String::fromUTF8("準備完了")
                 : juce::String::fromUTF8(
                     "音声出力を開始できませんでした"));
-        consumePendingOpllConversion();
+        static_cast<void>(consumePendingOpllConversion());
     }
 
     ~OpllEditorComponent() override {
         stopTimer();
         performance_keyboard_.allNotesOff();
         favorite_.setLookAndFeel(nullptr);
-        static_cast<void>(
-            engine_.submit(
-                mgstc::engine::EngineCommand::noteOff(
-                    kOpllTrack)));
+        silenceAllVoices();
     }
 
     void prepareVisualInspection() {
@@ -8372,34 +10014,32 @@ public:
     }
 
     void refreshExternalState() {
-        consumePendingOpllConversion();
+        synchronizeMasterVolumeSlider(
+            master_volume_, master_volume_revision_, audio_service_);
+        // pending取込が試聴を始めた直後に configureEngine(false) すると
+        // hardResetで音が消えるため、取込成功時は再構成しない。
+        if (!consumePendingOpllConversion() && engine_ready_) {
+            static_cast<void>(configureEngine(false));
+        }
     }
 
     void deactivate() {
         performance_keyboard_.allNotesOff();
-        audition_stop_time_ms_.reset();
-        for (std::uint8_t channel = 0; channel < 9; ++channel) {
-            static_cast<void>(engine_.submit(
-                mgstc::engine::EngineCommand::noteOff(
-                    static_cast<std::uint8_t>(
-                        kOpllTrack + channel))));
-        }
-        static_cast<void>(voice_allocator_.allNotesOff());
+        silenceAllVoices();
     }
 
     void paint(juce::Graphics& graphics) override {
         graphics.fillAll(
             getLookAndFeel().findColour(
                 juce::ResizableWindow::backgroundColourId));
-        const auto preview_panel =
-            juce::Rectangle<int>(
-                940, 92, 356, getHeight() - 222);
-        graphics.setColour(juce::Colour(0xFF29323C));
-        graphics.fillRoundedRectangle(
-            preview_panel.toFloat(), 9.0F);
-        graphics.setColour(juce::Colour(0xFF435160));
-        graphics.drawRoundedRectangle(
-            preview_panel.toFloat(), 9.0F, 1.0F);
+        if (!library_panel_bounds_.isEmpty()) {
+            graphics.setColour(juce::Colour(0xFF29323C));
+            graphics.fillRoundedRectangle(
+                library_panel_bounds_.toFloat(), 9.0F);
+            graphics.setColour(juce::Colour(0xFF435160));
+            graphics.drawRoundedRectangle(
+                library_panel_bounds_.toFloat(), 9.0F, 1.0F);
+        }
         if (!common_parameter_bounds_.isEmpty()) {
             graphics.setColour(juce::Colour(0xFF29323C));
             graphics.fillRoundedRectangle(
@@ -8462,6 +10102,7 @@ public:
 
         auto right = area.removeFromRight(356);
         area.removeFromRight(16);
+        library_panel_bounds_ = right;
         common_parameter_bounds_ = area.removeFromTop(62);
         auto common_parameters = common_parameter_bounds_.reduced(12, 5);
         common_parameters_title_.setBounds(
@@ -8789,8 +10430,10 @@ private:
             output_number_.grabKeyboardFocus();
             return;
         }
-        juce::SystemClipboard::copyTextToClipboard(
-            definition);
+        if (!mgstc::platform::copyTextToClipboardUnicodeAndAnsi(
+                std::wstring(definition.toWideCharPointer()))) {
+            juce::SystemClipboard::copyTextToClipboard(definition);
+        }
         updateStatus(
             juce::String::fromUTF8(
                 "OPLL音色定義をコピーしました"));
@@ -8846,6 +10489,8 @@ private:
     }
 
     void convertToScc(int frame) {
+        audio_service_.setSharedOpllPatch(patch_);
+        static_cast<void>(configureEngine(false));
         updateStatus(juce::String::fromUTF8(
             "OPLL音色をSCC波形へ近似変換しています…"));
         const auto pcm = makeOpllReferencePcm(
@@ -8873,23 +10518,25 @@ private:
             "SCC近似波形を生成し、SCCエディタへ送りました"));
     }
 
-    void consumePendingOpllConversion() {
+    [[nodiscard]] bool consumePendingOpllConversion() {
         const auto file = pendingConversionFile("opll");
         if (!file.existsAsFile()) {
-            return;
+            return false;
         }
         const auto text = utf8Text(file.loadFileAsString());
         const auto parsed =
             mgstc::engine::parseMgsOpllDefinition(text);
         if (!parsed) {
+            static_cast<void>(file.deleteFile());
             updateStatus(juce::String::fromUTF8(
                 "受信したOPLL近似音色を読み込めませんでした"));
-            return;
+            return false;
         }
         static_cast<void>(file.deleteFile());
         commitPatch(parsed->patch);
         updateStatus(juce::String::fromUTF8(
             "SCCから近似変換したOPLL音色を読み込みました"));
+        return true;
     }
 
     bool importWaveBytes(
@@ -8918,32 +10565,43 @@ private:
                     "波形の1周期を抽出できませんでした"));
             return false;
         }
-        juce::MouseCursor::showWaitCursor();
-        auto candidates =
-            mgstc::engine::
-                approximateWavePcmCandidatesWithOpll(pcm);
-        juce::MouseCursor::hideWaitCursor();
-        if (candidates.empty()) {
-            showError(
-                source_name,
-                juce::String::fromUTF8(
-                    "OPLL近似音色を生成できませんでした"));
-            return false;
-        }
-        wave_candidates_ = std::move(candidates);
-        wave_candidate_index_ = 0;
-        commitPatch(wave_candidates_.front(), false);
-        updateWaveCandidateControls();
-        updateStatus(
-            source_name
-            + juce::String::fromUTF8(
-                "完了: OPLL近似候補 ")
-            + juce::String(
-                static_cast<int>(wave_candidates_.size()))
-            + juce::String::fromUTF8("件／約 ")
-            + juce::String(
-                analysis.estimated_frequency_hz, 1)
-            + " Hz");
+        const auto frequency_hz = analysis.estimated_frequency_hz;
+        juce::Component::SafePointer<OpllEditorComponent> safe(this);
+        runWithConversionBusyDialog(
+            this,
+            [pcm] {
+                return mgstc::engine::
+                    approximateWavePcmCandidatesWithOpll(pcm);
+            },
+            [safe, source_name, frequency_hz](
+                std::vector<mgstc::engine::OpllPatchParameters>
+                    candidates) {
+                if (safe == nullptr) {
+                    return;
+                }
+                if (candidates.empty()) {
+                    safe->showError(
+                        source_name,
+                        juce::String::fromUTF8(
+                            "OPLL近似音色を生成できませんでした"));
+                    return;
+                }
+                safe->wave_candidates_ = std::move(candidates);
+                safe->wave_candidate_index_ = 0;
+                safe->commitPatch(
+                    safe->wave_candidates_.front(), false);
+                safe->updateWaveCandidateControls();
+                safe->updateStatus(
+                    source_name
+                    + juce::String::fromUTF8(
+                        "完了: OPLL近似候補 ")
+                    + juce::String(
+                        static_cast<int>(
+                            safe->wave_candidates_.size()))
+                    + juce::String::fromUTF8("件／約 ")
+                    + juce::String(frequency_hz, 1)
+                    + " Hz");
+            });
         return true;
     }
 
@@ -9765,10 +11423,15 @@ private:
             preview = nullptr) {
         if (immediate_audition_.getToggleState()) {
             static_cast<void>(auditionOneSecond(preview));
+            return;
+        }
+        // 即時発声OFFでも共有プログラムへ確定音色を反映する。
+        if (preview == nullptr) {
+            static_cast<void>(configureEngine(false));
         }
     }
 
-    void controlsChanged() {
+    void controlsChanged(bool commit = true) {
         if (syncing_) {
             return;
         }
@@ -9779,13 +11442,18 @@ private:
         patch_.feedback = static_cast<std::uint8_t>(
             feedback_.getValue());
         clearWaveCandidates();
-        recordHistory();
+        if (commit) {
+            recordHistory();
+        }
         refreshEnvelopeTrace();
         updateDefinitionPreview();
         auditionAfterEdit();
         updateStatus(
-            juce::String::fromUTF8(
-                "OPLL音色を更新しました"));
+            commit
+                ? juce::String::fromUTF8(
+                      "OPLL音色を更新しました")
+                : juce::String::fromUTF8(
+                      "OPLL音色を編集中"));
     }
 
     void envelopeGraphChanged(bool commit) {
@@ -9799,19 +11467,19 @@ private:
         patch_.feedback = static_cast<std::uint8_t>(
             feedback_.getValue());
         clearWaveCandidates();
+        refreshEnvelopeTrace();
+        updateDefinitionPreview();
+        auditionAfterEdit();
         if (commit) {
             recordHistory();
             updateStatus(
                 juce::String::fromUTF8(
                     "EGグラフの編集をUndo履歴へ確定しました"));
-            return;
+        } else {
+            updateStatus(
+                juce::String::fromUTF8(
+                    "EGグラフをドラッグ編集中"));
         }
-        refreshEnvelopeTrace();
-        updateDefinitionPreview();
-        auditionAfterEdit();
-        updateStatus(
-            juce::String::fromUTF8(
-                "EGグラフをドラッグ編集中"));
     }
 
     [[nodiscard]] std::optional<std::uint8_t>
@@ -9846,67 +11514,57 @@ private:
             false);
     }
 
+    void clearEngineVoices() {
+        for (std::uint8_t channel = 0; channel < 9; ++channel) {
+            static_cast<void>(engine_.submit(
+                mgstc::engine::EngineCommand::noteOff(
+                    static_cast<std::uint8_t>(
+                        kOpllTrack + channel))));
+        }
+        static_cast<void>(voice_allocator_.allNotesOff());
+    }
+
+    void silenceAllVoices() {
+        audition_stop_time_ms_.reset();
+        performance_keyboard_.clearPreviewNote();
+        clearEngineVoices();
+    }
+
     bool configureEngine(
         bool retrigger,
         const mgstc::engine::OpllPatchParameters*
             preview = nullptr) {
-        auto edit = engine_.beginProgramEdit();
-        if (!edit.valid()) {
-            return false;
+        // hardReset前にアロケータと実発音を揃え、Poly残留を防ぐ。
+        clearEngineVoices();
+        engine_holds_temporary_program_ = (preview != nullptr);
+        const auto& patch = preview ? *preview : patch_;
+        if (preview == nullptr) {
+            audio_service_.setSharedOpllPatch(patch_);
         }
-        std::array<std::uint8_t, 32> scc_wave{};
-        const auto registers =
-            mgstc::engine::encodeOpllPatch(
-                preview ? *preview : patch_);
-        bool configured =
-            edit.engine->session().setSequenceEnvelope(
-                kPsgTrack, {0x40, 0xEF, 0x01, 0x60})
-            && edit.engine->session().setSequenceEnvelope(
-                kSccTrack,
-                {0x10, 0x00, 0x40, 0xEF, 0x01, 0x60})
-            && edit.engine->session().setPsgToneNoise(
-                kPsgTrack, 1, 0)
-            && edit.engine->session().setPsgFixedVolume(
-                kPsgTrack, 15)
-            && edit.engine->session().mapper().defineSccPatch(
-                0, scc_wave)
-                == mgstc::engine::MapError::None
-            && edit.engine->session().mapper()
-                .defineOpllOriginalPatch(16, registers)
-                == mgstc::engine::MapError::None;
-        for (std::uint8_t track = kOpllTrack;
-             track < kOpllTrack + 9;
-             ++track) {
-            configured = configured
-                && edit.engine->session().setSequenceEnvelope(
-                    track, {0x10, 0x10, 0x40, 0xEF, 0x01, 0x60});
-        }
-        if (!configured) {
-            static_cast<void>(
-                engine_.discardProgramEdit(edit));
-            return false;
-        }
-        const auto submitted = engine_.submitProgram(
-            edit,
-            {
-                .retrigger = retrigger,
-                .track = kOpllTrack,
-                .midi_note = last_audition_note_,
-            });
-        if (!submitted && edit.valid()) {
-            static_cast<void>(
-                engine_.discardProgramEdit(edit));
-        }
-        return submitted;
+        return audio_service_.submitSharedEditorProgram(
+            audio_service_.sharedSccWaveform(),
+            patch,
+            retrigger,
+            kOpllTrack,
+            last_audition_note_);
     }
 
     void startPerformanceNote(std::uint8_t note) {
         audition_stop_time_ms_.reset();
         performance_keyboard_.clearPreviewNote();
         last_audition_note_ = note;
+        saveLastAuditionNoteSetting(last_audition_note_);
         updateAuditionNoteLabels();
         refreshEnvelopeTrace();
         if (!engine_ready_) {
+            updateStatus(
+                juce::String::fromUTF8(
+                    "鍵盤演奏を開始できませんでした"));
+            return;
+        }
+        // 一時試聴が残っていると鍵盤が未確定音色を鳴らすため、確定へ戻す。
+        if (engine_holds_temporary_program_
+            && !configureEngine(false)) {
             updateStatus(
                 juce::String::fromUTF8(
                     "鍵盤演奏を開始できませんでした"));
@@ -9987,12 +11645,10 @@ private:
         if (audition_stop_time_ms_
             && juce::Time::getMillisecondCounterHiRes()
                 >= *audition_stop_time_ms_) {
-            audition_stop_time_ms_.reset();
-            static_cast<void>(
-                engine_.submit(
-                    mgstc::engine::EngineCommand::noteOff(
-                        kOpllTrack)));
-            performance_keyboard_.clearPreviewNote();
+            silenceAllVoices();
+            if (engine_holds_temporary_program_) {
+                static_cast<void>(configureEngine(false));
+            }
             updateStatus(
                 juce::String::fromUTF8(
                     "1秒試聴が完了しました"));
@@ -10022,6 +11678,7 @@ private:
     juce::Label feedback_label_;
     juce::Slider feedback_;
     juce::Rectangle<int> common_parameter_bounds_;
+    juce::Rectangle<int> library_panel_bounds_;
     juce::Label title_;
     juce::Label description_;
     juce::DrawableButton load_{
@@ -10087,6 +11744,7 @@ private:
     bool editor_baseline_valid_{};
     bool syncing_{};
     bool engine_ready_{};
+    bool engine_holds_temporary_program_{};
     std::uint8_t last_audition_note_{kPreviewNote};
     int settings_poll_ticks_{};
     std::uint64_t master_volume_revision_{};
@@ -10406,6 +12064,9 @@ private:
             audio_service_->clearScopeFrames();
         }
         active_editor_ = editor;
+        if (auto& window = windowSlot(editor); window != nullptr) {
+            window->refreshExternalState();
+        }
     }
 
     void timerCallback() override {

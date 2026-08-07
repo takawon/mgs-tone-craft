@@ -37,9 +37,11 @@ bool notePitch(std::uint8_t midi_note, NotePitch& output) noexcept {
     output.psg_scc_period = std::max<std::uint16_t>(
         1,
         static_cast<std::uint16_t>(kPsgSccOctaveOne[semitone] >> shift));
+    // F-numbers come from MGSDRV; Block is raised so labeled notes match
+    // A440 / PSG / SCC (MIDI 60 ≈ C4). YM2413 Block is 0..7, so C8–B8 clamp.
     output.opll = {
         kOpllFNumbers[semitone],
-        static_cast<std::uint8_t>(octave - 1),
+        static_cast<std::uint8_t>(std::min<unsigned>(7u, octave)),
     };
     return true;
 }

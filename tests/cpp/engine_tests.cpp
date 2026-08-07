@@ -1,11 +1,14 @@
 #include <cstdint>
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <functional>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <numbers>
 #include <sstream>
 #include <stdexcept>
@@ -20,7 +23,11 @@
 #include "mgstc/engine/chip_rack.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
+#include "mgstc/engine/emulator_sound_output.hpp"
 #include "mgstc/engine/engine_core.hpp"
+#include "mgstc/engine/mamidi_memo_sound_output.hpp"
+#include "mgstc/engine/mamidi_register_map.hpp"
+#include "mgstc/engine/mamidi_rpc_client.hpp"
 #include "mgstc/engine/mgs_envelope_io.hpp"
 #include "mgstc/engine/mgs_timbre_io.hpp"
 #include "mgstc/engine/note_pitch.hpp"
@@ -42,13 +49,29 @@
 #include "mgstc/audio/wasapi_audio_sink.hpp"
 #endif
 
+#include "rpc/server.h"
+
 namespace {
 
 using mgstc::engine::EventBuffer;
+using mgstc::engine::EmulatorSoundOutput;
 using mgstc::engine::EngineCore;
 using mgstc::engine::ChipId;
 using mgstc::engine::ChipRack;
+using mgstc::engine::MAmidiMemoSoundOutput;
+using mgstc::engine::MAmidiChipAccess;
+using mgstc::engine::MAmidiConnectionState;
+using mgstc::engine::MAmidiDeviceId;
+using mgstc::engine::MAmidiRpcClient;
 using mgstc::engine::MapError;
+using mgstc::engine::fillOpllSilenceWrites;
+using mgstc::engine::fillPsgSilenceWrites;
+using mgstc::engine::fillSccSilenceWrites;
+using mgstc::engine::kMAmidiOpllSilenceWriteCount;
+using mgstc::engine::kMAmidiPsgSilenceWriteCount;
+using mgstc::engine::kMAmidiSccSilenceWriteCount;
+using mgstc::engine::mapRegisterWriteToMAmidi;
+using mgstc::engine::MAmidiMapOptions;
 using mgstc::engine::MeaningEvent;
 using mgstc::engine::MeaningEventKind;
 using mgstc::engine::MixerGains;
@@ -94,6 +117,7 @@ using mgstc::engine::formatMgsOpllDefinition;
 using mgstc::engine::formatMgsSccDefinition;
 using mgstc::engine::invertSccWaveform;
 using mgstc::engine::mergeSccWaveforms;
+using mgstc::engine::mirrorSccWaveform;
 using mgstc::engine::normalizeSccWaveform;
 using mgstc::engine::parseMgsOpllDefinition;
 using mgstc::engine::parseMgsSccDefinition;
@@ -103,6 +127,7 @@ using mgstc::engine::shiftSccWaveformVertically;
 using mgstc::engine::traceOpllEnvelope;
 using mgstc::engine::ym2413RomPatch;
 using mgstc::engine::analyzeWaveCycle;
+using mgstc::engine::approximateSccWaveformCandidatesWithOpll;
 using mgstc::engine::approximateWaveCycleWithOpll;
 using mgstc::engine::approximateWavePcmCandidatesWithOpll;
 using mgstc::engine::approximateWavePcmWithOpll;
@@ -486,14 +511,76 @@ void testMgsdrvNoteTables() {
     REQUIRE_EQ(notePitch(60, pitch), true);
     REQUIRE_EQ(pitch.psg_scc_period, static_cast<std::uint16_t>(0x01AB));
     REQUIRE_EQ(pitch.opll.f_number, static_cast<std::uint16_t>(0x00AC));
-    REQUIRE_EQ(pitch.opll.block, static_cast<std::uint8_t>(3));
+    // A440 Block: MIDI 60 ≈ C4 (not MGSDRV dump block-1).
+    REQUIRE_EQ(pitch.opll.block, static_cast<std::uint8_t>(4));
+    const double opll_c4_hz = pitch.opll.f_number * 3579545.0
+        / (72.0 * static_cast<double>(1u << (19 - pitch.opll.block)));
+    REQUIRE_EQ(opll_c4_hz > 250.0, true);
+    REQUIRE_EQ(opll_c4_hz < 275.0, true);
 
     REQUIRE_EQ(notePitch(61, pitch), true);
     REQUIRE_EQ(pitch.psg_scc_period, static_cast<std::uint16_t>(0x0193));
     REQUIRE_EQ(pitch.opll.f_number, static_cast<std::uint16_t>(0x00B6));
 
+    REQUIRE_EQ(notePitch(108, pitch), true);
+    REQUIRE_EQ(pitch.opll.block, static_cast<std::uint8_t>(7));
+
     REQUIRE_EQ(notePitch(23, pitch), false);
     REQUIRE_EQ(notePitch(120, pitch), false);
+}
+
+void testSccAdapterPlaysLabeledC4Near261Hz() {
+    // MGSDRV period for MIDI 60 must yield ~C4 when the SCC core runs at
+    // the MSX master clock (not master/2).
+    NotePitch pitch{};
+    REQUIRE_EQ(notePitch(60, pitch), true);
+    mgstc::engine::SccAdapter scc;
+    REQUIRE_EQ(scc.valid(), true);
+    scc.reset();
+    for (std::uint8_t index = 0; index < 32; ++index) {
+        const auto sample = static_cast<std::uint8_t>(std::lround(
+            127.0
+            * std::sin(
+                2.0 * std::numbers::pi * static_cast<double>(index)
+                / 32.0)));
+        REQUIRE_EQ(scc.write(0, index, sample), true);
+    }
+    REQUIRE_EQ(
+        scc.write(1, 0, static_cast<std::uint8_t>(pitch.psg_scc_period & 0xFF)),
+        true);
+    REQUIRE_EQ(
+        scc.write(
+            1,
+            1,
+            static_cast<std::uint8_t>((pitch.psg_scc_period >> 8) & 0x0F)),
+        true);
+    REQUIRE_EQ(scc.write(2, 0, 15), true);
+    REQUIRE_EQ(scc.write(3, 0, 1), true);
+    for (int index = 0; index < 2000; ++index) {
+        static_cast<void>(scc.renderSample());
+    }
+    std::vector<float> samples;
+    samples.reserve(8000);
+    for (int index = 0; index < 8000; ++index) {
+        samples.push_back(scc.renderSample());
+    }
+    int first = -1;
+    int period = 0;
+    for (int index = 1; index < static_cast<int>(samples.size()); ++index) {
+        if (samples[static_cast<std::size_t>(index - 1)] <= 0.0F
+            && samples[static_cast<std::size_t>(index)] > 0.0F) {
+            if (first < 0) {
+                first = index;
+            } else {
+                period = index - first;
+                break;
+            }
+        }
+    }
+    REQUIRE_EQ(period > 0, true);
+    const float hz = 48000.0F / static_cast<float>(period);
+    REQUIRE_EQ(hz > 250.0F, true);
+    REQUIRE_EQ(hz < 275.0F, true);
 }
 
 void testRuntimePsgNoteOnOrderMatchesObservedBoundary() {
@@ -618,7 +705,8 @@ void testRuntimeOpllKeyOnAndOffRegisters() {
     REQUIRE_EQ(session.processTick().ok(), true);
     REQUIRE_EQ(session.writes().size(), static_cast<std::size_t>(2));
     REQUIRE_EQ(session.writes()[0].address, static_cast<std::uint8_t>(0x20));
-    REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0x16));
+    // MIDI 60 → Fnum 0xAC, Block 4, KeyOn → 0x10 | (4 << 1) = 0x18
+    REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0x18));
     REQUIRE_EQ(session.writes()[0].reason, WriteReason::KeyOn);
     REQUIRE_EQ(session.writes()[1].address, static_cast<std::uint8_t>(0x10));
     REQUIRE_EQ(session.writes()[1].value, static_cast<std::uint8_t>(0xAC));
@@ -627,7 +715,7 @@ void testRuntimeOpllKeyOnAndOffRegisters() {
     REQUIRE_EQ(session.processTick().ok(), true);
     REQUIRE_EQ(session.writes().size(), static_cast<std::size_t>(1));
     REQUIRE_EQ(session.writes()[0].address, static_cast<std::uint8_t>(0x20));
-    REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0x06));
+    REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0x08));
     REQUIRE_EQ(session.writes()[0].reason, WriteReason::KeyOff);
 }
 
@@ -665,7 +753,7 @@ void testChipRackRendersAllThreeChips() {
     setup.push_back(
         {0, sequence++, ChipId::Opll, 0, 0x30, 0x10, 8, WriteReason::Patch});
     setup.push_back(
-        {0, sequence++, ChipId::Opll, 0, 0x20, 0x16, 8, WriteReason::KeyOn});
+        {0, sequence++, ChipId::Opll, 0, 0x20, 0x18, 8, WriteReason::KeyOn});
     setup.push_back(
         {0, sequence++, ChipId::Opll, 0, 0x10, 0xAC, 8, WriteReason::Frequency});
 
@@ -682,6 +770,533 @@ void testChipRackRendersAllThreeChips() {
     REQUIRE_EQ(psg_peak > 0.001F, true);
     REQUIRE_EQ(scc_peak > 0.001F, true);
     REQUIRE_EQ(opll_peak > 0.001F, true);
+}
+
+void testEmulatorSoundOutputMirrorsChipRack() {
+    EmulatorSoundOutput output;
+    REQUIRE_EQ(output.valid(), true);
+    REQUIRE_EQ(output.isOpen(), true);
+    REQUIRE_EQ(
+        output.kind(),
+        mgstc::engine::SoundOutputKind::Emulator);
+
+    const RegisterWrite tone_low{
+        0,
+        0,
+        ChipId::Psg,
+        0,
+        0,
+        0xAB,
+        0,
+        WriteReason::Frequency,
+    };
+    const RegisterWrite tone_high{
+        0,
+        1,
+        ChipId::Psg,
+        0,
+        1,
+        0x01,
+        0,
+        WriteReason::Frequency,
+    };
+    const RegisterWrite mixer{
+        0,
+        2,
+        ChipId::Psg,
+        0,
+        7,
+        0xBE,
+        0,
+        WriteReason::Patch,
+    };
+    const RegisterWrite volume{
+        0,
+        3,
+        ChipId::Psg,
+        0,
+        8,
+        0x0F,
+        0,
+        WriteReason::Volume,
+    };
+    REQUIRE_EQ(output.writeRegister(tone_low), true);
+    REQUIRE_EQ(output.writeRegister(tone_high), true);
+    REQUIRE_EQ(output.writeRegister(mixer), true);
+    REQUIRE_EQ(output.writeRegister(volume), true);
+
+    float peak = 0.0F;
+    for (int sample = 0; sample < 4'096; ++sample) {
+        peak = std::max(peak, std::abs(output.renderSample().psg));
+    }
+    REQUIRE_EQ(peak > 0.001F, true);
+
+    output.allNotesOff();
+    peak = 0.0F;
+    for (int sample = 0; sample < 4'096; ++sample) {
+        peak = std::max(peak, std::abs(output.renderSample().psg));
+    }
+    REQUIRE_EQ(peak < 0.001F, true);
+}
+
+void testMAmidiChipRegisterMap() {
+    const auto volume = mapRegisterWriteToMAmidi(RegisterWrite{
+        0,
+        0,
+        ChipId::Psg,
+        0,
+        8,
+        0x0F,
+        0,
+        WriteReason::Volume,
+    });
+    REQUIRE_EQ(volume.has_value(), true);
+    REQUIRE_EQ(volume->device_id, static_cast<std::uint8_t>(MAmidiDeviceId::Psg));
+    REQUIRE_EQ(volume->address, 8U);
+    REQUIRE_EQ(volume->data, 0x0FU);
+
+    const auto mixer = mapRegisterWriteToMAmidi(RegisterWrite{
+        0,
+        1,
+        ChipId::Psg,
+        0,
+        7,
+        0xBE,
+        0,
+        WriteReason::Patch,
+    });
+    REQUIRE_EQ(mixer.has_value(), true);
+    REQUIRE_EQ(mixer->data, 0x3EU);
+
+    REQUIRE_EQ(
+        mapRegisterWriteToMAmidi(RegisterWrite{
+            0,
+            2,
+            ChipId::Psg,
+            0,
+            14,
+            0,
+            0,
+            WriteReason::Patch,
+        }).has_value(),
+        false);
+
+    const auto opll_key = mapRegisterWriteToMAmidi(RegisterWrite{
+        0,
+        3,
+        ChipId::Opll,
+        0,
+        0x20,
+        0x16,
+        8,
+        WriteReason::KeyOn,
+    });
+    REQUIRE_EQ(opll_key.has_value(), true);
+    REQUIRE_EQ(opll_key->device_id, static_cast<std::uint8_t>(MAmidiDeviceId::Opll));
+    REQUIRE_EQ(opll_key->address, 0x20U);
+    REQUIRE_EQ(opll_key->data, 0x16U);
+
+    REQUIRE_EQ(
+        mapRegisterWriteToMAmidi(RegisterWrite{
+            0,
+            4,
+            ChipId::Opll,
+            0,
+            0x39,
+            0,
+            0,
+            WriteReason::Patch,
+        }).has_value(),
+        false);
+
+    // MGSTC ports → MAmidi absolute SCC addresses (not emu2212 0xC0/D0/E1).
+    const auto scc_wave = mapRegisterWriteToMAmidi(RegisterWrite{
+        0,
+        5,
+        ChipId::Scc,
+        0,
+        0x10,
+        0x40,
+        3,
+        WriteReason::Patch,
+    });
+    REQUIRE_EQ(scc_wave.has_value(), true);
+    REQUIRE_EQ(scc_wave->device_id, static_cast<std::uint8_t>(7));
+    REQUIRE_EQ(scc_wave->address, 0x10U);
+    REQUIRE_EQ(scc_wave->data, 0x40U);
+
+    const auto scc_freq = mapRegisterWriteToMAmidi(RegisterWrite{
+        0,
+        6,
+        ChipId::Scc,
+        1,
+        0,
+        0xAB,
+        3,
+        WriteReason::Frequency,
+    });
+    REQUIRE_EQ(scc_freq.has_value(), true);
+    REQUIRE_EQ(scc_freq->address, 0x80U);
+
+    const auto scc_vol = mapRegisterWriteToMAmidi(RegisterWrite{
+        0,
+        7,
+        ChipId::Scc,
+        2,
+        0,
+        0x0F,
+        3,
+        WriteReason::Volume,
+    });
+    REQUIRE_EQ(scc_vol.has_value(), true);
+    REQUIRE_EQ(scc_vol->address, 0x8AU);
+
+    const auto scc_key = mapRegisterWriteToMAmidi(RegisterWrite{
+        0,
+        8,
+        ChipId::Scc,
+        3,
+        0,
+        0x01,
+        3,
+        WriteReason::KeyOn,
+    });
+    REQUIRE_EQ(scc_key.has_value(), true);
+    REQUIRE_EQ(scc_key->address, 0x8FU);
+
+    const auto scc_plus = mapRegisterWriteToMAmidi(
+        RegisterWrite{
+            0,
+            9,
+            ChipId::Scc,
+            2,
+            1,
+            0x0C,
+            4,
+            WriteReason::Volume,
+        },
+        MAmidiMapOptions{.unit_no = 0, .scc_plus = true});
+    REQUIRE_EQ(scc_plus.has_value(), true);
+    REQUIRE_EQ(scc_plus->address, 0x18BU);
+
+    REQUIRE_EQ(
+        mapRegisterWriteToMAmidi(RegisterWrite{
+            0,
+            10,
+            ChipId::Scc,
+            1,
+            10,
+            0,
+            0,
+            WriteReason::Frequency,
+        }).has_value(),
+        false);
+
+    MAmidiChipAccess psg_silence[kMAmidiPsgSilenceWriteCount]{};
+    fillPsgSilenceWrites(psg_silence, 2);
+    REQUIRE_EQ(psg_silence[0].device_id, static_cast<std::uint8_t>(11));
+    REQUIRE_EQ(psg_silence[0].unit_no, static_cast<std::uint8_t>(2));
+    REQUIRE_EQ(psg_silence[0].address, 7U);
+    REQUIRE_EQ(psg_silence[0].data, 0x3FU);
+
+    MAmidiChipAccess opll_silence[kMAmidiOpllSilenceWriteCount]{};
+    fillOpllSilenceWrites(opll_silence, 1);
+    REQUIRE_EQ(opll_silence[0].device_id, static_cast<std::uint8_t>(9));
+    REQUIRE_EQ(opll_silence[0].address, 0x20U);
+    REQUIRE_EQ(
+        opll_silence[kMAmidiOpllSilenceWriteCount - 1].address,
+        0x0EU);
+
+    MAmidiChipAccess scc_silence[kMAmidiSccSilenceWriteCount]{};
+    fillSccSilenceWrites(scc_silence, 0, false);
+    REQUIRE_EQ(scc_silence[0].device_id, static_cast<std::uint8_t>(7));
+    REQUIRE_EQ(scc_silence[0].address, 0x8AU);
+    REQUIRE_EQ(scc_silence[4].address, 0x8EU);
+    REQUIRE_EQ(scc_silence[5].address, 0x8FU);
+}
+
+void testMAmidiMemoSoundOutputOpenFailsWithoutServer() {
+    MAmidiMemoSoundOutput output;
+    REQUIRE_EQ(
+        output.kind(),
+        mgstc::engine::SoundOutputKind::MAmidiMemo);
+    REQUIRE_EQ(output.host(), std::string{"localhost"});
+    REQUIRE_EQ(output.port(), static_cast<std::uint16_t>(30000));
+    // Avoid the default chip_server port — it may be occupied locally.
+    output.setEndpoint("127.0.0.1", 39999);
+    REQUIRE_EQ(output.open(), false);
+    REQUIRE_EQ(output.isOpen(), false);
+    REQUIRE_EQ(
+        output.connectionState(),
+        MAmidiConnectionState::Disconnected);
+    REQUIRE_EQ(output.lastError().empty(), false);
+    REQUIRE_EQ(
+        output.writeRegister(RegisterWrite{
+            0,
+            0,
+            ChipId::Psg,
+            0,
+            8,
+            0x0F,
+            0,
+            WriteReason::Volume,
+        }),
+        false);
+}
+
+void testMAmidiRpcClientConnectsToMockChipServer() {
+    constexpr std::uint16_t kPort = 39111;
+    std::mutex mutex;
+    std::vector<MAmidiChipAccess> received;
+    std::condition_variable cv;
+
+    rpc::server server(kPort);
+    server.bind(
+        MAmidiRpcClient::kMethodName,
+        [&](unsigned char device_id,
+            unsigned char unit_no,
+            unsigned int address,
+            unsigned int data) {
+            std::lock_guard lock(mutex);
+            received.push_back(MAmidiChipAccess{
+                static_cast<std::uint8_t>(device_id),
+                static_cast<std::uint8_t>(unit_no),
+                address,
+                data,
+            });
+            cv.notify_all();
+        });
+    server.async_run(1);
+
+    MAmidiMemoSoundOutput output;
+    output.setEndpoint("127.0.0.1", kPort);
+    REQUIRE_EQ(output.open(), true);
+    REQUIRE_EQ(output.isOpen(), true);
+    REQUIRE_EQ(
+        output.connectionState(),
+        MAmidiConnectionState::Connected);
+    REQUIRE_EQ(
+        output.statusText().find("connected") != std::string::npos,
+        true);
+
+    // Probe uses (0,0,0,0); wait for it, then send mapped PSG writes.
+    {
+        std::unique_lock lock(mutex);
+        REQUIRE_EQ(
+            cv.wait_for(lock, std::chrono::seconds(2), [&] {
+                return !received.empty();
+            }),
+            true);
+    }
+
+    REQUIRE_EQ(
+        output.writeRegister(RegisterWrite{
+            0,
+            0,
+            ChipId::Psg,
+            0,
+            8,
+            0x0F,
+            0,
+            WriteReason::Volume,
+        }),
+        true);
+    REQUIRE_EQ(
+        output.writeRegister(RegisterWrite{
+            0,
+            1,
+            ChipId::Psg,
+            0,
+            7,
+            0xBE,
+            0,
+            WriteReason::Patch,
+        }),
+        true);
+    REQUIRE_EQ(
+        output.writeRegister(RegisterWrite{
+            0,
+            2,
+            ChipId::Opll,
+            0,
+            0x20,
+            0x16,
+            8,
+            WriteReason::KeyOn,
+        }),
+        true);
+    REQUIRE_EQ(
+        output.writeRegister(RegisterWrite{
+            0,
+            3,
+            ChipId::Scc,
+            2,
+            0,
+            0x0F,
+            0,
+            WriteReason::Volume,
+        }),
+        true);
+    REQUIRE_EQ(
+        output.writeRegister(RegisterWrite{
+            0,
+            4,
+            ChipId::Scc,
+            3,
+            0,
+            0x01,
+            0,
+            WriteReason::KeyOn,
+        }),
+        true);
+    REQUIRE_EQ(output.waitForIdle(2000), true);
+
+    {
+        std::unique_lock lock(mutex);
+        REQUIRE_EQ(
+            cv.wait_for(lock, std::chrono::seconds(2), [&] {
+                return received.size() >= 6;
+            }),
+            true);
+        // Skip probe at [0]; PSG volume, masked mixer, OPLL, SCC vol/key.
+        REQUIRE_EQ(received[1].device_id, static_cast<std::uint8_t>(11));
+        REQUIRE_EQ(received[1].address, 8U);
+        REQUIRE_EQ(received[1].data, 0x0FU);
+        REQUIRE_EQ(received[2].device_id, static_cast<std::uint8_t>(11));
+        REQUIRE_EQ(received[2].address, 7U);
+        REQUIRE_EQ(received[2].data, 0x3EU);
+        REQUIRE_EQ(received[3].device_id, static_cast<std::uint8_t>(9));
+        REQUIRE_EQ(received[3].address, 0x20U);
+        REQUIRE_EQ(received[3].data, 0x16U);
+        REQUIRE_EQ(received[4].device_id, static_cast<std::uint8_t>(7));
+        REQUIRE_EQ(received[4].address, 0x8AU);
+        REQUIRE_EQ(received[4].data, 0x0FU);
+        REQUIRE_EQ(received[5].device_id, static_cast<std::uint8_t>(7));
+        REQUIRE_EQ(received[5].address, 0x8FU);
+        REQUIRE_EQ(received[5].data, 0x01U);
+    }
+
+    const auto before_silence = [&] {
+        std::lock_guard lock(mutex);
+        return received.size();
+    }();
+    const auto silence_count =
+        kMAmidiPsgSilenceWriteCount
+        + kMAmidiOpllSilenceWriteCount
+        + kMAmidiSccSilenceWriteCount;
+    output.allNotesOff();
+    REQUIRE_EQ(output.waitForIdle(2000), true);
+    {
+        std::unique_lock lock(mutex);
+        REQUIRE_EQ(
+            cv.wait_for(lock, std::chrono::seconds(2), [&] {
+                return received.size() >= before_silence + silence_count;
+            }),
+            true);
+        REQUIRE_EQ(received[before_silence].device_id, static_cast<std::uint8_t>(11));
+        REQUIRE_EQ(received[before_silence].address, 7U);
+        REQUIRE_EQ(received[before_silence].data, 0x3FU);
+        REQUIRE_EQ(
+            received[before_silence + kMAmidiPsgSilenceWriteCount].device_id,
+            static_cast<std::uint8_t>(9));
+        const auto scc_silence_at =
+            before_silence
+            + kMAmidiPsgSilenceWriteCount
+            + kMAmidiOpllSilenceWriteCount;
+        REQUIRE_EQ(received[scc_silence_at].device_id, static_cast<std::uint8_t>(7));
+        REQUIRE_EQ(received[scc_silence_at].address, 0x8AU);
+        REQUIRE_EQ(
+            received[scc_silence_at + kMAmidiSccSilenceWriteCount - 1].address,
+            0x8FU);
+    }
+
+    output.close();
+    REQUIRE_EQ(output.isOpen(), false);
+    server.stop();
+}
+
+void testEngineCoreRemoteBackendSilencesLocalMix() {
+    constexpr std::uint16_t kPort = 39112;
+    rpc::server server(kPort);
+    server.bind(
+        MAmidiRpcClient::kMethodName,
+        [](unsigned char, unsigned char, unsigned int, unsigned int) {
+        });
+    server.async_run(1);
+
+    MAmidiMemoSoundOutput remote;
+    remote.setEndpoint("127.0.0.1", kPort);
+    REQUIRE_EQ(remote.open(), true);
+
+    EngineCore engine;
+    engine.setOutputBackend(&remote);
+    REQUIRE_EQ(engine.waveformMonitor(), false);
+    REQUIRE_EQ(
+        engine.outputKind(),
+        mgstc::engine::SoundOutputKind::MAmidiMemo);
+    REQUIRE_EQ(engine.session().setSequenceEnvelope(0, {0x0F}), true);
+    REQUIRE_EQ(engine.session().queueNoteOn(0, 60), true);
+
+    std::vector<float> output(800 * 2);
+    const auto result = engine.render(output);
+    REQUIRE_EQ(result.ok(), true);
+    float peak = 0.0F;
+    for (float sample : output) {
+        peak = std::max(peak, std::abs(sample));
+    }
+    REQUIRE_EQ(peak < 0.001F, true);
+
+    OpllScopeFrame scope{};
+    REQUIRE_EQ(engine.takeOpllScopeFrame(scope), true);
+    float scope_peak = 0.0F;
+    for (float sample : scope.mixed_samples) {
+        scope_peak = std::max(scope_peak, std::abs(sample));
+    }
+    REQUIRE_EQ(scope_peak < 0.001F, true);
+
+    remote.close();
+    server.stop();
+}
+
+void testEngineCoreWaveformMonitorKeepsScopeWithSilentMix() {
+    constexpr std::uint16_t kPort = 39113;
+    rpc::server server(kPort);
+    server.bind(
+        MAmidiRpcClient::kMethodName,
+        [](unsigned char, unsigned char, unsigned int, unsigned int) {
+        });
+    server.async_run(1);
+
+    MAmidiMemoSoundOutput remote;
+    remote.setEndpoint("127.0.0.1", kPort);
+    REQUIRE_EQ(remote.open(), true);
+
+    EngineCore engine;
+    engine.setOutputBackend(&remote);
+    engine.setWaveformMonitor(true);
+    REQUIRE_EQ(engine.session().setSequenceEnvelope(0, {0x0F}), true);
+    REQUIRE_EQ(engine.session().queueNoteOn(0, 60), true);
+
+    std::vector<float> output(800 * 2);
+    const auto result = engine.render(output);
+    REQUIRE_EQ(result.ok(), true);
+
+    float mix_peak = 0.0F;
+    for (float sample : output) {
+        mix_peak = std::max(mix_peak, std::abs(sample));
+    }
+    REQUIRE_EQ(mix_peak < 0.001F, true);
+
+    OpllScopeFrame scope{};
+    REQUIRE_EQ(engine.takeOpllScopeFrame(scope), true);
+    float scope_peak = 0.0F;
+    for (float sample : scope.mixed_samples) {
+        scope_peak = std::max(scope_peak, std::abs(sample));
+    }
+    REQUIRE_EQ(scope_peak > 0.001F, true);
+
+    remote.close();
+    server.stop();
 }
 
 void testEngineCoreSplitsAtEightHundredFrameBoundary() {
@@ -821,8 +1436,7 @@ void testSccPresetGenerationIncludesDocumentedHarmonics() {
         SccWavePreset::Sine,
         SccWavePreset::Square,
         SccWavePreset::Triangle,
-        SccWavePreset::SawUp,
-        SccWavePreset::SawDown,
+        SccWavePreset::Saw,
         SccWavePreset::Pulse25,
         SccWavePreset::Pulse12_5,
     };
@@ -882,6 +1496,10 @@ void testSccWaveformUtilityTransforms() {
     const auto inverted = invertSccWaveform(waveform);
     REQUIRE_EQ(inverted[0], static_cast<std::int8_t>(127));
     REQUIRE_EQ(inverted[1], static_cast<std::int8_t>(-64));
+
+    const auto mirrored = mirrorSccWaveform(waveform);
+    REQUIRE_EQ(mirrored[0], waveform[31]);
+    REQUIRE_EQ(mirrored[31], waveform[0]);
 
     const auto rotated = rotateSccWaveform(waveform, 1);
     REQUIRE_EQ(rotated[1], waveform[0]);
@@ -1857,6 +2475,109 @@ void testWaveCycleProducesValidOpllApproximation() {
     REQUIRE_EQ(patch.feedback <= 7, true);
 }
 
+void testSccSineApproximationMatchesKeyboardPitch() {
+    // Same MIDI note: converted OPLL fundamental should track the SCC
+    // audition frequency (period-window scoring), not an octave above it.
+    SccWaveform waveform{};
+    for (std::size_t index = 0; index < waveform.size(); ++index) {
+        waveform[index] = static_cast<std::int8_t>(std::lround(
+            127.0 * std::sin(
+                2.0 * std::numbers::pi * static_cast<double>(index)
+                / waveform.size())));
+    }
+    const auto first =
+        approximateSccWaveformCandidatesWithOpll(waveform);
+    const auto second =
+        approximateSccWaveformCandidatesWithOpll(waveform);
+    REQUIRE_EQ(first.empty(), false);
+    REQUIRE_EQ(first, second);
+
+    NotePitch pitch{};
+    REQUIRE_EQ(notePitch(60, pitch), true);
+    const float scc_hz = static_cast<float>(
+        3579545.0 / ((static_cast<double>(pitch.psg_scc_period) + 1.0) * 32.0));
+    const float mul_factor = [](std::uint8_t mul) {
+        static constexpr float kFactors[16] = {
+            0.5F, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 12, 12, 15, 15};
+        return kFactors[mul & 15];
+    }(first.front().carrier.multiplier);
+    const float opll_base = static_cast<float>(
+        pitch.opll.f_number * 3579545.0
+        / (72.0 * static_cast<double>(1u << (19 - pitch.opll.block))));
+    const float opll_hz = opll_base * mul_factor;
+    const float ratio = opll_hz / scc_hz;
+    REQUIRE_EQ(ratio > 0.94F, true);
+    REQUIRE_EQ(ratio < 1.06F, true);
+}
+
+void testSineReferencePeriodIsNotOctaveDoubled() {
+    mgstc::engine::WavePcm pcm;
+    pcm.sample_rate = 48000;
+    pcm.mono_samples.resize(48000);
+    constexpr double frequency = 261.625565;
+    for (std::size_t index = 0; index < pcm.mono_samples.size(); ++index) {
+        const double time =
+            static_cast<double>(index) / pcm.sample_rate;
+        pcm.mono_samples[index] = static_cast<float>(
+            std::sin(2.0 * std::numbers::pi * frequency * time));
+    }
+    const auto analysis = analyzeWaveCycle(pcm);
+    REQUIRE_EQ(analysis.estimated_frequency_hz > 240.0F, true);
+    REQUIRE_EQ(analysis.estimated_frequency_hz < 290.0F, true);
+}
+
+void testOpllToSccReferenceCapturePitchAndCycle() {
+    // OPLL→SCC capture follows notePitch (A440), same as live audition.
+    NotePitch pitch{};
+    REQUIRE_EQ(notePitch(60, pitch), true);
+    REQUIRE_EQ(pitch.opll.f_number, static_cast<std::uint16_t>(0xAC));
+    REQUIRE_EQ(pitch.opll.block, static_cast<std::uint8_t>(4));
+
+    const double scc_hz = 3579545.0
+        / ((static_cast<double>(pitch.psg_scc_period) + 1.0) * 32.0);
+    const double opll_hz = pitch.opll.f_number * 3579545.0
+        / (72.0 * static_cast<double>(1u << (19 - pitch.opll.block)));
+    REQUIRE_EQ(opll_hz / scc_hz > 0.94, true);
+    REQUIRE_EQ(opll_hz / scc_hz < 1.06, true);
+
+    mgstc::engine::Ym2413Adapter opll;
+    REQUIRE_EQ(opll.valid(), true);
+    const auto patch = defaultOpllPatch();
+    const auto registers = encodeOpllPatch(patch);
+    for (std::size_t index = 0; index < registers.size(); ++index) {
+        REQUIRE_EQ(
+            opll.write(
+                static_cast<std::uint8_t>(index), registers[index]),
+            true);
+    }
+    REQUIRE_EQ(opll.write(0x30, 0x00), true);
+    REQUIRE_EQ(
+        opll.write(
+            0x10, static_cast<std::uint8_t>(pitch.opll.f_number & 0xFF)),
+        true);
+    REQUIRE_EQ(
+        opll.write(
+            0x20,
+            static_cast<std::uint8_t>(
+                0x10
+                | ((pitch.opll.block & 7) << 1)
+                | ((pitch.opll.f_number >> 8) & 1))),
+        true);
+    for (int index = 0; index < 4800; ++index) {
+        static_cast<void>(opll.renderSample());
+    }
+    mgstc::engine::WavePcm pcm;
+    pcm.sample_rate = 48000;
+    pcm.mono_samples.resize(8192);
+    for (auto& sample : pcm.mono_samples) {
+        sample = opll.renderSample();
+    }
+    const auto analysis = analyzeWaveCycle(pcm);
+    REQUIRE_EQ(analysis.cycle.size() >= 2, true);
+    REQUIRE_EQ(analysis.estimated_frequency_hz > 240.0F, true);
+    REQUIRE_EQ(analysis.estimated_frequency_hz < 290.0F, true);
+}
+
 void testWavePcmProducesDeterministicTimedOpllApproximation() {
     mgstc::engine::WavePcm pcm;
     pcm.sample_rate = 8000;
@@ -2432,6 +3153,7 @@ int main() {
         {"VolumeCombination", testVolumeCombination},
         {"ChipSpecificVolumeMapping", testChipSpecificVolumeMapping},
         {"MgsdrvNoteTables", testMgsdrvNoteTables},
+        {"SccAdapterPlaysLabeledC4Near261Hz", testSccAdapterPlaysLabeledC4Near261Hz},
         {"RuntimePsgNoteOnOrderMatchesObservedBoundary", testRuntimePsgNoteOnOrderMatchesObservedBoundary},
         {"RuntimeBoundaryWritesMatchVgmFixture", testRuntimeBoundaryWritesMatchVgmFixture},
         {"RuntimeSccKeyMaskPreservesOtherChannels", testRuntimeSccKeyMaskPreservesOtherChannels},
@@ -2439,6 +3161,12 @@ int main() {
         {"AuditionGateSuppressesEnvelopeUntilNoteOn", testAuditionGateSuppressesEnvelopeUntilNoteOn},
         {"RuntimeOpllKeyOnAndOffRegisters", testRuntimeOpllKeyOnAndOffRegisters},
         {"ChipRackRendersAllThreeChips", testChipRackRendersAllThreeChips},
+        {"EmulatorSoundOutputMirrorsChipRack", testEmulatorSoundOutputMirrorsChipRack},
+        {"MAmidiChipRegisterMap", testMAmidiChipRegisterMap},
+        {"MAmidiMemoSoundOutputOpenFailsWithoutServer", testMAmidiMemoSoundOutputOpenFailsWithoutServer},
+        {"MAmidiRpcClientConnectsToMockChipServer", testMAmidiRpcClientConnectsToMockChipServer},
+        {"EngineCoreRemoteBackendSilencesLocalMix", testEngineCoreRemoteBackendSilencesLocalMix},
+        {"EngineCoreWaveformMonitorKeepsScopeWithSilentMix", testEngineCoreWaveformMonitorKeepsScopeWithSilentMix},
         {"EngineCoreSplitsAtEightHundredFrameBoundary", testEngineCoreSplitsAtEightHundredFrameBoundary},
         {"EngineCoreValidatesAndClampsOutput", testEngineCoreValidatesAndClampsOutput},
         {"EngineCorePublishesOneSixtiethOpllScope", testEngineCorePublishesOneSixtiethOpllScope},
@@ -2476,6 +3204,9 @@ int main() {
         {"TimbreLibrarySelectedExportAndNonDestructiveImport", testTimbreLibrarySelectedExportAndNonDestructiveImport},
         {"WavePcmCycleConvertsToScc", testWavePcmCycleConvertsToScc},
         {"WaveCycleProducesValidOpllApproximation", testWaveCycleProducesValidOpllApproximation},
+        {"SccSineApproximationMatchesKeyboardPitch", testSccSineApproximationMatchesKeyboardPitch},
+        {"SineReferencePeriodIsNotOctaveDoubled", testSineReferencePeriodIsNotOctaveDoubled},
+        {"OpllToSccReferenceCapturePitchAndCycle", testOpllToSccReferenceCapturePitchAndCycle},
         {"WavePcmProducesDeterministicTimedOpllApproximation", testWavePcmProducesDeterministicTimedOpllApproximation},
         {"DefaultCompositeTimbreHasThreeAudibleSources", testDefaultCompositeTimbreHasThreeAudibleSources},
         {"CompositeLayerRemovalReusesFreedChannel", testCompositeLayerRemovalReusesFreedChannel},

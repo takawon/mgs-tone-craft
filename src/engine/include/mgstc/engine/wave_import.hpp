@@ -34,6 +34,16 @@ struct WaveCycleAnalysis {
 [[nodiscard]] OpllPatchParameters approximateWaveCycleWithOpll(
     std::span<const float> cycle) noexcept;
 
+// Ranked steady-state OPLL approximations for one waveform cycle.
+// Deterministic: identical cycle samples yield identical register values.
+[[nodiscard]] std::vector<OpllPatchParameters>
+approximateWaveCycleCandidatesWithOpll(std::span<const float> cycle);
+
+// SCC 32-sample waveform → OPLL. Fits by rendering both at the same MIDI
+// note and comparing audio (no envelope path; SCC single-timbre is steady).
+[[nodiscard]] std::vector<OpllPatchParameters>
+approximateSccWaveformCandidatesWithOpll(const SccWaveform& waveform);
+
 // Uses the complete audible portion of a WAV to fit both the steady-state
 // spectrum and the YM2413 hardware envelope. The search is deterministic:
 // identical PCM and emu2413 versions produce identical register values.

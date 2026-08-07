@@ -6,9 +6,11 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 
 #include "mgstc/engine/engine_command.hpp"
 #include "mgstc/engine/engine_core.hpp"
+#include "mgstc/engine/mamidi_memo_sound_output.hpp"
 #include "mgstc/engine/program_edit.hpp"
 #include "mgstc/engine/spsc_queue.hpp"
 
@@ -29,6 +31,15 @@ struct EngineNotice {
     std::uint64_t generation{};
 };
 
+struct MAmidiOutputSettings {
+    std::string host{MAmidiMemoSoundOutput::kDefaultHost};
+    std::uint16_t port{MAmidiMemoSoundOutput::kDefaultPort};
+    std::uint8_t unit_no{0};
+    bool scc_plus{false};
+    // Default off: RPC output does not drive local scope unless enabled.
+    bool waveform_monitor{false};
+};
+
 class RealtimeEngineHost {
 public:
     static constexpr std::size_t kCommandCapacity = 256;
@@ -37,6 +48,10 @@ public:
     static constexpr std::size_t kProgramSlotCount = 3;
 
     RealtimeEngineHost();
+    ~RealtimeEngineHost();
+
+    RealtimeEngineHost(const RealtimeEngineHost&) = delete;
+    RealtimeEngineHost& operator=(const RealtimeEngineHost&) = delete;
 
     // UI thread only. Construction and program editing may allocate.
     [[nodiscard]] ProgramEdit beginProgramEdit();
@@ -48,6 +63,15 @@ public:
 
     // UI thread only.
     [[nodiscard]] bool submit(const EngineCommand& command) noexcept;
+
+    // UI thread only. Does not auto-fall back to emulator on failure.
+    void setMAmidiSettings(MAmidiOutputSettings settings);
+    [[nodiscard]] const MAmidiOutputSettings& mamidiSettings() const noexcept;
+    [[nodiscard]] bool setSoundOutputKind(SoundOutputKind kind);
+    [[nodiscard]] SoundOutputKind soundOutputKind() const noexcept;
+    [[nodiscard]] bool reconnectMAmidi();
+    [[nodiscard]] std::string soundOutputStatus() const;
+    [[nodiscard]] std::string soundOutputLastError() const;
 
     // UI thread only.
     [[nodiscard]] bool pollNotice(EngineNotice& notice) noexcept;
@@ -82,12 +106,17 @@ private:
     void loadProgram(const EngineCommand& command) noexcept;
     void reject(EngineCommandType command) noexcept;
     void notify(const EngineNotice& notice) noexcept;
+    void applyOutputRouting() noexcept;
+    void applyOutputRouting(EngineCore& engine) noexcept;
 
     SpscQueue<EngineCommand, kCommandCapacity> commands_{};
     SpscQueue<EngineNotice, kNoticeCapacity> notices_{};
     std::unique_ptr<SpscQueue<OpllScopeFrame, kOpllScopeCapacity>>
         opll_scope_frames_;
     std::unique_ptr<ProgramSlot[]> programs_;
+    std::unique_ptr<MAmidiMemoSoundOutput> mamidi_;
+    MAmidiOutputSettings mamidi_settings_{};
+    SoundOutputKind output_kind_{SoundOutputKind::Emulator};
     std::uint8_t active_program_{};
     MixerGains current_gains_{};
     bool clipping_{};

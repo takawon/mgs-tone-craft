@@ -11,15 +11,26 @@ RealtimeEngineHost::RealtimeEngineHost()
     : opll_scope_frames_(
           std::make_unique<
               SpscQueue<OpllScopeFrame, kOpllScopeCapacity>>()),
-      programs_(std::make_unique<ProgramSlot[]>(kProgramSlotCount)) {
+      programs_(std::make_unique<ProgramSlot[]>(kProgramSlotCount)),
+      mamidi_(std::make_unique<MAmidiMemoSoundOutput>()) {
     programs_[0].state.store(
         ProgramSlotState::Active,
         std::memory_order_relaxed);
+    applyOutputRouting(programs_[0].engine);
+}
+
+RealtimeEngineHost::~RealtimeEngineHost() {
+    output_kind_ = SoundOutputKind::Emulator;
+    applyOutputRouting();
+    if (mamidi_ != nullptr) {
+        mamidi_->close();
+    }
 }
 
 ProgramEdit RealtimeEngineHost::beginProgramEdit() {
     // All construction and destruction stays on the UI thread.
     EngineCore fresh;
+    applyOutputRouting(fresh);
     for (std::uint8_t index = 0; index < kProgramSlotCount; ++index) {
         auto expected = ProgramSlotState::Free;
         auto& slot = programs_[index];
@@ -101,6 +112,107 @@ bool RealtimeEngineHost::submit(
     return commands_.tryPush(command);
 }
 
+void RealtimeEngineHost::setMAmidiSettings(
+    MAmidiOutputSettings settings) {
+    const bool endpoint_changed =
+        settings.host != mamidi_settings_.host
+        || settings.port != mamidi_settings_.port
+        || settings.unit_no != mamidi_settings_.unit_no
+        || settings.scc_plus != mamidi_settings_.scc_plus;
+    mamidi_settings_ = std::move(settings);
+    // Waveform monitor is local-only and must update without reconnect.
+    applyOutputRouting();
+
+    if (mamidi_ == nullptr || !endpoint_changed) {
+        return;
+    }
+    const bool was_open = mamidi_->isOpen();
+    if (was_open) {
+        mamidi_->close();
+    }
+    mamidi_->setEndpoint(mamidi_settings_.host, mamidi_settings_.port);
+    mamidi_->setUnitNo(mamidi_settings_.unit_no);
+    mamidi_->setSccPlus(mamidi_settings_.scc_plus);
+    if (was_open || output_kind_ == SoundOutputKind::MAmidiMemo) {
+        if (!mamidi_->open()) {
+            // Keep MAmidi selected; do not silently fall back.
+            applyOutputRouting();
+            return;
+        }
+        applyOutputRouting();
+    }
+}
+
+const MAmidiOutputSettings& RealtimeEngineHost::mamidiSettings()
+    const noexcept {
+    return mamidi_settings_;
+}
+
+bool RealtimeEngineHost::setSoundOutputKind(SoundOutputKind kind) {
+    if (kind == SoundOutputKind::Emulator) {
+        output_kind_ = SoundOutputKind::Emulator;
+        applyOutputRouting();
+        if (mamidi_ != nullptr) {
+            mamidi_->close();
+        }
+        return true;
+    }
+
+    if (mamidi_ == nullptr) {
+        return false;
+    }
+    mamidi_->setEndpoint(mamidi_settings_.host, mamidi_settings_.port);
+    mamidi_->setUnitNo(mamidi_settings_.unit_no);
+    mamidi_->setSccPlus(mamidi_settings_.scc_plus);
+    if (!mamidi_->isOpen() && !mamidi_->open()) {
+        // Selection stays on emulator until connect succeeds.
+        return false;
+    }
+    output_kind_ = SoundOutputKind::MAmidiMemo;
+    applyOutputRouting();
+    return true;
+}
+
+SoundOutputKind RealtimeEngineHost::soundOutputKind() const noexcept {
+    return output_kind_;
+}
+
+bool RealtimeEngineHost::reconnectMAmidi() {
+    if (mamidi_ == nullptr) {
+        return false;
+    }
+    mamidi_->close();
+    mamidi_->setEndpoint(mamidi_settings_.host, mamidi_settings_.port);
+    mamidi_->setUnitNo(mamidi_settings_.unit_no);
+    mamidi_->setSccPlus(mamidi_settings_.scc_plus);
+    if (!mamidi_->open()) {
+        // Remain on MAmidiMemo if already selected; no emu auto-switch.
+        applyOutputRouting();
+        return false;
+    }
+    if (output_kind_ == SoundOutputKind::MAmidiMemo) {
+        applyOutputRouting();
+    }
+    return true;
+}
+
+std::string RealtimeEngineHost::soundOutputStatus() const {
+    if (output_kind_ == SoundOutputKind::Emulator) {
+        return "Output: Emulator";
+    }
+    if (mamidi_ == nullptr) {
+        return "Output: MAmidiMEmo (unavailable)";
+    }
+    return mamidi_->statusText();
+}
+
+std::string RealtimeEngineHost::soundOutputLastError() const {
+    if (mamidi_ == nullptr) {
+        return {};
+    }
+    return mamidi_->lastError();
+}
+
 bool RealtimeEngineHost::pollNotice(EngineNotice& notice) noexcept {
     return notices_.tryPop(notice);
 }
@@ -122,6 +234,23 @@ void RealtimeEngineHost::reject(
     });
 }
 
+void RealtimeEngineHost::applyOutputRouting() noexcept {
+    for (std::uint8_t index = 0; index < kProgramSlotCount; ++index) {
+        applyOutputRouting(programs_[index].engine);
+    }
+}
+
+void RealtimeEngineHost::applyOutputRouting(EngineCore& engine) noexcept {
+    // Keep the MAmidi backend selected even while disconnected so writes
+    // fail closed instead of silently falling back to the simulator.
+    if (output_kind_ == SoundOutputKind::MAmidiMemo && mamidi_ != nullptr) {
+        engine.setOutputBackend(mamidi_.get());
+    } else {
+        engine.setOutputBackend(nullptr);
+    }
+    engine.setWaveformMonitor(mamidi_settings_.waveform_monitor);
+}
+
 void RealtimeEngineHost::loadProgram(
     const EngineCommand& command) noexcept {
     if (command.program_slot >= kProgramSlotCount) {
@@ -138,6 +267,7 @@ void RealtimeEngineHost::loadProgram(
     }
 
     static_cast<void>(incoming.engine.setGains(current_gains_));
+    applyOutputRouting(incoming.engine);
     incoming.engine.hardReset();
     incoming.engine.session().gateUntilNoteOn();
     const auto previous = active_program_;
