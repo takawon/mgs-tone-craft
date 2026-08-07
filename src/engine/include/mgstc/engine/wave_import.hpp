@@ -25,6 +25,13 @@ struct WaveCycleAnalysis {
     WavePcm& output,
     std::string* error = nullptr);
 
+// Writes mono PCM as 16-bit little-endian RIFF/WAVE. Prep for the deferred
+// share-clip omake (audition PCM → WAV → optional external ffmpeg mp4).
+[[nodiscard]] bool writeWavePcm(
+    const WavePcm& pcm,
+    std::vector<std::uint8_t>& output,
+    std::string* error = nullptr);
+
 [[nodiscard]] WaveCycleAnalysis analyzeWaveCycle(
     const WavePcm& pcm);
 

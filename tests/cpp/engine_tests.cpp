@@ -2,6 +2,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <filesystem>
 #include <fstream>
@@ -107,6 +108,7 @@ using mgstc::engine::approximateWaveCycleWithOpll;
 using mgstc::engine::approximateWavePcmCandidatesWithOpll;
 using mgstc::engine::approximateWavePcmWithOpll;
 using mgstc::engine::parseWavePcm;
+using mgstc::engine::writeWavePcm;
 using mgstc::engine::waveCycleToScc;
 #ifdef _WIN32
 using mgstc::audio::WasapiAudioSink;
@@ -1841,6 +1843,41 @@ void testWavePcmCycleConvertsToScc() {
     REQUIRE_EQ(static_cast<int>(scc[24]) <= -125, true);
 }
 
+void testWavePcmWriteReadRoundTrip() {
+    mgstc::engine::WavePcm original;
+    original.sample_rate = 48000;
+    original.mono_samples.resize(480);
+    for (std::size_t index = 0; index < original.mono_samples.size();
+         ++index) {
+        original.mono_samples[index] = static_cast<float>(
+            std::sin(2.0 * std::numbers::pi * index / 48.0) * 0.75);
+    }
+    std::vector<std::uint8_t> bytes;
+    std::string error;
+    REQUIRE_EQ(writeWavePcm(original, bytes, &error), true);
+    REQUIRE_EQ(bytes.size() >= 44U, true);
+    REQUIRE_EQ(std::memcmp(bytes.data(), "RIFF", 4), 0);
+    REQUIRE_EQ(std::memcmp(bytes.data() + 8, "WAVE", 4), 0);
+
+    mgstc::engine::WavePcm decoded;
+    REQUIRE_EQ(parseWavePcm(bytes, decoded, &error), true);
+    REQUIRE_EQ(decoded.sample_rate, original.sample_rate);
+    REQUIRE_EQ(decoded.mono_samples.size(), original.mono_samples.size());
+    for (std::size_t index = 0; index < original.mono_samples.size();
+         ++index) {
+        REQUIRE_EQ(
+            std::abs(
+                decoded.mono_samples[index]
+                - original.mono_samples[index])
+                <= (1.0F / 32768.0F) + 1.0e-6F,
+            true);
+    }
+
+    mgstc::engine::WavePcm empty;
+    empty.sample_rate = 48000;
+    REQUIRE_EQ(writeWavePcm(empty, bytes, &error), false);
+}
+
 void testWaveCycleProducesValidOpllApproximation() {
     std::array<float, 64> cycle{};
     for (std::size_t index = 0; index < cycle.size(); ++index) {
@@ -2475,6 +2512,7 @@ int main() {
         {"TimbreLibraryCrudAndVersionedRoundTrip", testTimbreLibraryCrudAndVersionedRoundTrip},
         {"TimbreLibrarySelectedExportAndNonDestructiveImport", testTimbreLibrarySelectedExportAndNonDestructiveImport},
         {"WavePcmCycleConvertsToScc", testWavePcmCycleConvertsToScc},
+        {"WavePcmWriteReadRoundTrip", testWavePcmWriteReadRoundTrip},
         {"WaveCycleProducesValidOpllApproximation", testWaveCycleProducesValidOpllApproximation},
         {"WavePcmProducesDeterministicTimedOpllApproximation", testWavePcmProducesDeterministicTimedOpllApproximation},
         {"DefaultCompositeTimbreHasThreeAudibleSources", testDefaultCompositeTimbreHasThreeAudibleSources},

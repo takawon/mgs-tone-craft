@@ -819,6 +819,67 @@ bool parseWavePcm(
     return true;
 }
 
+bool writeWavePcm(
+    const WavePcm& pcm,
+    std::vector<std::uint8_t>& output,
+    std::string* error) {
+    const auto fail = [&](const char* message) {
+        if (error) {
+            *error = message;
+        }
+        return false;
+    };
+    if (pcm.sample_rate == 0) {
+        return fail("WAVE sample rate must be non-zero.");
+    }
+    const auto frames = pcm.mono_samples.size();
+    if (frames < 2 || frames > pcm.sample_rate * 60ULL) {
+        return fail("WAVE must contain between two samples and 60 seconds.");
+    }
+    constexpr std::uint16_t channels = 1;
+    constexpr std::uint16_t bits = 16;
+    constexpr std::uint16_t block_align = channels * (bits / 8);
+    const auto byte_rate = pcm.sample_rate * block_align;
+    const auto data_bytes =
+        static_cast<std::uint32_t>(frames * block_align);
+    constexpr std::uint32_t fmt_chunk_size = 16;
+    constexpr std::size_t header_bytes = 44;
+    output.assign(header_bytes + data_bytes, 0);
+    const auto put16 = [&](std::size_t offset, std::uint16_t value) {
+        output[offset] = static_cast<std::uint8_t>(value);
+        output[offset + 1] = static_cast<std::uint8_t>(value >> 8);
+    };
+    const auto put32 = [&](std::size_t offset, std::uint32_t value) {
+        for (int byte = 0; byte < 4; ++byte) {
+            output[offset + static_cast<std::size_t>(byte)] =
+                static_cast<std::uint8_t>(value >> (byte * 8));
+        }
+    };
+    std::memcpy(output.data(), "RIFF", 4);
+    put32(4, static_cast<std::uint32_t>(output.size() - 8));
+    std::memcpy(output.data() + 8, "WAVEfmt ", 8);
+    put32(16, fmt_chunk_size);
+    put16(20, 1);
+    put16(22, channels);
+    put32(24, pcm.sample_rate);
+    put32(28, byte_rate);
+    put16(32, block_align);
+    put16(34, bits);
+    std::memcpy(output.data() + 36, "data", 4);
+    put32(40, data_bytes);
+    for (std::size_t index = 0; index < frames; ++index) {
+        const float clamped =
+            std::clamp(pcm.mono_samples[index], -1.0F, 1.0F);
+        // Match parseWavePcm's 16-bit scale (sample / 32768.0F).
+        const auto sample = static_cast<std::int16_t>(std::lround(
+            std::clamp(clamped * 32768.0F, -32768.0F, 32767.0F)));
+        put16(
+            header_bytes + index * block_align,
+            static_cast<std::uint16_t>(sample));
+    }
+    return true;
+}
+
 WaveCycleAnalysis analyzeWaveCycle(const WavePcm& pcm) {
     WaveCycleAnalysis result{};
     if (pcm.mono_samples.size() < 2 || pcm.sample_rate == 0) {
