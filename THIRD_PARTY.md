@@ -1,5 +1,25 @@
 # サードパーティーライブラリ
 
+本体（MGS Tone Craft）のライセンスはAGPL-3.0-onlyで、全文は`LICENSE`に置く。
+ここでは依存関係の取得方法とライセンスを記録する。
+
+## UIフレームワーク（JUCE）
+
+| 項目 | 値 |
+|---|---|
+| 取得方法 | CMake `FetchContent`（ソースツリーへvendorしない） |
+| 固定コミット | `91ad83ae34a81e0833b1a2b0866f54846370ae53`（JUCE 8.0.15） |
+| ライセンス | AGPLv3 と商用ライセンスのデュアル。本プロジェクトはAGPLv3側で使用 |
+| 使用モジュール | `juce_gui_extra`、`juce_audio_utils`とその依存モジュール |
+
+- 本体をAGPL-3.0-onlyとすることでJUCEのAGPLv3条件を満たす。商用ライセンスは購入しない。
+- JUCE 8.0.15はスプラッシュ画面を使用しない版であり、`JUCE_DISPLAY_SPLASH_SCREEN`は
+  指定しても無視される。表示義務のための追加実装は行わない。
+- JUCEモジュールが同梱するzlib、pnglib、jpeglib、HarfBuzzなどの各依存は、
+  JUCEソース内の`LICENSE.md`および各ディレクトリのライセンス表示に従う。
+
+## 音源エミュレータ
+
 音源プレビューでは、Digital Sound Antiquesによる次のMITライセンス実装を
 `third_party`へvendored sourceとして固定して使用する。ネストした`.git`は
 含めず、各ライブラリのライセンス表示を保持する。

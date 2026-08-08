@@ -103,6 +103,18 @@ OPLL／SCC単音色エディタの「Audacityから変換」は、Audacityで現
 
 `mod-script-pipe`を有効にすると、同じPC上で動作する他のプログラムからもAudacityを操作できる状態になります。信頼できないプログラムを実行する環境や複数ユーザーが同時利用する環境では有効にしないでください。連携を使用しない期間は、Audacityのモジュール設定で無効に戻すことを推奨します。
 
+## ライセンス
+
+MGS Tone CraftはGNU Affero General Public License v3.0 only（AGPL-3.0-only）で
+配布します。全文は[LICENSE](LICENSE)にあります。
+
+- UIフレームワークのJUCE 8はAGPLv3と商用ライセンスのデュアルライセンスで、
+  本プロジェクトはAGPLv3側の条件で使用しています。
+- 音源エミュレータ（emu2149／emu2212／emu2413）はMITライセンスで、
+  `third_party`へ各ライセンス全文とともに同梱しています。
+- 依存関係と各ライセンスの詳細は[THIRD_PARTY.md](THIRD_PARTY.md)を参照してください。
+- キャラクター画像を含む`assets`の図案は本プロジェクトの自作物です。
+
 ## 文書
 
 - [仕様書](SPECIFICATION.md)
