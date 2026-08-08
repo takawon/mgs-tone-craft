@@ -107,6 +107,32 @@ function Import-VsEnvironment([string]$VsDevCmd) {
     Normalize-ProcessPath
 }
 
+function Resolve-Git([string]$VsRoot) {
+    $found = Get-Command git.exe -ErrorAction SilentlyContinue
+    if ($found) {
+        return $found.Source
+    }
+
+    # CMake FetchContent needs git to download JUCE and rpclib. A machine with
+    # only Visual Studio installed still has one, but not on PATH.
+    $candidates = @(
+        (Join-Path $VsRoot ("Common7\IDE\CommonExtensions\Microsoft\" +
+            "TeamFoundation\Team Explorer\Git\cmd")),
+        (Join-Path $env:ProgramFiles "Git\cmd"),
+        (Join-Path ${env:ProgramFiles(x86)} "Git\cmd")
+    )
+    foreach ($directory in $candidates) {
+        $candidate = Join-Path $directory "git.exe"
+        if (Test-Path -LiteralPath $candidate) {
+            $env:PATH = "$directory;$env:PATH"
+            return $candidate
+        }
+    }
+
+    throw ("Git was not found. CMake needs it to download JUCE and rpclib. " +
+        "Install Git for Windows or the Visual Studio Git component.")
+}
+
 Push-Location $projectRoot
 try {
     $vsDevCmd = Find-VsDevCmd
@@ -139,9 +165,12 @@ try {
         throw "MSVC compiler 'cl.exe' was not found after VsDevCmd."
     }
 
+    $gitExecutable = Resolve-Git $vsRoot
+
     Write-Host "MSVC:  $($compiler.Source)"
     Write-Host "CMake: $cmakeExecutable"
     Write-Host "Ninja: $ninjaExecutable"
+    Write-Host "Git:   $gitExecutable"
 
     $runtimeOutputDirectory = Join-Path $projectRoot "build"
     $resolvedBuildDirectory = if (
