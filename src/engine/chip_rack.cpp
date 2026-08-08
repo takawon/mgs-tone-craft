@@ -1,7 +1,11 @@
 #include "mgstc/engine/chip_rack.hpp"
 
+#include <cmath>
 #include <cstdint>
+#include <optional>
 #include <utility>
+
+#include "mgstc/engine/sinc_rate_conv.hpp"
 
 extern "C" {
 #include "emu2149.h"
@@ -19,13 +23,31 @@ constexpr std::uint32_t kSccClock = kMasterClock;
 constexpr std::uint32_t kSampleRate = 48'000;
 constexpr float kInt16Scale = 1.0F / 32768.0F;
 
+// YM2149 with internal /2 clock divider advances the tone generator at
+// master/16. Match that cadence, then sinc-downsample to the engine rate
+// (closer to MSXplay/libkss high-quality PSG path with MML lpf=0).
+constexpr double kPsgNativeRate =
+    static_cast<double>(kMasterClock) / 16.0;
+// YM2413 native output is master/72. Feed that into the same external
+// sinc path as PSG so OPLL is not left on emu2413's built-in converter alone.
+constexpr double kOpllNativeRate =
+    static_cast<double>(kMasterClock) / 72.0;
+
 }  // namespace
 
 struct Ym2149Adapter::Impl {
     PSG* chip{};
+    std::optional<SincRateConv> rate_conv;
 
     Impl()
-        : chip(PSG_new(kMasterClock, kSampleRate)) {}
+        : chip(PSG_new(
+              kMasterClock,
+              static_cast<std::uint32_t>(std::lround(kPsgNativeRate))))
+        , rate_conv(
+              chip != nullptr
+                  ? std::optional<SincRateConv>(
+                        SincRateConv(kPsgNativeRate, kSampleRate))
+                  : std::nullopt) {}
 
     ~Impl() {
         PSG_delete(chip);
@@ -37,8 +59,12 @@ Ym2149Adapter::Ym2149Adapter()
     if (valid()) {
         PSG_setClockDivider(impl_->chip, 1);
         PSG_setVolumeMode(impl_->chip, 1);
-        PSG_setQuality(impl_->chip, 1);
+        // Bypass emu2149's light internal converter; external sinc owns AA.
+        PSG_setQuality(impl_->chip, 0);
         PSG_reset(impl_->chip);
+        if (impl_->rate_conv) {
+            impl_->rate_conv->reset();
+        }
     }
 }
 
@@ -47,12 +73,13 @@ Ym2149Adapter::Ym2149Adapter(Ym2149Adapter&&) noexcept = default;
 Ym2149Adapter& Ym2149Adapter::operator=(Ym2149Adapter&&) noexcept = default;
 
 bool Ym2149Adapter::valid() const noexcept {
-    return impl_ && impl_->chip;
+    return impl_ && impl_->chip && impl_->rate_conv.has_value();
 }
 
 void Ym2149Adapter::reset() noexcept {
     if (valid()) {
         PSG_reset(impl_->chip);
+        impl_->rate_conv->reset();
     }
 }
 
@@ -67,9 +94,12 @@ bool Ym2149Adapter::write(
 }
 
 float Ym2149Adapter::renderSample() noexcept {
-    return valid()
-        ? static_cast<float>(PSG_calc(impl_->chip)) * kInt16Scale
-        : 0.0F;
+    if (!valid()) {
+        return 0.0F;
+    }
+    return impl_->rate_conv->next([this] {
+        return static_cast<float>(PSG_calc(impl_->chip)) * kInt16Scale;
+    });
 }
 
 struct SccAdapter::Impl {
@@ -87,7 +117,8 @@ SccAdapter::SccAdapter()
     : impl_(std::make_unique<Impl>()) {
     if (valid()) {
         SCC_set_type(impl_->chip, SCC_STANDARD);
-        SCC_set_quality(impl_->chip, 1);
+        // Match MSXplay live playback (kss-decoder-worker): scc quality off.
+        SCC_set_quality(impl_->chip, 0);
         SCC_reset(impl_->chip);
     }
 }
@@ -155,9 +186,17 @@ float SccAdapter::renderSample() noexcept {
 
 struct Ym2413Adapter::Impl {
     OPLL* chip{};
+    std::optional<SincRateConv> rate_conv;
 
     Impl()
-        : chip(OPLL_new(kMasterClock, kSampleRate)) {}
+        : chip(OPLL_new(
+              kMasterClock,
+              static_cast<std::uint32_t>(std::lround(kOpllNativeRate))))
+        , rate_conv(
+              chip != nullptr
+                  ? std::optional<SincRateConv>(
+                        SincRateConv(kOpllNativeRate, kSampleRate))
+                  : std::nullopt) {}
 
     ~Impl() {
         OPLL_delete(chip);
@@ -167,9 +206,12 @@ struct Ym2413Adapter::Impl {
 Ym2413Adapter::Ym2413Adapter()
     : impl_(std::make_unique<Impl>()) {
     if (valid()) {
+        // Native rate disables emu2413's internal RateConv; external sinc
+        // owns anti-alias filtering (same family as the PSG path).
         OPLL_reset(impl_->chip);
         OPLL_setChipType(impl_->chip, 0);
         OPLL_resetPatch(impl_->chip, OPLL_2413_TONE);
+        impl_->rate_conv->reset();
     }
 }
 
@@ -178,7 +220,7 @@ Ym2413Adapter::Ym2413Adapter(Ym2413Adapter&&) noexcept = default;
 Ym2413Adapter& Ym2413Adapter::operator=(Ym2413Adapter&&) noexcept = default;
 
 bool Ym2413Adapter::valid() const noexcept {
-    return impl_ && impl_->chip;
+    return impl_ && impl_->chip && impl_->rate_conv.has_value();
 }
 
 void Ym2413Adapter::reset() noexcept {
@@ -186,6 +228,7 @@ void Ym2413Adapter::reset() noexcept {
         OPLL_reset(impl_->chip);
         OPLL_setChipType(impl_->chip, 0);
         OPLL_resetPatch(impl_->chip, OPLL_2413_TONE);
+        impl_->rate_conv->reset();
     }
 }
 
@@ -200,9 +243,12 @@ bool Ym2413Adapter::write(
 }
 
 float Ym2413Adapter::renderSample() noexcept {
-    return valid()
-        ? static_cast<float>(OPLL_calc(impl_->chip)) * kInt16Scale
-        : 0.0F;
+    if (!valid()) {
+        return 0.0F;
+    }
+    return impl_->rate_conv->next([this] {
+        return static_cast<float>(OPLL_calc(impl_->chip)) * kInt16Scale;
+    });
 }
 
 bool ChipRack::valid() const noexcept {

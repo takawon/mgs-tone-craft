@@ -132,6 +132,7 @@ add_library(mgstc_engine STATIC
     src/engine/runtime_session.cpp
     src/engine/scc_waveform.cpp
     src/engine/shared_state.cpp
+    src/engine/sinc_rate_conv.cpp
     src/engine/timbre_library.cpp
     src/engine/track_runtime.cpp
     src/engine/voice_allocator.cpp
