@@ -8,6 +8,12 @@
   - Windows 10/11 SDK
 - CMake 3.25以上
 - Ninja（Visual StudioのDeveloper Command Promptに同梱）
+- Git
+
+依存関係のJUCEとrpclibはリポジトリへvendorせず、CMakeの構成時に`FetchContent`が
+公式リポジトリから取得する。このためGitとネットワーク接続が必要である。
+`git`がPATHに無い場合、`tools\build.cmd`はVisual Studio同梱のGitを探して
+プロセス内のPATHへ追加する。見つからない場合は導入を促して停止する。
 
 現在の開発環境では、Visual Studio 2026、MSVC 19.51、Windows SDK
 10.0.26100.0、CMake 4.2で動作確認している。
