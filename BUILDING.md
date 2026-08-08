@@ -124,6 +124,14 @@ ctest --test-dir build --output-on-failure
 音源エミュレータの固定コミットとライセンスは
 [THIRD_PARTY.md](THIRD_PARTY.md)を参照する。
 
+## バージョン表記
+
+`About`タブに出るバージョンは、CMakeのconfigure時に
+[SPECIFICATION.md](SPECIFICATION.md)の`文書版`行を読み取り、
+`MGSTC_DOC_VERSION`として`mgstc`へ渡している。
+仕様書側の文書版を上げれば次のビルドで自動的に再configureされるため、
+ソース側の版数を書き換える必要はない。
+
 ## 日本語パスについて
 
 Visual StudioとCMakeは通常、日本語を含むプロジェクトパスを扱える。

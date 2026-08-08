@@ -48,6 +48,11 @@
 
 #include "audio_import_bridge.hpp"
 
+// Supplied by CMake from the SPECIFICATION.md document version.
+#ifndef MGSTC_DOC_VERSION
+#define MGSTC_DOC_VERSION "0.0"
+#endif
+
 namespace {
 
 static_assert(
@@ -563,6 +568,105 @@ void configureSettingsButton(
     return juce::ImageFileFormat::loadFrom(data, static_cast<size_t>(size));
 }
 
+// アルファを持たない画像（背景が一様な暗色で塗られた素材）を、外周から
+// つながっている背景だけ透過させて切り抜く。塗り足しは外周起点の塗り
+// つぶしに限定するため、被写体内部の暗い部分は残る。
+[[nodiscard]] juce::Image withDarkBackgroundKeyedOut(
+    const juce::Image& source,
+    int key_level = 48) {
+    if (!source.isValid()) {
+        return source;
+    }
+    auto image = source.convertedToFormat(juce::Image::ARGB);
+    const auto width = image.getWidth();
+    const auto height = image.getHeight();
+    if (width <= 0 || height <= 0) {
+        return image;
+    }
+
+    {
+        juce::Image::BitmapData pixels(
+            image, juce::Image::BitmapData::readWrite);
+        const auto pixel_index = [width](int x, int y) {
+            return static_cast<std::size_t>(y)
+                * static_cast<std::size_t>(width)
+                + static_cast<std::size_t>(x);
+        };
+        const auto brightness = [&pixels](int x, int y) {
+            const auto colour = pixels.getPixelColour(x, y);
+            return static_cast<int>(juce::jmax(
+                colour.getRed(),
+                colour.getGreen(),
+                colour.getBlue()));
+        };
+
+        std::vector<std::uint8_t> keyed(
+            static_cast<std::size_t>(width)
+                * static_cast<std::size_t>(height),
+            0);
+        std::vector<std::pair<int, int>> pending;
+        const auto visit = [&](int x, int y) {
+            if (x < 0 || y < 0 || x >= width || y >= height) {
+                return;
+            }
+            auto& flag = keyed[pixel_index(x, y)];
+            if (flag != 0 || brightness(x, y) > key_level) {
+                return;
+            }
+            flag = 1;
+            pending.emplace_back(x, y);
+        };
+        for (int x = 0; x < width; ++x) {
+            visit(x, 0);
+            visit(x, height - 1);
+        }
+        for (int y = 0; y < height; ++y) {
+            visit(0, y);
+            visit(width - 1, y);
+        }
+        while (!pending.empty()) {
+            const auto [x, y] = pending.back();
+            pending.pop_back();
+            visit(x - 1, y);
+            visit(x + 1, y);
+            visit(x, y - 1);
+            visit(x, y + 1);
+        }
+
+        const auto edge_level = key_level * 2;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const auto colour = pixels.getPixelColour(x, y);
+                if (keyed[pixel_index(x, y)] != 0) {
+                    pixels.setPixelColour(x, y, colour.withAlpha(0.0F));
+                    continue;
+                }
+                const auto touches_background =
+                    (x > 0 && keyed[pixel_index(x - 1, y)] != 0)
+                    || (x + 1 < width
+                        && keyed[pixel_index(x + 1, y)] != 0)
+                    || (y > 0 && keyed[pixel_index(x, y - 1)] != 0)
+                    || (y + 1 < height
+                        && keyed[pixel_index(x, y + 1)] != 0);
+                if (!touches_background) {
+                    continue;
+                }
+                const auto level = brightness(x, y);
+                if (level >= edge_level) {
+                    continue;
+                }
+                pixels.setPixelColour(
+                    x,
+                    y,
+                    colour.withAlpha(
+                        static_cast<float>(level)
+                        / static_cast<float>(edge_level)));
+            }
+        }
+    }
+    return image;
+}
+
 struct AnimatedGifSupport final {
     AnimatedGifSupport() {
         Gdiplus::GdiplusStartupInput input;
@@ -859,6 +963,20 @@ public:
     }
 };
 
+// juce::DialogWindow の既定の閉じるボタンは非表示にするだけでモーダルを
+// 解除しないため、タイトルバーの✘でも閉じられるようにする。
+class ModalDialogWindow final : public juce::DialogWindow {
+public:
+    ModalDialogWindow(
+        const juce::String& name,
+        juce::Colour background)
+        : juce::DialogWindow(name, background, true, true) {}
+
+    void closeButtonPressed() override {
+        exitModalState(0);
+    }
+};
+
 template <typename Work, typename OnDone>
 void runWithConversionBusyDialog(
     juce::Component* anchor,
@@ -893,9 +1011,10 @@ void runWithConversionBusyDialog(
 class AboutPanel final : public juce::Component {
 public:
     AboutPanel() {
-        logo_ = loadEmbeddedPng(
-            BinaryData::MGSTC_logo_png,
-            BinaryData::MGSTC_logo_pngSize);
+        logo_ = withDarkBackgroundKeyedOut(
+            loadEmbeddedPng(
+                BinaryData::MGSTC_logo_png,
+                BinaryData::MGSTC_logo_pngSize));
         title_.setText(
             "MGS Tone Craft", juce::dontSendNotification);
         title_.setFont(
@@ -916,7 +1035,8 @@ public:
         detail_.setText(
             juce::String::fromUTF8(
                 "MGSDRV向け複合音色エディタ\n"
-                "Version 0.1.0"),
+                "Version ")
+                + juce::String(MGSTC_DOC_VERSION),
             juce::dontSendNotification);
         detail_.setJustificationType(juce::Justification::centred);
         detail_.setColour(
@@ -2059,6 +2179,142 @@ private:
     bool engine_ready_{};
 };
 
+// UI spacing scale (4px base). New controls should use these values.
+namespace UiLayout {
+constexpr int xs = 4;
+constexpr int sm = 8;
+constexpr int md = 12;
+constexpr int lg = 16;
+constexpr int xl = 24;
+
+constexpr int pageMargin = 24;
+constexpr int pageMarginPaint = 20;
+constexpr int panelGap = 16;
+constexpr int panelRadius = 9;
+constexpr int panelPad = 10;
+constexpr int rowGap = 8;
+constexpr int controlGap = 6;
+constexpr int iconButton = 40;
+constexpr int textButtonH = 32;
+constexpr int fieldH = 30;
+constexpr int titleH = 34;
+constexpr int descriptionH = 28;
+constexpr int keyboardH = 94;
+constexpr int keyboardGap = 10;
+constexpr int statusH = 36;
+constexpr int toolbarH = 40;
+
+constexpr int libraryWidth = 256;
+constexpr int libraryTitleH = 28;
+constexpr int libraryMemoH = 72;
+constexpr int libraryButtonH = 32;
+constexpr int libraryButtonMinW = 54;
+constexpr juce::uint32 panelFill = 0xFF29323C;
+constexpr juce::uint32 panelStroke = 0xFF435160;
+constexpr juce::uint32 pageFill = 0xFF20262E;
+} // namespace UiLayout
+
+void paintRoundedPanelFrame(
+    juce::Graphics& graphics,
+    juce::Rectangle<int> bounds) {
+    if (bounds.isEmpty()) {
+        return;
+    }
+    graphics.setColour(juce::Colour(UiLayout::panelFill));
+    graphics.fillRoundedRectangle(
+        bounds.toFloat(),
+        static_cast<float>(UiLayout::panelRadius));
+    graphics.setColour(juce::Colour(UiLayout::panelStroke));
+    graphics.drawRoundedRectangle(
+        bounds.toFloat(),
+        static_cast<float>(UiLayout::panelRadius),
+        1.0F);
+}
+
+struct TimbreLibraryWidgets {
+    juce::Label& title;
+    juce::TextEditor& filter;
+    juce::ComboBox& list;
+    juce::TextEditor& name;
+    juce::TextEditor& tags;
+    juce::TextEditor& memo;
+    juce::ToggleButton& favorite;
+    juce::TextButton& library_new;
+    juce::TextButton& library_load;
+    juce::TextButton& library_save;
+    juce::TextButton& library_save_as;
+    juce::TextButton& library_cancel;
+    juce::TextButton& library_delete;
+    juce::TextButton& library_import;
+    juce::TextButton& library_export;
+    juce::Label& mgsc_title;
+    juce::Label& output_number_label;
+    juce::TextEditor& output_number;
+    juce::TextEditor& mgsc_preview;
+};
+
+void layoutTimbreLibraryPanel(
+    juce::Rectangle<int> panel,
+    TimbreLibraryWidgets widgets) {
+    using namespace UiLayout;
+    auto area = panel.reduced(panelPad);
+    widgets.title.setBounds(area.removeFromTop(libraryTitleH));
+    area.removeFromTop(sm);
+    widgets.filter.setBounds(area.removeFromTop(fieldH));
+    area.removeFromTop(sm);
+    widgets.list.setBounds(area.removeFromTop(fieldH + xs));
+    area.removeFromTop(sm);
+    widgets.name.setBounds(area.removeFromTop(fieldH));
+    area.removeFromTop(sm);
+    widgets.tags.setBounds(area.removeFromTop(fieldH));
+    area.removeFromTop(sm);
+    widgets.memo.setBounds(area.removeFromTop(libraryMemoH));
+    area.removeFromTop(xs + xs / 2);
+    widgets.favorite.setBounds(area.removeFromTop(fieldH));
+    area.removeFromTop(sm);
+
+    auto edit_row = area.removeFromTop(libraryButtonH);
+    const int edit_w =
+        (edit_row.getWidth() - controlGap * 3) / 4;
+    widgets.library_new.setBounds(
+        edit_row.removeFromLeft(juce::jmax(libraryButtonMinW, edit_w)));
+    edit_row.removeFromLeft(controlGap);
+    widgets.library_load.setBounds(
+        edit_row.removeFromLeft(juce::jmax(libraryButtonMinW, edit_w)));
+    edit_row.removeFromLeft(controlGap);
+    widgets.library_save.setBounds(
+        edit_row.removeFromLeft(juce::jmax(libraryButtonMinW, edit_w)));
+    edit_row.removeFromLeft(controlGap);
+    widgets.library_save_as.setBounds(edit_row);
+
+    area.removeFromTop(xs + xs / 2);
+    auto file_row = area.removeFromTop(libraryButtonH);
+    const int file_w =
+        (file_row.getWidth() - controlGap * 3) / 4;
+    widgets.library_cancel.setBounds(
+        file_row.removeFromLeft(juce::jmax(libraryButtonMinW, file_w)));
+    file_row.removeFromLeft(controlGap);
+    widgets.library_delete.setBounds(
+        file_row.removeFromLeft(juce::jmax(libraryButtonMinW, file_w)));
+    file_row.removeFromLeft(controlGap);
+    widgets.library_import.setBounds(
+        file_row.removeFromLeft(juce::jmax(libraryButtonMinW, file_w)));
+    file_row.removeFromLeft(controlGap);
+    widgets.library_export.setBounds(file_row);
+
+    area.removeFromTop(sm);
+    widgets.mgsc_title.setBounds(area.removeFromTop(24));
+    area.removeFromTop(xs);
+    auto number_row = area.removeFromTop(fieldH);
+    widgets.output_number_label.setBounds(
+        number_row.removeFromLeft(118));
+    number_row.removeFromLeft(sm);
+    widgets.output_number.setBounds(
+        number_row.removeFromLeft(54));
+    area.removeFromTop(sm);
+    widgets.mgsc_preview.setBounds(area);
+}
+
 class MgstcLookAndFeel final : public juce::LookAndFeel_V4 {
 public:
     MgstcLookAndFeel() {
@@ -2087,6 +2343,74 @@ public:
         setColour(juce::TextButton::textColourOffId, text);
         setColour(juce::TextButton::textColourOnId, text);
     }
+
+    void drawLinearSlider(
+        juce::Graphics& graphics,
+        int x,
+        int y,
+        int width,
+        int height,
+        float slider_position,
+        float minimum_position,
+        float maximum_position,
+        juce::Slider::SliderStyle style,
+        juce::Slider& slider) override {
+        const auto draw = [&] {
+            juce::LookAndFeel_V4::drawLinearSlider(
+                graphics,
+                x,
+                y,
+                width,
+                height,
+                slider_position,
+                minimum_position,
+                maximum_position,
+                style,
+                slider);
+        };
+        if (slider.isEnabled()) {
+            draw();
+            return;
+        }
+        graphics.beginTransparencyLayer(kDisabledOpacity);
+        draw();
+        graphics.endTransparencyLayer();
+    }
+
+    void drawRotarySlider(
+        juce::Graphics& graphics,
+        int x,
+        int y,
+        int width,
+        int height,
+        float slider_position,
+        float start_angle,
+        float end_angle,
+        juce::Slider& slider) override {
+        const auto draw = [&] {
+            juce::LookAndFeel_V4::drawRotarySlider(
+                graphics,
+                x,
+                y,
+                width,
+                height,
+                slider_position,
+                start_angle,
+                end_angle,
+                slider);
+        };
+        if (slider.isEnabled()) {
+            draw();
+            return;
+        }
+        graphics.beginTransparencyLayer(kDisabledOpacity);
+        draw();
+        graphics.endTransparencyLayer();
+    }
+
+private:
+    // 無効なバーはスイッチ（位相自動・音量維持）と同じ薄さへ揃える。
+    static constexpr float kDisabledOpacity = 0.45F;
 };
 
 class SwitchLookAndFeel final : public juce::LookAndFeel_V4 {
@@ -2684,7 +3008,7 @@ private:
                     midi_page,
                     true);
                 tabs_.addTab(
-                    juce::String::fromUTF8("出力"),
+                    "Output",
                     juce::Colour(0xFF243040),
                     output_page,
                     true);
@@ -2784,16 +3108,14 @@ private:
             audio_service_,
             midi_input_.getSelectedId(),
             initial_tab);
-        auto* dialog = new juce::DialogWindow(
+        auto* dialog = new ModalDialogWindow(
             juce::String::fromUTF8("アプリ設定"),
-            juce::Colour(0xFF1B222C),
-            true,
-            true);
+            juce::Colour(0xFF1B222C));
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         dialog->setContentOwned(content, true);
-        dialog->centreAroundComponent(
-            this, content->getWidth(), content->getHeight() + 32);
+        dialog->centreWithSize(
+            content->getWidth(), content->getHeight() + 32);
 
         juce::Component::SafePointer<PerformanceKeyboard> safe(this);
         juce::Component::SafePointer<juce::DialogWindow> safe_dialog(
@@ -3709,21 +4031,28 @@ public:
         const int first_lane = juce::jlimit(
             0, juce::jmax(0, static_cast<int>(lane_count) - 1),
             juce::roundToInt(vertical_scroll_.getCurrentRangeStart()));
-        const int visible_lanes = juce::jmax(1, area.getHeight() / kLaneHeight);
-        const int last_lane = juce::jmin(
-            static_cast<int>(lane_count), first_lane + visible_lanes + 1);
         const auto numbers = mgstc::engine::resolveTimbreNumbers(timbre_);
         graph_bounds_.assign(timbre_.layers.size(), {});
-        for (int lane_index = first_lane; lane_index < last_lane; ++lane_index) {
-            auto lane = juce::Rectangle<int>(
-                area.getX(),
-                area.getY() + (lane_index - first_lane) * kLaneHeight,
-                area.getWidth(), kLaneHeight).reduced(0, 3);
-            if (lane.getY() >= area.getBottom()) {
+        int lane_y = area.getY();
+        for (int lane_index = 0;
+             lane_index < static_cast<int>(lane_count);
+             ++lane_index) {
+            const int lane_height = laneHeightForIndex(lane_index);
+            if (lane_index < first_lane) {
+                continue;
+            }
+            if (lane_y >= area.getBottom()) {
                 break;
             }
+            auto lane = juce::Rectangle<int>(
+                area.getX(),
+                lane_y,
+                area.getWidth(),
+                lane_height).reduced(0, 3);
             lane.setBottom(juce::jmin(lane.getBottom(), area.getBottom()));
-            const bool mixed_lane = lane_index == static_cast<int>(timbre_.layers.size());
+            lane_y += lane_height;
+            const bool mixed_lane =
+                lane_index == static_cast<int>(timbre_.layers.size());
             const std::size_t index = static_cast<std::size_t>(lane_index);
             const auto colour = mixed_lane
                 ? juce::Colour(0xFF35C4ED)
@@ -3813,8 +4142,34 @@ private:
     };
 
     static constexpr int kDefaultVisibleCounts = 120;
-    static constexpr int kLaneHeight = 104;
+    static constexpr int kChannelLaneHeight = 208;
+    static constexpr int kMixLaneHeight = 104;
     static constexpr int kScrollBarSize = 15;
+
+    [[nodiscard]] int laneHeightForIndex(int lane_index) const noexcept {
+        return lane_index == static_cast<int>(timbre_.layers.size())
+            ? kMixLaneHeight
+            : kChannelLaneHeight;
+    }
+
+    [[nodiscard]] int visibleLaneCount(int graph_height) const noexcept {
+        const int lane_count = juce::jmax(
+            1, static_cast<int>(timbre_.layers.size()) + 1);
+        int used = 0;
+        int count = 0;
+        for (int index = 0; index < lane_count; ++index) {
+            const int next = used + laneHeightForIndex(index);
+            if (count > 0 && next > graph_height) {
+                break;
+            }
+            used = next;
+            ++count;
+            if (used >= graph_height) {
+                break;
+            }
+        }
+        return juce::jmax(1, count);
+    }
 
     [[nodiscard]] static constexpr int maximumCount() noexcept {
         return static_cast<int>(
@@ -4269,7 +4624,7 @@ private:
         const int lane_count = juce::jmax(
             1, static_cast<int>(timbre_.layers.size()) + 1);
         const int visible_lanes = juce::jlimit(
-            1, lane_count, juce::jmax(1, graph.getHeight() / kLaneHeight));
+            1, lane_count, visibleLaneCount(graph.getHeight()));
         vertical_scroll_.setRangeLimits(
             0.0, static_cast<double>(lane_count), juce::dontSendNotification);
         vertical_scroll_.setCurrentRange(
@@ -4821,8 +5176,8 @@ public:
     }
 
     void paint(juce::Graphics& graphics) override {
-        graphics.fillAll(juce::Colour(0xFF20262E));
-        const auto outer = getLocalBounds().reduced(20);
+        graphics.fillAll(juce::Colour(UiLayout::pageFill));
+        const auto outer = getLocalBounds().reduced(UiLayout::pageMarginPaint);
         auto right = outer;
         right.removeFromTop(64);
         right.removeFromBottom(108);
@@ -4830,45 +5185,42 @@ public:
         auto left = outer;
         left.removeFromTop(118);
         left.removeFromBottom(108);
-        left.removeFromRight(commonPanelWidth() + 14);
-        graphics.setColour(juce::Colour(0xFF29323C));
-        graphics.fillRoundedRectangle(left.toFloat(), 9.0F);
-        graphics.fillRoundedRectangle(right.toFloat(), 9.0F);
-        graphics.setColour(juce::Colour(0xFF435160));
-        graphics.drawRoundedRectangle(left.toFloat(), 9.0F, 1.0F);
-        graphics.drawRoundedRectangle(right.toFloat(), 9.0F, 1.0F);
+        left.removeFromRight(commonPanelWidth() + UiLayout::panelGap - UiLayout::xs);
+        paintRoundedPanelFrame(graphics, left);
+        paintRoundedPanelFrame(graphics, right);
     }
 
     void resized() override {
-        auto area = getLocalBounds().reduced(24);
-        title_.setBounds(area.removeFromTop(34));
+        using namespace UiLayout;
+        auto area = getLocalBounds().reduced(pageMargin);
+        title_.setBounds(area.removeFromTop(titleH));
         description_.setBounds(area.removeFromTop(26));
-        settings_.setBounds(getWidth() - 58, 24, 34, 34);
-        master_volume_.setBounds(getWidth() - 104, 21, 40, 40);
-        open_opll_.setBounds(getWidth() - 202, 27, 92, 28);
-        open_scc_.setBounds(getWidth() - 296, 27, 88, 28);
-        area.removeFromTop(4);
+        settings_.setBounds(getWidth() - 58, pageMargin, 34, 34);
+        master_volume_.setBounds(getWidth() - 104, pageMargin - 3, 40, 40);
+        open_opll_.setBounds(getWidth() - 202, pageMargin + 3, 92, 28);
+        open_scc_.setBounds(getWidth() - 296, pageMargin + 3, 88, 28);
+        area.removeFromTop(xs);
 
         auto keyboard_area = area.removeFromBottom(96);
-        area.removeFromBottom(10);
+        area.removeFromBottom(keyboardGap);
         performance_keyboard_.setBounds(keyboard_area);
         auto right = area.removeFromRight(commonPanelWidth());
-        area.removeFromRight(14);
+        area.removeFromRight(panelGap - xs);
         auto metadata = area.removeFromTop(38);
         name_label_.setBounds(metadata.removeFromLeft(78));
         name_.setBounds(metadata.removeFromLeft(180));
-        metadata.removeFromLeft(6);
+        metadata.removeFromLeft(controlGap);
         composite_select_.setBounds(
             metadata.removeFromLeft(150));
-        metadata.removeFromLeft(6);
+        metadata.removeFromLeft(controlGap);
         new_.setBounds(metadata.removeFromLeft(50));
-        metadata.removeFromLeft(5);
+        metadata.removeFromLeft(xs + 1);
         save_.setBounds(metadata.removeFromLeft(50));
-        metadata.removeFromLeft(5);
+        metadata.removeFromLeft(xs + 1);
         save_as_.setBounds(metadata);
-        area.removeFromTop(12);
+        area.removeFromTop(md);
 
-        auto left = area.reduced(14);
+        auto left = area.reduced(panelPad + xs);
         for (std::size_t index = 0;
              index < juce::jmin(timbre_.layers.size(), source_.size());
              ++index) {
@@ -4878,58 +5230,58 @@ public:
             enabled_[index].setBounds(switches.removeFromLeft(92));
             mute_[index].setBounds(switches.removeFromLeft(112));
             solo_[index].setBounds(switches.removeFromLeft(88));
-            row.removeFromTop(5);
+            row.removeFromTop(xs + 1);
             auto identity = row.removeFromTop(30);
             layer_name_[index].setBounds(
                 identity.removeFromLeft(110));
-            identity.removeFromLeft(6);
+            identity.removeFromLeft(controlGap);
             timbre_select_[index].setBounds(
                 identity.removeFromLeft(150));
-            identity.removeFromLeft(6);
+            identity.removeFromLeft(controlGap);
             channel_[index].setBounds(
                 identity.removeFromLeft(66));
-            identity.removeFromLeft(6);
+            identity.removeFromLeft(controlGap);
             number_mode_[index].setBounds(
                 identity.removeFromLeft(70));
-            identity.removeFromLeft(6);
+            identity.removeFromLeft(controlGap);
             timbre_number_[index].setBounds(
                 identity.removeFromLeft(54));
-            identity.removeFromLeft(6);
+            identity.removeFromLeft(controlGap);
             edit_[index].setBounds(identity);
-            row.removeFromTop(5);
+            row.removeFromTop(xs + 1);
             auto sliders = row.removeFromTop(54);
             const int width = (sliders.getWidth() - 18) / 4;
             layoutLayerSlider(
                 sliders.removeFromLeft(width),
                 pitch_label_[index],
                 pitch_[index]);
-            sliders.removeFromLeft(6);
+            sliders.removeFromLeft(controlGap);
             layoutLayerSlider(
                 sliders.removeFromLeft(width),
                 detune_label_[index],
                 detune_[index]);
-            sliders.removeFromLeft(6);
+            sliders.removeFromLeft(controlGap);
             layoutLayerSlider(
                 sliders.removeFromLeft(width),
                 delay_label_[index],
                 delay_[index]);
-            sliders.removeFromLeft(6);
+            sliders.removeFromLeft(controlGap);
             layoutLayerSlider(
                 sliders,
                 volume_label_[index],
                 volume_[index]);
-            left.removeFromTop(8);
+            left.removeFromTop(sm);
         }
 
         auto footer = left.removeFromTop(42);
         stop_.setBounds(footer.removeFromLeft(90));
-        footer.removeFromLeft(12);
+        footer.removeFromLeft(md);
         status_.setBounds(footer);
 
-        right.reduce(12, 12);
+        right.reduce(md, md);
         resource_.setBounds(right.removeFromTop(28));
         warning_.setBounds(right.removeFromTop(42));
-        right.removeFromTop(8);
+        right.removeFromTop(sm);
         timeline_.setBounds(right);
     }
 
@@ -6433,7 +6785,7 @@ public:
         addAndMakeVisible(graph_);
 
         background_load_.setButtonText(
-            juce::String::fromUTF8("背景…"));
+            juce::String::fromUTF8("背景読込"));
         background_load_.setTooltip(
             juce::String::fromUTF8(
                 "波形トレース用の背景画像を読み込みます。"
@@ -6441,7 +6793,7 @@ public:
         background_load_.onClick = [this] { chooseBackgroundImage(); };
         addAndMakeVisible(background_load_);
         background_clear_.setButtonText(
-            juce::String::fromUTF8("背景消"));
+            juce::String::fromUTF8("背景消去"));
         background_clear_.setTooltip(
             juce::String::fromUTF8(
                 "背景画像の参照をクリアします"));
@@ -6449,6 +6801,7 @@ public:
             background_path_.clear();
             background_image_ = {};
             applyBackgroundToGraph();
+            updateBackgroundControlState();
             saveBackgroundSettings();
             updateStatus(
                 juce::String::fromUTF8("背景画像をクリアしました"));
@@ -6578,17 +6931,17 @@ public:
         configureButton(
             library_new_,
             juce::String::fromUTF8("新規"),
-            juce::String::fromUTF8("新しいSCC音色を作成"),
+            juce::String::fromUTF8("新しいSCC音色を作成します"),
             [this] { newLibraryEntry(); });
         configureButton(
             library_load_,
             juce::String::fromUTF8("読込"),
-            juce::String::fromUTF8("選択した音色を読み込みます"),
+            juce::String::fromUTF8("選択音色を編集値へ読み込みます"),
             [this] { loadSelectedLibraryEntry(); });
         configureButton(
             library_save_,
             juce::String::fromUTF8("保存"),
-            juce::String::fromUTF8("選択中の音色を更新します"),
+            juce::String::fromUTF8("選択音色を更新します"),
             [this] { saveLibraryEntry(false); });
         configureButton(
             library_save_as_,
@@ -6598,12 +6951,12 @@ public:
         configureButton(
             library_cancel_,
             juce::String::fromUTF8("取消"),
-            juce::String::fromUTF8("編集開始時点の音色へ戻します"),
+            juce::String::fromUTF8("編集開始時点へ戻します"),
             [this] { restoreEditorBaseline(); });
         configureButton(
             library_delete_,
             juce::String::fromUTF8("削除"),
-            juce::String::fromUTF8("選択中の音色をライブラリから削除します"),
+            juce::String::fromUTF8("選択音色を削除します"),
             [this] { deleteSelectedLibraryEntry(); });
         configureButton(
             library_import_,
@@ -6613,7 +6966,7 @@ public:
         configureButton(
             library_export_,
             juce::String::fromUTF8("書出"),
-            juce::String::fromUTF8("選択中の音色を.mgstcへ書き出します"),
+            juce::String::fromUTF8("選択音色を.mgstcへ書き出します"),
             [this] { exportSelectedLibraryEntry(); });
 
         mgsc_title_.setText(
@@ -6667,6 +7020,7 @@ public:
         setEditorBaseline();
         updateDefinitionPreview();
         loadBackgroundSettings();
+        updateBackgroundControlState();
         refreshPresetPreview(false);
         setSize(1360, 900);
         engine_ready_ = audio_service.running()
@@ -6718,61 +7072,58 @@ public:
     }
 
     void paint(juce::Graphics& graphics) override {
-        graphics.fillAll(juce::Colour(0xFF20262E));
-        auto content = getLocalBounds().reduced(20);
-        content.removeFromBottom(106);
-        auto library_panel = content.removeFromRight(268);
-        content.removeFromRight(8);
-        auto panel = content
-            .withTrimmedTop(216)
-            .withTrimmedBottom(64);
-        graphics.setColour(juce::Colour(0xFF29323C));
-        graphics.fillRoundedRectangle(panel.toFloat(), 9.0F);
-        graphics.fillRoundedRectangle(
-            library_panel.withTrimmedTop(74).toFloat(), 9.0F);
-        graphics.setColour(juce::Colour(0xFF435160));
-        graphics.drawRoundedRectangle(panel.toFloat(), 9.0F, 1.0F);
-        graphics.drawRoundedRectangle(
-            library_panel.withTrimmedTop(74).toFloat(), 9.0F, 1.0F);
+        graphics.fillAll(juce::Colour(UiLayout::pageFill));
+        paintRoundedPanelFrame(graphics, editor_panel_bounds_);
+        paintRoundedPanelFrame(graphics, library_panel_bounds_);
     }
 
     void resized() override {
-        auto area = getLocalBounds().reduced(24);
-        title_.setBounds(area.removeFromTop(34));
-        description_.setBounds(area.removeFromTop(28));
-        settings_.setBounds(getWidth() - 58, 24, 34, 34);
-        master_volume_.setBounds(getWidth() - 104, 21, 40, 40);
-        immediate_audition_.setBounds(getWidth() - 146, 24, 34, 34);
-        area.removeFromTop(12);
+        using namespace UiLayout;
+        auto area = getLocalBounds().reduced(pageMargin);
+        title_.setBounds(area.removeFromTop(titleH));
+        description_.setBounds(area.removeFromTop(descriptionH));
+        settings_.setBounds(getWidth() - 58, pageMargin, 34, 34);
+        master_volume_.setBounds(getWidth() - 104, pageMargin - 3, 40, 40);
+        immediate_audition_.setBounds(getWidth() - 146, pageMargin, 34, 34);
+        area.removeFromTop(md);
 
-        auto keyboard_area = area.removeFromBottom(94);
-        area.removeFromBottom(10);
+        auto keyboard_area = area.removeFromBottom(keyboardH);
+        area.removeFromBottom(keyboardGap);
         performance_keyboard_.setBounds(keyboard_area);
-        auto library_area = area.removeFromRight(256);
-        area.removeFromRight(16);
 
-        auto file_row = area.removeFromTop(40);
-        constexpr int icon_size = 40;
-        load_.setBounds(file_row.removeFromLeft(icon_size));
-        file_row.removeFromLeft(6);
-        save_.setBounds(file_row.removeFromLeft(icon_size));
-        file_row.removeFromLeft(6);
-        paste_.setBounds(file_row.removeFromLeft(icon_size));
-        file_row.removeFromLeft(6);
-        copy_.setBounds(file_row.removeFromLeft(icon_size));
-        file_row.removeFromLeft(6);
-        undo_.setBounds(file_row.removeFromLeft(icon_size));
-        file_row.removeFromLeft(6);
-        redo_.setBounds(file_row.removeFromLeft(icon_size));
-        file_row.removeFromLeft(14);
+        auto library_area = area.removeFromRight(libraryWidth);
+        library_panel_bounds_ = library_area;
+        area.removeFromRight(panelGap);
+
+        status_.setBounds(area.removeFromBottom(statusH));
+        area.removeFromBottom(sm);
+
+        constexpr int background_block_h =
+            fieldH + xs + fieldH + xs + fieldH;
+        auto background_block = area.removeFromBottom(background_block_h);
+        area.removeFromBottom(sm);
+
+        auto file_row = area.removeFromTop(toolbarH);
+        load_.setBounds(file_row.removeFromLeft(iconButton));
+        file_row.removeFromLeft(controlGap);
+        save_.setBounds(file_row.removeFromLeft(iconButton));
+        file_row.removeFromLeft(controlGap);
+        paste_.setBounds(file_row.removeFromLeft(iconButton));
+        file_row.removeFromLeft(controlGap);
+        copy_.setBounds(file_row.removeFromLeft(iconButton));
+        file_row.removeFromLeft(controlGap);
+        undo_.setBounds(file_row.removeFromLeft(iconButton));
+        file_row.removeFromLeft(controlGap);
+        redo_.setBounds(file_row.removeFromLeft(iconButton));
+        file_row.removeFromLeft(lg - xs);
         import_wave_.setBounds(file_row.removeFromLeft(66));
-        file_row.removeFromLeft(10);
+        file_row.removeFromLeft(sm);
         import_audacity_.setBounds(file_row.removeFromLeft(184));
-        file_row.removeFromLeft(10);
+        file_row.removeFromLeft(sm);
         open_opll_.setBounds(file_row.removeFromLeft(120));
-        file_row.removeFromLeft(8);
-        convert_to_opll_.setBounds(file_row.removeFromLeft(40));
-        area.removeFromTop(10);
+        file_row.removeFromLeft(sm);
+        convert_to_opll_.setBounds(file_row.removeFromLeft(iconButton));
+        area.removeFromTop(sm);
 
         auto preset_row = area.removeFromTop(38);
         auto preset_bounds = preset_row.removeFromLeft(240);
@@ -6780,46 +7131,55 @@ public:
         auto preview_bounds = preset_bounds;
         preview_bounds.removeFromRight(24);
         preset_preview_.setBounds(
-            preview_bounds.removeFromRight(76).reduced(4, 4));
+            preview_bounds.removeFromRight(76).reduced(xs, xs));
         preset_preview_.toFront(false);
-        preset_row.removeFromLeft(8);
+        preset_row.removeFromLeft(sm);
         harmonic_.setBounds(preset_row.removeFromLeft(230));
-        preset_row.removeFromLeft(8);
+        preset_row.removeFromLeft(sm);
         apply_range_.setBounds(preset_row.removeFromLeft(110));
-        preset_row.removeFromLeft(8);
+        preset_row.removeFromLeft(sm);
         apply_preset_.setBounds(preset_row.removeFromLeft(70));
-        preset_row.removeFromLeft(6);
+        preset_row.removeFromLeft(controlGap);
         cancel_preview_.setBounds(preset_row.removeFromLeft(56));
-        preset_row.removeFromLeft(8);
+        preset_row.removeFromLeft(sm);
         ab_audition_.setBounds(preset_row.removeFromLeft(52));
-        preset_row.removeFromLeft(8);
-        average_.setBounds(preset_row.removeFromLeft(42));
-        preset_row.removeFromLeft(6);
-        normalize_.setBounds(preset_row.removeFromLeft(42));
-        preset_row.removeFromLeft(6);
-        invert_.setBounds(preset_row.removeFromLeft(42));
 
-        area.removeFromTop(8);
+        area.removeFromTop(sm);
         auto merge_row = area.removeFromTop(38);
         merge_enabled_.setBounds(merge_row.removeFromLeft(176));
-        merge_row.removeFromLeft(8);
+        merge_row.removeFromLeft(sm);
         merge_amount_.setBounds(merge_row.removeFromLeft(210));
-        merge_row.removeFromLeft(10);
+        merge_row.removeFromLeft(sm);
         auto_phase_.setBounds(merge_row.removeFromLeft(104));
         polarity_.setBounds(merge_row.removeFromLeft(112));
         preserve_volume_.setBounds(merge_row.removeFromLeft(104));
-        merge_row.removeFromLeft(12);
+        merge_row.removeFromLeft(md);
         preset_flip_h_.setBounds(merge_row.removeFromLeft(88));
-        merge_row.removeFromLeft(6);
+        merge_row.removeFromLeft(controlGap);
         preset_flip_v_.setBounds(merge_row.removeFromLeft(88));
 
-        area.removeFromTop(14);
-        auto editor_row = area.removeFromTop(
-            juce::jmax(240, area.getHeight() - 196));
-        graph_.setBounds(editor_row.withTrimmedRight(220));
-        auto tool_area = editor_row.removeFromRight(210);
-        auto cursor_area = tool_area.removeFromLeft(86);
-        const auto button_size = 42;
+        area.removeFromTop(md);
+        editor_panel_bounds_ = area;
+        constexpr int button_size = 42;
+        constexpr int cursor_pad_w = 86;
+        constexpr int scale_bar_w = 62;
+        constexpr int tool_column_w =
+            cursor_pad_w + controlGap + scale_bar_w;
+        auto editor_row = area.reduced(panelPad);
+        graph_.setBounds(
+            editor_row.withTrimmedRight(tool_column_w + panelGap));
+        auto tool_area = editor_row.removeFromRight(tool_column_w);
+        auto wave_tools = tool_area.removeFromBottom(button_size)
+            .withSizeKeepingCentre(
+                button_size * 3 + controlGap * 2, button_size);
+        tool_area.removeFromBottom(md);
+        average_.setBounds(wave_tools.removeFromLeft(button_size));
+        wave_tools.removeFromLeft(controlGap);
+        normalize_.setBounds(wave_tools.removeFromLeft(button_size));
+        wave_tools.removeFromLeft(controlGap);
+        invert_.setBounds(wave_tools.removeFromLeft(button_size));
+
+        auto cursor_area = tool_area.removeFromLeft(cursor_pad_w);
         shift_up_.setBounds(
             cursor_area.getCentreX() - button_size / 2,
             cursor_area.getY() + 54,
@@ -6840,100 +7200,71 @@ public:
             cursor_area.getY() + 150,
             button_size,
             button_size);
-        auto scale_area = tool_area.removeFromLeft(62).reduced(5, 44);
+        auto scale_area =
+            tool_area.removeFromRight(scale_bar_w).reduced(5, 44);
         scale_reset_.setBounds(scale_area.removeFromBottom(34));
-        scale_area.removeFromBottom(8);
+        scale_area.removeFromBottom(sm);
         vertical_scale_.setBounds(scale_area);
-        area.removeFromTop(8);
-        auto background_tools = area.removeFromTop(30);
+
+        auto background_tools = background_block.removeFromTop(fieldH);
         background_load_.setBounds(
-            background_tools.removeFromLeft(64));
-        background_tools.removeFromLeft(4);
+            background_tools.removeFromLeft(84));
+        background_tools.removeFromLeft(controlGap);
         background_clear_.setBounds(
-            background_tools.removeFromLeft(64));
-        background_tools.removeFromLeft(6);
+            background_tools.removeFromLeft(84));
+        background_tools.removeFromLeft(sm);
         background_visible_.setBounds(
-            background_tools.removeFromLeft(90));
-        background_tools.removeFromLeft(6);
+            background_tools.removeFromLeft(108));
+        background_tools.removeFromLeft(sm);
         background_opacity_label_.setBounds(
             background_tools.removeFromLeft(28));
         background_opacity_.setBounds(
             background_tools.removeFromLeft(140));
-        area.removeFromTop(4);
-        auto background_pos = area.removeFromTop(30);
+        background_block.removeFromTop(xs);
+        auto background_pos = background_block.removeFromTop(fieldH);
         const auto pos_half =
-            (background_pos.getWidth() - 12) / 2;
+            (background_pos.getWidth() - md) / 2;
         auto x_area = background_pos.removeFromLeft(pos_half);
         background_x_label_.setBounds(x_area.removeFromLeft(18));
         background_x_.setBounds(x_area);
-        background_pos.removeFromLeft(12);
+        background_pos.removeFromLeft(md);
         background_y_label_.setBounds(
             background_pos.removeFromLeft(18));
         background_y_.setBounds(background_pos);
-        area.removeFromTop(4);
-        auto background_size = area.removeFromTop(30);
+        background_block.removeFromTop(xs);
+        auto background_size = background_block;
         const auto size_half =
-            (background_size.getWidth() - 12) / 2;
+            (background_size.getWidth() - md) / 2;
         auto w_area = background_size.removeFromLeft(size_half);
         background_w_label_.setBounds(w_area.removeFromLeft(18));
         background_width_.setBounds(w_area);
-        background_size.removeFromLeft(12);
+        background_size.removeFromLeft(md);
         background_h_label_.setBounds(
             background_size.removeFromLeft(18));
         background_height_.setBounds(background_size);
-        area.removeFromTop(8);
-        auto footer = area.removeFromTop(42);
-        status_.setBounds(footer);
 
-        library_title_.setBounds(
-            library_area.removeFromTop(34));
-        library_area.removeFromTop(8);
-        library_filter_.setBounds(
-            library_area.removeFromTop(32));
-        library_area.removeFromTop(8);
-        library_list_.setBounds(
-            library_area.removeFromTop(34));
-        library_area.removeFromTop(10);
-        name_.setBounds(library_area.removeFromTop(34));
-        library_area.removeFromTop(8);
-        tags_.setBounds(library_area.removeFromTop(34));
-        library_area.removeFromTop(8);
-        memo_.setBounds(library_area.removeFromTop(82));
-        library_area.removeFromTop(6);
-        favorite_.setBounds(library_area.removeFromTop(30));
-        library_area.removeFromTop(8);
-        auto library_buttons = library_area.removeFromTop(34);
-        library_new_.setBounds(
-            library_buttons.removeFromLeft(54));
-        library_buttons.removeFromLeft(6);
-        library_load_.setBounds(
-            library_buttons.removeFromLeft(54));
-        library_buttons.removeFromLeft(6);
-        library_save_.setBounds(
-            library_buttons.removeFromLeft(54));
-        library_buttons.removeFromLeft(6);
-        library_save_as_.setBounds(library_buttons);
-        library_area.removeFromTop(6);
-        auto library_file_buttons = library_area.removeFromTop(34);
-        library_cancel_.setBounds(
-            library_file_buttons.removeFromLeft(54));
-        library_file_buttons.removeFromLeft(6);
-        library_delete_.setBounds(
-            library_file_buttons.removeFromLeft(54));
-        library_file_buttons.removeFromLeft(6);
-        library_import_.setBounds(
-            library_file_buttons.removeFromLeft(54));
-        library_file_buttons.removeFromLeft(6);
-        library_export_.setBounds(library_file_buttons);
-        library_area.removeFromTop(10);
-        mgsc_title_.setBounds(library_area.removeFromTop(26));
-        auto number_row = library_area.removeFromTop(30);
-        output_number_label_.setBounds(
-            number_row.removeFromLeft(118));
-        number_row.removeFromLeft(8);
-        output_number_.setBounds(number_row.removeFromLeft(54));
-        library_area.removeFromTop(8);
-        mgsc_preview_.setBounds(library_area);
+        layoutTimbreLibraryPanel(
+            library_area,
+            TimbreLibraryWidgets{
+                library_title_,
+                library_filter_,
+                library_list_,
+                name_,
+                tags_,
+                memo_,
+                favorite_,
+                library_new_,
+                library_load_,
+                library_save_,
+                library_save_as_,
+                library_cancel_,
+                library_delete_,
+                library_import_,
+                library_export_,
+                mgsc_title_,
+                output_number_label_,
+                output_number_,
+                mgsc_preview_});
     }
 
     bool keyPressed(const juce::KeyPress& key) override {
@@ -7263,6 +7594,7 @@ private:
                         juce::dontSendNotification);
                 }
                 applyBackgroundToGraph();
+                updateBackgroundControlState();
                 saveBackgroundSettings();
                 updateStatus(
                     juce::String::fromUTF8(
@@ -7311,6 +7643,7 @@ private:
         if (!image.isValid()) {
             background_image_ = {};
             applyBackgroundToGraph();
+            updateBackgroundControlState();
             saveBackgroundSettings();
             updateStatus(
                 juce::String::fromUTF8(
@@ -7327,6 +7660,7 @@ private:
             static_cast<double>(background_image_.getHeight()),
             juce::dontSendNotification);
         applyBackgroundToGraph();
+        updateBackgroundControlState();
         saveBackgroundSettings();
         updateStatus(
             juce::String::fromUTF8("背景画像を読み込みました"));
@@ -7344,12 +7678,31 @@ private:
             juce::roundToInt(background_height_.getValue()));
     }
 
+    void updateBackgroundControlState() {
+        const bool has_background = background_image_.isValid()
+            || background_path_.isNotEmpty();
+        background_load_.setEnabled(true);
+        background_clear_.setEnabled(has_background);
+        background_visible_.setEnabled(has_background);
+        background_opacity_label_.setEnabled(has_background);
+        background_opacity_.setEnabled(has_background);
+        background_x_label_.setEnabled(has_background);
+        background_x_.setEnabled(has_background);
+        background_y_label_.setEnabled(has_background);
+        background_y_.setEnabled(has_background);
+        background_w_label_.setEnabled(has_background);
+        background_width_.setEnabled(has_background);
+        background_h_label_.setEnabled(has_background);
+        background_height_.setEnabled(has_background);
+    }
+
     void loadBackgroundSettings() {
         const auto file = settingsFile();
         background_path_.clear();
         background_image_ = {};
         if (!file.existsAsFile()) {
             applyBackgroundToGraph();
+            updateBackgroundControlState();
             return;
         }
         const auto path = file.getFullPathName();
@@ -7417,6 +7770,7 @@ private:
             }
         }
         applyBackgroundToGraph();
+        updateBackgroundControlState();
     }
 
     void saveBackgroundSettings() {
@@ -8641,6 +8995,8 @@ private:
         "immediate audition",
         juce::DrawableButton::ImageOnButtonBackground};
     SccWaveGraph graph_;
+    juce::Rectangle<int> editor_panel_bounds_;
+    juce::Rectangle<int> library_panel_bounds_;
     juce::Label library_title_;
     juce::ComboBox library_list_;
     juce::TextEditor library_filter_;
@@ -9877,7 +10233,7 @@ public:
             juce::dontSendNotification);
         addAndMakeVisible(output_number_label_);
         output_number_.setInputRestrictions(2, "0123456789");
-        output_number_.setText("16", false);
+        output_number_.setText("15", false);
         output_number_.setTooltip(
             juce::String::fromUTF8(
                 "OPLLオリジナル音色のMGSC出力番号 15～31"));
@@ -9890,28 +10246,32 @@ public:
                 "MGSC @v 定義プレビュー"),
             juce::dontSendNotification);
         mgsc_title_.setFont(
-            juce::FontOptions(17.0F, juce::Font::bold));
+            juce::FontOptions(15.0F, juce::Font::bold));
         addAndMakeVisible(mgsc_title_);
         mgsc_preview_.setMultiLine(true);
         mgsc_preview_.setReadOnly(true);
         mgsc_preview_.setFont(
-            juce::FontOptions(13.0F, juce::Font::plain));
+            juce::FontOptions(12.0F, juce::Font::plain));
         addAndMakeVisible(mgsc_preview_);
 
         library_title_.setText(
-            juce::String::fromUTF8("OPLL音色ライブラリ"),
+            juce::String::fromUTF8("音色ライブラリ"),
             juce::dontSendNotification);
         library_title_.setFont(
-            juce::FontOptions(17.0F, juce::Font::bold));
+            juce::FontOptions(18.0F, juce::Font::bold));
         addAndMakeVisible(library_title_);
         library_filter_.setTextToShowWhenEmpty(
             juce::String::fromUTF8("名前・タグ・メモを検索"),
             juce::Colour(0xFF7F8993));
+        library_filter_.setTooltip(
+            juce::String::fromUTF8("OPLL音色ライブラリを絞り込みます"));
         library_filter_.onTextChange =
             [this] { refreshLibraryList(); };
         addAndMakeVisible(library_filter_);
         library_list_.setTextWhenNothingSelected(
             juce::String::fromUTF8("保存済み音色を選択"));
+        library_list_.setTooltip(
+            juce::String::fromUTF8("OPLL音色ライブラリ"));
         library_list_.onChange =
             [this] { selectLibraryEntryFromList(); };
         addAndMakeVisible(library_list_);
@@ -9947,7 +10307,7 @@ public:
             [this] { saveLibraryEntry(false); });
         configureButton(
             library_save_as_,
-            juce::String::fromUTF8("別名"),
+            juce::String::fromUTF8("別名保存"),
             juce::String::fromUTF8("新しい音色として保存します"),
             [this] { saveLibraryEntry(true); });
         configureButton(
@@ -9960,11 +10320,11 @@ public:
             [this] { deleteSelectedLibraryEntry(); });
         configureButton(
             library_import_, juce::String::fromUTF8("取込"),
-            juce::String::fromUTF8("外部.mgstcを取り込みます"),
+            juce::String::fromUTF8("外部.mgstcライブラリを取り込みます"),
             [this] { importLibraryFile(); });
         configureButton(
             library_export_, juce::String::fromUTF8("書出"),
-            juce::String::fromUTF8("選択音色を書き出します"),
+            juce::String::fromUTF8("選択音色を.mgstcへ書き出します"),
             [this] { exportSelectedLibraryEntry(); });
 
         status_.setJustificationType(
@@ -10029,157 +10389,113 @@ public:
     }
 
     void paint(juce::Graphics& graphics) override {
-        graphics.fillAll(
-            getLookAndFeel().findColour(
-                juce::ResizableWindow::backgroundColourId));
-        if (!library_panel_bounds_.isEmpty()) {
-            graphics.setColour(juce::Colour(0xFF29323C));
-            graphics.fillRoundedRectangle(
-                library_panel_bounds_.toFloat(), 9.0F);
-            graphics.setColour(juce::Colour(0xFF435160));
-            graphics.drawRoundedRectangle(
-                library_panel_bounds_.toFloat(), 9.0F, 1.0F);
-        }
-        if (!common_parameter_bounds_.isEmpty()) {
-            graphics.setColour(juce::Colour(0xFF29323C));
-            graphics.fillRoundedRectangle(
-                common_parameter_bounds_.toFloat(), 9.0F);
-            graphics.setColour(juce::Colour(0xFF435160));
-            graphics.drawRoundedRectangle(
-                common_parameter_bounds_.toFloat(), 9.0F, 1.0F);
-        }
+        graphics.fillAll(juce::Colour(UiLayout::pageFill));
+        paintRoundedPanelFrame(graphics, library_panel_bounds_);
+        paintRoundedPanelFrame(graphics, common_parameter_bounds_);
     }
 
     void resized() override {
-        auto area = getLocalBounds().reduced(24);
-        title_.setBounds(area.removeFromTop(34));
-        description_.setBounds(area.removeFromTop(28));
-        settings_.setBounds(getWidth() - 58, 24, 34, 34);
-        master_volume_.setBounds(getWidth() - 104, 21, 40, 40);
-        immediate_audition_.setBounds(getWidth() - 146, 24, 34, 34);
-        area.removeFromTop(10);
+        using namespace UiLayout;
+        auto area = getLocalBounds().reduced(pageMargin);
+        title_.setBounds(area.removeFromTop(titleH));
+        description_.setBounds(area.removeFromTop(descriptionH));
+        settings_.setBounds(getWidth() - 58, pageMargin, 34, 34);
+        master_volume_.setBounds(getWidth() - 104, pageMargin - 3, 40, 40);
+        immediate_audition_.setBounds(getWidth() - 146, pageMargin, 34, 34);
+        area.removeFromTop(sm);
 
-        auto keyboard_area = area.removeFromBottom(94);
-        area.removeFromBottom(10);
+        auto keyboard_area = area.removeFromBottom(keyboardH);
+        area.removeFromBottom(keyboardGap);
         performance_keyboard_.setBounds(keyboard_area);
-        auto toolbar = area.removeFromTop(40);
-        constexpr int icon_size = 40;
+        auto toolbar = area.removeFromTop(toolbarH);
         for (auto* button :
              std::array<juce::DrawableButton*, 6>{
                  &load_, &save_, &paste_, &copy_, &undo_, &redo_}) {
             button->setBounds(
-                toolbar.removeFromLeft(icon_size));
-            toolbar.removeFromLeft(6);
+                toolbar.removeFromLeft(iconButton));
+            toolbar.removeFromLeft(controlGap);
         }
-        toolbar.removeFromLeft(6);
+        toolbar.removeFromLeft(controlGap);
         import_wave_.setBounds(
             toolbar.removeFromLeft(70));
-        toolbar.removeFromLeft(6);
+        toolbar.removeFromLeft(controlGap);
         import_audacity_.setBounds(
             toolbar.removeFromLeft(154));
-        toolbar.removeFromLeft(12);
+        toolbar.removeFromLeft(md);
         wave_previous_.setBounds(
             toolbar.removeFromLeft(40));
         wave_candidate_label_.setBounds(
             toolbar.removeFromLeft(112));
         wave_next_.setBounds(
             toolbar.removeFromLeft(40));
-        area.removeFromTop(10);
+        toolbar.removeFromLeft(sm);
+        open_scc_.setBounds(
+            toolbar.removeFromLeft(120));
+        toolbar.removeFromLeft(sm);
+        convert_to_scc_.setBounds(
+            toolbar.removeFromLeft(iconButton));
+        area.removeFromTop(sm);
 
         auto preset_row = area.removeFromTop(38);
         rom_preset_.setBounds(
             preset_row.removeFromLeft(230));
-        preset_row.removeFromLeft(8);
+        preset_row.removeFromLeft(sm);
         rom_load_.setBounds(
             preset_row.removeFromLeft(150));
-        preset_row.removeFromLeft(20);
-        open_scc_.setBounds(
-            preset_row.removeFromLeft(110));
-        preset_row.removeFromLeft(8);
-        convert_to_scc_.setBounds(
-            preset_row.removeFromLeft(40));
-        area.removeFromTop(14);
+        area.removeFromTop(md);
 
-        auto right = area.removeFromRight(356);
-        area.removeFromRight(16);
+        auto right = area.removeFromRight(libraryWidth);
+        area.removeFromRight(panelGap);
         library_panel_bounds_ = right;
         common_parameter_bounds_ = area.removeFromTop(62);
-        auto common_parameters = common_parameter_bounds_.reduced(12, 5);
+        auto common_parameters = common_parameter_bounds_.reduced(panelPad, xs + 1);
         common_parameters_title_.setBounds(
             common_parameters.removeFromTop(20));
         auto common_row = common_parameters;
-        const auto common_width = (common_row.getWidth() - 16) / 2;
+        const auto common_width = (common_row.getWidth() - panelGap) / 2;
         auto tl_area = common_row.removeFromLeft(common_width);
         mod_total_level_label_.setBounds(tl_area.removeFromLeft(34));
         mod_total_level_.setBounds(tl_area);
-        common_row.removeFromLeft(16);
+        common_row.removeFromLeft(panelGap);
         feedback_label_.setBounds(common_row.removeFromLeft(72));
         feedback_.setBounds(common_row);
-        area.removeFromTop(10);
+        area.removeFromTop(sm);
         auto operators = area.removeFromTop(408);
         const auto panel_width =
-            (operators.getWidth() - 14) / 2;
+            (operators.getWidth() - panelGap + xs) / 2;
         modulator_.setBounds(
             operators.removeFromLeft(panel_width));
-        operators.removeFromLeft(14);
+        operators.removeFromLeft(panelGap - xs);
         carrier_.setBounds(operators);
 
-        area.removeFromTop(12);
+        area.removeFromTop(md);
         scope_title_.setBounds(area.removeFromTop(28));
         scope_.setBounds(area.removeFromTop(110));
-        area.removeFromTop(8);
-        status_.setBounds(area.removeFromTop(36));
+        area.removeFromTop(sm);
+        status_.setBounds(area.removeFromTop(statusH));
 
-        library_title_.setBounds(right.removeFromTop(28));
-        right.removeFromTop(6);
-        library_filter_.setBounds(right.removeFromTop(28));
-        right.removeFromTop(6);
-        library_list_.setBounds(right.removeFromTop(32));
-        right.removeFromTop(6);
-        name_.setBounds(right.removeFromTop(28));
-        right.removeFromTop(5);
-        tags_.setBounds(right.removeFromTop(28));
-        right.removeFromTop(5);
-        memo_.setBounds(right.removeFromTop(52));
-        right.removeFromTop(5);
-        favorite_.setBounds(right.removeFromTop(26));
-        right.removeFromTop(6);
-        auto edit_buttons = right.removeFromTop(30);
-        const auto button_width =
-            (edit_buttons.getWidth() - 15) / 4;
-        library_new_.setBounds(
-            edit_buttons.removeFromLeft(button_width));
-        edit_buttons.removeFromLeft(5);
-        library_load_.setBounds(
-            edit_buttons.removeFromLeft(button_width));
-        edit_buttons.removeFromLeft(5);
-        library_save_.setBounds(
-            edit_buttons.removeFromLeft(button_width));
-        edit_buttons.removeFromLeft(5);
-        library_save_as_.setBounds(edit_buttons);
-        right.removeFromTop(5);
-        auto file_buttons = right.removeFromTop(30);
-        library_cancel_.setBounds(
-            file_buttons.removeFromLeft(button_width));
-        file_buttons.removeFromLeft(5);
-        library_delete_.setBounds(
-            file_buttons.removeFromLeft(button_width));
-        file_buttons.removeFromLeft(5);
-        library_import_.setBounds(
-            file_buttons.removeFromLeft(button_width));
-        file_buttons.removeFromLeft(5);
-        library_export_.setBounds(file_buttons);
-        right.removeFromTop(10);
-        mgsc_title_.setBounds(right.removeFromTop(24));
-        right.removeFromTop(5);
-        auto number_row = right.removeFromTop(32);
-        output_number_label_.setBounds(
-            number_row.removeFromLeft(122));
-        number_row.removeFromLeft(8);
-        output_number_.setBounds(
-            number_row.removeFromLeft(64));
-        right.removeFromTop(6);
-        mgsc_preview_.setBounds(right);
+        layoutTimbreLibraryPanel(
+            right,
+            TimbreLibraryWidgets{
+                library_title_,
+                library_filter_,
+                library_list_,
+                name_,
+                tags_,
+                memo_,
+                favorite_,
+                library_new_,
+                library_load_,
+                library_save_,
+                library_save_as_,
+                library_cancel_,
+                library_delete_,
+                library_import_,
+                library_export_,
+                mgsc_title_,
+                output_number_label_,
+                output_number_,
+                mgsc_preview_});
     }
 
     bool keyPressed(const juce::KeyPress& key) override {
