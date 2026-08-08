@@ -575,105 +575,6 @@ void configureSettingsButton(
     return juce::ImageFileFormat::loadFrom(data, static_cast<size_t>(size));
 }
 
-// アルファを持たない画像（背景が一様な暗色で塗られた素材）を、外周から
-// つながっている背景だけ透過させて切り抜く。塗り足しは外周起点の塗り
-// つぶしに限定するため、被写体内部の暗い部分は残る。
-[[nodiscard]] juce::Image withDarkBackgroundKeyedOut(
-    const juce::Image& source,
-    int key_level = 48) {
-    if (!source.isValid()) {
-        return source;
-    }
-    auto image = source.convertedToFormat(juce::Image::ARGB);
-    const auto width = image.getWidth();
-    const auto height = image.getHeight();
-    if (width <= 0 || height <= 0) {
-        return image;
-    }
-
-    {
-        juce::Image::BitmapData pixels(
-            image, juce::Image::BitmapData::readWrite);
-        const auto pixel_index = [width](int x, int y) {
-            return static_cast<std::size_t>(y)
-                * static_cast<std::size_t>(width)
-                + static_cast<std::size_t>(x);
-        };
-        const auto brightness = [&pixels](int x, int y) {
-            const auto colour = pixels.getPixelColour(x, y);
-            return static_cast<int>(juce::jmax(
-                colour.getRed(),
-                colour.getGreen(),
-                colour.getBlue()));
-        };
-
-        std::vector<std::uint8_t> keyed(
-            static_cast<std::size_t>(width)
-                * static_cast<std::size_t>(height),
-            0);
-        std::vector<std::pair<int, int>> pending;
-        const auto visit = [&](int x, int y) {
-            if (x < 0 || y < 0 || x >= width || y >= height) {
-                return;
-            }
-            auto& flag = keyed[pixel_index(x, y)];
-            if (flag != 0 || brightness(x, y) > key_level) {
-                return;
-            }
-            flag = 1;
-            pending.emplace_back(x, y);
-        };
-        for (int x = 0; x < width; ++x) {
-            visit(x, 0);
-            visit(x, height - 1);
-        }
-        for (int y = 0; y < height; ++y) {
-            visit(0, y);
-            visit(width - 1, y);
-        }
-        while (!pending.empty()) {
-            const auto [x, y] = pending.back();
-            pending.pop_back();
-            visit(x - 1, y);
-            visit(x + 1, y);
-            visit(x, y - 1);
-            visit(x, y + 1);
-        }
-
-        const auto edge_level = key_level * 2;
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                const auto colour = pixels.getPixelColour(x, y);
-                if (keyed[pixel_index(x, y)] != 0) {
-                    pixels.setPixelColour(x, y, colour.withAlpha(0.0F));
-                    continue;
-                }
-                const auto touches_background =
-                    (x > 0 && keyed[pixel_index(x - 1, y)] != 0)
-                    || (x + 1 < width
-                        && keyed[pixel_index(x + 1, y)] != 0)
-                    || (y > 0 && keyed[pixel_index(x, y - 1)] != 0)
-                    || (y + 1 < height
-                        && keyed[pixel_index(x, y + 1)] != 0);
-                if (!touches_background) {
-                    continue;
-                }
-                const auto level = brightness(x, y);
-                if (level >= edge_level) {
-                    continue;
-                }
-                pixels.setPixelColour(
-                    x,
-                    y,
-                    colour.withAlpha(
-                        static_cast<float>(level)
-                        / static_cast<float>(edge_level)));
-            }
-        }
-    }
-    return image;
-}
-
 struct AnimatedGifSupport final {
     AnimatedGifSupport() {
         Gdiplus::GdiplusStartupInput input;
@@ -843,6 +744,55 @@ bool loadAnimatedGifFrames(
         return false;
     }
 
+    // GIFのフレーム遅延はPropertyTagFrameDelayに1/100秒単位で格納される。
+    // タグがない、値が0、または読込に失敗したフレームだけ50msへフォールバックする。
+    constexpr PROPID frame_delay_property = 0x5100;
+    constexpr int fallback_delay_ms = 50;
+    std::vector<std::uint64_t> delay_storage;
+    const auto delay_property_size =
+        bitmap.GetPropertyItemSize(frame_delay_property);
+    if (delay_property_size > 0) {
+        delay_storage.resize(
+            (static_cast<std::size_t>(delay_property_size)
+             + sizeof(std::uint64_t) - 1)
+            / sizeof(std::uint64_t));
+    }
+    const Gdiplus::PropertyItem* delay_property = nullptr;
+    if (!delay_storage.empty()) {
+        auto* item = reinterpret_cast<Gdiplus::PropertyItem*>(
+            delay_storage.data());
+        if (bitmap.GetPropertyItem(
+                frame_delay_property,
+                delay_property_size,
+                item)
+            == Gdiplus::Ok) {
+            delay_property = item;
+        }
+    }
+    const auto delayForFrame = [delay_property](UINT frame) {
+        if (delay_property == nullptr
+            || delay_property->value == nullptr
+            || delay_property->type
+                != 4) {  // PropertyTagTypeLong
+            return fallback_delay_ms;
+        }
+        const auto delay_count =
+            delay_property->length / sizeof(UINT);
+        if (frame >= delay_count) {
+            return fallback_delay_ms;
+        }
+        const auto hundredths =
+            static_cast<const UINT*>(delay_property->value)[frame];
+        if (hundredths == 0) {
+            return fallback_delay_ms;
+        }
+        constexpr auto maximum_hundredths =
+            static_cast<UINT>(
+                std::numeric_limits<int>::max() / 10);
+        return static_cast<int>(
+            juce::jmin(hundredths, maximum_hundredths) * 10);
+    };
+
     frames.reserve(frame_count);
     delays_ms.reserve(frame_count);
     for (UINT frame = 0; frame < frame_count; ++frame) {
@@ -855,7 +805,7 @@ bool loadAnimatedGifFrames(
             continue;
         }
         frames.push_back(std::move(converted));
-        delays_ms.push_back(50);
+        delays_ms.push_back(delayForFrame(frame));
     }
     return !frames.empty();
 }
@@ -1018,10 +968,9 @@ void runWithConversionBusyDialog(
 class AboutPanel final : public juce::Component {
 public:
     AboutPanel() {
-        logo_ = withDarkBackgroundKeyedOut(
-            loadEmbeddedPng(
-                BinaryData::MGSTC_logo_png,
-                BinaryData::MGSTC_logo_pngSize));
+        logo_ = loadEmbeddedPng(
+            BinaryData::MGSTC_logo_png,
+            BinaryData::MGSTC_logo_pngSize);
         title_.setText(
             "MGS Tone Craft", juce::dontSendNotification);
         title_.setFont(
@@ -7587,12 +7536,14 @@ private:
         juce::FileChooser chooser(
             juce::String::fromUTF8("SCC音色を保存する"),
             juce::File::getCurrentWorkingDirectory()
-                .getChildFile("scc-tone.mgs"),
-            "*.mgs;*.txt");
+                .getChildFile("scc-tone.txt"),
+            "*.txt");
         if (!chooser.browseForFileToSave(true)) {
             return;
         }
-        if (!chooser.getResult().replaceWithText(
+        const auto output_file =
+            chooser.getResult().withFileExtension(".txt");
+        if (!output_file.replaceWithText(
                 definition, false, false, "\r\n")) {
             showError(
                 juce::String::fromUTF8("ファイル保存"),
@@ -10893,12 +10844,14 @@ private:
         juce::FileChooser chooser(
             juce::String::fromUTF8("OPLL音色を保存する"),
             juce::File::getCurrentWorkingDirectory()
-                .getChildFile("opll-tone.mgs"),
-            "*.mgs;*.txt");
+                .getChildFile("opll-tone.txt"),
+            "*.txt");
         if (!chooser.browseForFileToSave(true)) {
             return;
         }
-        if (!chooser.getResult().replaceWithText(
+        const auto output_file =
+            chooser.getResult().withFileExtension(".txt");
+        if (!output_file.replaceWithText(
                 definition, false, false, "\r\n")) {
             showError(
                 juce::String::fromUTF8("ファイル保存"),
