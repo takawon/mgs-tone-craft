@@ -1,5 +1,6 @@
 /build/
 /build-*/
+/dist/
 *.obj
 *.pdb
 *.ilk
@@ -7,6 +8,14 @@
 # ローカル開発ツールとパッケージキャッシュ
 /.pnpm-store/
 /.site-tools/
+/.agents/
+/.cursor/
+
+# 内部向け文書（公開リポジトリには含めない。作業ツリーには残す）
+/SPECIFICATION.md
+/ENGINE_DESIGN.md
+/HANDOFF.md
+/RELEASE_CHECKLIST.md
 
 # UIドラフトは動作検証専用のため、ディレクトリ全体を非公開
 /draft-ui/

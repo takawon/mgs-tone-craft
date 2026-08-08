@@ -569,12 +569,6 @@ void configureSettingsButton(
     button.onClick = std::move(action);
 }
 
-[[nodiscard]] juce::Image loadEmbeddedPng(
-    const char* data,
-    int size) {
-    return juce::ImageFileFormat::loadFrom(data, static_cast<size_t>(size));
-}
-
 struct AnimatedGifSupport final {
     AnimatedGifSupport() {
         Gdiplus::GdiplusStartupInput input;
@@ -643,41 +637,24 @@ struct AnimatedGifSupport final {
     return image;
 }
 
-[[nodiscard]] juce::Image loadImageFileForBackground(
-    const juce::File& file) {
-    if (!file.existsAsFile()) {
+[[nodiscard]] juce::Image loadImageMemory(
+    const void* data,
+    std::size_t size) {
+    if (data == nullptr || size == 0) {
         return {};
     }
-    if (auto image = juce::ImageFileFormat::loadFrom(file);
-        image.isValid()) {
-        return image;
-    }
-    ensureGdiplusInitialized();
-    Gdiplus::Bitmap bitmap(file.getFullPathName().toWideCharPointer());
-    if (bitmap.GetLastStatus() != Gdiplus::Ok) {
-        return {};
-    }
-    return gdiplusBitmapToImage(bitmap);
-}
-
-[[nodiscard]] juce::Image loadImageBytesForBackground(
-    const std::vector<std::uint8_t>& bytes) {
-    if (bytes.empty()) {
-        return {};
-    }
-    if (auto image = juce::ImageFileFormat::loadFrom(
-            bytes.data(), bytes.size());
+    if (auto image = juce::ImageFileFormat::loadFrom(data, size);
         image.isValid()) {
         return image;
     }
     ensureGdiplusInitialized();
     const auto memory = ::GlobalAlloc(
-        GMEM_MOVEABLE, static_cast<SIZE_T>(bytes.size()));
+        GMEM_MOVEABLE, static_cast<SIZE_T>(size));
     if (memory == nullptr) {
         return {};
     }
     if (auto* locked = ::GlobalLock(memory)) {
-        std::memcpy(locked, bytes.data(), bytes.size());
+        std::memcpy(locked, data, size);
         ::GlobalUnlock(memory);
     } else {
         ::GlobalFree(memory);
@@ -698,6 +675,28 @@ struct AnimatedGifSupport final {
     }
     stream->Release();
     return image;
+}
+
+[[nodiscard]] juce::Image loadImageFileForBackground(
+    const juce::File& file) {
+    if (!file.existsAsFile()) {
+        return {};
+    }
+    if (auto image = juce::ImageFileFormat::loadFrom(file);
+        image.isValid()) {
+        return image;
+    }
+    ensureGdiplusInitialized();
+    Gdiplus::Bitmap bitmap(file.getFullPathName().toWideCharPointer());
+    if (bitmap.GetLastStatus() != Gdiplus::Ok) {
+        return {};
+    }
+    return gdiplusBitmapToImage(bitmap);
+}
+
+[[nodiscard]] juce::Image loadImageBytesForBackground(
+    const std::vector<std::uint8_t>& bytes) {
+    return loadImageMemory(bytes.data(), bytes.size());
 }
 
 bool loadAnimatedGifFrames(
@@ -968,9 +967,9 @@ void runWithConversionBusyDialog(
 class AboutPanel final : public juce::Component {
 public:
     AboutPanel() {
-        logo_ = loadEmbeddedPng(
+        logo_ = loadImageMemory(
             BinaryData::MGSTC_logo_png,
-            BinaryData::MGSTC_logo_pngSize);
+            static_cast<std::size_t>(BinaryData::MGSTC_logo_pngSize));
         title_.setText(
             "MGS Tone Craft", juce::dontSendNotification);
         title_.setFont(

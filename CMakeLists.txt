@@ -11,10 +11,10 @@ project(
 
 option(MGSTC_BUILD_TESTS "Build engine tests" ON)
 
-# The About panel must show the same version as SPECIFICATION.md, so read
-# the document version ("- <label>: 0.91") straight out of the specification
-# instead of keeping a second copy in the sources.
+# About shows MGSTC_DOC_VERSION. Prefer local SPECIFICATION.md when present
+# (private working tree). Public checkouts use the tracked VERSION file.
 set(MGSTC_SPECIFICATION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/SPECIFICATION.md")
+set(MGSTC_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 set(MGSTC_DOC_VERSION "${PROJECT_VERSION}")
 if(EXISTS "${MGSTC_SPECIFICATION_FILE}")
     file(
@@ -33,6 +33,16 @@ if(EXISTS "${MGSTC_SPECIFICATION_FILE}")
         DIRECTORY
         APPEND
         PROPERTY CMAKE_CONFIGURE_DEPENDS "${MGSTC_SPECIFICATION_FILE}"
+    )
+elseif(EXISTS "${MGSTC_VERSION_FILE}")
+    file(STRINGS "${MGSTC_VERSION_FILE}" _mgstc_version_lines LIMIT_COUNT 1)
+    if(_mgstc_version_lines)
+        string(STRIP "${_mgstc_version_lines}" MGSTC_DOC_VERSION)
+    endif()
+    set_property(
+        DIRECTORY
+        APPEND
+        PROPERTY CMAKE_CONFIGURE_DEPENDS "${MGSTC_VERSION_FILE}"
     )
 endif()
 message(STATUS "MGSTC document version: ${MGSTC_DOC_VERSION}")
