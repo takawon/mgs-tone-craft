@@ -15,6 +15,9 @@
 `git`がPATHに無い場合、`tools\build.cmd`はVisual Studio同梱のGitを探して
 プロセス内のPATHへ追加する。見つからない場合は導入を促して停止する。
 
+アプリの表示バージョンは、作業ツリーに`SPECIFICATION.md`がある場合はそこから、
+無い場合（公開ソースのみのクローンなど）はルートの`VERSION`から読み取る。
+
 現在の開発環境では、Visual Studio 2026、MSVC 19.51、Windows SDK
 10.0.26100.0、CMake 4.2で動作確認している。
 
