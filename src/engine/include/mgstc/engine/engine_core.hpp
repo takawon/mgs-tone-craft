@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <span>
 
+#include "mgstc/engine/dc_blocker.hpp"
 #include "mgstc/engine/emulator_sound_output.hpp"
 #include "mgstc/engine/runtime_session.hpp"
 #include "mgstc/engine/sound_output_backend.hpp"
@@ -122,6 +123,7 @@ private:
     bool waveform_monitor_{false};
     TickClock clock_{};
     MixerGains gains_{};
+    DcBlocker mix_dc_blocker_{48'000.0F, 3.4F};
     std::array<float, OpllScopeFrame::kSampleCount> psg_scope_work_{};
     std::array<float, OpllScopeFrame::kSampleCount> scc_scope_work_{};
     std::array<float, OpllScopeFrame::kSampleCount> opll_scope_work_{};

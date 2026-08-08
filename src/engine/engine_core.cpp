@@ -57,6 +57,7 @@ void EngineCore::hardReset() noexcept {
         emulator_.reset();
     }
     clock_.reset();
+    mix_dc_blocker_.reset();
     psg_scope_work_.fill(0.0F);
     scc_scope_work_.fill(0.0F);
     opll_scope_work_.fill(0.0F);
@@ -119,7 +120,10 @@ RenderResult EngineCore::render(
             scope_chips.psg * gains_.psg
             + scope_chips.scc * gains_.scc
             + scope_chips.opll * gains_.opll);
-        const auto scope_mixed = std::clamp(scope_raw, -1.0F, 1.0F);
+        // Mild DC block on the mixed float bus (MSXplay/libkss-like output
+        // stage with MML lpf=0: RCF off, DC filter still active).
+        const auto scope_filtered = mix_dc_blocker_.process(scope_raw);
+        const auto scope_mixed = std::clamp(scope_filtered, -1.0F, 1.0F);
         const auto scope_index = opll_scope_position_++;
         psg_scope_work_[scope_index] = scope_chips.psg;
         scc_scope_work_[scope_index] = scope_chips.scc;
@@ -137,8 +141,8 @@ RenderResult EngineCore::render(
 
         // Audible destination is the remote chip; keep PC mix silent.
         const auto mixed = remote_output ? 0.0F : scope_mixed;
-        result.clipped =
-            result.clipped || (!remote_output && scope_mixed != scope_raw);
+        result.clipped = result.clipped
+            || (!remote_output && scope_mixed != scope_filtered);
         interleaved_stereo[frame * 2] = mixed;
         interleaved_stereo[frame * 2 + 1] = mixed;
         static_cast<void>(clock_.consumeFrames(1));

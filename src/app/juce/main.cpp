@@ -63,8 +63,10 @@ constexpr std::uint8_t kPsgTrack = 0;
 constexpr std::uint8_t kSccTrack = 3;
 constexpr std::uint8_t kOpllTrack = 8;
 constexpr std::uint8_t kPreviewNote = 60;
-constexpr std::uint16_t kPcOctaveDownScanCode = 0x33;
-constexpr std::uint16_t kPcOctaveUpScanCode = 0x34;
+// PC演奏オクターブ移動は Page Down（下降）／Page Up（上昇）。
+// 拡張キーのためスキャンコードではなく仮想キーで判定する。
+constexpr int kPcOctaveDownVirtualKey = VK_NEXT;
+constexpr int kPcOctaveUpVirtualKey = VK_PRIOR;
 constexpr std::array<std::uint16_t, 33>
     kPcPerformanceScanCodes{
         0x2C, 0x1F, 0x2D, 0x20, 0x2E, 0x2F, 0x22, 0x30,
@@ -234,6 +236,11 @@ struct CompositeTimbreImpact {
         && (GetAsyncKeyState(static_cast<int>(virtual_key))
             & 0x8000)
             != 0;
+}
+
+[[nodiscard]] bool virtualKeyIsDown(int virtual_key) {
+    return virtual_key != 0
+        && (GetAsyncKeyState(virtual_key) & 0x8000) != 0;
 }
 
 [[nodiscard]] juce::String midiNoteName(std::uint8_t midi_note) {
@@ -1114,10 +1121,9 @@ public:
         std::function<void(const SccWaveform&)>;
 
     SccWaveGraph() {
-        setMouseCursor(juce::MouseCursor::CrosshairCursor);
         setTooltip(
             juce::String::fromUTF8(
-                "ドラッグして32個の波形値を編集します"));
+                "波形枠内をドラッグして32個の波形値を編集します"));
         for (std::size_t index = 0; index < waveform_.size(); ++index) {
             auto decimal = std::make_unique<juce::TextEditor>();
             auto hexadecimal = std::make_unique<juce::TextEditor>();
@@ -1160,6 +1166,14 @@ public:
         reference_waveform_ = current;
         waveform_ = candidate;
         syncValueEditors(current);
+        repaint();
+    }
+
+    void setApplyRange(mgstc::engine::SccApplyRange range) {
+        if (apply_range_ == range) {
+            return;
+        }
+        apply_range_ = range;
         repaint();
     }
 
@@ -1330,6 +1344,33 @@ public:
                 58,
                 20,
                 juce::Justification::centredLeft);
+
+            // 左半分／右半分適用時、変更しない側へ半透明マスクを重ねる。
+            if (apply_range_
+                != mgstc::engine::SccApplyRange::All) {
+                const auto mid_x = graph.getCentreX();
+                const auto masked =
+                    apply_range_
+                        == mgstc::engine::SccApplyRange::LeftHalf
+                    ? juce::Rectangle<int>(
+                          mid_x,
+                          graph.getY(),
+                          graph.getRight() - mid_x,
+                          graph.getHeight())
+                    : juce::Rectangle<int>(
+                          graph.getX(),
+                          graph.getY(),
+                          mid_x - graph.getX(),
+                          graph.getHeight());
+                graphics.setColour(
+                    juce::Colour(0x99091018));
+                graphics.fillRect(masked);
+                graphics.setColour(juce::Colour(0x66A0AEBC));
+                graphics.drawVerticalLine(
+                    mid_x,
+                    static_cast<float>(graph.getY()),
+                    static_cast<float>(graph.getBottom()));
+            }
         } else {
             graphics.setColour(confirmed_colour);
             graphics.strokePath(
@@ -1382,6 +1423,14 @@ public:
     }
 
     void mouseDown(const juce::MouseEvent& event) override {
+        // 初回クリックは波形枠内だけを受け付ける。枠外からの開始は無視する。
+        if (!graphBounds().contains(event.getPosition())) {
+            mouse_edit_active_ = false;
+            updateEditCursor(event.getPosition());
+            return;
+        }
+        mouse_edit_active_ = true;
+        setMouseCursor(juce::MouseCursor::CrosshairCursor);
         if (reference_waveform_) {
             waveform_ = *reference_waveform_;
             reference_waveform_.reset();
@@ -1395,12 +1444,33 @@ public:
     }
 
     void mouseDrag(const juce::MouseEvent& event) override {
+        // 枠内で開始したドラッグは、枠外へ出ても従来どおり追従する。
+        if (!mouse_edit_active_) {
+            return;
+        }
+        setMouseCursor(juce::MouseCursor::CrosshairCursor);
         updateFromMouse(event.position);
     }
 
-    void mouseUp(const juce::MouseEvent&) override {
+    void mouseUp(const juce::MouseEvent& event) override {
+        if (!mouse_edit_active_) {
+            updateEditCursor(event.getPosition());
+            return;
+        }
+        mouse_edit_active_ = false;
         if (drag_start_ != waveform_ && on_commit_) {
             on_commit_(drag_start_, waveform_);
+        }
+        updateEditCursor(event.getPosition());
+    }
+
+    void mouseMove(const juce::MouseEvent& event) override {
+        updateEditCursor(event.getPosition());
+    }
+
+    void mouseExit(const juce::MouseEvent&) override {
+        if (!mouse_edit_active_) {
+            setMouseCursor(juce::MouseCursor::NormalCursor);
         }
     }
 
@@ -1429,6 +1499,15 @@ private:
             .withTrimmedBottom(52)
             .withTrimmedLeft(28)
             .reduced(2, 0);
+    }
+
+    void updateEditCursor(juce::Point<int> position) {
+        if (mouse_edit_active_
+            || graphBounds().contains(position)) {
+            setMouseCursor(juce::MouseCursor::CrosshairCursor);
+        } else {
+            setMouseCursor(juce::MouseCursor::NormalCursor);
+        }
     }
 
     static void configureValueEditor(
@@ -1602,6 +1681,9 @@ private:
     std::array<std::unique_ptr<juce::TextEditor>, 32>
         hex_editors_;
     int selected_index_{-1};
+    bool mouse_edit_active_{};
+    mgstc::engine::SccApplyRange apply_range_{
+        mgstc::engine::SccApplyRange::All};
 };
 
 class SharedAudioService final {
@@ -2738,17 +2820,17 @@ public:
         };
         addChildComponent(midi_input_);
 
-        octave_down_.setButtonText(",");
+        octave_down_.setButtonText("PgDn");
         octave_down_.setTooltip(
             juce::String::fromUTF8(
-                "PCキーボードのオクターブを下げます"));
+                "PCキーボードのオクターブを下げます（Page Down）"));
         octave_down_.onClick = [this] { changePcOctave(-1); };
         addAndMakeVisible(octave_down_);
 
-        octave_up_.setButtonText(".");
+        octave_up_.setButtonText("PgUp");
         octave_up_.setTooltip(
             juce::String::fromUTF8(
-                "PCキーボードのオクターブを上げます"));
+                "PCキーボードのオクターブを上げます（Page Up）"));
         octave_up_.onClick = [this] { changePcOctave(1); };
         addAndMakeVisible(octave_up_);
 
@@ -2823,7 +2905,12 @@ public:
             return false;
         }
         const auto character = key.getTextCharacter();
-        return character >= 0x20 && character != 0x7F;
+        if (character >= 0x20 && character != 0x7F) {
+            return true;
+        }
+        const auto code = key.getKeyCode();
+        return code == juce::KeyPress::pageUpKey
+            || code == juce::KeyPress::pageDownKey;
     }
 
     [[nodiscard]] bool hasActiveNote() const noexcept {
@@ -2868,11 +2955,11 @@ public:
         auto controls = area.removeFromTop(30);
         mode_.setBounds(controls.removeFromLeft(68));
         controls.removeFromLeft(10);
-        octave_down_.setBounds(controls.removeFromLeft(34));
+        octave_down_.setBounds(controls.removeFromLeft(48));
         controls.removeFromLeft(4);
         octave_label_.setBounds(controls.removeFromLeft(132));
         controls.removeFromLeft(4);
-        octave_up_.setBounds(controls.removeFromLeft(34));
+        octave_up_.setBounds(controls.removeFromLeft(48));
         controls.removeFromLeft(12);
         midi_status_.setBounds(controls);
         area.removeFromTop(5);
@@ -2906,7 +2993,7 @@ private:
                 midi_help_.setText(
                     juce::String::fromUTF8(
                         "使用するMIDI入力機器を選択してください。\n"
-                        "接続状態は鍵盤上部のオクターブ操作（.）の右側へ常時表示されます。"),
+                        "接続状態は鍵盤上部のオクターブ操作（PgUp）の右側へ常時表示されます。"),
                     juce::dontSendNotification);
                 midi_help_.setJustificationType(
                     juce::Justification::topLeft);
@@ -3385,9 +3472,9 @@ private:
                 kPcPerformanceScanCodes[index]);
         }
         octave_down_key_ =
-            physicalKeyIsDown(kPcOctaveDownScanCode);
+            virtualKeyIsDown(kPcOctaveDownVirtualKey);
         octave_up_key_ =
-            physicalKeyIsDown(kPcOctaveUpScanCode);
+            virtualKeyIsDown(kPcOctaveUpVirtualKey);
     }
 
     void pollPcKeyboard() {
@@ -3401,9 +3488,9 @@ private:
             return;
         }
         const bool down =
-            physicalKeyIsDown(kPcOctaveDownScanCode);
+            virtualKeyIsDown(kPcOctaveDownVirtualKey);
         const bool up =
-            physicalKeyIsDown(kPcOctaveUpScanCode);
+            virtualKeyIsDown(kPcOctaveUpVirtualKey);
         if (down && !octave_down_key_) {
             changePcOctave(-1);
         }
@@ -5142,7 +5229,7 @@ public:
         updateStatus(
             engine_ready_
                 ? juce::String::fromUTF8(
-                      "準備完了 / PC鍵盤 Z=C・上段+1oct・[,] [.]=oct移動")
+                      "準備完了 / PC鍵盤 Z=C・上段+1oct・PgDn/PgUp=oct移動")
                 : juce::String::fromUTF8(
                       "音声出力を開始できませんでした"));
     }
@@ -6275,6 +6362,13 @@ public:
 
     void setWaveform(const SccWaveform& waveform) {
         waveform_ = waveform;
+        has_waveform_ = true;
+        repaint();
+    }
+
+    void clear() {
+        waveform_ = {};
+        has_waveform_ = false;
         repaint();
     }
 
@@ -6291,6 +6385,17 @@ public:
             juce::roundToInt(graph.getCentreY()),
             graph.getX(),
             graph.getRight());
+
+        if (!has_waveform_) {
+            graphics.setColour(juce::Colour(0xFF8A97A4));
+            graphics.setFont(juce::FontOptions(11.0F));
+            graphics.drawFittedText(
+                juce::String::fromUTF8("未選択"),
+                getLocalBounds(),
+                juce::Justification::centred,
+                1);
+            return;
+        }
 
         juce::Path path;
         for (std::size_t index = 0; index < waveform_.size(); ++index) {
@@ -6323,6 +6428,7 @@ public:
 
 private:
     SccWaveform waveform_{};
+    bool has_waveform_{};
 };
 
 class SccPresetMenuItem final : public juce::PopupMenu::CustomComponent {
@@ -6485,7 +6591,8 @@ public:
             [this] { convertToOpll(); });
 
         rebuildPresetMenu();
-        preset_.setSelectedId(1, juce::dontSendNotification);
+        preset_.setTextWhenNothingSelected(
+            juce::String::fromUTF8("プリセット未選択"));
         preset_.setTooltip(
             juce::String::fromUTF8("適用するプリセット波形"));
         preset_.onChange = [this] { refreshPresetPreview(); };
@@ -7021,7 +7128,7 @@ public:
         updateDefinitionPreview();
         loadBackgroundSettings();
         updateBackgroundControlState();
-        refreshPresetPreview(false);
+        clearPresetSelectionState();
         setSize(1360, 900);
         engine_ready_ = audio_service.running()
             && configureEngine(false);
@@ -7337,7 +7444,10 @@ private:
         constexpr std::array<const char*, 6> names{
             "Sine", "Square", "Triangle", "Saw",
             "Pulse 25%", "Pulse 12.5%"};
-        const int selected = juce::jlimit(1, 6, preset_.getSelectedId());
+        // 0 は未選択。倍音変更で作り直しても選択なしのまま保つ。
+        const int selected = hasPresetSelection()
+            ? juce::jlimit(1, 6, preset_.getSelectedId())
+            : 0;
         auto* menu = preset_.getRootMenu();
         menu->clear();
         const auto harmonic = selectedHarmonic();
@@ -7352,6 +7462,11 @@ private:
                 juce::String(names[index]));
         }
         preset_.setSelectedId(selected, juce::dontSendNotification);
+    }
+
+    [[nodiscard]] bool hasPresetSelection() const noexcept {
+        const auto value = preset_.getSelectedId();
+        return value >= 1 && value <= 6;
     }
 
     [[nodiscard]] mgstc::engine::SccWavePreset
@@ -8549,6 +8664,12 @@ private:
     }
 
     void applyPreset() {
+        if (!hasPresetSelection()) {
+            updateStatus(
+                juce::String::fromUTF8(
+                    "プリセットを選んでから適用してください"));
+            return;
+        }
         const auto candidate = makePresetCandidate();
         dismissPreviewState(false);
         commitWave(candidate);
@@ -8594,14 +8715,31 @@ private:
         return generated;
     }
 
+    // プリセットが未選択の間は候補波形を作らず、適用もできない状態にする。
+    void clearPresetSelectionState() {
+        preview_wave_ = scc_wave_;
+        dismissPreviewState(true);
+        preset_preview_.clear();
+        apply_preset_.setEnabled(false);
+    }
+
     void refreshPresetPreview(bool audition = true) {
+        if (!hasPresetSelection()) {
+            clearPresetSelectionState();
+            return;
+        }
+        apply_preset_.setEnabled(true);
         preview_wave_ = makePresetCandidate();
         preview_active_ = true;
-        ab_next_plays_b_ = true;
+        // プリセット選択直後は候補(B)を鍵盤でも確認できる状態にする。
+        // A/Bボタンの次の操作は原音(A)への切り替えとなる。
+        ab_keyboard_plays_b_ = true;
+        ab_next_plays_b_ = false;
         cancel_preview_.setEnabled(true);
         ab_audition_.setEnabled(true);
         updateAbAuditionButton();
         preset_preview_.setWaveform(makePresetPreviewWave());
+        graph_.setApplyRange(selectedApplyRange());
         graph_.setPreview(scc_wave_, preview_wave_);
         if (audition && engine_ready_) {
             static_cast<void>(auditionAfterEdit(&preview_wave_));
@@ -8644,6 +8782,7 @@ private:
                     "A/B試聴を開始できませんでした"));
             return;
         }
+        ab_keyboard_plays_b_ = play_b;
         ab_next_plays_b_ = !play_b;
         updateAbAuditionButton();
         updateStatus(
@@ -8655,10 +8794,12 @@ private:
 
     void dismissPreviewState(bool keep_graph_overlay_clear) {
         preview_active_ = false;
+        ab_keyboard_plays_b_ = false;
         ab_next_plays_b_ = true;
         cancel_preview_.setEnabled(false);
         ab_audition_.setEnabled(false);
         updateAbAuditionButton();
+        graph_.setApplyRange(mgstc::engine::SccApplyRange::All);
         if (keep_graph_overlay_clear) {
             graph_.clearPreviewOverlay();
         }
@@ -8682,6 +8823,12 @@ private:
         ab_audition_.setTooltip(tip);
         ab_audition_.setTitle(tip);
         ab_audition_.setDescription(tip);
+    }
+
+    [[nodiscard]] const SccWaveform* keyboardPreviewWave() const noexcept {
+        return preview_active_ && ab_keyboard_plays_b_
+            ? &preview_wave_
+            : nullptr;
     }
 
     void updateMergeControlState() {
@@ -8811,9 +8958,21 @@ private:
                     "鍵盤演奏を開始できませんでした"));
             return;
         }
-        // 一時試聴が残っていると鍵盤が未確定音色を鳴らすため、確定へ戻す。
-        if (engine_holds_temporary_program_
+        if (preview_active_) {
+            // A/Bで現在選ばれている側を鍵盤でも確認する。
+            // Polyの追加ノートでは hardReset しない。
+            if (voice_allocator_.activeVoiceCount() == 0
+                && !configureEngine(false, keyboardPreviewWave())) {
+                updateStatus(
+                    juce::String::fromUTF8(
+                        "鍵盤演奏を開始できませんでした"));
+                return;
+            }
+        } else if (
+            engine_holds_temporary_program_
             && !configureEngine(false)) {
+            // 一時試聴（1秒／A/B）が残っていると鍵盤が未確定音色を
+            // 鳴らすため、プレビュー中以外は確定へ戻す。
             updateStatus(
                 juce::String::fromUTF8(
                     "鍵盤演奏を開始できませんでした"));
@@ -8836,7 +8995,12 @@ private:
             return;
         }
         updateStatus(
-            juce::String::fromUTF8("鍵盤演奏中: SCC / ")
+            juce::String::fromUTF8(
+                preview_active_
+                    ? (ab_keyboard_plays_b_
+                           ? "鍵盤演奏中: SCC / B 候補 / "
+                           : "鍵盤演奏中: SCC / A 原音 / ")
+                    : "鍵盤演奏中: SCC / ")
             + midiNoteName(note));
     }
 
@@ -8857,7 +9021,11 @@ private:
 
     void stopNote() {
         silenceAllVoices();
-        if (engine_holds_temporary_program_) {
+        if (preview_active_) {
+            // 現在のA/B側を維持し、続けて鍵盤で確認できるようにする。
+            static_cast<void>(configureEngine(
+                false, keyboardPreviewWave()));
+        } else if (engine_holds_temporary_program_) {
             static_cast<void>(configureEngine(false));
         }
         updateStatus(juce::String::fromUTF8("発音を停止しました"));
@@ -8877,9 +9045,12 @@ private:
         if (immediate_audition_.getToggleState()) {
             return auditionOneSecond(preview);
         }
-        // 即時発声OFFでも共有プログラムへ確定波形を反映し、
-        // 他エディタの音色を消さない。
-        return preview != nullptr || configureEngine(false);
+        // 即時発声OFFでも候補／確定をエンジンへ載せ、鍵盤で確認できる
+        // ようにする。共有SCC波形は確定時だけ更新する。
+        if (preview != nullptr) {
+            return configureEngine(false, preview);
+        }
+        return configureEngine(false);
     }
 
     void armOneSecondPreview() {
@@ -8907,7 +9078,10 @@ private:
             && juce::Time::getMillisecondCounterHiRes()
                 >= *audition_stop_time_ms_) {
             silenceAllVoices();
-            if (engine_holds_temporary_program_) {
+            if (preview_active_) {
+                static_cast<void>(configureEngine(
+                    false, keyboardPreviewWave()));
+            } else if (engine_holds_temporary_program_) {
                 static_cast<void>(configureEngine(false));
             }
             updateStatus(
@@ -9035,6 +9209,7 @@ private:
         "MgsToneCraftTimbreLibraryV1"};
     bool editor_baseline_valid_{};
     bool preview_active_{};
+    bool ab_keyboard_plays_b_{};
     bool ab_next_plays_b_{true};
     bool scale_previewing_{};
     bool engine_ready_{};
