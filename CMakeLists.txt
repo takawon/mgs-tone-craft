@@ -11,6 +11,32 @@ project(
 
 option(MGSTC_BUILD_TESTS "Build engine tests" ON)
 
+# The About panel must show the same version as SPECIFICATION.md, so read
+# the document version ("- <label>: 0.91") straight out of the specification
+# instead of keeping a second copy in the sources.
+set(MGSTC_SPECIFICATION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/SPECIFICATION.md")
+set(MGSTC_DOC_VERSION "${PROJECT_VERSION}")
+if(EXISTS "${MGSTC_SPECIFICATION_FILE}")
+    file(
+        STRINGS "${MGSTC_SPECIFICATION_FILE}" _mgstc_doc_version_lines
+        REGEX "^- [^:]+: [0-9]+\\.[0-9]+[ \t]*$"
+        LIMIT_COUNT 1
+        ENCODING UTF-8
+    )
+    if(_mgstc_doc_version_lines)
+        string(
+            REGEX REPLACE "^.*: ([0-9]+\\.[0-9]+)[ \t]*$" "\\1"
+            MGSTC_DOC_VERSION "${_mgstc_doc_version_lines}"
+        )
+    endif()
+    set_property(
+        DIRECTORY
+        APPEND
+        PROPERTY CMAKE_CONFIGURE_DEPENDS "${MGSTC_SPECIFICATION_FILE}"
+    )
+endif()
+message(STATUS "MGSTC document version: ${MGSTC_DOC_VERSION}")
+
 # MAmidiMEmo chip_server speaks msgpack-RPC (rpclib). Pin a published
 # release; protocol is compatible with the copy bundled in MAmidiMEmo.
 # Modern MSVC removed stdext::checked_array_iterator — apply the same
@@ -240,6 +266,7 @@ if(WIN32)
                 JUCE_WEB_BROWSER=0
                 JUCE_USE_CURL=0
                 JUCE_MODAL_LOOPS_PERMITTED=1
+                MGSTC_DOC_VERSION="${MGSTC_DOC_VERSION}"
         )
         if(MSVC)
             target_compile_options(
