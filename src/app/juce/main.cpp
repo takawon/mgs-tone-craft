@@ -2,6 +2,7 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -16,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -30,6 +32,7 @@
 
 #include "BinaryData.h"
 
+#include "asio_audio_sink.hpp"
 #include "mgstc/audio/wasapi_audio_sink.hpp"
 #include "mgstc/engine/engine_command.hpp"
 #include "mgstc/engine/chip_rack.hpp"
@@ -43,6 +46,7 @@
 #include "mgstc/engine/realtime_engine_host.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/timbre_library.hpp"
+#include "mgstc/engine/timbre_tags.hpp"
 #include "mgstc/engine/voice_allocator.hpp"
 #include "mgstc/engine/wave_import.hpp"
 
@@ -76,11 +80,58 @@ constexpr std::array<std::uint16_t, 33>
         0x19, 0x1A, 0x0D, 0x1B, 0x7D};
 
 using EditorOpenCallback =
-    std::function<void(const juce::String&)>;
+    std::function<void(
+        const juce::String&,
+        std::optional<std::uint64_t>)>;
 using EditorCloseCallback =
     std::function<void(const juce::String&)>;
 using EditorActivateCallback =
     std::function<void(const juce::String&)>;
+using TagManagementCallback =
+    std::function<void(juce::Component*)>;
+
+void showAlertWhenMouseReleased(
+    juce::MessageBoxOptions options,
+    std::function<void(int)> callback) {
+    if (juce::ModifierKeys::getCurrentModifiersRealtime()
+            .isAnyMouseButtonDown()) {
+        juce::Timer::callAfterDelay(
+            16,
+            [options = std::move(options),
+             callback = std::move(callback)]() mutable {
+                showAlertWhenMouseReleased(
+                    std::move(options), std::move(callback));
+            });
+        return;
+    }
+    juce::AlertWindow::showAsync(
+        std::move(options), std::move(callback));
+}
+
+void showDiscardConfirmation(
+    juce::Component* parent,
+    const juce::String& action,
+    std::function<void()> continue_action) {
+    juce::AlertWindow::showAsync(
+        juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::WarningIcon)
+            .withTitle(
+                juce::String::fromUTF8("未保存の変更があります"))
+            .withMessage(
+                juce::String::fromUTF8(
+                    "現在の編集内容は保存されていません。\n")
+                + action
+                + juce::String::fromUTF8("を続けますか？"))
+            .withButton(
+                juce::String::fromUTF8("保存せず続行"))
+            .withButton(juce::String::fromUTF8("キャンセル"))
+            .withAssociatedComponent(parent),
+        [continue_action = std::move(continue_action)](int result) {
+            if (result == 1 && continue_action) {
+                continue_action();
+            }
+        });
+}
 
 [[nodiscard]] juce::File applicationDataDirectory() {
     return juce::File::getSpecialLocation(
@@ -93,11 +144,41 @@ using EditorActivateCallback =
         "composite-timbre-library-v1.mgstc");
 }
 
+[[nodiscard]] juce::File timbreLibraryFile() {
+    return applicationDataDirectory().getChildFile(
+        "timbre-library-v1.mgstc");
+}
+
 [[nodiscard]] std::string utf8String(const juce::String& text) {
     const auto utf8 = text.toUTF8();
     return {
         utf8.getAddress(),
         static_cast<std::size_t>(utf8.sizeInBytes() - 1)};
+}
+
+[[nodiscard]] std::int64_t currentUnixTime() {
+    return static_cast<std::int64_t>(
+        juce::Time::getCurrentTime().toMilliseconds() / 1000);
+}
+
+// U+25B6 BLACK RIGHT-POINTING TRIANGLE as explicit UTF-8 bytes.
+// Keep A/B labels independent of source-file encoding while still
+// rendering the play glyph through juce::String::fromUTF8.
+[[nodiscard]] juce::String abNextSideButtonText(bool next_is_a) {
+    return juce::String::fromUTF8(
+        next_is_a ? "\xE2\x96\xB6" "A" : "\xE2\x96\xB6" "B");
+}
+
+[[nodiscard]] bool sameEditableTimbreLibraryEntry(
+    const mgstc::engine::TimbreLibraryEntry& left,
+    const mgstc::engine::TimbreLibraryEntry& right) {
+    return left.category == right.category
+        && left.name == right.name
+        && left.tags == right.tags
+        && left.memo == right.memo
+        && left.favorite == right.favorite
+        && left.opll_registers == right.opll_registers
+        && left.scc_waveform == right.scc_waveform;
 }
 
 [[nodiscard]] std::optional<
@@ -114,6 +195,29 @@ loadCompositeTimbreLibrary(std::string* error = nullptr) {
 [[nodiscard]] bool persistCompositeTimbreLibrary(
     const mgstc::engine::CompositeTimbreLibrary& library) {
     const auto target = compositeTimbreLibraryFile();
+    if (!target.getParentDirectory().createDirectory()) {
+        return false;
+    }
+    juce::TemporaryFile temporary(target);
+    const auto contents = library.serialize();
+    return temporary.getFile().replaceWithData(
+               contents.data(), contents.size())
+        && temporary.overwriteTargetFileWithTemporary();
+}
+
+[[nodiscard]] std::optional<mgstc::engine::TimbreLibrary>
+loadTimbreLibrary(std::string* error = nullptr) {
+    const auto file = timbreLibraryFile();
+    if (!file.existsAsFile()) {
+        return mgstc::engine::TimbreLibrary{};
+    }
+    return mgstc::engine::TimbreLibrary::deserialize(
+        utf8String(file.loadFileAsString()), error);
+}
+
+[[nodiscard]] bool persistTimbreLibrary(
+    const mgstc::engine::TimbreLibrary& library) {
+    const auto target = timbreLibraryFile();
     if (!target.getParentDirectory().createDirectory()) {
         return false;
     }
@@ -207,7 +311,10 @@ struct CompositeTimbreImpact {
     for (auto* component = focused;
          component != nullptr;
          component = component->getParentComponent()) {
-        if (dynamic_cast<juce::TextEditor*>(component) != nullptr) {
+        if (const auto* editor =
+                dynamic_cast<const juce::TextEditor*>(component);
+            editor != nullptr && !editor->isReadOnly()) {
+            // 読み取り専用のMGSCプレビューは入力欄とみなさない。
             return true;
         }
         if (const auto* label =
@@ -866,9 +973,193 @@ private:
     int display_height_{256};
 };
 
-class ConversionBusyContent final : public juce::Component {
+enum class OpllConversionQuality {
+    standard,
+    thorough,
+};
+
+class SwitchLookAndFeel final : public juce::LookAndFeel_V4 {
 public:
-    ConversionBusyContent() {
+    void drawToggleButton(
+        juce::Graphics& graphics,
+        juce::ToggleButton& button,
+        bool should_draw_highlight,
+        bool should_draw_down) override {
+        auto bounds = button.getLocalBounds().toFloat();
+        const auto enabled = button.isEnabled();
+        const auto active = button.getToggleState();
+        const auto switch_bounds = juce::Rectangle<float>(
+            bounds.getX(),
+            bounds.getCentreY() - 9.0F,
+            34.0F,
+            18.0F);
+        auto track = active
+            ? juce::Colour(0xFF2FA9D6)
+            : juce::Colour(0xFF4C5863);
+        if (should_draw_highlight || should_draw_down) {
+            track = track.brighter(0.12F);
+        }
+        if (!enabled) {
+            track = track.withMultipliedAlpha(0.45F);
+        }
+        graphics.setColour(track);
+        graphics.fillRoundedRectangle(switch_bounds, 9.0F);
+
+        const auto thumb_x = active
+            ? switch_bounds.getRight() - 16.0F
+            : switch_bounds.getX() + 2.0F;
+        graphics.setColour(
+            juce::Colours::white.withMultipliedAlpha(
+                enabled ? 0.95F : 0.45F));
+        graphics.fillEllipse(
+            thumb_x, switch_bounds.getY() + 2.0F, 14.0F, 14.0F);
+
+        graphics.setColour(
+            juce::Colour(0xFFE6EDF3).withMultipliedAlpha(
+                enabled ? 1.0F : 0.45F));
+        graphics.setFont(juce::FontOptions(13.0F));
+        graphics.drawFittedText(
+            button.getButtonText(),
+            button.getLocalBounds().withTrimmedLeft(42),
+            juce::Justification::centredLeft,
+            1);
+
+        if (button.hasKeyboardFocus(true)) {
+            graphics.setColour(juce::Colour(0xFF53E3A6));
+            graphics.drawRoundedRectangle(
+                bounds.reduced(0.5F), 4.0F, 1.0F);
+        }
+    }
+};
+
+class OpllConversionQualityContent final : public juce::Component {
+public:
+    using ConvertCallback =
+        std::function<void(OpllConversionQuality)>;
+
+    explicit OpllConversionQualityContent(ConvertCallback callback)
+        : callback_(std::move(callback)) {
+        standard_label_.setText(
+            juce::String::fromUTF8("標準"),
+            juce::dontSendNotification);
+        standard_label_.setJustificationType(
+            juce::Justification::centredRight);
+        addAndMakeVisible(standard_label_);
+
+        quality_toggle_.setButtonText(
+            juce::String::fromUTF8("じっくり（最大約2分）"));
+        quality_toggle_.setTitle(juce::String::fromUTF8(
+            "OPLL変換品質：標準（オフ）／じっくり（オン）"));
+        quality_toggle_.setTooltip(juce::String::fromUTF8(
+            "OPLL変換品質を切り替えます。"
+            "オフは標準、オンはじっくり（最大約2分）です"));
+        quality_toggle_.setToggleState(
+            false, juce::dontSendNotification);
+        quality_toggle_.setLookAndFeel(&switch_look_and_feel_);
+        addAndMakeVisible(quality_toggle_);
+
+        convert_.setButtonText(juce::String::fromUTF8("変換"));
+        convert_.onClick = [this] {
+            const auto quality = quality_toggle_.getToggleState()
+                ? OpllConversionQuality::thorough
+                : OpllConversionQuality::standard;
+            auto callback = std::move(callback_);
+            closeDialog(1);
+            if (callback) {
+                callback(quality);
+            }
+        };
+        addAndMakeVisible(convert_);
+
+        cancel_.setButtonText(juce::String::fromUTF8("キャンセル"));
+        cancel_.onClick = [this] { closeDialog(0); };
+        addAndMakeVisible(cancel_);
+        setSize(400, 150);
+    }
+
+    ~OpllConversionQualityContent() override {
+        quality_toggle_.setLookAndFeel(nullptr);
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(18);
+        auto quality = area.removeFromTop(32);
+        standard_label_.setBounds(quality.removeFromLeft(86));
+        quality.removeFromLeft(10);
+        quality_toggle_.setBounds(quality);
+        auto buttons = area.removeFromBottom(34);
+        cancel_.setBounds(buttons.removeFromRight(112));
+        buttons.removeFromRight(8);
+        convert_.setBounds(buttons.removeFromRight(112));
+    }
+
+private:
+    void closeDialog(int result) {
+        if (auto* dialog =
+                findParentComponentOfClass<juce::DialogWindow>()) {
+            dialog->exitModalState(result);
+        }
+    }
+
+    ConvertCallback callback_;
+    SwitchLookAndFeel switch_look_and_feel_;
+    juce::Label standard_label_;
+    juce::ToggleButton quality_toggle_;
+    juce::TextButton convert_;
+    juce::TextButton cancel_;
+};
+
+void showOpllConversionQualityDialog(
+    juce::Component* anchor,
+    OpllConversionQualityContent::ConvertCallback callback);
+
+struct ConversionProgressState {
+    std::shared_ptr<mgstc::engine::OpllApproximationControl> control{
+        std::make_shared<
+            mgstc::engine::OpllApproximationControl>()};
+
+    void requestCancellation() const noexcept {
+        control->requestCancel();
+    }
+
+    [[nodiscard]] bool cancellationRequested() const noexcept {
+        return control->cancelRequested();
+    }
+
+    [[nodiscard]] double progressFraction() const noexcept {
+        const auto current = control->progress();
+        if (current.phase
+            == mgstc::engine::OpllApproximationPhase::Completed) {
+            return 1.0;
+        }
+        if (current.total == 0) {
+            return 0.0;
+        }
+        return static_cast<double>(current.completed)
+            / static_cast<double>(current.total);
+    }
+};
+
+[[nodiscard]] mgstc::engine::OpllApproximationOptions
+makeOpllApproximationOptions(
+    OpllConversionQuality quality,
+    const ConversionProgressState& progress) {
+    mgstc::engine::OpllApproximationOptions options;
+    options.effort = quality == OpllConversionQuality::thorough
+        ? mgstc::engine::OpllApproximationEffort::Thorough
+        : mgstc::engine::OpllApproximationEffort::Standard;
+    options.control = progress.control;
+    return options;
+}
+
+class ConversionBusyContent final
+    : public juce::Component,
+      private juce::Timer {
+public:
+    explicit ConversionBusyContent(
+        std::shared_ptr<ConversionProgressState> state)
+        : state_(std::move(state)),
+          progress_bar_(displayed_progress_) {
         label_.setText(
             juce::String::fromUTF8("変換中…"),
             juce::dontSendNotification);
@@ -877,46 +1168,111 @@ public:
             juce::Label::textColourId, juce::Colour(0xFFE6EDF3));
         addAndMakeVisible(label_);
 
+        addAndMakeVisible(progress_bar_);
+        progress_bar_.setColour(
+            juce::ProgressBar::backgroundColourId,
+            juce::Colour(0xFF26323C));
+        progress_bar_.setColour(
+            juce::ProgressBar::foregroundColourId,
+            juce::Colour(0xFF53E3A6));
+
         gif_.loadFromMemory(
             BinaryData::mgstc_spin_gif,
             BinaryData::mgstc_spin_gifSize);
         // Source GIF is 512x512; show at about 50%.
         gif_.setDisplaySize(256, 256);
         addAndMakeVisible(gif_);
-        setSize(320, 330);
+
+        cancel_.setButtonText(juce::String::fromUTF8("キャンセル"));
+        cancel_.onClick = [this] { requestCancellation(); };
+        addAndMakeVisible(cancel_);
+
+        startTimerHz(30);
+        setSize(320, 402);
+    }
+
+    ~ConversionBusyContent() override {
+        stopTimer();
+    }
+
+    void requestCancellation() {
+        state_->requestCancellation();
+        label_.setText(
+            juce::String::fromUTF8("キャンセル中…"),
+            juce::dontSendNotification);
+        cancel_.setEnabled(false);
     }
 
     void resized() override {
         auto area = getLocalBounds().reduced(16);
         label_.setBounds(area.removeFromTop(28));
         area.removeFromTop(8);
+        progress_bar_.setBounds(area.removeFromTop(22));
+        area.removeFromTop(8);
+        auto buttons = area.removeFromBottom(34);
+        cancel_.setBounds(buttons.withSizeKeepingCentre(120, 34));
+        area.removeFromBottom(8);
         gif_.setBounds(
             area.withSizeKeepingCentre(256, 256));
     }
 
 private:
+    void timerCallback() override {
+        displayed_progress_ = juce::jlimit(
+            0.0,
+            1.0,
+            state_->progressFraction());
+    }
+
+    std::shared_ptr<ConversionProgressState> state_;
+    double displayed_progress_{0.0};
     juce::Label label_;
+    juce::ProgressBar progress_bar_;
     AnimatedGifComponent gif_;
+    juce::TextButton cancel_;
 };
 
 class ConversionBusyDialog final : public juce::DialogWindow {
 public:
-    ConversionBusyDialog()
+    explicit ConversionBusyDialog(
+        std::shared_ptr<ConversionProgressState> state)
         : juce::DialogWindow(
               juce::String::fromUTF8("変換中"),
               juce::Colour(0xFF1B222C),
               false,
-              true) {
+              true),
+          state_(std::move(state)) {
         setUsingNativeTitleBar(true);
         setResizable(false, false);
-        auto* content = new ConversionBusyContent();
+        auto* content = new ConversionBusyContent(state_);
+        content_ = content;
         setContentOwned(content, true);
         centreWithSize(content->getWidth(), content->getHeight() + 32);
     }
 
-    void closeButtonPressed() override {
-        // Conversion cannot be cancelled; ignore close.
+    ~ConversionBusyDialog() override {
+        requestCancellation();
     }
+
+    void keepTaskAlive(std::shared_ptr<void> task) {
+        task_ = std::move(task);
+    }
+
+    void closeButtonPressed() override {
+        requestCancellation();
+    }
+
+private:
+    void requestCancellation() {
+        state_->requestCancellation();
+        if (content_ != nullptr) {
+            content_->requestCancellation();
+        }
+    }
+
+    std::shared_ptr<ConversionProgressState> state_;
+    ConversionBusyContent* content_{};
+    std::shared_ptr<void> task_;
 };
 
 // juce::DialogWindow の既定の閉じるボタンは非表示にするだけでモーダルを
@@ -933,12 +1289,550 @@ public:
     }
 };
 
+void showOpllConversionQualityDialog(
+    juce::Component* anchor,
+    OpllConversionQualityContent::ConvertCallback callback) {
+    auto* dialog = new ModalDialogWindow(
+        juce::String::fromUTF8("OPLL変換品質"),
+        juce::Colour(0xFF1B222C));
+    auto* content =
+        new OpllConversionQualityContent(std::move(callback));
+    dialog->setUsingNativeTitleBar(true);
+    dialog->setResizable(false, false);
+    dialog->setContentOwned(content, true);
+    if (anchor != nullptr) {
+        dialog->centreAroundComponent(
+            anchor, content->getWidth(), content->getHeight() + 32);
+    } else {
+        dialog->centreWithSize(
+            content->getWidth(), content->getHeight() + 32);
+    }
+    dialog->enterModalState(true, nullptr, true);
+}
+
+struct TagChoice {
+    std::string name;
+    std::size_t count{};
+};
+
+[[nodiscard]] juce::String tagSelectionSummary(
+    std::span<const std::string> tags,
+    const juce::String& empty_text) {
+    if (tags.empty()) {
+        return empty_text;
+    }
+    auto text = juce::String::fromUTF8(tags.front().c_str());
+    if (tags.size() > 1) {
+        text += "  +"
+            + juce::String(static_cast<int>(tags.size() - 1));
+    }
+    return text;
+}
+
+class TagSelectionContent final
+    : public juce::Component,
+      private juce::ListBoxModel {
+public:
+    using SelectionCallback =
+        std::function<void(std::vector<std::string>)>;
+
+    TagSelectionContent(
+        std::vector<TagChoice> available,
+        std::vector<std::string> selected,
+        bool allow_custom,
+        SelectionCallback callback)
+        : available_(std::move(available)),
+          selected_(std::move(selected)),
+          allow_custom_(allow_custom),
+          callback_(std::move(callback)) {
+        filter_.setTextToShowWhenEmpty(
+            juce::String::fromUTF8("タグ候補を検索"),
+            juce::Colour(0xFF7F8993));
+        filter_.onTextChange = [this] { rebuildFilteredRows(); };
+        addAndMakeVisible(filter_);
+
+        list_.setModel(this);
+        list_.setRowHeight(30);
+        list_.setMultipleSelectionEnabled(false);
+        addAndMakeVisible(list_);
+
+        custom_.setTextToShowWhenEmpty(
+            juce::String::fromUTF8(
+                "独自タグ（カンマ区切りで複数追加可）"),
+            juce::Colour(0xFF7F8993));
+        custom_.onReturnKey = [this] { addCustomTags(); };
+        addAndMakeVisible(custom_);
+        custom_.setVisible(allow_custom_);
+
+        add_.setButtonText(juce::String::fromUTF8("追加"));
+        add_.onClick = [this] { addCustomTags(); };
+        addAndMakeVisible(add_);
+        add_.setVisible(allow_custom_);
+
+        clear_.setButtonText(juce::String::fromUTF8("すべて解除"));
+        clear_.onClick = [this] {
+            selected_.clear();
+            list_.repaint();
+        };
+        addAndMakeVisible(clear_);
+
+        ok_.setButtonText(juce::String::fromUTF8("決定"));
+        ok_.onClick = [this] {
+            if (callback_) {
+                callback_(selected_);
+            }
+            closeDialog(1);
+        };
+        addAndMakeVisible(ok_);
+
+        cancel_.setButtonText(juce::String::fromUTF8("キャンセル"));
+        cancel_.onClick = [this] { closeDialog(0); };
+        addAndMakeVisible(cancel_);
+
+        rebuildFilteredRows();
+        setSize(500, 560);
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(16);
+        filter_.setBounds(area.removeFromTop(32));
+        area.removeFromTop(8);
+        auto buttons = area.removeFromBottom(34);
+        clear_.setBounds(buttons.removeFromLeft(100));
+        buttons.removeFromLeft(8);
+        cancel_.setBounds(buttons.removeFromRight(100));
+        buttons.removeFromRight(8);
+        ok_.setBounds(buttons.removeFromRight(100));
+        area.removeFromBottom(8);
+        if (allow_custom_) {
+            auto custom_row = area.removeFromBottom(32);
+            add_.setBounds(custom_row.removeFromRight(72));
+            custom_row.removeFromRight(8);
+            custom_.setBounds(custom_row);
+            area.removeFromBottom(8);
+        }
+        list_.setBounds(area);
+    }
+
+private:
+    [[nodiscard]] int getNumRows() override {
+        return static_cast<int>(filtered_rows_.size());
+    }
+
+    void paintListBoxItem(
+        int row_number,
+        juce::Graphics& graphics,
+        int width,
+        int height,
+        bool row_is_selected) override {
+        if (row_number < 0
+            || static_cast<std::size_t>(row_number)
+                >= filtered_rows_.size()) {
+            return;
+        }
+        if (row_is_selected) {
+            graphics.fillAll(juce::Colour(0xFF344454));
+        }
+        const auto& choice =
+            available_[filtered_rows_[static_cast<std::size_t>(
+                row_number)]];
+        const bool checked = isSelected(choice.name);
+        auto check = juce::Rectangle<int>(8, (height - 18) / 2, 18, 18);
+        graphics.setColour(
+            checked ? juce::Colour(0xFF2AD6C9)
+                    : juce::Colour(0xFF68737E));
+        graphics.drawRect(check, 2);
+        if (checked) {
+            graphics.drawLine(
+                static_cast<float>(check.getX() + 4),
+                static_cast<float>(check.getCentreY()),
+                static_cast<float>(check.getX() + 8),
+                static_cast<float>(check.getBottom() - 4),
+                2.0F);
+            graphics.drawLine(
+                static_cast<float>(check.getX() + 8),
+                static_cast<float>(check.getBottom() - 4),
+                static_cast<float>(check.getRight() - 3),
+                static_cast<float>(check.getY() + 3),
+                2.0F);
+        }
+        auto label = juce::String::fromUTF8(choice.name.c_str());
+        if (choice.count != 0) {
+            label += "  ("
+                + juce::String(static_cast<int>(choice.count))
+                + ")";
+        }
+        graphics.setColour(juce::Colour(0xFFE6EDF3));
+        graphics.drawText(
+            label, 36, 0, width - 42, height,
+            juce::Justification::centredLeft, true);
+    }
+
+    void listBoxItemClicked(
+        int row,
+        const juce::MouseEvent&) override {
+        toggleRow(row);
+    }
+
+    void returnKeyPressed(int row) override {
+        toggleRow(row);
+    }
+
+    [[nodiscard]] bool isSelected(std::string_view name) const {
+        const std::array<std::string, 1> required{
+            std::string(name)};
+        return mgstc::engine::containsAllTimbreTags(
+            selected_, required);
+    }
+
+    void toggleRow(int row) {
+        if (row < 0
+            || static_cast<std::size_t>(row)
+                >= filtered_rows_.size()) {
+            return;
+        }
+        const auto& name =
+            available_[filtered_rows_[static_cast<std::size_t>(row)]].name;
+        if (isSelected(name)) {
+            std::erase_if(
+                selected_,
+                [&name](const std::string& selected) {
+                    return juce::String::fromUTF8(selected.c_str())
+                        .equalsIgnoreCase(
+                            juce::String::fromUTF8(name.c_str()));
+                });
+        } else {
+            selected_.push_back(name);
+        }
+        selected_ = mgstc::engine::parseTimbreTags(
+            mgstc::engine::serializeTimbreTags(selected_));
+        list_.repaintRow(row);
+    }
+
+    void addCustomTags() {
+        if (!allow_custom_) {
+            return;
+        }
+        auto additions = mgstc::engine::parseTimbreTags(
+            utf8String(custom_.getText()));
+        selected_.insert(
+            selected_.end(), additions.begin(), additions.end());
+        selected_ = mgstc::engine::parseTimbreTags(
+            mgstc::engine::serializeTimbreTags(selected_));
+        for (const auto& tag : additions) {
+            const auto exists = std::any_of(
+                available_.begin(), available_.end(),
+                [&tag](const TagChoice& choice) {
+                    return juce::String::fromUTF8(choice.name.c_str())
+                        .equalsIgnoreCase(
+                            juce::String::fromUTF8(tag.c_str()));
+                });
+            if (!exists) {
+                available_.push_back({tag, 0});
+            }
+        }
+        custom_.clear();
+        rebuildFilteredRows();
+    }
+
+    void rebuildFilteredRows() {
+        filtered_rows_.clear();
+        const auto filter = filter_.getText().trim();
+        for (std::size_t index = 0; index < available_.size(); ++index) {
+            const auto label =
+                juce::String::fromUTF8(available_[index].name.c_str());
+            if (filter.isEmpty() || label.containsIgnoreCase(filter)) {
+                filtered_rows_.push_back(index);
+            }
+        }
+        list_.updateContent();
+        list_.repaint();
+    }
+
+    void closeDialog(int result) {
+        if (auto* dialog =
+                findParentComponentOfClass<juce::DialogWindow>()) {
+            dialog->exitModalState(result);
+        }
+    }
+
+    std::vector<TagChoice> available_;
+    std::vector<std::size_t> filtered_rows_;
+    std::vector<std::string> selected_;
+    bool allow_custom_{};
+    SelectionCallback callback_;
+    juce::TextEditor filter_;
+    juce::ListBox list_;
+    juce::TextEditor custom_;
+    juce::TextButton add_;
+    juce::TextButton clear_;
+    juce::TextButton ok_;
+    juce::TextButton cancel_;
+};
+
+void showTagSelectionDialog(
+    juce::Component* anchor,
+    const juce::String& title,
+    std::vector<TagChoice> available,
+    std::vector<std::string> selected,
+    bool allow_custom,
+    TagSelectionContent::SelectionCallback callback) {
+    auto* dialog = new ModalDialogWindow(
+        title, juce::Colour(0xFF1B222C));
+    auto* content = new TagSelectionContent(
+        std::move(available),
+        std::move(selected),
+        allow_custom,
+        std::move(callback));
+    dialog->setContentOwned(content, true);
+    dialog->setResizable(false, false);
+    if (anchor != nullptr) {
+        dialog->centreAroundComponent(
+            anchor, content->getWidth(), content->getHeight() + 32);
+    } else {
+        dialog->centreWithSize(
+            content->getWidth(), content->getHeight() + 32);
+    }
+    dialog->enterModalState(true, nullptr, true);
+}
+
+class TagManagementContent final : public juce::Component {
+public:
+    using ApplyCallback =
+        std::function<void(std::string, std::string)>;
+
+    TagManagementContent(
+        std::vector<TagChoice> custom_tags,
+        ApplyCallback callback)
+        : custom_tags_(std::move(custom_tags)),
+          callback_(std::move(callback)) {
+        source_label_.setText(
+            juce::String::fromUTF8("管理する独自タグ"),
+            juce::dontSendNotification);
+        addAndMakeVisible(source_label_);
+        int item_id = 1;
+        for (const auto& tag : custom_tags_) {
+            source_.addItem(
+                juce::String::fromUTF8(tag.name.c_str())
+                    + "  ("
+                    + juce::String(static_cast<int>(tag.count))
+                    + ")",
+                item_id++);
+        }
+        source_.setTextWhenNothingSelected(
+            juce::String::fromUTF8("独自タグを選択"));
+        source_.onChange = [this] { updateState(); };
+        addAndMakeVisible(source_);
+
+        replacement_label_.setText(
+            juce::String::fromUTF8("変更先タグ"),
+            juce::dontSendNotification);
+        addAndMakeVisible(replacement_label_);
+        replacement_.setTextToShowWhenEmpty(
+            juce::String::fromUTF8(
+                "新しい名前、既存タグ名、または標準タグ名"),
+            juce::Colour(0xFF7F8993));
+        replacement_.onTextChange = [this] { updateState(); };
+        addAndMakeVisible(replacement_);
+
+        impact_.setColour(
+            juce::Label::textColourId, juce::Colour(0xFFB9C6D2));
+        impact_.setJustificationType(juce::Justification::centredLeft);
+        addAndMakeVisible(impact_);
+
+        apply_.setButtonText(
+            juce::String::fromUTF8("名前変更／統合"));
+        apply_.onClick = [this] {
+            if (const auto selected = selectedTag();
+                selected && replacement_.getText().trim().isNotEmpty()) {
+                if (callback_) {
+                    callback_(
+                        *selected,
+                        utf8String(replacement_.getText().trim()));
+                }
+                closeDialog(1);
+            }
+        };
+        addAndMakeVisible(apply_);
+
+        remove_.setButtonText(juce::String::fromUTF8("削除"));
+        remove_.onClick = [this] { confirmDelete(); };
+        addAndMakeVisible(remove_);
+
+        cancel_.setButtonText(
+            juce::String::fromUTF8("キャンセル"));
+        cancel_.onClick = [this] { closeDialog(0); };
+        addAndMakeVisible(cancel_);
+
+        updateState();
+        setSize(540, 250);
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(18);
+        source_label_.setBounds(area.removeFromTop(24));
+        source_.setBounds(area.removeFromTop(34));
+        area.removeFromTop(10);
+        replacement_label_.setBounds(area.removeFromTop(24));
+        replacement_.setBounds(area.removeFromTop(34));
+        area.removeFromTop(8);
+        impact_.setBounds(area.removeFromTop(28));
+        auto buttons = area.removeFromBottom(36);
+        cancel_.setBounds(buttons.removeFromRight(104));
+        buttons.removeFromRight(8);
+        remove_.setBounds(buttons.removeFromRight(88));
+        buttons.removeFromRight(8);
+        apply_.setBounds(buttons.removeFromRight(150));
+    }
+
+private:
+    [[nodiscard]] std::optional<std::string> selectedTag() const {
+        const auto selected = source_.getSelectedId();
+        if (selected <= 0
+            || static_cast<std::size_t>(selected)
+                > custom_tags_.size()) {
+            return std::nullopt;
+        }
+        return custom_tags_[
+            static_cast<std::size_t>(selected - 1)].name;
+    }
+
+    void updateState() {
+        const auto selected = source_.getSelectedId();
+        const bool valid = selected > 0
+            && static_cast<std::size_t>(selected)
+                <= custom_tags_.size();
+        const auto count = valid
+            ? custom_tags_[static_cast<std::size_t>(selected - 1)].count
+            : 0;
+        impact_.setText(
+            valid
+                ? juce::String::fromUTF8("使用中の音色: ")
+                    + juce::String(static_cast<int>(count))
+                : juce::String::fromUTF8(
+                      "独自タグを選択してください"),
+            juce::dontSendNotification);
+        apply_.setEnabled(
+            valid && replacement_.getText().trim().isNotEmpty());
+        remove_.setEnabled(valid);
+    }
+
+    void confirmDelete() {
+        const auto selected = selectedTag();
+        if (!selected) {
+            return;
+        }
+        juce::Component::SafePointer<TagManagementContent> safe(this);
+        juce::AlertWindow::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(
+                    juce::MessageBoxIconType::WarningIcon)
+                .withTitle(
+                    juce::String::fromUTF8("独自タグの削除"))
+                .withMessage(
+                    juce::String::fromUTF8("「")
+                    + juce::String::fromUTF8(selected->c_str())
+                    + juce::String::fromUTF8(
+                        "」をすべての音色から削除しますか？"))
+                .withButton(juce::String::fromUTF8("削除"))
+                .withButton(
+                    juce::String::fromUTF8("キャンセル"))
+                .withAssociatedComponent(this),
+            [safe, selected](int result) {
+                if (safe == nullptr || result != 1) {
+                    return;
+                }
+                if (safe->callback_) {
+                    safe->callback_(*selected, {});
+                }
+                safe->closeDialog(1);
+            });
+    }
+
+    void closeDialog(int result) {
+        if (auto* dialog =
+                findParentComponentOfClass<juce::DialogWindow>()) {
+            dialog->exitModalState(result);
+        }
+    }
+
+    std::vector<TagChoice> custom_tags_;
+    ApplyCallback callback_;
+    juce::Label source_label_;
+    juce::ComboBox source_;
+    juce::Label replacement_label_;
+    juce::TextEditor replacement_;
+    juce::Label impact_;
+    juce::TextButton apply_;
+    juce::TextButton remove_;
+    juce::TextButton cancel_;
+};
+
+void showTagManagementDialog(
+    juce::Component* anchor,
+    std::vector<TagChoice> custom_tags,
+    TagManagementContent::ApplyCallback callback) {
+    auto* dialog = new ModalDialogWindow(
+        juce::String::fromUTF8("独自タグ管理"),
+        juce::Colour(0xFF1B222C));
+    auto* content = new TagManagementContent(
+        std::move(custom_tags), std::move(callback));
+    dialog->setContentOwned(content, true);
+    dialog->setResizable(false, false);
+    if (anchor != nullptr) {
+        dialog->centreAroundComponent(
+            anchor, content->getWidth(), content->getHeight() + 32);
+    } else {
+        dialog->centreWithSize(
+            content->getWidth(), content->getHeight() + 32);
+    }
+    dialog->enterModalState(true, nullptr, true);
+}
+
+[[nodiscard]] std::vector<TagChoice> presetTagChoices(
+    std::span<const std::string> selected) {
+    std::vector<TagChoice> choices;
+    for (const auto tag : mgstc::engine::presetTimbreTags()) {
+        choices.push_back({std::string(tag), 0});
+    }
+    for (const auto& tag : selected) {
+        const auto exists = std::any_of(
+            choices.begin(), choices.end(),
+            [&tag](const TagChoice& choice) {
+                return juce::String::fromUTF8(choice.name.c_str())
+                    .equalsIgnoreCase(
+                        juce::String::fromUTF8(tag.c_str()));
+            });
+        if (!exists) {
+            choices.push_back({tag, 0});
+        }
+    }
+    return choices;
+}
+
+[[nodiscard]] std::vector<TagChoice> usageTagChoices(
+    std::span<const std::vector<std::string>> tag_sets) {
+    std::vector<TagChoice> choices;
+    for (auto usage :
+         mgstc::engine::collectTimbreTagUsage(tag_sets)) {
+        choices.push_back({std::move(usage.name), usage.count});
+    }
+    return choices;
+}
+
 template <typename Work, typename OnDone>
 void runWithConversionBusyDialog(
     juce::Component* anchor,
     Work work,
     OnDone on_done) {
-    auto* dialog = new ConversionBusyDialog();
+    using Result =
+        std::invoke_result_t<Work, ConversionProgressState&>;
+    struct Task {
+        std::jthread worker;
+    };
+
+    auto progress = std::make_shared<ConversionProgressState>();
+    auto* dialog = new ConversionBusyDialog(progress);
     if (anchor != nullptr) {
         dialog->centreAroundComponent(
             anchor, dialog->getWidth(), dialog->getHeight());
@@ -947,21 +1841,32 @@ void runWithConversionBusyDialog(
 
     juce::Component::SafePointer<ConversionBusyDialog> safe_dialog(
         dialog);
-    std::thread(
-        [safe_dialog, work = std::move(work),
+    auto task = std::make_shared<Task>();
+    dialog->keepTaskAlive(task);
+    std::weak_ptr<Task> weak_task(task);
+    task->worker = std::jthread(
+        [safe_dialog,
+         progress,
+         weak_task,
+         work = std::move(work),
          on_done = std::move(on_done)]() mutable {
-            auto result = work();
-            juce::MessageManager::callAsync(
-                [safe_dialog,
-                 result = std::move(result),
-                 on_done = std::move(on_done)]() mutable {
-                    if (safe_dialog != nullptr) {
+            Result result = work(*progress);
+            const bool cancelled = progress->cancellationRequested();
+            if (auto task = weak_task.lock()) {
+                juce::MessageManager::callAsync(
+                    [safe_dialog,
+                     task = std::move(task),
+                     result = std::move(result),
+                     on_done = std::move(on_done),
+                     cancelled]() mutable {
+                        if (safe_dialog == nullptr) {
+                            return;
+                        }
                         safe_dialog->exitModalState(1);
-                    }
-                    on_done(std::move(result));
-                });
-        })
-        .detach();
+                        on_done(std::move(result), cancelled);
+                    });
+            }
+        });
 }
 
 class AboutPanel final : public juce::Component {
@@ -997,6 +1902,19 @@ public:
         detail_.setColour(
             juce::Label::textColourId, juce::Colour(0xFF9AA8B5));
         addAndMakeVisible(detail_);
+
+        copyright_.setText(
+            "Copyright(C) 2026 Takawo. All right reserves.",
+            juce::dontSendNotification);
+        copyright_.setJustificationType(juce::Justification::centred);
+        copyright_.setColour(
+            juce::Label::textColourId, juce::Colour(0xFF9AA8B5));
+        addAndMakeVisible(copyright_);
+
+        github_.setJustificationType(juce::Justification::centred);
+        x_.setJustificationType(juce::Justification::centred);
+        addAndMakeVisible(github_);
+        addAndMakeVisible(x_);
     }
 
     void paint(juce::Graphics& g) override {
@@ -1022,6 +1940,9 @@ public:
         subtitle_.setBounds(area.removeFromTop(24));
         area.removeFromTop(8);
         detail_.setBounds(area.removeFromTop(48));
+        x_.setBounds(area.removeFromBottom(22));
+        github_.setBounds(area.removeFromBottom(22));
+        copyright_.setBounds(area.removeFromBottom(22));
     }
 
 private:
@@ -1030,6 +1951,13 @@ private:
     juce::Label title_;
     juce::Label subtitle_;
     juce::Label detail_;
+    juce::Label copyright_;
+    juce::HyperlinkButton github_{
+        "GitHub",
+        juce::URL("https://github.com/takawon/mgs-tone-craft")};
+    juce::HyperlinkButton x_{
+        "X",
+        juce::URL("https://x.com/takawo_n")};
 };
 
 void configureImmediateAuditionButton(
@@ -1377,6 +2305,10 @@ public:
             updateEditCursor(event.getPosition());
             return;
         }
+        // DEC/HEX入力欄にフォーカスが残っているとPCキー演奏が抑制される。
+        // 波形ドラッグ開始時にフォーカスを奪い、演奏できる状態へ戻す。
+        setWantsKeyboardFocus(true);
+        grabKeyboardFocus();
         mouse_edit_active_ = true;
         setMouseCursor(juce::MouseCursor::CrosshairCursor);
         if (reference_waveform_) {
@@ -1634,20 +2566,30 @@ private:
         mgstc::engine::SccApplyRange::All};
 };
 
-class SharedAudioService final {
+enum class PcAudioBackend : std::uint8_t {
+    Wasapi,
+    Asio,
+};
+
+class SharedAudioService final : private juce::Timer {
 public:
     SharedAudioService() {
         master_volume_percent_ = loadMasterVolumePercent();
-        audio_.setMasterVolumePercent(
+        wasapi_audio_.setMasterVolumePercent(
+            static_cast<std::uint32_t>(master_volume_percent_));
+        asio_audio_.setMasterVolumePercent(
             static_cast<std::uint32_t>(master_volume_percent_));
         loadAndApplySoundOutputSettings();
-        running_ = audio_.start(engine_);
+        loadAndStartPcAudioSettings();
+        startTimerHz(2);
     }
 
     ~SharedAudioService() {
+        stopTimer();
         static_cast<void>(
             engine_.submit(mgstc::engine::EngineCommand::stop()));
-        audio_.stop();
+        asio_audio_.close();
+        wasapi_audio_.stop();
     }
 
     SharedAudioService(const SharedAudioService&) = delete;
@@ -1658,7 +2600,7 @@ public:
     }
 
     [[nodiscard]] bool running() const noexcept {
-        return running_;
+        return active_audio_ != nullptr && active_audio_->running();
     }
 
     [[nodiscard]] int masterVolumePercent() const noexcept {
@@ -1675,10 +2617,128 @@ public:
             return;
         }
         master_volume_percent_ = next;
-        audio_.setMasterVolumePercent(
+        wasapi_audio_.setMasterVolumePercent(
+            static_cast<std::uint32_t>(next));
+        asio_audio_.setMasterVolumePercent(
             static_cast<std::uint32_t>(next));
         saveMasterVolumePercent();
         ++master_volume_revision_;
+    }
+
+    [[nodiscard]] PcAudioBackend pcAudioBackend() const noexcept {
+        return pc_audio_backend_;
+    }
+
+    [[nodiscard]] std::string asioDriverName() const {
+        return asio_driver_name_;
+    }
+
+    [[nodiscard]] std::vector<std::string> asioDriverNames() {
+        return asio_audio_.driverNames();
+    }
+
+    [[nodiscard]] bool applyPcAudioSettings(
+        PcAudioBackend backend,
+        std::string driver_name) {
+        stopActiveAudio();
+        pc_audio_note_.clear();
+
+        if (backend == PcAudioBackend::Asio) {
+            if (asio_audio_.open(driver_name)
+                && asio_audio_.start(engine_)) {
+                active_audio_ = &asio_audio_;
+                pc_audio_backend_ = PcAudioBackend::Asio;
+                asio_driver_name_ = std::move(driver_name);
+                drainAudioStatuses(asio_audio_);
+                savePcAudioSettings();
+                return true;
+            }
+            pc_audio_note_ = "ASIOを開始できません: "
+                + asio_audio_.lastError()
+                + "。既定出力へ戻しました。";
+            asio_audio_.close();
+        }
+
+        const auto started = wasapi_audio_.start(engine_);
+        active_audio_ = started ? &wasapi_audio_ : nullptr;
+        pc_audio_backend_ = PcAudioBackend::Wasapi;
+        if (!started && pc_audio_note_.empty()) {
+            pc_audio_note_ = "既定のWASAPI出力を開始できません。";
+        }
+        if (backend == PcAudioBackend::Asio) {
+            asio_driver_name_ = std::move(driver_name);
+        }
+        savePcAudioSettings();
+        return backend == PcAudioBackend::Wasapi && started;
+    }
+
+    [[nodiscard]] bool showAsioControlPanel() {
+        if (pc_audio_backend_ != PcAudioBackend::Asio
+            || asio_driver_name_.empty()) {
+            pc_audio_note_ =
+                "ASIOを適用してからASIO設定を開いてください。";
+            return false;
+        }
+
+        // 設定画面の開閉やドライバー再初期化で来るStoppedを、
+        // 故障扱いの自動WASAPI復帰と混同しない。
+        suppress_pc_audio_fallback_ = true;
+        const auto driver = asio_driver_name_;
+        asio_audio_.stop();
+        // 多くのASIOパネルは非同期で戻る。戻り値だけで成否を決めず、
+        // 必ず同じドライバーを開き直してから再開する。
+        static_cast<void>(asio_audio_.showControlPanel());
+        asio_audio_.close();
+        drainAudioStatuses(asio_audio_);
+
+        if (asio_audio_.open(driver) && asio_audio_.start(engine_)) {
+            active_audio_ = &asio_audio_;
+            pc_audio_backend_ = PcAudioBackend::Asio;
+            drainAudioStatuses(asio_audio_);
+            pc_audio_note_.clear();
+            suppress_pc_audio_fallback_ = false;
+            return true;
+        }
+
+        const auto detail = asio_audio_.lastError();
+        suppress_pc_audio_fallback_ = false;
+        fallBackToWasapi(
+            "ASIO設定後に再開できません"
+            + (detail.empty() ? std::string(".")
+                              : ": " + detail));
+        return false;
+    }
+
+    [[nodiscard]] bool asioControlPanelAvailable() const noexcept {
+        return pc_audio_backend_ == PcAudioBackend::Asio
+            && asio_audio_.hasControlPanel();
+    }
+
+    [[nodiscard]] std::string pcAudioStatus() const {
+        if (pc_audio_backend_ == PcAudioBackend::Asio
+            && active_audio_ == &asio_audio_
+            && asio_audio_.running()) {
+            const auto rate = asio_audio_.currentSampleRate();
+            const auto rate_text = juce::String(rate / 1000.0, 1)
+                                       .trimCharactersAtEnd(".0")
+                                       .toStdString();
+            std::string result = "ASIO: " + asio_driver_name_ + " (";
+            if (std::abs(rate - 48'000.0) < 0.5) {
+                result += "48 kHz、リアルタイム変換なし)";
+            } else {
+                result += "48 kHz → " + rate_text
+                    + " kHz リアルタイム変換中)";
+            }
+            return result;
+        }
+        auto result = active_audio_ == &wasapi_audio_
+                && wasapi_audio_.running()
+            ? std::string("既定出力 (WASAPI共有モード)")
+            : std::string("PC音声出力は停止しています");
+        if (!pc_audio_note_.empty()) {
+            result += "\n" + pc_audio_note_;
+        }
+        return result;
     }
 
     void clearScopeFrames() {
@@ -1896,6 +2956,146 @@ private:
         }
     }
 
+    void stopActiveAudio() noexcept {
+        if (active_audio_ != nullptr) {
+            active_audio_->stop();
+            active_audio_ = nullptr;
+        }
+        asio_audio_.close();
+        wasapi_audio_.stop();
+    }
+
+    static void drainAudioStatuses(
+        mgstc::audio::AudioSink& audio) noexcept {
+        mgstc::audio::AudioSinkStatus status{};
+        while (audio.pollStatus(status)) {
+        }
+    }
+
+    void fallBackToWasapi(std::string note) {
+        asio_audio_.close();
+        wasapi_audio_.stop();
+        const auto started = wasapi_audio_.start(engine_);
+        active_audio_ = started ? &wasapi_audio_ : nullptr;
+        pc_audio_backend_ = PcAudioBackend::Wasapi;
+        pc_audio_note_ = std::move(note);
+        if (!started) {
+            pc_audio_note_ +=
+                "\n既定のWASAPI出力も開始できません。";
+        }
+        drainAudioStatuses(wasapi_audio_);
+        savePcAudioSettings();
+    }
+
+    void timerCallback() override {
+        if (suppress_pc_audio_fallback_ || active_audio_ == nullptr) {
+            return;
+        }
+
+        mgstc::audio::AudioSinkStatus status{};
+        bool device_failed = false;
+        while (active_audio_->pollStatus(status)) {
+            device_failed = device_failed
+                || status.type
+                    == mgstc::audio::AudioSinkStatusType::DeviceError
+                || (status.type
+                        == mgstc::audio::AudioSinkStatusType::Stopped
+                    && !active_audio_->running());
+        }
+        if (!device_failed && active_audio_->running()) {
+            return;
+        }
+
+        if (active_audio_ == &asio_audio_) {
+            const auto detail = asio_audio_.lastError();
+            fallBackToWasapi(
+                "ASIOデバイスが停止したため既定出力へ戻しました。"
+                + (detail.empty() ? std::string{}
+                                  : "\n" + detail));
+            return;
+        }
+
+        wasapi_audio_.stop();
+        active_audio_ = nullptr;
+        pc_audio_note_ =
+            "既定のWASAPI出力でデバイスエラーが発生しました。";
+    }
+
+    void loadAndStartPcAudioSettings() {
+        const auto file = settingsFile();
+        wchar_t backend_buffer[32]{};
+        wchar_t driver_buffer[256]{};
+        if (file.existsAsFile()) {
+            static_cast<void>(GetPrivateProfileStringW(
+                L"PcAudio",
+                L"Backend",
+                L"WASAPI",
+                backend_buffer,
+                static_cast<DWORD>(std::size(backend_buffer)),
+                file.getFullPathName().toWideCharPointer()));
+            static_cast<void>(GetPrivateProfileStringW(
+                L"PcAudio",
+                L"AsioDriver",
+                L"",
+                driver_buffer,
+                static_cast<DWORD>(std::size(driver_buffer)),
+                file.getFullPathName().toWideCharPointer()));
+        }
+        asio_driver_name_ =
+            juce::String(driver_buffer).toStdString();
+
+        if (juce::String(backend_buffer) == "ASIO"
+            && !asio_driver_name_.empty()
+            && asio_audio_.open(asio_driver_name_)
+            && asio_audio_.start(engine_)) {
+            pc_audio_backend_ = PcAudioBackend::Asio;
+            active_audio_ = &asio_audio_;
+            drainAudioStatuses(asio_audio_);
+            return;
+        }
+
+        if (juce::String(backend_buffer) == "ASIO") {
+            pc_audio_note_ = "保存済みASIOを開始できないため、"
+                "既定出力を使用しています。";
+            asio_audio_.close();
+        }
+        pc_audio_backend_ = PcAudioBackend::Wasapi;
+        if (wasapi_audio_.start(engine_)) {
+            active_audio_ = &wasapi_audio_;
+            drainAudioStatuses(wasapi_audio_);
+        } else {
+            pc_audio_note_ += pc_audio_note_.empty() ? "" : "\n";
+            pc_audio_note_ +=
+                "既定のWASAPI出力を開始できません。";
+        }
+    }
+
+    void savePcAudioSettings() const {
+        const auto file = settingsFile();
+        if (file.getParentDirectory().createDirectory().failed()) {
+            return;
+        }
+        const auto path = file.getFullPathName();
+        const auto* backend = pc_audio_backend_ == PcAudioBackend::Asio
+            ? L"ASIO"
+            : L"WASAPI";
+        static_cast<void>(WritePrivateProfileStringW(
+            L"PcAudio",
+            L"Backend",
+            backend,
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            L"PcAudio",
+            L"AsioDriver",
+            juce::String(asio_driver_name_).toWideCharPointer(),
+            path.toWideCharPointer()));
+        static_cast<void>(WritePrivateProfileStringW(
+            nullptr,
+            nullptr,
+            nullptr,
+            path.toWideCharPointer()));
+    }
+
     [[nodiscard]] static int loadMasterVolumePercent() {
         const auto file = settingsFile();
         if (!file.existsAsFile()) {
@@ -1936,14 +3136,19 @@ private:
     }
 
     mgstc::engine::RealtimeEngineHost engine_;
-    mgstc::audio::WasapiAudioSink audio_;
+    mgstc::audio::WasapiAudioSink wasapi_audio_;
+    mgstc::audio::AsioAudioSink asio_audio_;
+    mgstc::audio::AudioSink* active_audio_{};
     SccWaveform shared_scc_wave_{
         mgstc::engine::generateSccPreset(
             mgstc::engine::SccWavePreset::Sine,
             mgstc::engine::SccHarmonic::One)};
     mgstc::engine::OpllPatchParameters shared_opll_patch_{
         mgstc::engine::defaultOpllPatch()};
-    bool running_{};
+    PcAudioBackend pc_audio_backend_{PcAudioBackend::Wasapi};
+    std::string asio_driver_name_;
+    std::string pc_audio_note_;
+    bool suppress_pc_audio_fallback_{};
     int master_volume_percent_{100};
     std::uint64_t master_volume_revision_{1};
 };
@@ -2264,9 +3469,14 @@ void paintRoundedPanelFrame(
 struct TimbreLibraryWidgets {
     juce::Label& title;
     juce::TextEditor& filter;
+    juce::TextButton& tag_filter;
+    juce::TextButton& tag_manage;
+    juce::ToggleButton& favorite_only;
+    juce::TextButton& ab_audition;
+    juce::ComboBox& sort;
     juce::ComboBox& list;
     juce::TextEditor& name;
-    juce::TextEditor& tags;
+    juce::TextButton& tags;
     juce::TextEditor& memo;
     juce::ToggleButton& favorite;
     juce::TextButton& library_new;
@@ -2274,6 +3484,8 @@ struct TimbreLibraryWidgets {
     juce::TextButton& library_save;
     juce::TextButton& library_save_as;
     juce::TextButton& library_cancel;
+    juce::TextButton& library_duplicate;
+    juce::TextButton& library_rename;
     juce::TextButton& library_delete;
     juce::TextButton& library_import;
     juce::TextButton& library_export;
@@ -2291,6 +3503,20 @@ void layoutTimbreLibraryPanel(
     widgets.title.setBounds(area.removeFromTop(libraryTitleH));
     area.removeFromTop(sm);
     widgets.filter.setBounds(area.removeFromTop(fieldH));
+    area.removeFromTop(sm);
+    auto tag_row = area.removeFromTop(fieldH);
+    widgets.tag_manage.setBounds(tag_row.removeFromRight(92));
+    tag_row.removeFromRight(controlGap);
+    widgets.tag_filter.setBounds(tag_row);
+    area.removeFromTop(sm);
+    auto filter_options = area.removeFromTop(fieldH);
+    widgets.favorite_only.setBounds(
+        filter_options.removeFromLeft(116));
+    filter_options.removeFromLeft(controlGap);
+    widgets.ab_audition.setBounds(
+        filter_options.removeFromLeft(52));
+    filter_options.removeFromLeft(controlGap);
+    widgets.sort.setBounds(filter_options);
     area.removeFromTop(sm);
     widgets.list.setBounds(area.removeFromTop(fieldH + xs));
     area.removeFromTop(sm);
@@ -2318,15 +3544,28 @@ void layoutTimbreLibraryPanel(
     widgets.library_save_as.setBounds(edit_row);
 
     area.removeFromTop(xs + xs / 2);
+    auto manage_row = area.removeFromTop(libraryButtonH);
+    const int manage_w =
+        (manage_row.getWidth() - controlGap * 3) / 4;
+    widgets.library_cancel.setBounds(
+        manage_row.removeFromLeft(
+            juce::jmax(libraryButtonMinW, manage_w)));
+    manage_row.removeFromLeft(controlGap);
+    widgets.library_duplicate.setBounds(
+        manage_row.removeFromLeft(
+            juce::jmax(libraryButtonMinW, manage_w)));
+    manage_row.removeFromLeft(controlGap);
+    widgets.library_rename.setBounds(
+        manage_row.removeFromLeft(
+            juce::jmax(libraryButtonMinW, manage_w)));
+    manage_row.removeFromLeft(controlGap);
+    widgets.library_delete.setBounds(
+        manage_row);
+
+    area.removeFromTop(xs + xs / 2);
     auto file_row = area.removeFromTop(libraryButtonH);
     const int file_w =
-        (file_row.getWidth() - controlGap * 3) / 4;
-    widgets.library_cancel.setBounds(
-        file_row.removeFromLeft(juce::jmax(libraryButtonMinW, file_w)));
-    file_row.removeFromLeft(controlGap);
-    widgets.library_delete.setBounds(
-        file_row.removeFromLeft(juce::jmax(libraryButtonMinW, file_w)));
-    file_row.removeFromLeft(controlGap);
+        (file_row.getWidth() - controlGap) / 2;
     widgets.library_import.setBounds(
         file_row.removeFromLeft(juce::jmax(libraryButtonMinW, file_w)));
     file_row.removeFromLeft(controlGap);
@@ -2441,60 +3680,6 @@ public:
 private:
     // 無効なバーはスイッチ（位相自動・音量維持）と同じ薄さへ揃える。
     static constexpr float kDisabledOpacity = 0.45F;
-};
-
-class SwitchLookAndFeel final : public juce::LookAndFeel_V4 {
-public:
-    void drawToggleButton(
-        juce::Graphics& graphics,
-        juce::ToggleButton& button,
-        bool should_draw_highlight,
-        bool should_draw_down) override {
-        auto bounds = button.getLocalBounds().toFloat();
-        const auto enabled = button.isEnabled();
-        const auto active = button.getToggleState();
-        const auto switch_bounds = juce::Rectangle<float>(
-            bounds.getX(),
-            bounds.getCentreY() - 9.0F,
-            34.0F,
-            18.0F);
-        auto track = active
-            ? juce::Colour(0xFF2FA9D6)
-            : juce::Colour(0xFF4C5863);
-        if (should_draw_highlight || should_draw_down) {
-            track = track.brighter(0.12F);
-        }
-        if (!enabled) {
-            track = track.withMultipliedAlpha(0.45F);
-        }
-        graphics.setColour(track);
-        graphics.fillRoundedRectangle(switch_bounds, 9.0F);
-
-        const auto thumb_x = active
-            ? switch_bounds.getRight() - 16.0F
-            : switch_bounds.getX() + 2.0F;
-        graphics.setColour(
-            juce::Colours::white.withMultipliedAlpha(
-                enabled ? 0.95F : 0.45F));
-        graphics.fillEllipse(
-            thumb_x, switch_bounds.getY() + 2.0F, 14.0F, 14.0F);
-
-        graphics.setColour(
-            juce::Colour(0xFFE6EDF3).withMultipliedAlpha(
-                enabled ? 1.0F : 0.45F));
-        graphics.setFont(juce::FontOptions(13.0F));
-        graphics.drawFittedText(
-            button.getButtonText(),
-            button.getLocalBounds().withTrimmedLeft(42),
-            juce::Justification::centredLeft,
-            1);
-
-        if (button.hasKeyboardFocus(true)) {
-            graphics.setColour(juce::Colour(0xFF53E3A6));
-            graphics.drawRoundedRectangle(
-                bounds.reduced(0.5F), 4.0F, 1.0F);
-        }
-    }
 };
 
 class SharedMidiInputService final
@@ -2865,6 +4050,25 @@ public:
         return !held_notes_.empty();
     }
 
+    // プログラム差し替え後に、押し中の鍵盤音を同じノートで張り直す。
+    void retriggerHeldNotes() {
+        if (!note_on_ || held_notes_.empty()) {
+            return;
+        }
+        std::vector<std::uint8_t> notes;
+        notes.reserve(held_notes_.size());
+        for (const auto& held : held_notes_) {
+            const auto note = static_cast<std::uint8_t>(held.note);
+            if (std::find(notes.begin(), notes.end(), note)
+                == notes.end()) {
+                notes.push_back(note);
+            }
+        }
+        for (const auto note : notes) {
+            note_on_(note);
+        }
+    }
+
     [[nodiscard]] int pcOctave() const noexcept {
         return pc_octave_;
     }
@@ -2968,18 +4172,83 @@ private:
                 midi_page->addAndMakeVisible(refresh_);
 
                 auto* output_page = new juce::Component();
-                output_help_.setText(
+                pc_audio_help_.setText(
                     juce::String::fromUTF8(
-                        "音声の出力先を選びます。MAmidiMEmo は "
+                        "PC音声出力を選びます。既定はWASAPI共有モードです。\n"
+                        "ASIOはドライバー選択後に適用し、必要ならASIO設定を開きます。"),
+                    juce::dontSendNotification);
+                pc_audio_help_.setJustificationType(
+                    juce::Justification::topLeft);
+                pc_audio_help_.setColour(
+                    juce::Label::textColourId,
+                    juce::Colour(0xFFE6EDF3));
+                output_page->addAndMakeVisible(pc_audio_help_);
+
+                pc_audio_kind_.addItem(
+                    juce::String::fromUTF8(
+                        "既定出力 (WASAPI共有モード)"),
+                    1);
+                pc_audio_kind_.addItem("ASIO", 2);
+                pc_audio_kind_.setSelectedId(
+                    audio_service_.pcAudioBackend()
+                            == PcAudioBackend::Asio
+                        ? 2
+                        : 1,
+                    juce::dontSendNotification);
+                output_page->addAndMakeVisible(pc_audio_kind_);
+
+                const auto saved_driver =
+                    audio_service_.asioDriverName();
+                int saved_driver_id{};
+                int driver_id = 1;
+                for (const auto& driver :
+                     audio_service_.asioDriverNames()) {
+                    asio_driver_.addItem(
+                        juce::String::fromUTF8(driver.c_str()),
+                        driver_id);
+                    if (driver == saved_driver) {
+                        saved_driver_id = driver_id;
+                    }
+                    ++driver_id;
+                }
+                if (saved_driver_id != 0) {
+                    asio_driver_.setSelectedId(
+                        saved_driver_id, juce::dontSendNotification);
+                } else if (asio_driver_.getNumItems() > 0) {
+                    asio_driver_.setSelectedItemIndex(
+                        0, juce::dontSendNotification);
+                }
+                output_page->addAndMakeVisible(asio_driver_);
+
+                asio_settings_.setButtonText(
+                    juce::String::fromUTF8("ASIO設定"));
+                output_page->addAndMakeVisible(asio_settings_);
+                pc_audio_status_.setColour(
+                    juce::Label::textColourId,
+                    juce::Colour(0xFF9AA8B5));
+                pc_audio_status_.setJustificationType(
+                    juce::Justification::topLeft);
+                output_page->addAndMakeVisible(pc_audio_status_);
+                pc_audio_kind_.onChange = [this] {
+                    const auto asio = pc_audio_kind_.getSelectedId() == 2;
+                    asio_driver_.setEnabled(asio);
+                };
+                asio_driver_.setEnabled(
+                    pc_audio_kind_.getSelectedId() == 2);
+                refreshPcAudioStatus();
+
+                mamidi_help_.setText(
+                    juce::String::fromUTF8(
+                        "音源の試聴経路を選びます。MAmidiMEmo は "
                         "MAmidiMEmo.exe -chip_server 起動後に接続します。\n"
                         "切断時はエミュレータへ自動切替しません。"),
                     juce::dontSendNotification);
-                output_help_.setJustificationType(
+                mamidi_help_.setJustificationType(
                     juce::Justification::topLeft);
-                output_help_.setColour(
+                mamidi_help_.setColour(
                     juce::Label::textColourId,
                     juce::Colour(0xFFE6EDF3));
-                output_page->addAndMakeVisible(output_help_);
+                output_page->addAndMakeVisible(mamidi_help_);
 
                 output_kind_.addItem(
                     juce::String::fromUTF8("内蔵エミュレータ"), 1);
@@ -3059,7 +4328,7 @@ private:
                 close_.setButtonText(
                     juce::String::fromUTF8("閉じる"));
                 addAndMakeVisible(close_);
-                setSize(460, 560);
+                setSize(460, 680);
             }
 
             void resized() override {
@@ -3084,7 +4353,18 @@ private:
                         tabs_.getTabContentComponent(1)) {
                     auto page =
                         output_page->getLocalBounds().reduced(12);
-                    output_help_.setBounds(page.removeFromTop(64));
+                    pc_audio_help_.setBounds(page.removeFromTop(48));
+                    page.removeFromTop(8);
+                    pc_audio_kind_.setBounds(page.removeFromTop(28));
+                    page.removeFromTop(8);
+                    asio_driver_.setBounds(page.removeFromTop(28));
+                    page.removeFromTop(8);
+                    asio_settings_.setBounds(
+                        page.removeFromTop(30).removeFromLeft(112));
+                    page.removeFromTop(8);
+                    pc_audio_status_.setBounds(page.removeFromTop(48));
+                    page.removeFromTop(12);
+                    mamidi_help_.setBounds(page.removeFromTop(48));
                     page.removeFromTop(8);
                     output_kind_.setBounds(page.removeFromTop(28));
                     page.removeFromTop(10);
@@ -3117,13 +4397,27 @@ private:
                     juce::dontSendNotification);
             }
 
+            void refreshPcAudioStatus() {
+                pc_audio_status_.setText(
+                    juce::String::fromUTF8(
+                        audio_service_.pcAudioStatus().c_str()),
+                    juce::dontSendNotification);
+                asio_settings_.setEnabled(
+                    audio_service_.asioControlPanelAvailable());
+            }
+
             juce::TabbedComponent tabs_{
                 juce::TabbedButtonBar::TabsAtTop};
             juce::Label midi_help_;
             juce::ComboBox midi_input_;
             juce::TextButton apply_midi_;
             juce::TextButton refresh_;
-            juce::Label output_help_;
+            juce::Label pc_audio_help_;
+            juce::ComboBox pc_audio_kind_;
+            juce::ComboBox asio_driver_;
+            juce::TextButton asio_settings_;
+            juce::Label pc_audio_status_;
+            juce::Label mamidi_help_;
             juce::ComboBox output_kind_;
             juce::TextEditor host_;
             juce::TextEditor port_;
@@ -3187,6 +4481,20 @@ private:
             if (safe == nullptr || safe_content == nullptr) {
                 return;
             }
+            const auto pc_backend =
+                safe_content->pc_audio_kind_.getSelectedId() == 2
+                ? PcAudioBackend::Asio
+                : PcAudioBackend::Wasapi;
+            const auto driver_name = utf8String(
+                safe_content->asio_driver_.getText());
+            if (!safe->audio_service_.applyPcAudioSettings(
+                    pc_backend,
+                    driver_name)) {
+                safe_content->pc_audio_kind_.setSelectedId(
+                    1, juce::sendNotificationSync);
+            }
+            safe_content->refreshPcAudioStatus();
+
             auto& engine = safe->audio_service_.engine();
             mgstc::engine::MAmidiOutputSettings settings{};
             settings.host = utf8String(
@@ -3221,6 +4529,19 @@ private:
             safe->audio_service_.saveSoundOutputSettings();
             safe_content->refreshOutputStatus();
             safe->syncMidiControls();
+        };
+        content->asio_settings_.onClick = [safe, safe_content] {
+            if (safe == nullptr || safe_content == nullptr) {
+                return;
+            }
+            static_cast<void>(
+                safe->audio_service_.showAsioControlPanel());
+            if (safe->audio_service_.pcAudioBackend()
+                != PcAudioBackend::Asio) {
+                safe_content->pc_audio_kind_.setSelectedId(
+                    1, juce::sendNotificationSync);
+            }
+            safe_content->refreshPcAudioStatus();
         };
         content->reconnect_.onClick = [safe, safe_content] {
             if (safe == nullptr || safe_content == nullptr) {
@@ -4876,8 +6197,10 @@ public:
     explicit CompositeEditorComponent(
         SharedAudioService& audio_service,
         SharedMidiInputService& midi_service,
-        EditorOpenCallback open_editor)
+        EditorOpenCallback open_editor,
+        TagManagementCallback manage_tags)
         : open_editor_(std::move(open_editor)),
+          manage_tags_(std::move(manage_tags)),
           audio_service_(audio_service),
           engine_(audio_service.engine()),
           tooltip_window_(this, 450),
@@ -4905,12 +6228,16 @@ public:
         open_scc_.setButtonText(juce::String::fromUTF8("SCC音色"));
         open_scc_.setTooltip(juce::String::fromUTF8(
             "チャンネルを追加していなくてもSCC音色エディタを開けます"));
-        open_scc_.onClick = [this] { open_editor_("scc"); };
+        open_scc_.onClick = [this] {
+            open_editor_("scc", std::nullopt);
+        };
         addAndMakeVisible(open_scc_);
         open_opll_.setButtonText(juce::String::fromUTF8("OPLL音色"));
         open_opll_.setTooltip(juce::String::fromUTF8(
             "チャンネルを追加していなくてもOPLL音色エディタを開けます"));
-        open_opll_.onClick = [this] { open_editor_("opll"); };
+        open_opll_.onClick = [this] {
+            open_editor_("opll", std::nullopt);
+        };
         addAndMakeVisible(open_opll_);
         description_.setText(
             juce::String::fromUTF8(
@@ -4929,20 +6256,67 @@ public:
             timbre_.name = name_.getText().toStdString();
         };
         addAndMakeVisible(name_);
+        tags_.setButtonText(juce::String::fromUTF8("タグを選択"));
+        tags_.setTooltip(
+            juce::String::fromUTF8(
+                "総合音色へ標準タグまたは独自タグを複数設定します"));
+        tags_.onClick = [this] { showTagEditor(); };
+        addAndMakeVisible(tags_);
+        favorite_.setButtonText(juce::String::fromUTF8("お気に入り"));
+        favorite_.onClick = [this] {
+            timbre_.favorite = favorite_.getToggleState();
+        };
+        addAndMakeVisible(favorite_);
+        composite_filter_.setTextToShowWhenEmpty(
+            juce::String::fromUTF8("名前・タグ・メモを検索"),
+            juce::Colour(0xFF7F8993));
+        composite_filter_.onTextChange = [this] {
+            refreshCompositeSelector();
+        };
+        addAndMakeVisible(composite_filter_);
+        composite_tag_filter_.setButtonText(
+            juce::String::fromUTF8("タグで絞り込み"));
+        composite_tag_filter_.onClick = [this] {
+            showLibraryTagFilter();
+        };
+        addAndMakeVisible(composite_tag_filter_);
+        tag_manage_.setButtonText(
+            juce::String::fromUTF8("タグ管理"));
+        tag_manage_.onClick = [this] {
+            if (manage_tags_) {
+                manage_tags_(this);
+            }
+        };
+        addAndMakeVisible(tag_manage_);
+        composite_favorite_only_.setButtonText(
+            juce::String::fromUTF8("★のみ"));
+        composite_favorite_only_.onClick = [this] {
+            refreshCompositeSelector();
+        };
+        addAndMakeVisible(composite_favorite_only_);
+        composite_sort_.addItem(
+            juce::String::fromUTF8("お気に入り優先"), 1);
+        composite_sort_.addItem(
+            juce::String::fromUTF8("最近使った順"), 2);
+        composite_sort_.addItem(
+            juce::String::fromUTF8("更新日時順"), 3);
+        composite_sort_.addItem(
+            juce::String::fromUTF8("名前順"), 4);
+        composite_sort_.setSelectedId(1, juce::dontSendNotification);
+        composite_sort_.onChange = [this] {
+            refreshCompositeSelector();
+        };
+        addAndMakeVisible(composite_sort_);
+        layer_favorite_only_.setButtonText(
+            juce::String::fromUTF8("レイヤー候補 ★のみ"));
+        layer_favorite_only_.onClick = [this] {
+            refreshTimbreSelectors();
+            syncControlsFromModel();
+        };
+        addAndMakeVisible(layer_favorite_only_);
 
         new_.setButtonText(juce::String::fromUTF8("新規"));
-        new_.onClick = [this] {
-            stopAudition();
-            timbre_ = mgstc::engine::defaultCompositeTimbre();
-            timbre_.layers.clear();
-            selected_composite_id_.reset();
-            composite_select_.setSelectedId(
-                0, juce::dontSendNotification);
-            syncControlsFromModel();
-            updateStatus(
-                juce::String::fromUTF8(
-                    "新しい総合音色を作成しました"));
-        };
+        new_.onClick = [this] { newCompositeTimbre(); };
         addAndMakeVisible(new_);
         save_.setButtonText(juce::String::fromUTF8("保存"));
         save_.setTooltip(
@@ -4959,15 +6333,48 @@ public:
             saveCompositeTimbre(true);
         };
         addAndMakeVisible(save_as_);
+        duplicate_.setButtonText(juce::String::fromUTF8("複製"));
+        duplicate_.setTooltip(
+            juce::String::fromUTF8(
+                "選択した保存済み総合音色を複製します"));
+        duplicate_.onClick = [this] {
+            duplicateSelectedCompositeTimbre();
+        };
+        addAndMakeVisible(duplicate_);
+        rename_.setButtonText(juce::String::fromUTF8("名前変更"));
+        rename_.setTooltip(
+            juce::String::fromUTF8(
+                "名前欄の内容へ保存済み総合音色の名前だけを変更します"));
+        rename_.onClick = [this] { renameSelectedCompositeTimbre(); };
+        addAndMakeVisible(rename_);
+        delete_.setButtonText(juce::String::fromUTF8("削除"));
+        delete_.setTooltip(
+            juce::String::fromUTF8(
+                "選択した保存済み総合音色を削除します"));
+        delete_.onClick = [this] { deleteSelectedCompositeTimbre(); };
+        addAndMakeVisible(delete_);
         composite_select_.setTextWhenNothingSelected(
             juce::String::fromUTF8("保存済み総合音色"));
         composite_select_.setTooltip(
             juce::String::fromUTF8(
-                "保存済みの総合音色を選択して読み込みます"));
+                "保存済み総合音色を選択して即時試聴します"));
         composite_select_.onChange = [this] {
-            loadSelectedCompositeTimbre();
+            selectCompositePreview();
         };
         addAndMakeVisible(composite_select_);
+        load_.setButtonText(juce::String::fromUTF8("読込"));
+        load_.setTooltip(
+            juce::String::fromUTF8(
+                "選択した総合音色を編集値へ読み込みます"));
+        load_.onClick = [this] { loadSelectedCompositeTimbre(); };
+        addAndMakeVisible(load_);
+        composite_ab_.setButtonText("A/B");
+        composite_ab_.setEnabled(false);
+        composite_ab_.setTooltip(
+            juce::String::fromUTF8(
+                "編集中(A)と選択した保存総合音色(B)を交互に試聴します"));
+        composite_ab_.onClick = [this] { auditionCompositeAb(); };
+        addAndMakeVisible(composite_ab_);
 
         constexpr std::array<const char*, 3> source_names{
             "PSG", "SCC", "OPLL"};
@@ -5090,10 +6497,22 @@ public:
                 }
                 if (timbre_.layers[index].source
                     == mgstc::engine::TimbreSource::Scc) {
-                    open_editor_("scc");
+                    open_editor_(
+                        "scc",
+                        timbre_.layers[index].base_timbre
+                            ? std::optional<std::uint64_t>{
+                                  timbre_.layers[index]
+                                      .base_timbre->library_id}
+                            : std::nullopt);
                 } else if (timbre_.layers[index].source
                            == mgstc::engine::TimbreSource::Opll) {
-                    open_editor_("opll");
+                    open_editor_(
+                        "opll",
+                        timbre_.layers[index].base_timbre
+                            ? std::optional<std::uint64_t>{
+                                  timbre_.layers[index]
+                                      .base_timbre->library_id}
+                            : std::nullopt);
                 }
             };
             edit_[index].setEnabled(index != 0);
@@ -5171,6 +6590,7 @@ public:
         refreshTimbreSelectors();
         refreshCompositeSelector();
         syncControlsFromModel();
+        setEditorBaseline();
         setSize(1440, 940);
         engine_ready_ = audio_service.running() && configureEngine();
         startTimerHz(60);
@@ -5201,13 +6621,58 @@ public:
             master_volume_, master_volume_revision_, audio_service_);
         loadCompositeLibrary();
         loadTimbreLibrary();
+        std::size_t updated_references{};
+        for (const auto& entry : timbre_library_.entries()) {
+            updated_references +=
+                mgstc::engine::updateTimbreReferences(
+                    std::span<mgstc::engine::CompositeTimbre>{
+                        &timbre_, 1},
+                    entry);
+        }
         refreshCompositeSelector();
         refreshTimbreSelectors();
+        if (updated_references != 0) {
+            syncControlsFromModel();
+            updateStatus(
+                juce::String::fromUTF8(
+                    "保存された単音色の更新を総合音色へ反映しました"
+                    "（総合音色は未保存です）"));
+        }
+    }
+
+    void applyTagRewrite(
+        std::string_view source,
+        std::string_view replacement) {
+        static_cast<void>(mgstc::engine::rewriteTimbreTag(
+            editor_baseline_.tags, source, replacement));
+        const bool editing_changed =
+            mgstc::engine::rewriteTimbreTag(
+                timbre_.tags, source, replacement);
+        static_cast<void>(mgstc::engine::rewriteTimbreTag(
+            composite_filter_tags_, source, replacement));
+        if (composite_preview_) {
+            static_cast<void>(mgstc::engine::rewriteTimbreTag(
+                composite_preview_->tags, source, replacement));
+        }
+        refreshExternalState();
+        updateTagButtons();
+        syncControlsFromModel();
+        if (editing_changed && hasUnsavedChanges()) {
+            updateStatus(
+                juce::String::fromUTF8(
+                    "独自タグの変更を編集中の総合音色へ反映しました"
+                    "（未保存）"));
+        }
     }
 
     void deactivate() {
         performance_keyboard_.allNotesOff();
         stopAudition();
+    }
+
+    [[nodiscard]] bool hasUnsavedChanges() const {
+        return timbre_ != editor_baseline_
+            || selected_composite_id_ != editor_baseline_id_;
     }
 
     void paint(juce::Graphics& graphics) override {
@@ -5218,7 +6683,7 @@ public:
         right.removeFromBottom(108);
         right = right.removeFromRight(commonPanelWidth());
         auto left = outer;
-        left.removeFromTop(118);
+        left.removeFromTop(194);
         left.removeFromBottom(108);
         left.removeFromRight(commonPanelWidth() + UiLayout::panelGap - UiLayout::xs);
         paintRoundedPanelFrame(graphics, left);
@@ -5252,7 +6717,38 @@ public:
         metadata.removeFromLeft(xs + 1);
         save_.setBounds(metadata.removeFromLeft(50));
         metadata.removeFromLeft(xs + 1);
-        save_as_.setBounds(metadata);
+        save_as_.setBounds(metadata.removeFromLeft(74));
+        metadata.removeFromLeft(controlGap);
+        favorite_.setBounds(metadata.removeFromLeft(104));
+        area.removeFromTop(sm);
+        auto search_row = area.removeFromTop(fieldH);
+        composite_filter_.setBounds(search_row.removeFromLeft(210));
+        search_row.removeFromLeft(controlGap);
+        composite_tag_filter_.setBounds(
+            search_row.removeFromLeft(170));
+        search_row.removeFromLeft(controlGap);
+        tags_.setBounds(search_row.removeFromLeft(180));
+        search_row.removeFromLeft(controlGap);
+        duplicate_.setBounds(search_row.removeFromLeft(58));
+        search_row.removeFromLeft(xs);
+        rename_.setBounds(search_row.removeFromLeft(78));
+        search_row.removeFromLeft(xs);
+        delete_.setBounds(search_row.removeFromLeft(52));
+        area.removeFromTop(sm);
+        auto sort_row = area.removeFromTop(fieldH);
+        composite_favorite_only_.setBounds(
+            sort_row.removeFromLeft(108));
+        sort_row.removeFromLeft(controlGap);
+        composite_sort_.setBounds(sort_row.removeFromLeft(190));
+        sort_row.removeFromLeft(controlGap);
+        layer_favorite_only_.setBounds(
+            sort_row.removeFromLeft(170));
+        sort_row.removeFromLeft(controlGap);
+        load_.setBounds(sort_row.removeFromLeft(54));
+        sort_row.removeFromLeft(xs);
+        composite_ab_.setBounds(sort_row.removeFromLeft(52));
+        sort_row.removeFromLeft(controlGap);
+        tag_manage_.setBounds(sort_row.removeFromLeft(84));
         area.removeFromTop(md);
 
         auto left = area.reduced(panelPad + xs);
@@ -5379,33 +6875,221 @@ private:
         }
     }
 
+    void updateTagButtons() {
+        tags_.setButtonText(tagSelectionSummary(
+            timbre_.tags, juce::String::fromUTF8("タグを選択")));
+        composite_tag_filter_.setButtonText(tagSelectionSummary(
+            composite_filter_tags_,
+            juce::String::fromUTF8("タグで絞り込み")));
+    }
+
+    void showTagEditor() {
+        juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+        showTagSelectionDialog(
+            this,
+            juce::String::fromUTF8("総合音色のタグ"),
+            presetTagChoices(timbre_.tags),
+            timbre_.tags,
+            true,
+            [safe](std::vector<std::string> selected) {
+                if (safe != nullptr) {
+                    safe->timbre_.tags = std::move(selected);
+                    safe->updateTagButtons();
+                }
+            });
+    }
+
+    void showLibraryTagFilter() {
+        std::vector<std::vector<std::string>> tag_sets;
+        for (const auto& entry : composite_library_.entries()) {
+            tag_sets.push_back(entry.timbre.tags);
+        }
+        juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+        showTagSelectionDialog(
+            this,
+            juce::String::fromUTF8("総合音色ライブラリのタグ検索"),
+            usageTagChoices(tag_sets),
+            composite_filter_tags_,
+            false,
+            [safe](std::vector<std::string> selected) {
+                if (safe != nullptr) {
+                    safe->composite_filter_tags_ = std::move(selected);
+                    safe->updateTagButtons();
+                    safe->refreshCompositeSelector();
+                }
+            });
+    }
+
     void refreshCompositeSelector() {
         syncing_ = true;
         composite_select_.clear(juce::dontSendNotification);
         composite_library_ids_.clear();
         int item_id = 1;
         int selected_item = 0;
+        const auto filter = composite_filter_.getText().trim();
+        std::vector<const mgstc::engine::CompositeTimbreLibraryEntry*>
+            ordered;
         for (const auto& entry : composite_library_.entries()) {
+            if (!composite_favorite_only_.getToggleState()
+                || entry.timbre.favorite) {
+                ordered.push_back(&entry);
+            }
+        }
+        const int sort_mode = composite_sort_.getSelectedId();
+        std::stable_sort(
+            ordered.begin(), ordered.end(),
+            [sort_mode](const auto* left, const auto* right) {
+                if (left->timbre.favorite != right->timbre.favorite) {
+                    return left->timbre.favorite;
+                }
+                if (sort_mode == 2
+                    && left->last_used_unix_seconds
+                        != right->last_used_unix_seconds) {
+                    return left->last_used_unix_seconds
+                        > right->last_used_unix_seconds;
+                }
+                if (sort_mode == 3
+                    && left->updated_unix_seconds
+                        != right->updated_unix_seconds) {
+                    return left->updated_unix_seconds
+                        > right->updated_unix_seconds;
+                }
+                if (sort_mode == 4) {
+                    return left->timbre.name < right->timbre.name;
+                }
+                return false;
+            });
+        for (const auto* entry_ptr : ordered) {
+            if (!entry_ptr) {
+                continue;
+            }
+            const auto& entry = *entry_ptr;
+            if (filter.isNotEmpty()) {
+                const auto name = juce::String::fromUTF8(
+                    entry.timbre.name.c_str());
+                const auto tags = juce::String::fromUTF8(
+                    mgstc::engine::serializeTimbreTags(
+                        entry.timbre.tags).c_str());
+                const auto memo = juce::String::fromUTF8(
+                    entry.timbre.memo.c_str());
+                if (!name.containsIgnoreCase(filter)
+                    && !tags.containsIgnoreCase(filter)
+                    && !memo.containsIgnoreCase(filter)) {
+                    continue;
+                }
+            }
+            if (!mgstc::engine::containsAllTimbreTags(
+                    entry.timbre.tags, composite_filter_tags_)) {
+                continue;
+            }
             composite_library_ids_.push_back(entry.id);
-            composite_select_.addItem(
-                juce::String::fromUTF8(
+            auto label = juce::String::fromUTF8(
                     entry.timbre.name.c_str())
                     + "  r"
                     + juce::String(
-                        static_cast<int>(entry.revision)),
-                item_id);
+                        static_cast<int>(entry.revision));
+            if (entry.timbre.favorite) {
+                label = juce::String::fromUTF8("★ ") + label;
+            }
+            composite_select_.addItem(label, item_id);
             if (selected_composite_id_
                 && *selected_composite_id_ == entry.id) {
                 selected_item = item_id;
             }
             ++item_id;
         }
-        if (selected_composite_id_ && selected_item == 0) {
-            selected_composite_id_.reset();
-        }
         composite_select_.setSelectedId(
             selected_item, juce::dontSendNotification);
         syncing_ = false;
+    }
+
+    void newCompositeTimbre() {
+        if (hasUnsavedChanges()) {
+            juce::Component::SafePointer<CompositeEditorComponent> safe(
+                this);
+            showDiscardConfirmation(
+                this,
+                juce::String::fromUTF8("新規作成"),
+                [safe] {
+                    if (safe != nullptr) {
+                        safe->performNewCompositeTimbre();
+                    }
+                });
+            return;
+        }
+        performNewCompositeTimbre();
+    }
+
+    void performNewCompositeTimbre() {
+        stopAudition();
+        timbre_ = mgstc::engine::defaultCompositeTimbre();
+        timbre_.layers.clear();
+        selected_composite_id_.reset();
+        composite_select_.setSelectedId(
+            0, juce::dontSendNotification);
+        syncControlsFromModel();
+        setEditorBaseline();
+        updateStatus(
+            juce::String::fromUTF8(
+                "新しい総合音色を作成しました"));
+    }
+
+    void selectCompositePreview() {
+        if (syncing_) {
+            return;
+        }
+        const auto selected = composite_select_.getSelectedId();
+        if (selected <= 0
+            || static_cast<std::size_t>(selected)
+                > composite_library_ids_.size()) {
+            composite_preview_.reset();
+            composite_ab_.setEnabled(false);
+            return;
+        }
+        const auto id = composite_library_ids_[
+            static_cast<std::size_t>(selected - 1)];
+        const auto* entry = composite_library_.find(id);
+        if (!entry) {
+            return;
+        }
+        composite_preview_ = entry->timbre;
+        composite_ab_next_b_ = false;
+        composite_ab_.setEnabled(true);
+        auditionCompositeModel(*composite_preview_);
+        static_cast<void>(
+            composite_library_.touch(id, unixTimeNow()));
+        static_cast<void>(
+            persistCompositeTimbreLibrary(composite_library_));
+        updateStatus(
+            juce::String::fromUTF8(
+                "B 保存済み総合音色を試聴中。「読込」で編集へ反映します"));
+    }
+
+    void auditionCompositeModel(
+        const mgstc::engine::CompositeTimbre& model) {
+        stopAudition();
+        auto editing = timbre_;
+        timbre_ = model;
+        startAudition();
+        timbre_ = std::move(editing);
+    }
+
+    void auditionCompositeAb() {
+        if (!composite_preview_) {
+            return;
+        }
+        const bool play_b = composite_ab_next_b_;
+        composite_ab_next_b_ = !composite_ab_next_b_;
+        if (play_b) {
+            auditionCompositeModel(*composite_preview_);
+        } else {
+            startAudition();
+        }
+        composite_ab_.setButtonText(abNextSideButtonText(play_b));
+        updateStatus(
+            play_b
+                ? juce::String::fromUTF8("B 保存済み総合音色を試聴中")
+                : juce::String::fromUTF8("A 編集中総合音色を試聴中"));
     }
 
     void loadSelectedCompositeTimbre() {
@@ -5420,6 +7104,23 @@ private:
         }
         const auto id = composite_library_ids_[
             static_cast<std::size_t>(selected - 1)];
+        if (hasUnsavedChanges()) {
+            juce::Component::SafePointer<CompositeEditorComponent> safe(
+                this);
+            showDiscardConfirmation(
+                this,
+                juce::String::fromUTF8("選択音色の読込"),
+                [safe, id] {
+                    if (safe != nullptr) {
+                        safe->performLoadCompositeTimbre(id);
+                    }
+                });
+            return;
+        }
+        performLoadCompositeTimbre(id);
+    }
+
+    void performLoadCompositeTimbre(std::uint64_t id) {
         juce::InterProcessLock::ScopedLockType lock(
             library_lock_);
         if (!lock.isLocked()
@@ -5441,10 +7142,15 @@ private:
         stopAudition();
         selected_composite_id_ = id;
         timbre_ = entry->timbre;
+        static_cast<void>(
+            composite_library_.touch(id, unixTimeNow()));
+        static_cast<void>(
+            persistCompositeTimbreLibrary(composite_library_));
         loadTimbreLibrary();
         refreshTimbreSelectors();
         refreshCompositeSelector();
         syncControlsFromModel();
+        setEditorBaseline();
         updateStatus(
             juce::String::fromUTF8("総合音色を読み込みました"));
         startAudition();
@@ -5506,12 +7212,145 @@ private:
             return;
         }
         refreshCompositeSelector();
+        setEditorBaseline();
         updateStatus(
             save_as
                 ? juce::String::fromUTF8(
                     "新しい総合音色として保存しました")
                 : juce::String::fromUTF8(
                     "総合音色を保存しました"));
+    }
+
+    void duplicateSelectedCompositeTimbre() {
+        if (!selected_composite_id_) {
+            showCompositeError(
+                juce::String::fromUTF8(
+                    "複製する総合音色を選択してください"));
+            return;
+        }
+        juce::InterProcessLock::ScopedLockType lock(library_lock_);
+        if (!lock.isLocked() || !reloadCompositeLibraryFromDisk()) {
+            showCompositeError(
+                juce::String::fromUTF8(
+                    "共有ライブラリを読み直せませんでした"));
+            return;
+        }
+        const auto* source =
+            composite_library_.find(*selected_composite_id_);
+        if (!source) {
+            showCompositeError(
+                juce::String::fromUTF8(
+                    "選択した総合音色は削除されています"));
+            return;
+        }
+        auto copy = source->timbre;
+        copy.name = composite_library_.uniqueName(copy.name);
+        selected_composite_id_ =
+            composite_library_.add(copy, unixTimeNow());
+        if (!persistCompositeTimbreLibrary(composite_library_)) {
+            showCompositeError(
+                juce::String::fromUTF8("複製を保存できませんでした"));
+            return;
+        }
+        timbre_ = std::move(copy);
+        refreshCompositeSelector();
+        syncControlsFromModel();
+        setEditorBaseline();
+        updateStatus(
+            juce::String::fromUTF8("総合音色を複製しました"));
+    }
+
+    void renameSelectedCompositeTimbre() {
+        if (!selected_composite_id_) {
+            showCompositeError(
+                juce::String::fromUTF8(
+                    "名前を変更する総合音色を選択してください"));
+            return;
+        }
+        const auto requested = utf8String(name_.getText().trim());
+        if (requested.empty()) {
+            showCompositeError(
+                juce::String::fromUTF8("新しい名前を入力してください"));
+            return;
+        }
+        juce::InterProcessLock::ScopedLockType lock(library_lock_);
+        if (!lock.isLocked() || !reloadCompositeLibraryFromDisk()) {
+            showCompositeError(
+                juce::String::fromUTF8(
+                    "共有ライブラリを読み直せませんでした"));
+            return;
+        }
+        const auto* source =
+            composite_library_.find(*selected_composite_id_);
+        if (!source) {
+            showCompositeError(
+                juce::String::fromUTF8(
+                    "選択した総合音色は削除されています"));
+            return;
+        }
+        auto renamed = source->timbre;
+        renamed.name = requested;
+        if (!composite_library_.update(
+                *selected_composite_id_, renamed, unixTimeNow())
+            || !persistCompositeTimbreLibrary(composite_library_)) {
+            showCompositeError(
+                juce::String::fromUTF8(
+                    "名前の変更を保存できませんでした"));
+            return;
+        }
+        timbre_.name = requested;
+        refreshCompositeSelector();
+        syncControlsFromModel();
+        setEditorBaseline();
+        updateStatus(
+            juce::String::fromUTF8("総合音色名を変更しました"));
+    }
+
+    void deleteSelectedCompositeTimbre() {
+        if (!selected_composite_id_) {
+            showCompositeError(
+                juce::String::fromUTF8(
+                    "削除する総合音色を選択してください"));
+            return;
+        }
+        const auto id = *selected_composite_id_;
+        juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+        juce::AlertWindow::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(
+                    juce::MessageBoxIconType::WarningIcon)
+                .withTitle(
+                    juce::String::fromUTF8("総合音色ライブラリ"))
+                .withMessage(
+                    juce::String::fromUTF8(
+                        "選択した総合音色を削除しますか？"))
+                .withButton(juce::String::fromUTF8("削除"))
+                .withButton(juce::String::fromUTF8("キャンセル"))
+                .withAssociatedComponent(this),
+            [safe, id](int result) {
+                if (safe == nullptr || result != 1) {
+                    return;
+                }
+                juce::InterProcessLock::ScopedLockType lock(
+                    safe->library_lock_);
+                if (!lock.isLocked()
+                    || !safe->reloadCompositeLibraryFromDisk()
+                    || !safe->composite_library_.erase(id)
+                    || !persistCompositeTimbreLibrary(
+                        safe->composite_library_)) {
+                    safe->showCompositeError(
+                        juce::String::fromUTF8(
+                            "削除結果を保存できませんでした"));
+                    return;
+                }
+                safe->performNewCompositeTimbre();
+                safe->refreshCompositeSelector();
+            });
+    }
+
+    void setEditorBaseline() {
+        editor_baseline_ = timbre_;
+        editor_baseline_id_ = selected_composite_id_;
     }
 
     [[nodiscard]] juce::File timbreLibraryFile() const {
@@ -5564,18 +7403,40 @@ private:
                     == mgstc::engine::TimbreSource::Scc
                 ? mgstc::engine::TimbreCategory::Scc
                 : mgstc::engine::TimbreCategory::Opll;
-            int item_id = 1;
+            const auto assigned_id =
+                timbre_.layers[index].base_timbre
+                ? std::optional<std::uint64_t>{
+                      timbre_.layers[index].base_timbre->library_id}
+                : std::nullopt;
+            std::vector<const mgstc::engine::TimbreLibraryEntry*> ordered;
             for (const auto& entry : timbre_library_.entries()) {
-                if (entry.category != category) {
+                if (entry.category == category
+                    && (!layer_favorite_only_.getToggleState()
+                        || entry.favorite
+                        || (assigned_id && *assigned_id == entry.id))) {
+                    ordered.push_back(&entry);
+                }
+            }
+            std::stable_sort(
+                ordered.begin(), ordered.end(),
+                [](const auto* left, const auto* right) {
+                    return left->favorite && !right->favorite;
+                });
+            int item_id = 1;
+            for (const auto* entry_ptr : ordered) {
+                if (!entry_ptr) {
                     continue;
                 }
+                const auto& entry = *entry_ptr;
                 timbre_library_ids_[index].push_back(entry.id);
-                timbre_select_[index].addItem(
-                    juce::String::fromUTF8(entry.name.c_str())
+                auto label = juce::String::fromUTF8(entry.name.c_str())
                         + "  r"
                         + juce::String(
-                            static_cast<int>(entry.revision)),
-                    item_id++);
+                            static_cast<int>(entry.revision));
+                if (entry.favorite) {
+                    label = juce::String::fromUTF8("★ ") + label;
+                }
+                timbre_select_[index].addItem(label, item_id++);
             }
         }
     }
@@ -5735,6 +7596,9 @@ private:
         syncing_ = true;
         name_.setText(
             juce::String::fromUTF8(timbre_.name.c_str()), false);
+        updateTagButtons();
+        favorite_.setToggleState(
+            timbre_.favorite, juce::dontSendNotification);
         for (std::size_t index = 0; index < source_.size(); ++index) {
             setLayerControlsVisible(index, index < timbre_.layers.size());
         }
@@ -5772,8 +7636,13 @@ private:
             edit_[index].setButtonText(
                 layer.source == mgstc::engine::TimbreSource::Psg
                     ? juce::String::fromUTF8("PSG設定")
-                    : juce::String::fromUTF8("単音色編集"));
-            edit_[index].setEnabled(has_saved_timbre);
+                    : layer.base_timbre
+                        ? juce::String::fromUTF8("編集: ")
+                            + juce::String::fromUTF8(
+                                layer.base_timbre->name.c_str())
+                        : juce::String::fromUTF8("単音色編集"));
+            edit_[index].setEnabled(
+                has_saved_timbre && layer.base_timbre.has_value());
             enabled_[index].setToggleState(
                 layer.enabled, juce::dontSendNotification);
             mute_[index].setToggleState(
@@ -6232,6 +8101,7 @@ private:
     }
 
     EditorOpenCallback open_editor_;
+    TagManagementCallback manage_tags_;
     SharedAudioService& audio_service_;
     mgstc::engine::RealtimeEngineHost& engine_;
     juce::TooltipWindow tooltip_window_;
@@ -6241,10 +8111,23 @@ private:
     juce::Label description_;
     juce::Label name_label_;
     juce::TextEditor name_;
+    juce::TextButton tags_;
+    juce::TextButton tag_manage_;
+    juce::ToggleButton favorite_;
+    juce::TextEditor composite_filter_;
+    juce::TextButton composite_tag_filter_;
+    juce::ToggleButton composite_favorite_only_;
+    juce::ComboBox composite_sort_;
+    juce::ToggleButton layer_favorite_only_;
     juce::ComboBox composite_select_;
     juce::TextButton new_;
+    juce::TextButton load_;
     juce::TextButton save_;
     juce::TextButton save_as_;
+    juce::TextButton composite_ab_;
+    juce::TextButton duplicate_;
+    juce::TextButton rename_;
+    juce::TextButton delete_;
     std::array<juce::Label, 3> source_;
     std::array<juce::ToggleButton, 3> enabled_;
     std::array<juce::ToggleButton, 3> mute_;
@@ -6279,6 +8162,12 @@ private:
     mgstc::engine::CompositeTimbreLibrary composite_library_;
     std::vector<std::uint64_t> composite_library_ids_;
     std::optional<std::uint64_t> selected_composite_id_;
+    std::optional<mgstc::engine::CompositeTimbre>
+        composite_preview_;
+    bool composite_ab_next_b_{true};
+    std::vector<std::string> composite_filter_tags_;
+    mgstc::engine::CompositeTimbre editor_baseline_;
+    std::optional<std::uint64_t> editor_baseline_id_;
     std::array<std::vector<std::uint64_t>, 3>
         timbre_library_ids_;
     juce::InterProcessLock library_lock_{
@@ -6440,8 +8329,10 @@ public:
     explicit SccEditorComponent(
         SharedAudioService& audio_service,
         SharedMidiInputService& midi_service,
-        EditorOpenCallback open_editor)
+        EditorOpenCallback open_editor,
+        TagManagementCallback manage_tags)
         : open_editor_(std::move(open_editor)),
+          manage_tags_(std::move(manage_tags)),
           audio_service_(audio_service),
           engine_(audio_service.engine()),
           tooltip_window_(this, 450),
@@ -6531,7 +8422,7 @@ public:
             juce::String::fromUTF8("OPLLを開く"),
             juce::String::fromUTF8(
                 "OPLL音色エディタを別ウィンドウで開きます"),
-            [this] { open_editor_("opll"); });
+            [this] { open_editor_("opll", std::nullopt); });
         configureIconButton(
             convert_to_opll_, EditorIcon::Convert,
             juce::String::fromUTF8(
@@ -6823,12 +8714,27 @@ public:
             });
         graph_.setLiveEditCallback(
             [this](const SccWaveform& waveform) {
-                if (immediate_audition_.getToggleState()
-                    && auditionOneSecond(&waveform)) {
+                if (!immediate_audition_.getToggleState()
+                    || !engine_ready_) {
+                    return;
+                }
+                // 鍵盤押し中に hardReset 付き1秒試聴へ入ると、押し中ノートが
+                // 消えてPCキーの立ち上がり判定とも食い違う。波形だけ差し替え、
+                // 押し中ノートを同じキーのまま張り直す。
+                if (performance_keyboard_.hasActiveNote()) {
+                    if (!configureEngine(false, &waveform)) {
+                        return;
+                    }
+                    const juce::ScopedValueSetter<bool> keep(
+                        keep_temporary_program_on_note_on_, true);
+                    performance_keyboard_.retriggerHeldNotes();
+                    return;
+                }
+                if (auditionOneSecond(&waveform)) {
                     updateStatus(
                         juce::String::fromUTF8(
                             "波形描画を1秒試聴中"));
-                    }
+                }
             });
         graph_.setValueCommitCallback(
             [this](const SccWaveform& waveform) {
@@ -6963,13 +8869,55 @@ public:
             refreshLibraryList();
         };
         addAndMakeVisible(library_filter_);
+        library_tag_filter_.setButtonText(
+            juce::String::fromUTF8("タグで絞り込み"));
+        library_tag_filter_.setTooltip(
+            juce::String::fromUTF8(
+                "保存済み音色で使われているタグを複数選択します"));
+        library_tag_filter_.onClick = [this] {
+            showLibraryTagFilter();
+        };
+        addAndMakeVisible(library_tag_filter_);
+        tag_manage_.setButtonText(
+            juce::String::fromUTF8("タグ管理"));
+        tag_manage_.onClick = [this] {
+            if (manage_tags_) {
+                manage_tags_(this);
+            }
+        };
+        addAndMakeVisible(tag_manage_);
+        favorite_only_.setButtonText(
+            juce::String::fromUTF8("★のみ"));
+        favorite_only_.onClick = [this] { refreshLibraryList(); };
+        addAndMakeVisible(favorite_only_);
+        library_ab_.setButtonText("A/B");
+        library_ab_.setTooltip(
+            juce::String::fromUTF8(
+                "編集中(A)と選択した保存音色(B)を交互に試聴します"));
+        library_ab_.setEnabled(false);
+        library_ab_.onClick = [this] { auditionLibraryAb(); };
+        addAndMakeVisible(library_ab_);
+        library_sort_.addItem(
+            juce::String::fromUTF8("お気に入り優先"), 1);
+        library_sort_.addItem(
+            juce::String::fromUTF8("最近使った順"), 2);
+        library_sort_.addItem(
+            juce::String::fromUTF8("更新日時順"), 3);
+        library_sort_.addItem(
+            juce::String::fromUTF8("名前順"), 4);
+        library_sort_.setSelectedId(1, juce::dontSendNotification);
+        library_sort_.onChange = [this] { refreshLibraryList(); };
+        addAndMakeVisible(library_sort_);
 
         name_.setTextToShowWhenEmpty(
             juce::String::fromUTF8("音色名"),
             juce::Colour(0xFF7F8993));
-        tags_.setTextToShowWhenEmpty(
-            juce::String::fromUTF8("タグ"),
-            juce::Colour(0xFF7F8993));
+        name_.onTextChange = [this] { updateDefinitionPreview(); };
+        tags_.setButtonText(juce::String::fromUTF8("タグを選択"));
+        tags_.setTooltip(
+            juce::String::fromUTF8(
+                "標準タグを複数選択、または独自タグを追加します"));
+        tags_.onClick = [this] { showTagEditor(); };
         memo_.setTextToShowWhenEmpty(
             juce::String::fromUTF8("メモ"),
             juce::Colour(0xFF7F8993));
@@ -7007,7 +8955,19 @@ public:
             library_cancel_,
             juce::String::fromUTF8("取消"),
             juce::String::fromUTF8("編集開始時点へ戻します"),
-            [this] { restoreEditorBaseline(); });
+            [this] { requestRestoreEditorBaseline(); });
+        configureButton(
+            library_duplicate_,
+            juce::String::fromUTF8("複製"),
+            juce::String::fromUTF8(
+                "選択音色を新しいIDと名前で複製します"),
+            [this] { duplicateSelectedLibraryEntry(); });
+        configureButton(
+            library_rename_,
+            juce::String::fromUTF8("名前変更"),
+            juce::String::fromUTF8(
+                "名前欄の内容へ選択音色の名前だけを変更します"),
+            [this] { renameSelectedLibraryEntry(); });
         configureButton(
             library_delete_,
             juce::String::fromUTF8("削除"),
@@ -7045,6 +9005,7 @@ public:
         addAndMakeVisible(output_number_);
         mgsc_preview_.setMultiLine(true);
         mgsc_preview_.setReadOnly(true);
+        mgsc_preview_.setWantsKeyboardFocus(false);
         mgsc_preview_.setScrollbarsShown(true);
         mgsc_preview_.setFont(
             juce::FontOptions(12.0F, juce::Font::plain));
@@ -7105,6 +9066,57 @@ public:
         if (!consumePendingSccConversion() && engine_ready_) {
             static_cast<void>(configureEngine(false));
         }
+    }
+
+    void applyTagRewrite(
+        std::string_view source,
+        std::string_view replacement) {
+        if (editor_baseline_valid_) {
+            static_cast<void>(mgstc::engine::rewriteTimbreTag(
+                editor_baseline_.tags, source, replacement));
+        }
+        const bool editing_changed =
+            mgstc::engine::rewriteTimbreTag(
+                selected_tags_, source, replacement);
+        static_cast<void>(mgstc::engine::rewriteTimbreTag(
+            selected_filter_tags_, source, replacement));
+        if (library_preview_) {
+            static_cast<void>(mgstc::engine::rewriteTimbreTag(
+                library_preview_->tags, source, replacement));
+        }
+        loadLibrary();
+        updateTagButtons();
+        refreshLibraryList();
+        if (editing_changed && hasUnsavedChanges()) {
+            updateStatus(
+                juce::String::fromUTF8(
+                    "独自タグの変更を編集中のSCC音色へ反映しました"
+                    "（未保存）"));
+        }
+    }
+
+    void requestLibraryEntry(std::uint64_t id) {
+        {
+            juce::InterProcessLock::ScopedLockType lock(library_lock_);
+            if (!lock.isLocked() || !reloadLibraryFromDisk()
+                || !library_.find(id)) {
+                showError(
+                    juce::String::fromUTF8("音色ライブラリ"),
+                    juce::String::fromUTF8(
+                        "割当音色を読み込めませんでした"));
+                return;
+            }
+        }
+        selected_library_id_ = id;
+        refreshLibraryList();
+        loadSelectedLibraryEntry();
+    }
+
+    [[nodiscard]] bool hasUnsavedChanges() const {
+        return editor_baseline_valid_
+            && (selected_library_id_ != editor_baseline_id_
+                || !sameEditableTimbreLibraryEntry(
+                    captureLibraryEntry(), editor_baseline_));
     }
 
     void deactivate() {
@@ -7303,6 +9315,11 @@ public:
             TimbreLibraryWidgets{
                 library_title_,
                 library_filter_,
+                library_tag_filter_,
+                tag_manage_,
+                favorite_only_,
+                library_ab_,
+                library_sort_,
                 library_list_,
                 name_,
                 tags_,
@@ -7313,6 +9330,8 @@ public:
                 library_save_,
                 library_save_as_,
                 library_cancel_,
+                library_duplicate_,
+                library_rename_,
                 library_delete_,
                 library_import_,
                 library_export_,
@@ -7467,7 +9486,9 @@ private:
         }
         const auto text =
             mgstc::engine::formatMgsSccDefinition(
-                scc_wave_, *number);
+                scc_wave_,
+                *number,
+                utf8Text(name_.getText().trim()));
         return juce::String::fromUTF8(
             text.data(),
             static_cast<int>(text.size()));
@@ -7901,42 +9922,69 @@ private:
     }
 
     void convertToOpll() {
-        audio_service_.setSharedSccWaveform(scc_wave_);
-        static_cast<void>(configureEngine(false));
-        updateStatus(juce::String::fromUTF8(
-            "SCC音色をOPLLへ近似変換しています…"));
         juce::Component::SafePointer<SccEditorComponent> safe(this);
         const auto waveform = scc_wave_;
-        runWithConversionBusyDialog(
+        showOpllConversionQualityDialog(
             this,
-            [waveform] {
-                return mgstc::engine::
-                    approximateSccWaveformCandidatesWithOpll(waveform);
-            },
-            [safe](std::vector<mgstc::engine::OpllPatchParameters>
-                       candidates) {
+            [safe, waveform](OpllConversionQuality quality) {
                 if (safe == nullptr) {
                     return;
                 }
-                if (candidates.empty()) {
-                    safe->updateStatus(juce::String::fromUTF8(
-                        "OPLL近似候補を生成できませんでした"));
-                    return;
-                }
-                const auto definition =
-                    mgstc::engine::formatMgsOpllDefinition(
-                        candidates.front(), 15);
-                const auto file = pendingConversionFile("opll");
-                if (!file.getParentDirectory().createDirectory()
-                    || !file.replaceWithText(
-                        juce::String::fromUTF8(definition.c_str()))) {
-                    safe->updateStatus(juce::String::fromUTF8(
-                        "OPLL変換データを保存できませんでした"));
-                    return;
-                }
-                safe->open_editor_("opll");
                 safe->updateStatus(juce::String::fromUTF8(
-                    "OPLL近似音色を生成し、OPLLエディタへ送りました"));
+                    "SCC音色をOPLLへ近似変換しています…"));
+                safe->audio_service_.setSharedSccWaveform(waveform);
+                static_cast<void>(safe->configureEngine(false));
+                runWithConversionBusyDialog(
+                    safe.getComponent(),
+                    [waveform, quality](
+                        ConversionProgressState& progress) {
+                        return mgstc::engine::
+                            approximateSccWaveformWithOpllResult(
+                                waveform,
+                                makeOpllApproximationOptions(
+                                    quality, progress));
+                    },
+                    [safe](
+                        mgstc::engine::OpllApproximationResult result,
+                        bool cancellation_requested) {
+                        if (safe == nullptr) {
+                            return;
+                        }
+                        if (cancellation_requested
+                            || result.completion
+                                == mgstc::engine::
+                                    OpllApproximationCompletion::
+                                        Cancelled) {
+                            safe->updateStatus(
+                                juce::String::fromUTF8(
+                                    "OPLL近似変換をキャンセルしました"));
+                            return;
+                        }
+                        if (result.candidates.empty()) {
+                            safe->updateStatus(
+                                juce::String::fromUTF8(
+                                    "OPLL近似候補を生成できませんでした"));
+                            return;
+                        }
+                        const auto definition =
+                            mgstc::engine::formatMgsOpllDefinition(
+                                result.candidates.front(), 15, {});
+                        const auto file = pendingConversionFile("opll");
+                        if (!file.getParentDirectory().createDirectory()
+                            || !file.replaceWithText(
+                                juce::String::fromUTF8(
+                                    definition.c_str()))) {
+                            safe->updateStatus(
+                                juce::String::fromUTF8(
+                                    "OPLL変換データを保存できませんでした"));
+                            return;
+                        }
+                        safe->open_editor_("opll", std::nullopt);
+                        safe->updateStatus(
+                            juce::String::fromUTF8(
+                                "OPLL近似音色を生成し、"
+                                "OPLLエディタへ送りました"));
+                    });
             });
     }
 
@@ -8120,22 +10168,103 @@ private:
         return true;
     }
 
+    void updateTagButtons() {
+        tags_.setButtonText(tagSelectionSummary(
+            selected_tags_, juce::String::fromUTF8("タグを選択")));
+        library_tag_filter_.setButtonText(tagSelectionSummary(
+            selected_filter_tags_,
+            juce::String::fromUTF8("タグで絞り込み")));
+    }
+
+    void showTagEditor() {
+        juce::Component::SafePointer<SccEditorComponent> safe(this);
+        showTagSelectionDialog(
+            this,
+            juce::String::fromUTF8("SCC音色のタグ"),
+            presetTagChoices(selected_tags_),
+            selected_tags_,
+            true,
+            [safe](std::vector<std::string> selected) {
+                if (safe != nullptr) {
+                    safe->selected_tags_ = std::move(selected);
+                    safe->updateTagButtons();
+                }
+            });
+    }
+
+    void showLibraryTagFilter() {
+        std::vector<std::vector<std::string>> tag_sets;
+        for (const auto& entry : library_.entries()) {
+            if (entry.category == mgstc::engine::TimbreCategory::Scc) {
+                tag_sets.push_back(entry.tags);
+            }
+        }
+        juce::Component::SafePointer<SccEditorComponent> safe(this);
+        showTagSelectionDialog(
+            this,
+            juce::String::fromUTF8("SCCライブラリのタグ検索"),
+            usageTagChoices(tag_sets),
+            selected_filter_tags_,
+            false,
+            [safe](std::vector<std::string> selected) {
+                if (safe != nullptr) {
+                    safe->selected_filter_tags_ = std::move(selected);
+                    safe->updateTagButtons();
+                    safe->refreshLibraryList();
+                }
+            });
+    }
+
     void refreshLibraryList() {
         library_list_.clear(juce::dontSendNotification);
         library_ids_.clear();
         const auto filter = library_filter_.getText().trim();
         int item_id = 1;
         int selected_item = 0;
+        std::vector<const mgstc::engine::TimbreLibraryEntry*> ordered;
         for (const auto& entry : library_.entries()) {
-            if (entry.category
-                != mgstc::engine::TimbreCategory::Scc) {
+            if (entry.category == mgstc::engine::TimbreCategory::Scc
+                && (!favorite_only_.getToggleState()
+                    || entry.favorite)) {
+                ordered.push_back(&entry);
+            }
+        }
+        const int sort_mode = library_sort_.getSelectedId();
+        std::stable_sort(
+            ordered.begin(), ordered.end(),
+            [sort_mode](const auto* left, const auto* right) {
+                if (left->favorite != right->favorite) {
+                    return left->favorite;
+                }
+                if (sort_mode == 2
+                    && left->last_used_unix_seconds
+                        != right->last_used_unix_seconds) {
+                    return left->last_used_unix_seconds
+                        > right->last_used_unix_seconds;
+                }
+                if (sort_mode == 3
+                    && left->updated_unix_seconds
+                        != right->updated_unix_seconds) {
+                    return left->updated_unix_seconds
+                        > right->updated_unix_seconds;
+                }
+                if (sort_mode == 4) {
+                    return left->name < right->name;
+                }
+                return false;
+            });
+        for (const auto* entry_ptr : ordered) {
+            if (!entry_ptr) {
                 continue;
             }
+            const auto& entry = *entry_ptr;
             if (filter.isNotEmpty()) {
                 const auto name =
                     juce::String::fromUTF8(entry.name.c_str());
                 const auto tags =
-                    juce::String::fromUTF8(entry.tags.c_str());
+                    juce::String::fromUTF8(
+                        mgstc::engine::serializeTimbreTags(
+                            entry.tags).c_str());
                 const auto memo =
                     juce::String::fromUTF8(entry.memo.c_str());
                 if (!name.containsIgnoreCase(filter)
@@ -8143,6 +10272,10 @@ private:
                     && !memo.containsIgnoreCase(filter)) {
                     continue;
                 }
+            }
+            if (!mgstc::engine::containsAllTimbreTags(
+                    entry.tags, selected_filter_tags_)) {
+                continue;
             }
             library_ids_.push_back(entry.id);
             auto label = juce::String::fromUTF8(entry.name.c_str())
@@ -8160,9 +10293,6 @@ private:
         }
         library_list_.setSelectedId(
             selected_item, juce::dontSendNotification);
-        if (selected_item == 0) {
-            selected_library_id_.reset();
-        }
     }
 
     [[nodiscard]] const mgstc::engine::TimbreLibraryEntry*
@@ -8189,22 +10319,81 @@ private:
         }
         name_.setText(
             juce::String::fromUTF8(entry->name.c_str()), false);
-        tags_.setText(
-            juce::String::fromUTF8(entry->tags.c_str()), false);
+        updateDefinitionPreview();
+        selected_tags_ = entry->tags;
+        updateTagButtons();
         memo_.setText(
             juce::String::fromUTF8(entry->memo.c_str()), false);
         favorite_.setToggleState(
             entry->favorite, juce::dontSendNotification);
+        library_preview_ = *entry;
+        library_ab_.setEnabled(true);
+        library_ab_next_b_ = false;
+        SccWaveform preview{};
+        std::transform(
+            entry->scc_waveform.begin(),
+            entry->scc_waveform.end(),
+            preview.begin(),
+            [](std::uint8_t value) {
+                return static_cast<std::int8_t>(value);
+            });
+        static_cast<void>(auditionOneSecond(&preview));
+        static_cast<void>(
+            library_.touch(entry->id, unixTimeNow()));
+        static_cast<void>(persistLibrary());
         updateStatus(
             juce::String::fromUTF8("音色を選択しました。"
                                    "「読込」で波形へ反映します"));
     }
 
+    void auditionLibraryAb() {
+        if (!library_preview_) {
+            return;
+        }
+        const bool play_b = library_ab_next_b_;
+        library_ab_next_b_ = !library_ab_next_b_;
+        if (play_b) {
+            SccWaveform preview{};
+            std::transform(
+                library_preview_->scc_waveform.begin(),
+                library_preview_->scc_waveform.end(),
+                preview.begin(),
+                [](std::uint8_t value) {
+                    return static_cast<std::int8_t>(value);
+                });
+            static_cast<void>(auditionOneSecond(&preview));
+        } else {
+            static_cast<void>(auditionOneSecond());
+        }
+        library_ab_.setButtonText(abNextSideButtonText(play_b));
+        updateStatus(
+            play_b
+                ? juce::String::fromUTF8("B 保存音色を試聴中")
+                : juce::String::fromUTF8("A 編集中音色を試聴中"));
+    }
+
     void newLibraryEntry() {
+        if (hasUnsavedChanges()) {
+            juce::Component::SafePointer<SccEditorComponent> safe(this);
+            showDiscardConfirmation(
+                this,
+                juce::String::fromUTF8("新規作成"),
+                [safe] {
+                    if (safe != nullptr) {
+                        safe->performNewLibraryEntry();
+                    }
+                });
+            return;
+        }
+        performNewLibraryEntry();
+    }
+
+    void performNewLibraryEntry() {
         selected_library_id_.reset();
         library_list_.setSelectedId(0, juce::dontSendNotification);
         name_.clear();
-        tags_.clear();
+        selected_tags_.clear();
+        updateTagButtons();
         memo_.clear();
         favorite_.setToggleState(false, juce::dontSendNotification);
         commitWave({});
@@ -8219,6 +10408,25 @@ private:
                 juce::String::fromUTF8("音色ライブラリ"),
                 juce::String::fromUTF8(
                     "読み込む音色を選択してください"));
+            return;
+        }
+        if (hasUnsavedChanges()) {
+            juce::Component::SafePointer<SccEditorComponent> safe(this);
+            showDiscardConfirmation(
+                this,
+                juce::String::fromUTF8("選択音色の読込"),
+                [safe] {
+                    if (safe != nullptr) {
+                        safe->performLoadSelectedLibraryEntry();
+                    }
+                });
+            return;
+        }
+        performLoadSelectedLibraryEntry();
+    }
+
+    void performLoadSelectedLibraryEntry() {
+        if (!selected_library_id_) {
             return;
         }
         const auto id = *selected_library_id_;
@@ -8250,6 +10458,9 @@ private:
                 return static_cast<std::int8_t>(value);
             });
         commitWave(waveform);
+        static_cast<void>(
+            library_.touch(id, unixTimeNow()));
+        static_cast<void>(persistLibrary());
         refreshLibraryList();
         setEditorBaseline();
         updateStatus(
@@ -8261,7 +10472,7 @@ private:
         mgstc::engine::TimbreLibraryEntry entry;
         entry.category = mgstc::engine::TimbreCategory::Scc;
         entry.name = utf8Text(name_.getText().trim());
-        entry.tags = utf8Text(tags_.getText().trim());
+        entry.tags = selected_tags_;
         entry.memo = utf8Text(memo_.getText());
         entry.favorite = favorite_.getToggleState();
         std::transform(
@@ -8392,7 +10603,6 @@ private:
         }
         refreshLibraryList();
         selectLibraryEntryFromList();
-        setEditorBaseline();
         if (!saved) {
             showError(
                 juce::String::fromUTF8("音色ライブラリ"),
@@ -8401,6 +10611,7 @@ private:
                     "ライブラリファイルを更新できませんでした"));
             return;
         }
+        setEditorBaseline();
         updateStatus(
             save_as
                 ? juce::String::fromUTF8(
@@ -8418,6 +10629,22 @@ private:
         editor_baseline_valid_ = true;
     }
 
+    void requestRestoreEditorBaseline() {
+        if (!hasUnsavedChanges()) {
+            restoreEditorBaseline();
+            return;
+        }
+        juce::Component::SafePointer<SccEditorComponent> safe(this);
+        showDiscardConfirmation(
+            this,
+            juce::String::fromUTF8("編集内容の取消"),
+            [safe] {
+                if (safe != nullptr) {
+                    safe->restoreEditorBaseline();
+                }
+            });
+    }
+
     void restoreEditorBaseline() {
         if (!editor_baseline_valid_) {
             return;
@@ -8425,8 +10652,8 @@ private:
         selected_library_id_ = editor_baseline_id_;
         name_.setText(
             juce::String::fromUTF8(editor_baseline_.name.c_str()), false);
-        tags_.setText(
-            juce::String::fromUTF8(editor_baseline_.tags.c_str()), false);
+        selected_tags_ = editor_baseline_.tags;
+        updateTagButtons();
         memo_.setText(
             juce::String::fromUTF8(editor_baseline_.memo.c_str()), false);
         favorite_.setToggleState(
@@ -8445,6 +10672,93 @@ private:
             juce::String::fromUTF8("編集開始時点の音色へ戻しました"));
     }
 
+    void duplicateSelectedLibraryEntry() {
+        if (!selected_library_id_) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "複製する音色を一覧から選択してください"));
+            return;
+        }
+        juce::InterProcessLock::ScopedLockType lock(library_lock_);
+        if (!lock.isLocked() || !reloadLibraryFromDisk()) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "共有ライブラリを読み直せませんでした"));
+            return;
+        }
+        const auto* source = library_.find(*selected_library_id_);
+        if (!source) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "選択した音色は削除されています"));
+            return;
+        }
+        auto copy = *source;
+        copy.name = library_.uniqueName(copy.category, copy.name);
+        selected_library_id_ = library_.add(copy, unixTimeNow());
+        if (!persistLibrary()) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                juce::String::fromUTF8("複製を保存できませんでした"));
+            return;
+        }
+        refreshLibraryList();
+        selectLibraryEntryFromList();
+        setEditorBaseline();
+        updateStatus(juce::String::fromUTF8("音色を複製しました"));
+    }
+
+    void renameSelectedLibraryEntry() {
+        if (!selected_library_id_) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "名前を変更する音色を選択してください"));
+            return;
+        }
+        const auto requested = utf8Text(name_.getText().trim());
+        if (requested.empty()) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                juce::String::fromUTF8("新しい名前を入力してください"));
+            return;
+        }
+        juce::InterProcessLock::ScopedLockType lock(library_lock_);
+        if (!lock.isLocked() || !reloadLibraryFromDisk()) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "共有ライブラリを読み直せませんでした"));
+            return;
+        }
+        const auto* source = library_.find(*selected_library_id_);
+        if (!source) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "選択した音色は削除されています"));
+            return;
+        }
+        auto renamed = *source;
+        renamed.name = requested;
+        if (!library_.update(
+                *selected_library_id_, renamed, unixTimeNow())
+            || !persistLibrary()) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "名前の変更を保存できませんでした"));
+            return;
+        }
+        refreshLibraryList();
+        selectLibraryEntryFromList();
+        setEditorBaseline();
+        updateStatus(juce::String::fromUTF8("音色名を変更しました"));
+    }
+
     void deleteSelectedLibraryEntry() {
         const auto* entry = selectedLibraryEntry();
         if (!entry) {
@@ -8455,6 +10769,19 @@ private:
             return;
         }
         const auto id = entry->id;
+        const auto impact = inspectCompositeTimbreImpact(id);
+        if (!impact.readable || !impact.uses.empty()) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                !impact.readable
+                    ? juce::String::fromUTF8(
+                          "総合音色ライブラリを確認できないため、"
+                          "安全に削除できません")
+                    : juce::String::fromUTF8(
+                          "総合音色から参照中のため削除できません。\n\n")
+                        + describeCompositeTimbreImpact(impact));
+            return;
+        }
         const auto name =
             juce::String::fromUTF8(entry->name.c_str());
         juce::Component::SafePointer<SccEditorComponent> safe(this);
@@ -8491,7 +10818,8 @@ private:
                 }
                 safe->selected_library_id_.reset();
                 safe->name_.clear();
-                safe->tags_.clear();
+                safe->selected_tags_.clear();
+                safe->updateTagButtons();
                 safe->memo_.clear();
                 safe->favorite_.setToggleState(
                     false, juce::dontSendNotification);
@@ -8767,9 +11095,7 @@ private:
         ab_audition_.setButtonText(
             !preview_active_
                 ? "A/B"
-                : (ab_next_plays_b_
-                       ? juce::String::fromUTF8("▶B")
-                       : juce::String::fromUTF8("▶A")));
+                : abNextSideButtonText(!ab_next_plays_b_));
         ab_audition_.setTooltip(tip);
         ab_audition_.setTitle(tip);
         ab_audition_.setDescription(tip);
@@ -8920,9 +11246,11 @@ private:
             }
         } else if (
             engine_holds_temporary_program_
+            && !keep_temporary_program_on_note_on_
             && !configureEngine(false)) {
             // 一時試聴（1秒／A/B）が残っていると鍵盤が未確定音色を
             // 鳴らすため、プレビュー中以外は確定へ戻す。
+            // 波形ドラッグ中の張り直しでは一時波形を維持する。
             updateStatus(
                 juce::String::fromUTF8(
                     "鍵盤演奏を開始できませんでした"));
@@ -9045,6 +11373,7 @@ private:
     }
 
     EditorOpenCallback open_editor_;
+    TagManagementCallback manage_tags_;
     SharedAudioService& audio_service_;
     mgstc::engine::RealtimeEngineHost& engine_;
     juce::TooltipWindow tooltip_window_;
@@ -9124,8 +11453,13 @@ private:
     juce::Label library_title_;
     juce::ComboBox library_list_;
     juce::TextEditor library_filter_;
+    juce::TextButton library_tag_filter_;
+    juce::TextButton tag_manage_;
+    juce::ToggleButton favorite_only_;
+    juce::TextButton library_ab_;
+    juce::ComboBox library_sort_;
     juce::TextEditor name_;
-    juce::TextEditor tags_;
+    juce::TextButton tags_;
     juce::TextEditor memo_;
     juce::ToggleButton favorite_;
     juce::TextButton library_new_;
@@ -9133,6 +11467,8 @@ private:
     juce::TextButton library_save_;
     juce::TextButton library_save_as_;
     juce::TextButton library_cancel_;
+    juce::TextButton library_duplicate_;
+    juce::TextButton library_rename_;
     juce::TextButton library_delete_;
     juce::TextButton library_import_;
     juce::TextButton library_export_;
@@ -9153,6 +11489,11 @@ private:
     mgstc::engine::TimbreLibrary library_;
     std::vector<std::uint64_t> library_ids_;
     std::optional<std::uint64_t> selected_library_id_;
+    std::optional<mgstc::engine::TimbreLibraryEntry>
+        library_preview_;
+    bool library_ab_next_b_{true};
+    std::vector<std::string> selected_tags_;
+    std::vector<std::string> selected_filter_tags_;
     mgstc::engine::TimbreLibraryEntry editor_baseline_;
     std::optional<std::uint64_t> editor_baseline_id_;
     juce::InterProcessLock library_lock_{
@@ -9164,6 +11505,7 @@ private:
     bool scale_previewing_{};
     bool engine_ready_{};
     bool engine_holds_temporary_program_{};
+    bool keep_temporary_program_on_note_on_{};
     std::uint8_t last_audition_note_{kPreviewNote};
     int settings_poll_ticks_{};
     std::uint64_t master_volume_revision_{};
@@ -10099,8 +12441,10 @@ public:
     explicit OpllEditorComponent(
         SharedAudioService& audio_service,
         SharedMidiInputService& midi_service,
-        EditorOpenCallback open_editor)
+        EditorOpenCallback open_editor,
+        TagManagementCallback manage_tags)
         : open_editor_(std::move(open_editor)),
+          manage_tags_(std::move(manage_tags)),
           audio_service_(audio_service),
           engine_(audio_service.engine()),
           tooltip_window_(this, 450),
@@ -10335,7 +12679,9 @@ public:
         open_scc_.setTooltip(
             juce::String::fromUTF8(
                 "SCC音色エディタを別ウィンドウで開きます"));
-        open_scc_.onClick = [this] { open_editor_("scc"); };
+        open_scc_.onClick = [this] {
+            open_editor_("scc", std::nullopt);
+        };
         addAndMakeVisible(open_scc_);
         configureIconButton(
             convert_to_scc_, EditorIcon::Convert,
@@ -10375,6 +12721,7 @@ public:
         addAndMakeVisible(mgsc_title_);
         mgsc_preview_.setMultiLine(true);
         mgsc_preview_.setReadOnly(true);
+        mgsc_preview_.setWantsKeyboardFocus(false);
         mgsc_preview_.setFont(
             juce::FontOptions(12.0F, juce::Font::plain));
         addAndMakeVisible(mgsc_preview_);
@@ -10393,6 +12740,45 @@ public:
         library_filter_.onTextChange =
             [this] { refreshLibraryList(); };
         addAndMakeVisible(library_filter_);
+        library_tag_filter_.setButtonText(
+            juce::String::fromUTF8("タグで絞り込み"));
+        library_tag_filter_.setTooltip(
+            juce::String::fromUTF8(
+                "保存済み音色で使われているタグを複数選択します"));
+        library_tag_filter_.onClick = [this] {
+            showLibraryTagFilter();
+        };
+        addAndMakeVisible(library_tag_filter_);
+        tag_manage_.setButtonText(
+            juce::String::fromUTF8("タグ管理"));
+        tag_manage_.onClick = [this] {
+            if (manage_tags_) {
+                manage_tags_(this);
+            }
+        };
+        addAndMakeVisible(tag_manage_);
+        favorite_only_.setButtonText(
+            juce::String::fromUTF8("★のみ"));
+        favorite_only_.onClick = [this] { refreshLibraryList(); };
+        addAndMakeVisible(favorite_only_);
+        library_ab_.setButtonText("A/B");
+        library_ab_.setTooltip(
+            juce::String::fromUTF8(
+                "編集中(A)と選択した保存音色(B)を交互に試聴します"));
+        library_ab_.setEnabled(false);
+        library_ab_.onClick = [this] { auditionLibraryAb(); };
+        addAndMakeVisible(library_ab_);
+        library_sort_.addItem(
+            juce::String::fromUTF8("お気に入り優先"), 1);
+        library_sort_.addItem(
+            juce::String::fromUTF8("最近使った順"), 2);
+        library_sort_.addItem(
+            juce::String::fromUTF8("更新日時順"), 3);
+        library_sort_.addItem(
+            juce::String::fromUTF8("名前順"), 4);
+        library_sort_.setSelectedId(1, juce::dontSendNotification);
+        library_sort_.onChange = [this] { refreshLibraryList(); };
+        addAndMakeVisible(library_sort_);
         library_list_.setTextWhenNothingSelected(
             juce::String::fromUTF8("保存済み音色を選択"));
         library_list_.setTooltip(
@@ -10403,9 +12789,12 @@ public:
         name_.setTextToShowWhenEmpty(
             juce::String::fromUTF8("音色名"),
             juce::Colour(0xFF7F8993));
-        tags_.setTextToShowWhenEmpty(
-            juce::String::fromUTF8("タグ"),
-            juce::Colour(0xFF7F8993));
+        name_.onTextChange = [this] { updateDefinitionPreview(); };
+        tags_.setButtonText(juce::String::fromUTF8("タグを選択"));
+        tags_.setTooltip(
+            juce::String::fromUTF8(
+                "標準タグを複数選択、または独自タグを追加します"));
+        tags_.onClick = [this] { showTagEditor(); };
         memo_.setTextToShowWhenEmpty(
             juce::String::fromUTF8("メモ"),
             juce::Colour(0xFF7F8993));
@@ -10438,7 +12827,17 @@ public:
         configureButton(
             library_cancel_, juce::String::fromUTF8("取消"),
             juce::String::fromUTF8("編集開始時点へ戻します"),
-            [this] { restoreEditorBaseline(); });
+            [this] { requestRestoreEditorBaseline(); });
+        configureButton(
+            library_duplicate_, juce::String::fromUTF8("複製"),
+            juce::String::fromUTF8(
+                "選択音色を新しいIDと名前で複製します"),
+            [this] { duplicateSelectedLibraryEntry(); });
+        configureButton(
+            library_rename_, juce::String::fromUTF8("名前変更"),
+            juce::String::fromUTF8(
+                "名前欄の内容へ選択音色の名前だけを変更します"),
+            [this] { renameSelectedLibraryEntry(); });
         configureButton(
             library_delete_, juce::String::fromUTF8("削除"),
             juce::String::fromUTF8("選択音色を削除します"),
@@ -10508,6 +12907,57 @@ public:
         }
     }
 
+    void applyTagRewrite(
+        std::string_view source,
+        std::string_view replacement) {
+        if (editor_baseline_valid_) {
+            static_cast<void>(mgstc::engine::rewriteTimbreTag(
+                editor_baseline_.tags, source, replacement));
+        }
+        const bool editing_changed =
+            mgstc::engine::rewriteTimbreTag(
+                selected_tags_, source, replacement);
+        static_cast<void>(mgstc::engine::rewriteTimbreTag(
+            selected_filter_tags_, source, replacement));
+        if (library_preview_) {
+            static_cast<void>(mgstc::engine::rewriteTimbreTag(
+                library_preview_->tags, source, replacement));
+        }
+        loadLibrary();
+        updateTagButtons();
+        refreshLibraryList();
+        if (editing_changed && hasUnsavedChanges()) {
+            updateStatus(
+                juce::String::fromUTF8(
+                    "独自タグの変更を編集中のOPLL音色へ反映しました"
+                    "（未保存）"));
+        }
+    }
+
+    void requestLibraryEntry(std::uint64_t id) {
+        {
+            juce::InterProcessLock::ScopedLockType lock(library_lock_);
+            if (!lock.isLocked() || !reloadLibraryFromDisk()
+                || !library_.find(id)) {
+                showError(
+                    juce::String::fromUTF8("OPLL音色ライブラリ"),
+                    juce::String::fromUTF8(
+                        "割当音色を読み込めませんでした"));
+                return;
+            }
+        }
+        selected_library_id_ = id;
+        refreshLibraryList();
+        loadSelectedLibraryEntry();
+    }
+
+    [[nodiscard]] bool hasUnsavedChanges() const {
+        return editor_baseline_valid_
+            && (selected_library_id_ != editor_baseline_id_
+                || !sameEditableTimbreLibraryEntry(
+                    captureLibraryEntry(), editor_baseline_));
+    }
+
     void deactivate() {
         performance_keyboard_.allNotesOff();
         silenceAllVoices();
@@ -10532,6 +12982,9 @@ public:
         auto keyboard_area = area.removeFromBottom(keyboardH);
         area.removeFromBottom(keyboardGap);
         performance_keyboard_.setBounds(keyboard_area);
+        auto library_area = area.removeFromRight(libraryWidth);
+        area.removeFromRight(panelGap);
+        library_panel_bounds_ = library_area;
         auto toolbar = area.removeFromTop(toolbarH);
         for (auto* button :
              std::array<juce::DrawableButton*, 6>{
@@ -10569,9 +13022,6 @@ public:
             preset_row.removeFromLeft(150));
         area.removeFromTop(md);
 
-        auto right = area.removeFromRight(libraryWidth);
-        area.removeFromRight(panelGap);
-        library_panel_bounds_ = right;
         common_parameter_bounds_ = area.removeFromTop(62);
         auto common_parameters = common_parameter_bounds_.reduced(panelPad, xs + 1);
         common_parameters_title_.setBounds(
@@ -10600,10 +13050,15 @@ public:
         status_.setBounds(area.removeFromTop(statusH));
 
         layoutTimbreLibraryPanel(
-            right,
+            library_area,
             TimbreLibraryWidgets{
                 library_title_,
                 library_filter_,
+                library_tag_filter_,
+                tag_manage_,
+                favorite_only_,
+                library_ab_,
+                library_sort_,
                 library_list_,
                 name_,
                 tags_,
@@ -10614,6 +13069,8 @@ public:
                 library_save_,
                 library_save_as_,
                 library_cancel_,
+                library_duplicate_,
+                library_rename_,
                 library_delete_,
                 library_import_,
                 library_export_,
@@ -10796,7 +13253,9 @@ private:
         }
         const auto text =
             mgstc::engine::formatMgsOpllDefinition(
-                patch_, *number);
+                patch_,
+                *number,
+                utf8Text(name_.getText().trim()));
         return juce::String::fromUTF8(
             text.data(),
             static_cast<int>(text.size()));
@@ -10947,7 +13406,7 @@ private:
         const auto waveform =
             mgstc::engine::waveCycleToScc(analysis.cycle);
         const auto definition =
-            mgstc::engine::formatMgsSccDefinition(waveform, 0);
+            mgstc::engine::formatMgsSccDefinition(waveform, 0, {});
         const auto file = pendingConversionFile("scc");
         if (!file.getParentDirectory().createDirectory()
             || !file.replaceWithText(
@@ -10956,7 +13415,7 @@ private:
                 "SCC変換データを保存できませんでした"));
             return;
         }
-        open_editor_("scc");
+        open_editor_("scc", std::nullopt);
         updateStatus(juce::String::fromUTF8(
             "SCC近似波形を生成し、SCCエディタへ送りました"));
     }
@@ -10985,65 +13444,91 @@ private:
     bool importWaveBytes(
         const std::vector<std::uint8_t>& bytes,
         const juce::String& source_name) {
-        mgstc::engine::WavePcm pcm;
-        std::string error;
-        if (!mgstc::engine::parseWavePcm(
-                std::span<const std::uint8_t>(bytes),
-                pcm,
-                &error)) {
-            showError(
-                source_name,
-                juce::String::fromUTF8(
-                    "WAVを読み込めませんでした。"
-                    "PCM 8/16/24/32bitまたは32bit floatの"
-                    "WAVEを使用してください"));
-            return false;
-        }
-        const auto analysis =
-            mgstc::engine::analyzeWaveCycle(pcm);
-        if (analysis.cycle.size() < 2) {
-            showError(
-                source_name,
-                juce::String::fromUTF8(
-                    "波形の1周期を抽出できませんでした"));
-            return false;
-        }
-        const auto frequency_hz = analysis.estimated_frequency_hz;
         juce::Component::SafePointer<OpllEditorComponent> safe(this);
-        runWithConversionBusyDialog(
+        showOpllConversionQualityDialog(
             this,
-            [pcm] {
-                return mgstc::engine::
-                    approximateWavePcmCandidatesWithOpll(pcm);
-            },
-            [safe, source_name, frequency_hz](
-                std::vector<mgstc::engine::OpllPatchParameters>
-                    candidates) {
+            [safe, bytes, source_name](
+                OpllConversionQuality quality) {
                 if (safe == nullptr) {
                     return;
                 }
-                if (candidates.empty()) {
+                mgstc::engine::WavePcm pcm;
+                std::string error;
+                if (!mgstc::engine::parseWavePcm(
+                        std::span<const std::uint8_t>(bytes),
+                        pcm,
+                        &error)) {
                     safe->showError(
                         source_name,
                         juce::String::fromUTF8(
-                            "OPLL近似音色を生成できませんでした"));
+                            "WAVを読み込めませんでした。"
+                            "PCM 8/16/24/32bitまたは32bit floatの"
+                            "WAVEを使用してください"));
                     return;
                 }
-                safe->wave_candidates_ = std::move(candidates);
-                safe->wave_candidate_index_ = 0;
-                safe->commitPatch(
-                    safe->wave_candidates_.front(), false);
-                safe->updateWaveCandidateControls();
-                safe->updateStatus(
-                    source_name
-                    + juce::String::fromUTF8(
-                        "完了: OPLL近似候補 ")
-                    + juce::String(
-                        static_cast<int>(
-                            safe->wave_candidates_.size()))
-                    + juce::String::fromUTF8("件／約 ")
-                    + juce::String(frequency_hz, 1)
-                    + " Hz");
+                const auto analysis =
+                    mgstc::engine::analyzeWaveCycle(pcm);
+                if (analysis.cycle.size() < 2) {
+                    safe->showError(
+                        source_name,
+                        juce::String::fromUTF8(
+                            "波形の1周期を抽出できませんでした"));
+                    return;
+                }
+                const auto frequency_hz =
+                    analysis.estimated_frequency_hz;
+                runWithConversionBusyDialog(
+                    safe.getComponent(),
+                    [pcm = std::move(pcm), quality](
+                        ConversionProgressState& progress) {
+                        return mgstc::engine::
+                            approximateWavePcmWithOpllResult(
+                                pcm,
+                                makeOpllApproximationOptions(
+                                    quality, progress));
+                    },
+                    [safe, source_name, frequency_hz](
+                        mgstc::engine::OpllApproximationResult result,
+                        bool cancellation_requested) {
+                        if (safe == nullptr) {
+                            return;
+                        }
+                        if (cancellation_requested
+                            || result.completion
+                                == mgstc::engine::
+                                    OpllApproximationCompletion::
+                                        Cancelled) {
+                            safe->updateStatus(
+                                source_name
+                                + juce::String::fromUTF8(
+                                    "をキャンセルしました"));
+                            return;
+                        }
+                        if (result.candidates.empty()) {
+                            safe->showError(
+                                source_name,
+                                juce::String::fromUTF8(
+                                    "OPLL近似音色を"
+                                    "生成できませんでした"));
+                            return;
+                        }
+                        safe->wave_candidates_ =
+                            std::move(result.candidates);
+                        safe->wave_candidate_index_ = 0;
+                        safe->commitPatch(
+                            safe->wave_candidates_.front(), false);
+                        safe->updateWaveCandidateControls();
+                        safe->updateStatus(
+                            source_name
+                            + juce::String::fromUTF8(
+                                "完了: OPLL近似候補 ")
+                            + juce::String(
+                                static_cast<int>(
+                                    safe->wave_candidates_.size()))
+                            + juce::String::fromUTF8("件／約 ")
+                            + juce::String(frequency_hz, 1)
+                            + " Hz");
+                    });
             });
         return true;
     }
@@ -11218,6 +13703,53 @@ private:
         return temporary.overwriteTargetFileWithTemporary();
     }
 
+    void updateTagButtons() {
+        tags_.setButtonText(tagSelectionSummary(
+            selected_tags_, juce::String::fromUTF8("タグを選択")));
+        library_tag_filter_.setButtonText(tagSelectionSummary(
+            selected_filter_tags_,
+            juce::String::fromUTF8("タグで絞り込み")));
+    }
+
+    void showTagEditor() {
+        juce::Component::SafePointer<OpllEditorComponent> safe(this);
+        showTagSelectionDialog(
+            this,
+            juce::String::fromUTF8("OPLL音色のタグ"),
+            presetTagChoices(selected_tags_),
+            selected_tags_,
+            true,
+            [safe](std::vector<std::string> selected) {
+                if (safe != nullptr) {
+                    safe->selected_tags_ = std::move(selected);
+                    safe->updateTagButtons();
+                }
+            });
+    }
+
+    void showLibraryTagFilter() {
+        std::vector<std::vector<std::string>> tag_sets;
+        for (const auto& entry : library_.entries()) {
+            if (entry.category == mgstc::engine::TimbreCategory::Opll) {
+                tag_sets.push_back(entry.tags);
+            }
+        }
+        juce::Component::SafePointer<OpllEditorComponent> safe(this);
+        showTagSelectionDialog(
+            this,
+            juce::String::fromUTF8("OPLLライブラリのタグ検索"),
+            usageTagChoices(tag_sets),
+            selected_filter_tags_,
+            false,
+            [safe](std::vector<std::string> selected) {
+                if (safe != nullptr) {
+                    safe->selected_filter_tags_ = std::move(selected);
+                    safe->updateTagButtons();
+                    safe->refreshLibraryList();
+                }
+            });
+    }
+
     void refreshLibraryList() {
         library_list_.clear(juce::dontSendNotification);
         library_ids_.clear();
@@ -11225,18 +13757,51 @@ private:
             library_filter_.getText().trim();
         int item_id = 1;
         int selected_item = 0;
+        std::vector<const mgstc::engine::TimbreLibraryEntry*> ordered;
         for (const auto& entry : library_.entries()) {
-            if (entry.category
-                != mgstc::engine::TimbreCategory::Opll) {
+            if (entry.category == mgstc::engine::TimbreCategory::Opll
+                && (!favorite_only_.getToggleState()
+                    || entry.favorite)) {
+                ordered.push_back(&entry);
+            }
+        }
+        const int sort_mode = library_sort_.getSelectedId();
+        std::stable_sort(
+            ordered.begin(), ordered.end(),
+            [sort_mode](const auto* left, const auto* right) {
+                if (left->favorite != right->favorite) {
+                    return left->favorite;
+                }
+                if (sort_mode == 2
+                    && left->last_used_unix_seconds
+                        != right->last_used_unix_seconds) {
+                    return left->last_used_unix_seconds
+                        > right->last_used_unix_seconds;
+                }
+                if (sort_mode == 3
+                    && left->updated_unix_seconds
+                        != right->updated_unix_seconds) {
+                    return left->updated_unix_seconds
+                        > right->updated_unix_seconds;
+                }
+                if (sort_mode == 4) {
+                    return left->name < right->name;
+                }
+                return false;
+            });
+        for (const auto* entry_ptr : ordered) {
+            if (!entry_ptr) {
                 continue;
             }
+            const auto& entry = *entry_ptr;
             if (filter.isNotEmpty()) {
                 const auto name =
                     juce::String::fromUTF8(
                         entry.name.c_str());
                 const auto tags =
                     juce::String::fromUTF8(
-                        entry.tags.c_str());
+                        mgstc::engine::serializeTimbreTags(
+                            entry.tags).c_str());
                 const auto memo =
                     juce::String::fromUTF8(
                         entry.memo.c_str());
@@ -11245,6 +13810,10 @@ private:
                     && !memo.containsIgnoreCase(filter)) {
                     continue;
                 }
+            }
+            if (!mgstc::engine::containsAllTimbreTags(
+                    entry.tags, selected_filter_tags_)) {
+                continue;
             }
             library_ids_.push_back(entry.id);
             auto label =
@@ -11264,9 +13833,6 @@ private:
         }
         library_list_.setSelectedId(
             selected_item, juce::dontSendNotification);
-        if (selected_item == 0) {
-            selected_library_id_.reset();
-        }
     }
 
     [[nodiscard]] const
@@ -11297,17 +13863,46 @@ private:
         name_.setText(
             juce::String::fromUTF8(entry->name.c_str()),
             false);
-        tags_.setText(
-            juce::String::fromUTF8(entry->tags.c_str()),
-            false);
+        updateDefinitionPreview();
+        selected_tags_ = entry->tags;
+        updateTagButtons();
         memo_.setText(
             juce::String::fromUTF8(entry->memo.c_str()),
             false);
         favorite_.setToggleState(
             entry->favorite, juce::dontSendNotification);
+        library_preview_ = *entry;
+        library_ab_.setEnabled(true);
+        library_ab_next_b_ = false;
+        const auto preview =
+            mgstc::engine::decodeOpllPatch(entry->opll_registers);
+        static_cast<void>(auditionOneSecond(&preview));
+        static_cast<void>(
+            library_.touch(entry->id, unixTimeNow()));
+        static_cast<void>(persistLibrary());
         updateStatus(
             juce::String::fromUTF8(
                 "音色を選択しました。「読込」で編集値へ反映します"));
+    }
+
+    void auditionLibraryAb() {
+        if (!library_preview_) {
+            return;
+        }
+        const bool play_b = library_ab_next_b_;
+        library_ab_next_b_ = !library_ab_next_b_;
+        if (play_b) {
+            const auto preview = mgstc::engine::decodeOpllPatch(
+                library_preview_->opll_registers);
+            static_cast<void>(auditionOneSecond(&preview));
+        } else {
+            static_cast<void>(auditionOneSecond());
+        }
+        library_ab_.setButtonText(abNextSideButtonText(play_b));
+        updateStatus(
+            play_b
+                ? juce::String::fromUTF8("B 保存音色を試聴中")
+                : juce::String::fromUTF8("A 編集中音色を試聴中"));
     }
 
     [[nodiscard]] mgstc::engine::TimbreLibraryEntry
@@ -11316,7 +13911,7 @@ private:
         entry.category =
             mgstc::engine::TimbreCategory::Opll;
         entry.name = utf8Text(name_.getText().trim());
-        entry.tags = utf8Text(tags_.getText().trim());
+        entry.tags = selected_tags_;
         entry.memo = utf8Text(memo_.getText());
         entry.favorite = favorite_.getToggleState();
         entry.opll_registers =
@@ -11325,11 +13920,28 @@ private:
     }
 
     void newLibraryEntry() {
+        if (hasUnsavedChanges()) {
+            juce::Component::SafePointer<OpllEditorComponent> safe(this);
+            showDiscardConfirmation(
+                this,
+                juce::String::fromUTF8("新規作成"),
+                [safe] {
+                    if (safe != nullptr) {
+                        safe->performNewLibraryEntry();
+                    }
+                });
+            return;
+        }
+        performNewLibraryEntry();
+    }
+
+    void performNewLibraryEntry() {
         selected_library_id_.reset();
         library_list_.setSelectedId(
             0, juce::dontSendNotification);
         name_.clear();
-        tags_.clear();
+        selected_tags_.clear();
+        updateTagButtons();
         memo_.clear();
         favorite_.setToggleState(
             false, juce::dontSendNotification);
@@ -11348,6 +13960,25 @@ private:
                     "OPLL音色ライブラリ"),
                 juce::String::fromUTF8(
                     "読み込む音色を選択してください"));
+            return;
+        }
+        if (hasUnsavedChanges()) {
+            juce::Component::SafePointer<OpllEditorComponent> safe(this);
+            showDiscardConfirmation(
+                this,
+                juce::String::fromUTF8("選択音色の読込"),
+                [safe] {
+                    if (safe != nullptr) {
+                        safe->performLoadSelectedLibraryEntry();
+                    }
+                });
+            return;
+        }
+        performLoadSelectedLibraryEntry();
+    }
+
+    void performLoadSelectedLibraryEntry() {
+        if (!selected_library_id_) {
             return;
         }
         const auto id = *selected_library_id_;
@@ -11375,6 +14006,9 @@ private:
         commitPatch(
             mgstc::engine::decodeOpllPatch(
                 entry->opll_registers));
+        static_cast<void>(
+            library_.touch(id, unixTimeNow()));
+        static_cast<void>(persistLibrary());
         refreshLibraryList();
         setEditorBaseline();
         updateStatus(
@@ -11535,6 +14169,22 @@ private:
         editor_baseline_valid_ = true;
     }
 
+    void requestRestoreEditorBaseline() {
+        if (!hasUnsavedChanges()) {
+            restoreEditorBaseline();
+            return;
+        }
+        juce::Component::SafePointer<OpllEditorComponent> safe(this);
+        showDiscardConfirmation(
+            this,
+            juce::String::fromUTF8("編集内容の取消"),
+            [safe] {
+                if (safe != nullptr) {
+                    safe->restoreEditorBaseline();
+                }
+            });
+    }
+
     void restoreEditorBaseline() {
         if (!editor_baseline_valid_) {
             return;
@@ -11544,10 +14194,8 @@ private:
             juce::String::fromUTF8(
                 editor_baseline_.name.c_str()),
             false);
-        tags_.setText(
-            juce::String::fromUTF8(
-                editor_baseline_.tags.c_str()),
-            false);
+        selected_tags_ = editor_baseline_.tags;
+        updateTagButtons();
         memo_.setText(
             juce::String::fromUTF8(
                 editor_baseline_.memo.c_str()),
@@ -11564,6 +14212,93 @@ private:
                 "編集開始時点の音色へ戻しました"));
     }
 
+    void duplicateSelectedLibraryEntry() {
+        if (!selected_library_id_) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "複製する音色を一覧から選択してください"));
+            return;
+        }
+        juce::InterProcessLock::ScopedLockType lock(library_lock_);
+        if (!lock.isLocked() || !reloadLibraryFromDisk()) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "共有ライブラリを読み直せませんでした"));
+            return;
+        }
+        const auto* source = library_.find(*selected_library_id_);
+        if (!source) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "選択した音色は削除されています"));
+            return;
+        }
+        auto copy = *source;
+        copy.name = library_.uniqueName(copy.category, copy.name);
+        selected_library_id_ = library_.add(copy, unixTimeNow());
+        if (!persistLibrary()) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                juce::String::fromUTF8("複製を保存できませんでした"));
+            return;
+        }
+        refreshLibraryList();
+        selectLibraryEntryFromList();
+        setEditorBaseline();
+        updateStatus(juce::String::fromUTF8("音色を複製しました"));
+    }
+
+    void renameSelectedLibraryEntry() {
+        if (!selected_library_id_) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "名前を変更する音色を選択してください"));
+            return;
+        }
+        const auto requested = utf8Text(name_.getText().trim());
+        if (requested.empty()) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                juce::String::fromUTF8("新しい名前を入力してください"));
+            return;
+        }
+        juce::InterProcessLock::ScopedLockType lock(library_lock_);
+        if (!lock.isLocked() || !reloadLibraryFromDisk()) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "共有ライブラリを読み直せませんでした"));
+            return;
+        }
+        const auto* source = library_.find(*selected_library_id_);
+        if (!source) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "選択した音色は削除されています"));
+            return;
+        }
+        auto renamed = *source;
+        renamed.name = requested;
+        if (!library_.update(
+                *selected_library_id_, renamed, unixTimeNow())
+            || !persistLibrary()) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                juce::String::fromUTF8(
+                    "名前の変更を保存できませんでした"));
+            return;
+        }
+        refreshLibraryList();
+        selectLibraryEntryFromList();
+        setEditorBaseline();
+        updateStatus(juce::String::fromUTF8("音色名を変更しました"));
+    }
+
     void deleteSelectedLibraryEntry() {
         const auto* entry = selectedLibraryEntry();
         if (!entry) {
@@ -11575,6 +14310,19 @@ private:
             return;
         }
         const auto id = entry->id;
+        const auto impact = inspectCompositeTimbreImpact(id);
+        if (!impact.readable || !impact.uses.empty()) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                !impact.readable
+                    ? juce::String::fromUTF8(
+                          "総合音色ライブラリを確認できないため、"
+                          "安全に削除できません")
+                    : juce::String::fromUTF8(
+                          "総合音色から参照中のため削除できません。\n\n")
+                        + describeCompositeTimbreImpact(impact));
+            return;
+        }
         const auto entry_name =
             juce::String::fromUTF8(entry->name.c_str());
         juce::Component::SafePointer<
@@ -11616,7 +14364,8 @@ private:
                 }
                 safe->selected_library_id_.reset();
                 safe->name_.clear();
-                safe->tags_.clear();
+                safe->selected_tags_.clear();
+                safe->updateTagButtons();
                 safe->memo_.clear();
                 safe->favorite_.setToggleState(
                     false, juce::dontSendNotification);
@@ -11949,7 +14698,9 @@ private:
         }
         const auto definition =
             mgstc::engine::formatMgsOpllDefinition(
-                patch_, *number);
+                patch_,
+                *number,
+                utf8Text(name_.getText().trim()));
         mgsc_preview_.setText(
             juce::String::fromUTF8(
                 definition.data(),
@@ -12103,6 +14854,7 @@ private:
     }
 
     EditorOpenCallback open_editor_;
+    TagManagementCallback manage_tags_;
     SharedAudioService& audio_service_;
     mgstc::engine::RealtimeEngineHost& engine_;
     juce::TooltipWindow tooltip_window_;
@@ -12158,9 +14910,14 @@ private:
     juce::TextEditor mgsc_preview_;
     juce::Label library_title_;
     juce::TextEditor library_filter_;
+    juce::TextButton library_tag_filter_;
+    juce::TextButton tag_manage_;
+    juce::ToggleButton favorite_only_;
+    juce::TextButton library_ab_;
+    juce::ComboBox library_sort_;
     juce::ComboBox library_list_;
     juce::TextEditor name_;
-    juce::TextEditor tags_;
+    juce::TextButton tags_;
     juce::TextEditor memo_;
     juce::ToggleButton favorite_;
     juce::TextButton library_new_;
@@ -12168,6 +14925,8 @@ private:
     juce::TextButton library_save_;
     juce::TextButton library_save_as_;
     juce::TextButton library_cancel_;
+    juce::TextButton library_duplicate_;
+    juce::TextButton library_rename_;
     juce::TextButton library_delete_;
     juce::TextButton library_import_;
     juce::TextButton library_export_;
@@ -12180,6 +14939,11 @@ private:
     mgstc::engine::TimbreLibrary library_;
     std::vector<std::uint64_t> library_ids_;
     std::optional<std::uint64_t> selected_library_id_;
+    std::optional<mgstc::engine::TimbreLibraryEntry>
+        library_preview_;
+    bool library_ab_next_b_{true};
+    std::vector<std::string> selected_tags_;
+    std::vector<std::string> selected_filter_tags_;
     mgstc::engine::TimbreLibraryEntry editor_baseline_;
     std::optional<std::uint64_t> editor_baseline_id_;
     juce::InterProcessLock library_lock_{
@@ -12213,6 +14977,7 @@ public:
         SharedAudioService& audio_service,
         SharedMidiInputService& midi_service,
         EditorOpenCallback open_editor,
+        TagManagementCallback manage_tags,
         EditorCloseCallback close_editor,
         EditorActivateCallback activate_editor)
         : DocumentWindow(
@@ -12229,15 +14994,18 @@ public:
         if (editor.equalsIgnoreCase("opll")) {
             setContentOwned(
                 new OpllEditorComponent(
-                    audio_service, midi_service, open_editor), true);
+                    audio_service, midi_service, open_editor,
+                    manage_tags), true);
         } else if (editor.equalsIgnoreCase("scc")) {
             setContentOwned(
                 new SccEditorComponent(
-                    audio_service, midi_service, open_editor), true);
+                    audio_service, midi_service, open_editor,
+                    manage_tags), true);
         } else {
             setContentOwned(
                 new CompositeEditorComponent(
-                    audio_service, midi_service, open_editor), true);
+                    audio_service, midi_service, open_editor,
+                    manage_tags), true);
         }
         setResizable(true, false);
         centreWithSize(getWidth(), getHeight());
@@ -12272,6 +15040,36 @@ public:
         }
     }
 
+    void requestLibraryEntry(std::uint64_t id) {
+        if (auto* opll =
+                dynamic_cast<OpllEditorComponent*>(
+                    getContentComponent())) {
+            opll->requestLibraryEntry(id);
+        } else if (auto* scc =
+                       dynamic_cast<SccEditorComponent*>(
+                           getContentComponent())) {
+            scc->requestLibraryEntry(id);
+        }
+    }
+
+    void applyTagRewrite(
+        std::string_view source,
+        std::string_view replacement) {
+        if (auto* opll =
+                dynamic_cast<OpllEditorComponent*>(
+                    getContentComponent())) {
+            opll->applyTagRewrite(source, replacement);
+        } else if (auto* scc =
+                       dynamic_cast<SccEditorComponent*>(
+                           getContentComponent())) {
+            scc->applyTagRewrite(source, replacement);
+        } else if (auto* composite =
+                       dynamic_cast<CompositeEditorComponent*>(
+                           getContentComponent())) {
+            composite->applyTagRewrite(source, replacement);
+        }
+    }
+
     void deactivate() {
         if (auto* opll =
                 dynamic_cast<OpllEditorComponent*>(
@@ -12286,6 +15084,33 @@ public:
                            getContentComponent())) {
             composite->deactivate();
         }
+    }
+
+    [[nodiscard]] bool hasUnsavedChanges() const {
+        const auto* content = getContentComponent();
+        if (const auto* opll =
+                dynamic_cast<const OpllEditorComponent*>(content)) {
+            return opll->hasUnsavedChanges();
+        }
+        if (const auto* scc =
+                dynamic_cast<const SccEditorComponent*>(content)) {
+            return scc->hasUnsavedChanges();
+        }
+        if (const auto* composite =
+                dynamic_cast<const CompositeEditorComponent*>(content)) {
+            return composite->hasUnsavedChanges();
+        }
+        return false;
+    }
+
+    [[nodiscard]] juce::String editorDisplayName() const {
+        if (editor_ == "opll") {
+            return juce::String::fromUTF8("OPLL音色エディタ");
+        }
+        if (editor_ == "scc") {
+            return juce::String::fromUTF8("SCC音色エディタ");
+        }
+        return juce::String::fromUTF8("総合画面");
     }
 
     [[nodiscard]] SnapshotResult writeContentSnapshot(
@@ -12419,6 +15244,10 @@ public:
         juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
     }
 
+    void systemRequestedQuit() override {
+        requestApplicationQuit();
+    }
+
 private:
     [[nodiscard]] static juce::String canonicalEditor(
         const juce::String& editor) {
@@ -12459,8 +15288,16 @@ private:
                 editor,
                 *audio_service_,
                 *midi_service_,
-                [this](const juce::String& target) {
-                    static_cast<void>(showEditor(target));
+                [this](
+                    const juce::String& target,
+                    std::optional<std::uint64_t> library_id) {
+                    auto* opened = showEditor(target);
+                    if (opened != nullptr && library_id) {
+                        opened->requestLibraryEntry(*library_id);
+                    }
+                },
+                [this](juce::Component* anchor) {
+                    showTagManagement(anchor);
                 },
                 [this](const juce::String& closed) {
                     closeEditor(closed);
@@ -12476,15 +15313,225 @@ private:
         return window.get();
     }
 
+    void showTagManagement(juce::Component* anchor) {
+        juce::InterProcessLock::ScopedLockType lock(
+            tag_management_lock_);
+        std::string error;
+        const auto timbres = loadTimbreLibrary(&error);
+        const auto composites = loadCompositeTimbreLibrary(&error);
+        if (!lock.isLocked() || !timbres || !composites) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("独自タグ管理"),
+                juce::String::fromUTF8(
+                    "共有ライブラリを読み込めませんでした"));
+            return;
+        }
+        std::vector<std::vector<std::string>> tag_sets;
+        tag_sets.reserve(
+            timbres->entries().size()
+            + composites->entries().size());
+        for (const auto& entry : timbres->entries()) {
+            tag_sets.push_back(entry.tags);
+        }
+        for (const auto& entry : composites->entries()) {
+            tag_sets.push_back(entry.timbre.tags);
+        }
+        std::vector<TagChoice> custom_tags;
+        for (auto usage :
+             mgstc::engine::collectTimbreTagUsage(tag_sets)) {
+            if (!mgstc::engine::isPresetTimbreTag(usage.name)) {
+                custom_tags.push_back(
+                    {std::move(usage.name), usage.count});
+            }
+        }
+        if (custom_tags.empty()) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::InfoIcon,
+                juce::String::fromUTF8("独自タグ管理"),
+                juce::String::fromUTF8(
+                    "管理対象の独自タグはありません"));
+            return;
+        }
+        showTagManagementDialog(
+            anchor,
+            std::move(custom_tags),
+            [this](std::string source, std::string replacement) {
+                applyGlobalTagRewrite(
+                    std::move(source), std::move(replacement));
+            });
+    }
+
+    void applyGlobalTagRewrite(
+        std::string source,
+        std::string replacement) {
+        juce::InterProcessLock::ScopedLockType lock(
+            tag_management_lock_);
+        std::string error;
+        auto timbres = loadTimbreLibrary(&error);
+        auto composites = loadCompositeTimbreLibrary(&error);
+        if (!lock.isLocked() || !timbres || !composites) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("独自タグ管理"),
+                juce::String::fromUTF8(
+                    "共有ライブラリを更新できませんでした"));
+            return;
+        }
+        const auto original_timbres = *timbres;
+        const auto original_composites = *composites;
+        const auto now = currentUnixTime();
+        const auto timbre_changes =
+            timbres->rewriteTag(source, replacement, now);
+        const auto composite_changes =
+            composites->rewriteTag(source, replacement, now);
+        if (timbre_changes == 0 && composite_changes == 0) {
+            return;
+        }
+
+        const bool timbres_saved =
+            timbre_changes == 0 || persistTimbreLibrary(*timbres);
+        const bool composites_saved = timbres_saved
+            && (composite_changes == 0
+                || persistCompositeTimbreLibrary(*composites));
+        if (!timbres_saved || !composites_saved) {
+            const bool rolled_back_timbres =
+                timbre_changes == 0
+                || persistTimbreLibrary(original_timbres);
+            const bool rolled_back_composites =
+                composite_changes == 0
+                || persistCompositeTimbreLibrary(
+                    original_composites);
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("独自タグ管理"),
+                rolled_back_timbres && rolled_back_composites
+                    ? juce::String::fromUTF8(
+                          "更新に失敗したため変更を取り消しました")
+                    : juce::String::fromUTF8(
+                          "更新とロールバックに失敗しました。"
+                          "ライブラリファイルを確認してください"));
+            return;
+        }
+
+        for (auto* window :
+             std::array<MainWindow*, 3>{
+                 main_window_.get(),
+                 scc_window_.get(),
+                 opll_window_.get()}) {
+            if (window != nullptr) {
+                window->applyTagRewrite(source, replacement);
+            }
+        }
+        auto completion_message =
+            juce::String::fromUTF8("更新した音色: ");
+        completion_message
+            << static_cast<int>(
+                   timbre_changes + composite_changes);
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::MessageBoxIconType::InfoIcon,
+            juce::String::fromUTF8("独自タグ管理"),
+            completion_message);
+    }
+
     void closeEditor(const juce::String& requested_editor) {
         const auto editor = canonicalEditor(requested_editor);
         if (editor == primary_editor_) {
+            requestApplicationQuit();
+            return;
+        }
+        auto& window = windowSlot(editor);
+        if (window == nullptr || !window->hasUnsavedChanges()) {
+            if (window != nullptr) {
+                window->setVisible(false);
+            }
+            return;
+        }
+        if (close_confirmation_pending_) {
+            return;
+        }
+        close_confirmation_pending_ = true;
+        const auto display_name = window->editorDisplayName();
+        showAlertWhenMouseReleased(
+            juce::MessageBoxOptions()
+                .withIconType(
+                    juce::MessageBoxIconType::WarningIcon)
+                .withTitle(
+                    juce::String::fromUTF8("未保存の変更"))
+                .withMessage(
+                    display_name
+                    + juce::String::fromUTF8(
+                        "に保存していない変更があります。\n"
+                        "保存せずに閉じますか？"))
+                .withButton(
+                    juce::String::fromUTF8("保存せず閉じる"))
+                .withButton(
+                    juce::String::fromUTF8("キャンセル"))
+                .withAssociatedComponent(window.get()),
+            [this, editor](int result) {
+                close_confirmation_pending_ = false;
+                if (result == 1) {
+                    if (auto& target = windowSlot(editor);
+                        target != nullptr) {
+                        target->setVisible(false);
+                    }
+                }
+            });
+    }
+
+    void requestApplicationQuit() {
+        if (close_confirmation_pending_) {
+            return;
+        }
+        juce::String unsaved_editors;
+        const auto append_if_dirty =
+            [&unsaved_editors](
+                const std::unique_ptr<MainWindow>& window) {
+                if (window == nullptr
+                    || !window->hasUnsavedChanges()) {
+                    return;
+                }
+                if (unsaved_editors.isNotEmpty()) {
+                    unsaved_editors += "\n";
+                }
+                unsaved_editors += juce::String::fromUTF8("・")
+                    + window->editorDisplayName();
+            };
+        append_if_dirty(main_window_);
+        append_if_dirty(scc_window_);
+        append_if_dirty(opll_window_);
+        if (unsaved_editors.isEmpty()) {
             quit();
             return;
         }
-        if (auto& window = windowSlot(editor); window != nullptr) {
-            window->setVisible(false);
-        }
+
+        close_confirmation_pending_ = true;
+        showAlertWhenMouseReleased(
+            juce::MessageBoxOptions()
+                .withIconType(
+                    juce::MessageBoxIconType::WarningIcon)
+                .withTitle(
+                    juce::String::fromUTF8("未保存の変更"))
+                .withMessage(
+                    juce::String::fromUTF8(
+                        "次の画面に保存していない変更があります。\n")
+                    + unsaved_editors
+                    + juce::String::fromUTF8(
+                        "\n\n保存せずにアプリを終了しますか？"))
+                .withButton(
+                    juce::String::fromUTF8("保存せず終了"))
+                .withButton(
+                    juce::String::fromUTF8("キャンセル"))
+                .withAssociatedComponent(
+                    main_window_ != nullptr
+                        ? main_window_.get()
+                        : snapshot_window_),
+            [this](int result) {
+                close_confirmation_pending_ = false;
+                if (result == 1) {
+                    quit();
+                }
+            });
     }
 
     void activateEditor(const juce::String& requested_editor) {
@@ -12539,6 +15586,9 @@ private:
     juce::String active_editor_{"main"};
     bool routing_test_mode_{};
     bool routing_test_passed_{};
+    bool close_confirmation_pending_{};
+    juce::InterProcessLock tag_management_lock_{
+        "MgsToneCraftTimbreLibraryV1"};
     juce::File snapshot_file_;
     MgstcLookAndFeel look_and_feel_;
 };

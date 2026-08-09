@@ -1,4 +1,5 @@
 #include "mgstc/engine/composite_timbre_library.hpp"
+#include "mgstc/engine/timbre_tags.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -11,7 +12,7 @@ namespace mgstc::engine {
 namespace {
 
 constexpr std::string_view kHeader{
-    "MGSTC_COMPOSITE_TIMBRE_LIBRARY\t1"};
+    "MGSTC_COMPOSITE_TIMBRE_LIBRARY\t3"};
 constexpr std::uint32_t kMaximumCollectionSize = 100000;
 constexpr std::uint32_t kMaximumStringSize = 1024 * 1024;
 
@@ -167,8 +168,12 @@ public:
     void timbre(const CompositeTimbre& value) {
         unsignedInteger(CompositeTimbre::kFormatVersion, 4);
         string(value.name);
-        string(value.tags);
+        unsignedInteger(value.tags.size(), 4);
+        for (const auto& tag : value.tags) {
+            string(tag);
+        }
         string(value.memo);
+        boolean(value.favorite);
         unsignedInteger(value.layers.size(), 4);
         for (const auto& layer : value.layers) {
             string(layer.name);
@@ -367,11 +372,25 @@ public:
     bool timbre(CompositeTimbre& value) {
         std::uint32_t layer_count{};
         if (!integer(format_version_, 4)
-            || format_version_ < 1
-            || format_version_ > CompositeTimbre::kFormatVersion
-            || !string(value.name)
-            || !string(value.tags)
-            || !string(value.memo)
+            || format_version_ != CompositeTimbre::kFormatVersion
+            || !string(value.name)) {
+            return false;
+        }
+        std::uint32_t tag_count{};
+        if (!integer(tag_count, 4)
+            || tag_count > kMaximumCollectionSize) {
+            return false;
+        }
+        value.tags.resize(tag_count);
+        for (auto& tag : value.tags) {
+            if (!string(tag)) {
+                return false;
+            }
+        }
+        value.tags = parseTimbreTags(
+            serializeTimbreTags(value.tags));
+        if (!string(value.memo)
+            || !boolean(value.favorite)
             || !integer(layer_count, 4)
             || layer_count > 1024) {
             return false;
@@ -527,6 +546,36 @@ bool CompositeTimbreLibrary::erase(std::uint64_t id) {
     return entries_.size() != old_size;
 }
 
+bool CompositeTimbreLibrary::touch(
+    std::uint64_t id,
+    std::int64_t now_unix_seconds) {
+    auto* entry = find(id);
+    if (!entry) {
+        return false;
+    }
+    entry->last_used_unix_seconds = now_unix_seconds;
+    if (entry->use_count
+        != std::numeric_limits<std::uint32_t>::max()) {
+        ++entry->use_count;
+    }
+    return true;
+}
+
+std::size_t CompositeTimbreLibrary::rewriteTag(
+    std::string_view source,
+    std::string_view replacement,
+    std::int64_t now_unix_seconds) {
+    std::size_t changed{};
+    for (auto& entry : entries_) {
+        if (rewriteTimbreTag(
+                entry.timbre.tags, source, replacement)) {
+            entry.updated_unix_seconds = now_unix_seconds;
+            ++changed;
+        }
+    }
+    return changed;
+}
+
 std::string CompositeTimbreLibrary::uniqueName(
     std::string_view requested_name) const {
     const std::string base = requested_name.empty()
@@ -596,6 +645,8 @@ std::string CompositeTimbreLibrary::serialize() const {
             << '\t' << entry.created_unix_seconds
             << '\t' << entry.updated_unix_seconds
             << '\t' << entry.revision
+            << '\t' << entry.last_used_unix_seconds
+            << '\t' << entry.use_count
             << '\t' << encodeTimbre(entry.timbre)
             << "\r\n";
     }
@@ -630,7 +681,7 @@ CompositeTimbreLibrary::deserialize(
         } else if (!line.empty()) {
             const auto fields = splitTabs(line);
             CompositeTimbreLibraryEntry entry;
-            if (fields.size() != 6 || fields[0] != "C"
+            if (fields.size() != 8 || fields[0] != "C"
                 || !parseInteger(fields[1], entry.id)
                 || entry.id == 0
                 || entry.id
@@ -641,13 +692,16 @@ CompositeTimbreLibrary::deserialize(
                     fields[3], entry.updated_unix_seconds)
                 || !parseInteger(fields[4], entry.revision)
                 || entry.revision == 0
+                || !parseInteger(
+                    fields[5], entry.last_used_unix_seconds)
+                || !parseInteger(fields[6], entry.use_count)
                 || library.find(entry.id)) {
                 setError(
                     error,
                     "invalid composite timbre library metadata");
                 return std::nullopt;
             }
-            auto timbre = decodeTimbre(fields[5]);
+            auto timbre = decodeTimbre(fields[7]);
             if (!timbre) {
                 setError(
                     error,

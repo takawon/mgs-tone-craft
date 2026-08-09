@@ -42,10 +42,21 @@ JUCEのWindowsリソース生成ツールは日本語を含む出力パスを処
 `%LOCALAPPDATA%\MgsToneCraft\cmake-build-<configuration>`へ自動配置する。
 完成した実行ファイルは従来どおりプロジェクト直下の`build`へ出力する。
 
+> **Debug／Releaseの上書き注意:** 両構成は中間Build treeが別でも、実行可能な
+> `build\mgstc.exe`を共有する。最後にビルドした構成がこのファイルを上書きするため、
+> Debug検証後にそのまま起動すると、Standard変換もDebug速度で動作する。Debugは
+> 診断用であり、利用者向けの変換速度評価には使わない。性能確認の最後は必ず
+> `.\tools\build.cmd -Configuration Release -SkipTests`（またはテストを含むRelease）
+> を実行し、ログがReleaseのBuild treeを示すことを確認してから`build\mgstc.exe`を
+> 起動する。
+
 通常のBuildでは現行UIを正式な`build\mgstc.exe`として生成する。従来の
 旧Win32 GUI版はソースを含めて削除済みであり、JUCE版だけをビルドする。JUCEは8.0.15の公式コミット
 `91ad83ae34a81e0833b1a2b0866f54846370ae53`へ固定し、初回構成時に
 公式GitHubリポジトリから取得する。
+ASIO対応もJUCE 8.0.15同梱のASIO SDKヘッダーを`JUCE_ASIO=1`で使用するため、
+別途ASIO SDKをダウンロードする必要はない。本体はAGPL-3.0-only、同梱ASIO SDKは
+GPLv3側の条件で使用し、配布ZIPにはSteinbergのASIO SDKライセンス全文を含める。
 
 ### 画面のPNG目視検査
 
@@ -86,6 +97,55 @@ Releaseビルド:
 .\tools\build.cmd -Configuration Release
 ```
 
+### OPLL変換探索ベンチマーク
+
+SCC→OPLL／WAV→OPLLの探索性能はDebugビルドではなくReleaseビルドで測定する。
+通常テストには壁時計による合否を含めず、明示的にベンチターゲットを有効化する。
+
+```powershell
+cmake -S . -B build-benchmark -G Ninja `
+    -DCMAKE_BUILD_TYPE=Release `
+    -DMGSTC_BUILD_TESTS=OFF `
+    -DMGSTC_BUILD_BENCHMARKS=ON
+cmake --build build-benchmark --target mgstc_wave_import_benchmark --parallel 8
+.\build\mgstc_wave_import_benchmark.exe `
+    --effort standard --workers 8 --runs 3 --case all
+```
+
+日本語を含むソースパスでJUCE関連ターゲットの構成を避けたい場合は、
+ASCIIだけのBuild treeを`-B`へ指定する。
+
+ベンチCLIは`--effort standard|thorough`、`--workers N`、`--runs N`、
+`--case scc|wav-short|wav-2s|all`を受け付ける。`thorough`の既定実行回数は1回。
+個別実行例:
+
+```powershell
+.\build\mgstc_wave_import_benchmark.exe `
+    --effort standard --workers 8 --runs 3 --case wav-2s
+.\build\mgstc_wave_import_benchmark.exe `
+    --effort thorough --workers 8 --runs 1 --case scc
+.\build\mgstc_wave_import_benchmark.exe `
+    --effort thorough --workers 8 --runs 1 --case wav-2s
+```
+
+評価件数は壁時計ではなく固定予算で制限する。StandardはSCC 5,000、WAVは
+代表周期5,000＋短尺2,100＋全長360。ThoroughはSCC 160,000、WAVは
+代表周期48,000＋短尺48,000＋全長6,000である。
+
+同一キー音高修正後の決定入力・8ワーカーでは、ReleaseのStandard中央値は
+SCC 2,330.7ms
+（hash `79b9901186d55905`）、WAV 0.25秒3,523.9ms
+（hash `46ffb00daaa554f5`）、WAV 2秒5,531.1ms
+（hash `2adf82269cb396a2`）。SCC→OPLLの候補評価音高が変わるため、修正前のhashとは
+一致しない。Debug／Release間では同じソース・入力・ワーカー数のhashを一致させる。
+構成間の速度差は候補生成、品質または決定性の変更
+ではなく、コンパイラ最適化とビルド構成による。直近の低速報告では、最終Debug検証が
+共有`build\mgstc.exe`を上書きしていた。
+Thorough 1回ではSCC 108,040.7ms（hash `199a71aadf6e3f3a`）、
+WAV 2秒122,088.9ms（hash `7ca5239c56a82f02`）を測定済み。
+`最大約2分`は機械負荷に依存する目安であり、評価件数の固定予算は変更しない。
+最終変更後の自動テストは83/83成功し、既存の決定性・キャンセルテストも成功した。
+
 テストを省略する場合:
 
 ```powershell
@@ -119,10 +179,14 @@ ctest --test-dir build --output-on-failure
   - 外部テストフレームワークに依存しないコア・音声生成テスト
 - `mgstc_chip_level_probe`
   - PSG・SCC・OPLLの単音Peak / RMSを再測定する診断ツール
+- `mgstc_wave_import_benchmark`（`MGSTC_BUILD_BENCHMARKS=ON`）
+  - SCC→OPLL／WAV→OPLL探索のRelease中央値と候補数を測定する
 - `mgstc_windows_audio`
   - Windows共有モード・イベント駆動WASAPI出力
 - `mgstc`
-  - 1組の共有エンジン・WASAPI出力・MIDI入力を使用するアプリ本体
+  - 1組の共有エンジン・WASAPI／ASIO選択出力・MIDI入力を使用するアプリ本体
+- `mgstc_stereo_sample_rate_converter_tests`
+  - ASIO向け48kHz→44.1／48／96kHzステレオ変換の連続性・左右同期テスト
 
 ネイティブアプリを起動する場合:
 

@@ -57,6 +57,15 @@ foreach ($name in @("emu2149", "emu2212", "emu2413")) {
     Copy-Item -LiteralPath $src `
         -Destination (Join-Path $licensesDir "$name-LICENSE.txt")
 }
+$juceBuildTree = Join-Path $env:LOCALAPPDATA `
+    ("MgsToneCraft\cmake-build-" + $Configuration.ToLowerInvariant())
+$asioLicense = Join-Path $juceBuildTree `
+    "_deps\juce-src\modules\juce_audio_devices\native\asio\LICENSE.txt"
+if (-not (Test-Path -LiteralPath $asioLicense)) {
+    throw "JUCE ASIO license was not found. Build $Configuration before packaging."
+}
+Copy-Item -LiteralPath $asioLicense `
+    -Destination (Join-Path $licensesDir "Steinberg-ASIO-SDK-LICENSE.txt")
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $zipName = "MGSToneCraft-$Version-win64.zip"

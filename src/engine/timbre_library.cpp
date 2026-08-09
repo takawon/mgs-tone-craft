@@ -1,4 +1,5 @@
 #include "mgstc/engine/timbre_library.hpp"
+#include "mgstc/engine/timbre_tags.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -9,8 +10,7 @@
 namespace mgstc::engine {
 namespace {
 
-constexpr std::string_view kHeaderV1{"MGSTC_TIMBRE_LIBRARY\t1"};
-constexpr std::string_view kHeaderV2{"MGSTC_TIMBRE_LIBRARY\t2"};
+constexpr std::string_view kHeader{"MGSTC_TIMBRE_LIBRARY\t4"};
 
 char hexDigit(std::uint8_t value) {
     return value < 10
@@ -62,6 +62,73 @@ std::optional<std::string> decodeString(std::string_view text) {
         result.push_back(static_cast<char>((*high << 4) | *low));
     }
     return result;
+}
+
+void appendUint32(std::string& output, std::uint32_t value) {
+    for (std::size_t index = 0; index < 4; ++index) {
+        output.push_back(static_cast<char>(
+            (value >> (index * 8U)) & 0xFFU));
+    }
+}
+
+[[nodiscard]] bool readUint32(
+    std::string_view input,
+    std::size_t& position,
+    std::uint32_t& value) {
+    if (position + 4 > input.size()) {
+        return false;
+    }
+    value = 0;
+    for (std::size_t index = 0; index < 4; ++index) {
+        value |= static_cast<std::uint32_t>(
+                     static_cast<unsigned char>(
+                         input[position + index]))
+            << (index * 8U);
+    }
+    position += 4;
+    return true;
+}
+
+[[nodiscard]] std::string encodeTagList(
+    std::span<const std::string> tags) {
+    std::string packed;
+    appendUint32(
+        packed, static_cast<std::uint32_t>(tags.size()));
+    for (const auto& tag : tags) {
+        appendUint32(
+            packed, static_cast<std::uint32_t>(tag.size()));
+        packed += tag;
+    }
+    return encodeBytes(packed);
+}
+
+[[nodiscard]] std::optional<std::vector<std::string>> decodeTagList(
+    std::string_view text) {
+    const auto packed = decodeString(text);
+    if (!packed) {
+        return std::nullopt;
+    }
+    std::size_t position{};
+    std::uint32_t count{};
+    if (!readUint32(*packed, position, count) || count > 100000) {
+        return std::nullopt;
+    }
+    std::vector<std::string> tags;
+    tags.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        std::uint32_t size{};
+        if (!readUint32(*packed, position, size)
+            || position + size > packed->size()) {
+            return std::nullopt;
+        }
+        tags.emplace_back(packed->substr(position, size));
+        position += size;
+    }
+    if (position != packed->size()) {
+        return std::nullopt;
+    }
+    const auto normalized = serializeTimbreTags(tags);
+    return parseTimbreTags(normalized);
 }
 
 template <std::size_t Size>
@@ -120,11 +187,13 @@ void writeEntry(
         << '\t' << entry.id
         << '\t' << entry.created_unix_seconds
         << '\t' << entry.updated_unix_seconds
+        << '\t' << entry.last_used_unix_seconds
+        << '\t' << entry.use_count
         << '\t' << (entry.favorite ? 1 : 0)
         << '\t' << entry.data_version
         << '\t' << entry.revision
         << '\t' << encodeBytes(entry.name)
-        << '\t' << encodeBytes(entry.tags)
+        << '\t' << encodeTagList(entry.tags)
         << '\t' << encodeBytes(entry.memo)
         << '\t' << encodeBytes(entry.opll_registers)
         << '\t' << encodeBytes(entry.scc_waveform)
@@ -157,6 +226,8 @@ std::uint64_t TimbreLibrary::add(
     entry.id = next_id_++;
     entry.created_unix_seconds = now_unix_seconds;
     entry.updated_unix_seconds = now_unix_seconds;
+    entry.last_used_unix_seconds = 0;
+    entry.use_count = 0;
     entry.data_version = 1;
     entry.revision = 1;
     entries_.push_back(std::move(entry));
@@ -175,6 +246,9 @@ bool TimbreLibrary::update(
     updated.id = current->id;
     updated.created_unix_seconds = current->created_unix_seconds;
     updated.updated_unix_seconds = now_unix_seconds;
+    updated.last_used_unix_seconds =
+        current->last_used_unix_seconds;
+    updated.use_count = current->use_count;
     updated.data_version = 1;
     updated.revision = current->revision
         == std::numeric_limits<std::uint32_t>::max()
@@ -191,9 +265,38 @@ bool TimbreLibrary::erase(std::uint64_t id) {
     return entries_.size() != old_size;
 }
 
+bool TimbreLibrary::touch(
+    std::uint64_t id,
+    std::int64_t now_unix_seconds) {
+    auto* entry = find(id);
+    if (!entry) {
+        return false;
+    }
+    entry->last_used_unix_seconds = now_unix_seconds;
+    if (entry->use_count
+        != std::numeric_limits<std::uint32_t>::max()) {
+        ++entry->use_count;
+    }
+    return true;
+}
+
+std::size_t TimbreLibrary::rewriteTag(
+    std::string_view source,
+    std::string_view replacement,
+    std::int64_t now_unix_seconds) {
+    std::size_t changed{};
+    for (auto& entry : entries_) {
+        if (rewriteTimbreTag(entry.tags, source, replacement)) {
+            entry.updated_unix_seconds = now_unix_seconds;
+            ++changed;
+        }
+    }
+    return changed;
+}
+
 std::string TimbreLibrary::serialize() const {
     std::ostringstream output;
-    output << kHeaderV2 << "\r\n";
+    output << kHeader << "\r\n";
     for (const auto& entry : entries_) {
         writeEntry(output, entry);
     }
@@ -207,7 +310,7 @@ std::optional<std::string> TimbreLibrary::serializeEntry(
         return std::nullopt;
     }
     std::ostringstream output;
-    output << kHeaderV2 << "\r\n";
+    output << kHeader << "\r\n";
     writeEntry(output, *entry);
     return output.str();
 }
@@ -264,7 +367,6 @@ std::optional<TimbreLibrary> TimbreLibrary::deserialize(
     std::string_view text,
     std::string* error) {
     TimbreLibrary library;
-    std::uint32_t schema_version{};
     std::size_t line_begin = 0;
     std::size_t line_number = 0;
     while (line_begin <= text.size()) {
@@ -279,19 +381,13 @@ std::optional<TimbreLibrary> TimbreLibrary::deserialize(
         }
         ++line_number;
         if (line_number == 1) {
-            if (line == kHeaderV1) {
-                schema_version = 1;
-            } else if (line == kHeaderV2) {
-                schema_version = 2;
-            } else {
+            if (line != kHeader) {
                 setError(error, "unsupported timbre library header");
                 return std::nullopt;
             }
         } else if (!line.empty()) {
             const auto fields = splitTabs(line);
-            const std::size_t expected_fields =
-                schema_version == 1 ? 11 : 12;
-            if (fields.size() != expected_fields
+            if (fields.size() != 14
                 || (fields[0] != "O" && fields[0] != "S")) {
                 setError(error, "invalid timbre library record");
                 return std::nullopt;
@@ -306,25 +402,23 @@ std::optional<TimbreLibrary> TimbreLibrary::deserialize(
                 || entry.id == std::numeric_limits<std::uint64_t>::max()
                 || !parseInteger(fields[2], entry.created_unix_seconds)
                 || !parseInteger(fields[3], entry.updated_unix_seconds)
-                || !parseInteger(fields[4], favorite)
+                || !parseInteger(
+                    fields[4], entry.last_used_unix_seconds)
+                || !parseInteger(fields[5], entry.use_count)
+                || !parseInteger(fields[6], favorite)
                 || favorite > 1
-                || !parseInteger(fields[5], entry.data_version)
+                || !parseInteger(fields[7], entry.data_version)
                 || entry.data_version != 1
-                || (schema_version == 2
-                    && (!parseInteger(fields[6], entry.revision)
-                        || entry.revision == 0))) {
+                || !parseInteger(fields[8], entry.revision)
+                || entry.revision == 0) {
                 setError(error, "invalid timbre library metadata");
                 return std::nullopt;
             }
-            if (schema_version == 1) {
-                entry.revision = 1;
-            }
-            const std::size_t payload_offset =
-                schema_version == 1 ? 6 : 7;
+            constexpr std::size_t payload_offset = 9;
             const auto name =
                 decodeString(fields[payload_offset]);
             const auto tags =
-                decodeString(fields[payload_offset + 1]);
+                decodeTagList(fields[payload_offset + 1]);
             const auto memo =
                 decodeString(fields[payload_offset + 2]);
             if (!name || !tags || !memo

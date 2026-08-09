@@ -1,0 +1,2 @@
+#define IDI_MGSTC_APP 101
+IDI_MGSTC_APP ICON "MGSTC_icon.ico"

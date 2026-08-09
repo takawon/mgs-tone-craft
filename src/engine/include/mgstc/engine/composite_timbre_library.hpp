@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -15,6 +16,8 @@ struct CompositeTimbreLibraryEntry {
     std::uint32_t revision{1};
     std::int64_t created_unix_seconds{};
     std::int64_t updated_unix_seconds{};
+    std::int64_t last_used_unix_seconds{};
+    std::uint32_t use_count{};
     CompositeTimbre timbre;
 
     friend bool operator==(
@@ -24,7 +27,7 @@ struct CompositeTimbreLibraryEntry {
 
 class CompositeTimbreLibrary {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 1;
+    static constexpr std::uint32_t kSchemaVersion = 3;
 
     [[nodiscard]] const std::vector<CompositeTimbreLibraryEntry>&
         entries() const noexcept;
@@ -41,6 +44,11 @@ public:
         const CompositeTimbre& replacement,
         std::int64_t now_unix_seconds);
     bool erase(std::uint64_t id);
+    bool touch(std::uint64_t id, std::int64_t now_unix_seconds);
+    std::size_t rewriteTag(
+        std::string_view source,
+        std::string_view replacement,
+        std::int64_t now_unix_seconds);
 
     [[nodiscard]] std::string uniqueName(
         std::string_view requested_name) const;

@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -8,6 +9,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <mutex>
 #include <numbers>
 #include <sstream>
@@ -39,6 +42,7 @@
 #include "mgstc/engine/runtime_session.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/timbre_library.hpp"
+#include "mgstc/engine/timbre_tags.hpp"
 #include "mgstc/engine/spsc_queue.hpp"
 #include "mgstc/engine/shared_state.hpp"
 #include "mgstc/engine/tick_clock.hpp"
@@ -128,9 +132,12 @@ using mgstc::engine::traceOpllEnvelope;
 using mgstc::engine::ym2413RomPatch;
 using mgstc::engine::analyzeWaveCycle;
 using mgstc::engine::approximateSccWaveformCandidatesWithOpll;
+using mgstc::engine::approximateSccWaveformWithOpllResult;
 using mgstc::engine::approximateWaveCycleWithOpll;
+using mgstc::engine::approximateWaveCycleWithOpllResult;
 using mgstc::engine::approximateWavePcmCandidatesWithOpll;
 using mgstc::engine::approximateWavePcmWithOpll;
+using mgstc::engine::approximateWavePcmWithOpllResult;
 using mgstc::engine::parseWavePcm;
 using mgstc::engine::waveCycleToScc;
 #ifdef _WIN32
@@ -507,23 +514,32 @@ void testChipSpecificVolumeMapping() {
 }
 
 void testMgsdrvNoteTables() {
+    constexpr std::array<std::uint16_t, 12> psg_scc_octave_one{
+        0x0D5D, 0x0C9C, 0x0BE7, 0x0B3C,
+        0x0A9B, 0x0A02, 0x0973, 0x08EB,
+        0x086B, 0x07F2, 0x0780, 0x0714,
+    };
+    constexpr std::array<std::uint16_t, 12> opll_f_numbers{
+        0x0AC, 0x0B6, 0x0C2, 0x0CD,
+        0x0D9, 0x0E6, 0x0F4, 0x102,
+        0x111, 0x122, 0x133, 0x145,
+    };
     NotePitch pitch{};
-    REQUIRE_EQ(notePitch(60, pitch), true);
-    REQUIRE_EQ(pitch.psg_scc_period, static_cast<std::uint16_t>(0x01AB));
-    REQUIRE_EQ(pitch.opll.f_number, static_cast<std::uint16_t>(0x00AC));
-    // A440 Block: MIDI 60 ≈ C4 (not MGSDRV dump block-1).
-    REQUIRE_EQ(pitch.opll.block, static_cast<std::uint8_t>(4));
-    const double opll_c4_hz = pitch.opll.f_number * 3579545.0
-        / (72.0 * static_cast<double>(1u << (19 - pitch.opll.block)));
-    REQUIRE_EQ(opll_c4_hz > 250.0, true);
-    REQUIRE_EQ(opll_c4_hz < 275.0, true);
-
-    REQUIRE_EQ(notePitch(61, pitch), true);
-    REQUIRE_EQ(pitch.psg_scc_period, static_cast<std::uint16_t>(0x0193));
-    REQUIRE_EQ(pitch.opll.f_number, static_cast<std::uint16_t>(0x00B6));
-
-    REQUIRE_EQ(notePitch(108, pitch), true);
-    REQUIRE_EQ(pitch.opll.block, static_cast<std::uint8_t>(7));
+    for (std::uint8_t octave = 0; octave < 8; ++octave) {
+        for (std::uint8_t semitone = 0; semitone < 12; ++semitone) {
+            const auto note = static_cast<std::uint8_t>(
+                24 + octave * 12 + semitone);
+            REQUIRE_EQ(notePitch(note, pitch), true);
+            REQUIRE_EQ(
+                pitch.psg_scc_period,
+                static_cast<std::uint16_t>(
+                    psg_scc_octave_one[semitone] >> octave));
+            REQUIRE_EQ(
+                pitch.opll.f_number,
+                opll_f_numbers[semitone]);
+            REQUIRE_EQ(pitch.opll.block, octave);
+        }
+    }
 
     REQUIRE_EQ(notePitch(23, pitch), false);
     REQUIRE_EQ(notePitch(120, pitch), false);
@@ -705,8 +721,8 @@ void testRuntimeOpllKeyOnAndOffRegisters() {
     REQUIRE_EQ(session.processTick().ok(), true);
     REQUIRE_EQ(session.writes().size(), static_cast<std::size_t>(2));
     REQUIRE_EQ(session.writes()[0].address, static_cast<std::uint8_t>(0x20));
-    // MIDI 60 → Fnum 0xAC, Block 4, KeyOn → 0x10 | (4 << 1) = 0x18
-    REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0x18));
+    // Editor C4 is MGSDRV o4: Fnum 0xAC, Block 3.
+    REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0x16));
     REQUIRE_EQ(session.writes()[0].reason, WriteReason::KeyOn);
     REQUIRE_EQ(session.writes()[1].address, static_cast<std::uint8_t>(0x10));
     REQUIRE_EQ(session.writes()[1].value, static_cast<std::uint8_t>(0xAC));
@@ -715,7 +731,7 @@ void testRuntimeOpllKeyOnAndOffRegisters() {
     REQUIRE_EQ(session.processTick().ok(), true);
     REQUIRE_EQ(session.writes().size(), static_cast<std::size_t>(1));
     REQUIRE_EQ(session.writes()[0].address, static_cast<std::uint8_t>(0x20));
-    REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0x08));
+    REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0x06));
     REQUIRE_EQ(session.writes()[0].reason, WriteReason::KeyOff);
 }
 
@@ -753,7 +769,7 @@ void testChipRackRendersAllThreeChips() {
     setup.push_back(
         {0, sequence++, ChipId::Opll, 0, 0x30, 0x10, 8, WriteReason::Patch});
     setup.push_back(
-        {0, sequence++, ChipId::Opll, 0, 0x20, 0x18, 8, WriteReason::KeyOn});
+        {0, sequence++, ChipId::Opll, 0, 0x20, 0x16, 8, WriteReason::KeyOn});
     setup.push_back(
         {0, sequence++, ChipId::Opll, 0, 0x10, 0xAC, 8, WriteReason::Frequency});
 
@@ -2229,12 +2245,53 @@ void testMgsOpllDefinitionImportExportRoundTrip() {
             0xF3, 0xAF, 0x60, 0x26}));
 
     const auto exported =
-        formatMgsOpllDefinition(imported->patch, 31);
-    REQUIRE_EQ(exported.find("\r\n") != std::string::npos, true);
+        formatMgsOpllDefinition(
+            imported->patch, 31, "Test\r\nVoice");
+    REQUIRE_EQ(
+        exported,
+        std::string(
+            "@v31 = { ; Test  Voice\r\n"
+            "; TL FB\r\n"
+            "  10, 2,\r\n"
+            "; AR DR SL RR KL MT AM VB EG KR DT\r\n"
+            "  15, 3, 6, 0, 0, 1, 0, 0, 1, 0, 0,\r\n"
+            "  10,15, 2, 6, 0, 4, 0, 0, 1, 0, 0 }\r\n"));
     const auto reimported = parseMgsOpllDefinition(exported);
     REQUIRE_EQ(reimported.has_value(), true);
     REQUIRE_EQ(reimported->number, static_cast<std::uint16_t>(31));
     REQUIRE_EQ(reimported->patch, imported->patch);
+
+    constexpr std::string_view requested_format =
+        "@v15 = { ; VoiceName\r\n"
+        "; TL FB\r\n"
+        "  24, 7,\r\n"
+        "; AR DR SL RR KL MT AM VB EG KR DT\r\n"
+        "   7, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0,\r\n"
+        "  10, 7, 1, 1, 0, 1, 0, 1, 0, 0, 0 }\r\n";
+    const auto requested = parseMgsOpllDefinition(requested_format);
+    REQUIRE_EQ(requested.has_value(), true);
+    REQUIRE_EQ(
+        formatMgsOpllDefinition(
+            requested->patch, 15, "VoiceName"),
+        std::string(requested_format));
+    REQUIRE_EQ(
+        formatMgsOpllDefinition(
+            requested->patch, 15, {}).starts_with(
+                "@v15 = {\r\n"),
+        true);
+    constexpr std::string_view aligned_columns =
+        "@v16 = {\r\n"
+        "; TL FB\r\n"
+        "   7, 7,\r\n"
+        "; AR DR SL RR KL MT AM VB EG KR DT\r\n"
+        "  15, 0, 0,15, 0,10, 0, 0, 1, 0, 0,\r\n"
+        "   7, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0 }\r\n";
+    const auto aligned = parseMgsOpllDefinition(aligned_columns);
+    REQUIRE_EQ(aligned.has_value(), true);
+    REQUIRE_EQ(
+        formatMgsOpllDefinition(aligned->patch, 16, {}),
+        std::string(aligned_columns));
+
     REQUIRE_EQ(
         parseMgsOpllDefinition("@v16={64,0}").has_value(),
         false);
@@ -2251,13 +2308,35 @@ void testMgsSccDefinitionImportExportRoundTrip() {
         waveform[index] = static_cast<std::int8_t>(
             static_cast<int>(index) * 8 - 128);
     }
-    const auto exported = formatMgsSccDefinition(waveform, 7);
-    REQUIRE_EQ(exported.starts_with("@s7 = {\r\n"), true);
+    const auto exported =
+        formatMgsSccDefinition(waveform, 7, "Test Voice");
+    REQUIRE_EQ(
+        exported.starts_with("@s7 = { ; Test Voice\r\n"),
+        true);
     const auto imported = parseMgsSccDefinition(
         std::string("; leading comment\r\n") + exported);
     REQUIRE_EQ(imported.has_value(), true);
     REQUIRE_EQ(imported->number, static_cast<std::uint16_t>(7));
     REQUIRE_EQ(imported->waveform, waveform);
+
+    constexpr std::string_view requested_format =
+        "@s0 = { ; VoiceName\r\n"
+        "  00 18 30 46 5a 6a 75 7d\r\n"
+        "  7f 7d 75 6a 5a 46 30 18\r\n"
+        "  00 e7 cf b9 a5 95 8a 82\r\n"
+        "  80 82 8a 95 a5 b9 cf e7\r\n"
+        "}\r\n";
+    const auto requested = parseMgsSccDefinition(requested_format);
+    REQUIRE_EQ(requested.has_value(), true);
+    REQUIRE_EQ(
+        formatMgsSccDefinition(
+            requested->waveform, 0, "VoiceName"),
+        std::string(requested_format));
+    REQUIRE_EQ(
+        formatMgsSccDefinition(
+            requested->waveform, 0, {}).starts_with(
+                "@s0 = {\r\n"),
+        true);
     const auto compact = parseMgsSccDefinition(
         "@s02={"
         "00010203 04050607 08090a0b 0c0d0e0f "
@@ -2282,7 +2361,7 @@ void testTimbreLibraryCrudAndVersionedRoundTrip() {
     mgstc::engine::TimbreLibraryEntry opll;
     opll.category = mgstc::engine::TimbreCategory::Opll;
     opll.name = "\xE3\x83\xAA\xE3\x83\xBC\xE3\x83\x89";
-    opll.tags = "bright,favorite";
+    opll.tags = {"bright", "favorite"};
     opll.memo = "line 1\nline 2\twith tab";
     opll.favorite = true;
     opll.opll_registers = {
@@ -2321,12 +2400,26 @@ void testTimbreLibraryCrudAndVersionedRoundTrip() {
     REQUIRE_EQ(restored->entries().size(), static_cast<std::size_t>(2));
     REQUIRE_EQ(restored->find(opll_id)->name, std::string("Updated"));
     REQUIRE_EQ(restored->find(opll_id)->memo, opll.memo);
+    REQUIRE_EQ(restored->find(opll_id)->tags, opll.tags);
     REQUIRE_EQ(
         restored->find(opll_id)->revision,
         static_cast<std::uint32_t>(2));
     REQUIRE_EQ(
         restored->find(opll_id)->opll_registers,
         opll.opll_registers);
+    auto touched = *restored;
+    const auto revision_before_touch =
+        touched.find(opll_id)->revision;
+    REQUIRE_EQ(touched.touch(opll_id, 250), true);
+    REQUIRE_EQ(
+        touched.find(opll_id)->last_used_unix_seconds,
+        static_cast<std::int64_t>(250));
+    REQUIRE_EQ(
+        touched.find(opll_id)->use_count,
+        static_cast<std::uint32_t>(1));
+    REQUIRE_EQ(
+        touched.find(opll_id)->revision,
+        revision_before_touch);
     REQUIRE_EQ(
         restored->find(scc_id)->scc_waveform,
         scc.scc_waveform);
@@ -2339,17 +2432,126 @@ void testTimbreLibraryCrudAndVersionedRoundTrip() {
 
     REQUIRE_EQ(
         mgstc::engine::TimbreLibrary::deserialize(
-            "MGSTC_TIMBRE_LIBRARY\t3\r\n", &error).has_value(),
+            "MGSTC_TIMBRE_LIBRARY\t2\r\n", &error).has_value(),
         false);
-    const auto legacy =
-        mgstc::engine::TimbreLibrary::deserialize(
-            "MGSTC_TIMBRE_LIBRARY\t1\r\n", &error);
-    REQUIRE_EQ(legacy.has_value(), true);
     REQUIRE_EQ(
         mgstc::engine::TimbreLibrary::deserialize(
-            "MGSTC_TIMBRE_LIBRARY\t1\r\nO\tbroken\r\n",
+            "MGSTC_TIMBRE_LIBRARY\t3\r\nO\tbroken\r\n",
             &error).has_value(),
         false);
+}
+
+void testTimbreTagsNormalizeMatchAndCollectUsage() {
+    using namespace mgstc::engine;
+    REQUIRE_EQ(presetTimbreTags().size(), static_cast<std::size_t>(78));
+
+    const auto parsed = parseTimbreTags(
+        " bright, Bright\xEF\xBC\x8C\xE5\x92\x8C\xE6\xA5\xBD\xE5\x99\xA8\npad ");
+    REQUIRE_EQ(
+        parsed,
+        std::vector<std::string>({
+            "bright",
+            "\xE5\x92\x8C\xE6\xA5\xBD\xE5\x99\xA8",
+            "pad",
+        }));
+    REQUIRE_EQ(
+        serializeTimbreTags(parsed),
+        std::string(
+            "bright,\xE5\x92\x8C\xE6\xA5\xBD\xE5\x99\xA8,pad"));
+    REQUIRE_EQ(
+        containsAllTimbreTags(
+            parsed, std::array<std::string, 2>{"PAD", "bright"}),
+        true);
+    REQUIRE_EQ(
+        containsAllTimbreTags(
+            parsed, std::array<std::string, 1>{"bass"}),
+        false);
+
+    const std::vector<std::vector<std::string>> tag_sets{
+        {"Lead", "bright"},
+        {"lead", "soft"},
+        {"bright"},
+    };
+    const auto usage = collectTimbreTagUsage(tag_sets);
+    const auto lead = std::find_if(
+        usage.begin(), usage.end(),
+        [](const TimbreTagUsage& item) {
+            return item.name == "Lead";
+        });
+    REQUIRE_EQ(lead != usage.end(), true);
+    REQUIRE_EQ(lead->count, static_cast<std::size_t>(2));
+
+    std::vector<std::string> managed{
+        "Lead", "bright", "soft"};
+    REQUIRE_EQ(
+        rewriteTimbreTag(managed, "lead", "bright"),
+        true);
+    REQUIRE_EQ(
+        managed,
+        std::vector<std::string>({"bright", "soft"}));
+    REQUIRE_EQ(
+        rewriteTimbreTag(managed, "BRIGHT", "Brightness"),
+        true);
+    REQUIRE_EQ(
+        managed,
+        std::vector<std::string>({"Brightness", "soft"}));
+    REQUIRE_EQ(
+        rewriteTimbreTag(managed, "soft", ""),
+        true);
+    REQUIRE_EQ(
+        managed,
+        std::vector<std::string>({"Brightness"}));
+    const auto preset = std::string(presetTimbreTags().front());
+    std::vector<std::string> preset_tags{preset, "Custom"};
+    REQUIRE_EQ(isPresetTimbreTag(preset), true);
+    REQUIRE_EQ(
+        rewriteTimbreTag(preset_tags, preset, "Other"),
+        false);
+
+    TimbreLibrary managed_library;
+    TimbreLibraryEntry first;
+    first.name = "First";
+    first.tags = {"Custom", "bright"};
+    const auto first_id = managed_library.add(first, 10);
+    auto second = first;
+    second.name = "Second";
+    const auto second_id = managed_library.add(second, 11);
+    const auto first_revision =
+        managed_library.find(first_id)->revision;
+    const auto second_revision =
+        managed_library.find(second_id)->revision;
+    REQUIRE_EQ(
+        managed_library.rewriteTag("custom", "bright", 20),
+        static_cast<std::size_t>(2));
+    REQUIRE_EQ(
+        managed_library.find(first_id)->tags,
+        std::vector<std::string>({"bright"}));
+    REQUIRE_EQ(
+        managed_library.find(first_id)->revision,
+        first_revision);
+    REQUIRE_EQ(
+        managed_library.find(second_id)->revision,
+        second_revision);
+    REQUIRE_EQ(
+        managed_library.find(second_id)->updated_unix_seconds,
+        static_cast<std::int64_t>(20));
+
+    CompositeTimbreLibrary managed_composites;
+    auto managed_composite = defaultCompositeTimbre();
+    managed_composite.tags = {"Custom", "Other"};
+    const auto composite_id =
+        managed_composites.add(managed_composite, 30);
+    const auto composite_revision =
+        managed_composites.find(composite_id)->revision;
+    REQUIRE_EQ(
+        managed_composites.rewriteTag("custom", "", 40),
+        static_cast<std::size_t>(1));
+    REQUIRE_EQ(
+        managed_composites.find(composite_id)->timbre.tags,
+        std::vector<std::string>({"Other"}));
+    REQUIRE_EQ(
+        managed_composites.find(composite_id)->revision,
+        composite_revision);
 }
 
 void testTimbreLibrarySelectedExportAndNonDestructiveImport() {
@@ -2357,7 +2559,7 @@ void testTimbreLibrarySelectedExportAndNonDestructiveImport() {
     mgstc::engine::TimbreLibraryEntry opll;
     opll.category = mgstc::engine::TimbreCategory::Opll;
     opll.name = "Lead";
-    opll.tags = "bright";
+    opll.tags = {"bright"};
     opll.opll_registers = {
         0x71, 0x61, 0x1E, 0x17, 0xD0, 0x78, 0x00, 0x17};
     const auto exported_id = source.add(opll, 10);
@@ -2404,7 +2606,7 @@ void testTimbreLibrarySelectedExportAndNonDestructiveImport() {
     REQUIRE_EQ(imported->name, std::string("Lead(2)"));
     REQUIRE_EQ(imported->created_unix_seconds, 30);
     REQUIRE_EQ(imported->updated_unix_seconds, 30);
-    REQUIRE_EQ(imported->tags, std::string("bright"));
+    REQUIRE_EQ(imported->tags, std::vector<std::string>{"bright"});
     REQUIRE_EQ(imported->opll_registers, opll.opll_registers);
 
     const auto size_before_invalid = destination.entries().size();
@@ -2475,39 +2677,206 @@ void testWaveCycleProducesValidOpllApproximation() {
     REQUIRE_EQ(patch.feedback <= 7, true);
 }
 
-void testSccSineApproximationMatchesKeyboardPitch() {
-    // Same MIDI note: converted OPLL fundamental should track the SCC
-    // audition frequency (period-window scoring), not an octave above it.
-    SccWaveform waveform{};
-    for (std::size_t index = 0; index < waveform.size(); ++index) {
-        waveform[index] = static_cast<std::int8_t>(std::lround(
+std::vector<float> renderSccAtRuntimeMidi(
+    const SccWaveform& waveform,
+    std::uint8_t midi_note) {
+    NotePitch pitch{};
+    REQUIRE_EQ(notePitch(midi_note, pitch), true);
+    mgstc::engine::SccAdapter chip;
+    REQUIRE_EQ(chip.valid(), true);
+    for (std::uint8_t index = 0; index < waveform.size(); ++index) {
+        REQUIRE_EQ(
+            chip.write(
+                0,
+                index,
+                static_cast<std::uint8_t>(waveform[index])),
+            true);
+    }
+    REQUIRE_EQ(
+        chip.write(
+            1,
+            0,
+            static_cast<std::uint8_t>(pitch.psg_scc_period & 0xFF)),
+        true);
+    REQUIRE_EQ(
+        chip.write(
+            1,
+            1,
+            static_cast<std::uint8_t>((pitch.psg_scc_period >> 8) & 0x0F)),
+        true);
+    REQUIRE_EQ(chip.write(2, 0, 15), true);
+    REQUIRE_EQ(chip.write(3, 0, 1), true);
+    for (std::size_t index = 0; index < 4'800; ++index) {
+        static_cast<void>(chip.renderSample());
+    }
+    std::vector<float> samples(12'000);
+    for (auto& sample : samples) {
+        sample = chip.renderSample();
+    }
+    return samples;
+}
+
+std::vector<float> renderOpllAtRuntimeMidi(
+    const mgstc::engine::OpllPatchParameters& patch,
+    std::uint8_t midi_note) {
+    NotePitch pitch{};
+    REQUIRE_EQ(notePitch(midi_note, pitch), true);
+    mgstc::engine::Ym2413Adapter chip;
+    REQUIRE_EQ(chip.valid(), true);
+    const auto registers = encodeOpllPatch(patch);
+    for (std::size_t index = 0; index < registers.size(); ++index) {
+        REQUIRE_EQ(
+            chip.write(
+                static_cast<std::uint8_t>(index),
+                registers[index]),
+            true);
+    }
+    REQUIRE_EQ(chip.write(0x30, 0x00), true);
+    REQUIRE_EQ(
+        chip.write(
+            0x10,
+            static_cast<std::uint8_t>(pitch.opll.f_number & 0xFF)),
+        true);
+    REQUIRE_EQ(
+        chip.write(
+            0x20,
+            static_cast<std::uint8_t>(
+                0x10
+                | ((pitch.opll.block & 7) << 1)
+                | ((pitch.opll.f_number >> 8) & 1))),
+        true);
+    for (std::size_t index = 0; index < 4'800; ++index) {
+        static_cast<void>(chip.renderSample());
+    }
+    std::vector<float> samples(12'000);
+    for (auto& sample : samples) {
+        sample = chip.renderSample();
+    }
+    return samples;
+}
+
+float estimateRenderedFrequency(std::vector<float> samples) {
+    const auto difference = [&samples](std::size_t lag) {
+        double error{};
+        double energy{};
+        for (std::size_t index = 0; index + lag < samples.size(); ++index) {
+            const double a = samples[index];
+            const double b = samples[index + lag];
+            const double delta = a - b;
+            error += delta * delta;
+            energy += a * a + b * b;
+        }
+        return energy > 1.0e-12
+            ? static_cast<float>(error / energy)
+            : std::numeric_limits<float>::max();
+    };
+    constexpr std::size_t minimum_lag = 48'000 / 2'000;
+    const std::size_t maximum_lag =
+        std::min<std::size_t>(48'000 / 40, samples.size() / 2);
+    std::size_t best_lag = minimum_lag;
+    float best_error = std::numeric_limits<float>::max();
+    for (std::size_t lag = minimum_lag; lag <= maximum_lag; ++lag) {
+        const float error = difference(lag);
+        if (error < best_error) {
+            best_error = error;
+            best_lag = lag;
+        }
+    }
+    // Fractional chip periods can make an integer multiple fit slightly
+    // better. Select the shortest period whose normalized mismatch is still
+    // effectively tied with the global minimum.
+    const float competitive_error =
+        std::max(best_error * 1.15F, best_error + 0.004F);
+    for (std::size_t lag = minimum_lag; lag < best_lag; ++lag) {
+        if (difference(lag) <= competitive_error) {
+            best_lag = lag;
+            break;
+        }
+    }
+    return 48'000.0F / static_cast<float>(best_lag);
+}
+
+void testSccApproximationMatchesSameRuntimeMidiPitch() {
+    constexpr std::uint8_t midi_note = 60;
+    const auto exercise = [](const SccWaveform& waveform) {
+        const float scc_hz =
+            estimateRenderedFrequency(renderSccAtRuntimeMidi(waveform, midi_note));
+        const auto candidates =
+            approximateSccWaveformCandidatesWithOpll(
+                waveform,
+                mgstc::engine::OpllApproximationOptions{8});
+        REQUIRE_EQ(candidates.empty(), false);
+        const float opll_hz = estimateRenderedFrequency(
+            renderOpllAtRuntimeMidi(candidates.front(), midi_note));
+        const float ratio = opll_hz / scc_hz;
+        REQUIRE_EQ(ratio > 0.90F, true);
+        REQUIRE_EQ(ratio < 1.10F, true);
+        return candidates;
+    };
+
+    SccWaveform sine{};
+    for (std::size_t index = 0; index < sine.size(); ++index) {
+        sine[index] = static_cast<std::int8_t>(std::lround(
             127.0 * std::sin(
                 2.0 * std::numbers::pi * static_cast<double>(index)
-                / waveform.size())));
+                / sine.size())));
     }
-    const auto first =
-        approximateSccWaveformCandidatesWithOpll(waveform);
-    const auto second =
-        approximateSccWaveformCandidatesWithOpll(waveform);
-    REQUIRE_EQ(first.empty(), false);
-    REQUIRE_EQ(first, second);
+    const auto eight_workers = exercise(sine);
+    const auto& sine_patch = eight_workers.front();
+    // MGSDRV's same-key OPLL base oscillator is one octave below SCC, so a
+    // sine fit invariantly needs CAR MULT=2. A doubled result reproduces the
+    // reported octave-high sound; halving both MULT fields restores the fit.
+    REQUIRE_EQ(
+        sine_patch.carrier.multiplier,
+        static_cast<std::uint8_t>(2));
+    const float sine_scc_hz =
+        estimateRenderedFrequency(renderSccAtRuntimeMidi(sine, midi_note));
+    auto octave_high = sine_patch;
+    octave_high.modulator.multiplier = static_cast<std::uint8_t>(
+        std::min<int>(15, sine_patch.modulator.multiplier * 2));
+    octave_high.carrier.multiplier = static_cast<std::uint8_t>(
+        std::min<int>(15, sine_patch.carrier.multiplier * 2));
+    const float octave_high_ratio =
+        estimateRenderedFrequency(
+            renderOpllAtRuntimeMidi(octave_high, midi_note))
+        / sine_scc_hz;
+    REQUIRE_EQ(octave_high_ratio > 1.85F, true);
+    REQUIRE_EQ(octave_high_ratio < 2.15F, true);
+    octave_high.modulator.multiplier /= 2;
+    octave_high.carrier.multiplier /= 2;
+    const float compensated_ratio =
+        estimateRenderedFrequency(
+            renderOpllAtRuntimeMidi(octave_high, midi_note))
+        / sine_scc_hz;
+    REQUIRE_EQ(compensated_ratio > 0.90F, true);
+    REQUIRE_EQ(compensated_ratio < 1.10F, true);
 
-    NotePitch pitch{};
-    REQUIRE_EQ(notePitch(60, pitch), true);
-    const float scc_hz = static_cast<float>(
-        3579545.0 / ((static_cast<double>(pitch.psg_scc_period) + 1.0) * 32.0));
-    const float mul_factor = [](std::uint8_t mul) {
-        static constexpr float kFactors[16] = {
-            0.5F, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 12, 12, 15, 15};
-        return kFactors[mul & 15];
-    }(first.front().carrier.multiplier);
-    const float opll_base = static_cast<float>(
-        pitch.opll.f_number * 3579545.0
-        / (72.0 * static_cast<double>(1u << (19 - pitch.opll.block))));
-    const float opll_hz = opll_base * mul_factor;
-    const float ratio = opll_hz / scc_hz;
-    REQUIRE_EQ(ratio > 0.94F, true);
-    REQUIRE_EQ(ratio < 1.06F, true);
+    SccWaveform saw{};
+    for (std::size_t index = 0; index < saw.size(); ++index) {
+        saw[index] = static_cast<std::int8_t>(
+            -120 + static_cast<int>(index) * 240
+                / static_cast<int>(saw.size() - 1));
+    }
+    static_cast<void>(exercise(saw));
+
+    const auto one_worker =
+        approximateSccWaveformCandidatesWithOpll(
+            sine,
+            mgstc::engine::OpllApproximationOptions{1});
+    REQUIRE_EQ(one_worker, eight_workers);
+    REQUIRE_EQ(one_worker.size() <= 12, true);
+    for (std::size_t first_index = 0;
+         first_index < one_worker.size();
+         ++first_index) {
+        for (std::size_t second_index = first_index + 1;
+             second_index < one_worker.size();
+             ++second_index) {
+            REQUIRE_EQ(
+                encodeOpllPatch(one_worker[first_index])
+                    == encodeOpllPatch(one_worker[second_index]),
+                false);
+        }
+    }
 }
 
 void testSineReferencePeriodIsNotOctaveDoubled() {
@@ -2527,14 +2896,17 @@ void testSineReferencePeriodIsNotOctaveDoubled() {
 }
 
 void testOpllToSccReferenceCapturePitchAndCycle() {
-    // OPLL→SCC capture follows notePitch (A440), same as live audition.
+    // OPLL→SCC capture follows the MGSDRV o4 pitch used by live audition.
     NotePitch pitch{};
     REQUIRE_EQ(notePitch(60, pitch), true);
     REQUIRE_EQ(pitch.opll.f_number, static_cast<std::uint16_t>(0xAC));
-    REQUIRE_EQ(pitch.opll.block, static_cast<std::uint8_t>(4));
+    REQUIRE_EQ(pitch.opll.block, static_cast<std::uint8_t>(3));
 
+    NotePitch same_physical_scc_pitch{};
+    REQUIRE_EQ(notePitch(48, same_physical_scc_pitch), true);
     const double scc_hz = 3579545.0
-        / ((static_cast<double>(pitch.psg_scc_period) + 1.0) * 32.0);
+        / ((static_cast<double>(same_physical_scc_pitch.psg_scc_period) + 1.0)
+           * 32.0);
     const double opll_hz = pitch.opll.f_number * 3579545.0
         / (72.0 * static_cast<double>(1u << (19 - pitch.opll.block)));
     REQUIRE_EQ(opll_hz / scc_hz > 0.94, true);
@@ -2574,8 +2946,8 @@ void testOpllToSccReferenceCapturePitchAndCycle() {
     }
     const auto analysis = analyzeWaveCycle(pcm);
     REQUIRE_EQ(analysis.cycle.size() >= 2, true);
-    REQUIRE_EQ(analysis.estimated_frequency_hz > 240.0F, true);
-    REQUIRE_EQ(analysis.estimated_frequency_hz < 290.0F, true);
+    REQUIRE_EQ(analysis.estimated_frequency_hz > 120.0F, true);
+    REQUIRE_EQ(analysis.estimated_frequency_hz < 145.0F, true);
 }
 
 void testWavePcmProducesDeterministicTimedOpllApproximation() {
@@ -2594,9 +2966,13 @@ void testWavePcmProducesDeterministicTimedOpllApproximation() {
                     2.0 * std::numbers::pi * 400.0 * time));
     }
     const auto first_candidates =
-        approximateWavePcmCandidatesWithOpll(pcm);
+        approximateWavePcmCandidatesWithOpll(
+            pcm,
+            mgstc::engine::OpllApproximationOptions{1});
     const auto second_candidates =
-        approximateWavePcmCandidatesWithOpll(pcm);
+        approximateWavePcmCandidatesWithOpll(
+            pcm,
+            mgstc::engine::OpllApproximationOptions{8});
     REQUIRE_EQ(first_candidates.empty(), false);
     REQUIRE_EQ(first_candidates, second_candidates);
     REQUIRE_EQ(first_candidates.size() <= 6, true);
@@ -2628,6 +3004,172 @@ void testWavePcmProducesDeterministicTimedOpllApproximation() {
     REQUIRE_EQ(first.carrier.decay_rate <= 15, true);
     REQUIRE_EQ(first.carrier.sustain_level <= 15, true);
     REQUIRE_EQ(first.carrier.release_rate <= 15, true);
+}
+
+void testOpllThoroughCompactProgressAndWorkerDeterminism() {
+    std::array<float, 64> cycle{};
+    for (std::size_t index = 0; index < cycle.size(); ++index) {
+        cycle[index] = static_cast<float>(
+            std::sin(2.0 * std::numbers::pi * index / cycle.size())
+            + 0.2 * std::sin(
+                6.0 * std::numbers::pi * index / cycle.size()));
+    }
+
+    auto one_control =
+        std::make_shared<mgstc::engine::OpllApproximationControl>();
+    mgstc::engine::OpllApproximationOptions one_options;
+    one_options.max_workers = 1;
+    one_options.effort =
+        mgstc::engine::OpllApproximationEffort::Thorough;
+    one_options.profile =
+        mgstc::engine::OpllApproximationProfile::Compact;
+    one_options.control = one_control;
+    mgstc::engine::OpllApproximationResult one_result;
+    std::atomic<bool> done{false};
+    std::thread worker([&] {
+        one_result = approximateWaveCycleWithOpllResult(cycle, one_options);
+        done.store(true, std::memory_order_release);
+    });
+    std::uint64_t previous{};
+    while (!done.load(std::memory_order_acquire)) {
+        const auto progress = one_control->progress();
+        REQUIRE_EQ(progress.completed >= previous, true);
+        REQUIRE_EQ(progress.completed <= progress.total, true);
+        previous = progress.completed;
+        std::this_thread::yield();
+    }
+    worker.join();
+    const auto finished = one_control->progress();
+    REQUIRE_EQ(
+        one_result.completion,
+        mgstc::engine::OpllApproximationCompletion::Completed);
+    REQUIRE_EQ(finished.completed, finished.total);
+    REQUIRE_EQ(
+        finished.phase,
+        mgstc::engine::OpllApproximationPhase::Completed);
+
+    auto eight_options = one_options;
+    eight_options.max_workers = 8;
+    eight_options.control.reset();
+    const auto eight_result =
+        approximateWaveCycleWithOpllResult(cycle, eight_options);
+    REQUIRE_EQ(one_result.candidates, eight_result.candidates);
+    REQUIRE_EQ(one_result.candidates.size() <= 12U, true);
+    for (std::size_t left = 0; left < one_result.candidates.size(); ++left) {
+        const auto registers = encodeOpllPatch(one_result.candidates[left]);
+        REQUIRE_EQ(one_result.candidates[left].feedback <= 7, true);
+        for (std::size_t right = left + 1;
+             right < one_result.candidates.size();
+             ++right) {
+            REQUIRE_EQ(
+                registers
+                    == encodeOpllPatch(one_result.candidates[right]),
+                false);
+        }
+    }
+
+    mgstc::engine::WavePcm pcm;
+    pcm.sample_rate = 8'000;
+    pcm.mono_samples.resize(240);
+    for (std::size_t index = 0; index < pcm.mono_samples.size(); ++index) {
+        const float time = static_cast<float>(index) / pcm.sample_rate;
+        pcm.mono_samples[index] = std::exp(-time * 8.0F)
+            * static_cast<float>(
+                std::sin(2.0 * std::numbers::pi * 200.0 * time));
+    }
+    one_options.control.reset();
+    const auto wav_one = approximateWavePcmWithOpllResult(pcm, one_options);
+    const auto wav_eight =
+        approximateWavePcmWithOpllResult(pcm, eight_options);
+    REQUIRE_EQ(wav_one.candidates, wav_eight.candidates);
+    REQUIRE_EQ(wav_one.candidates.empty(), false);
+    REQUIRE_EQ(wav_one.candidates.size() <= 6U, true);
+}
+
+void testOpllControlledCancellationDiscardsCandidates() {
+    SccWaveform waveform{};
+    for (std::size_t index = 0; index < waveform.size(); ++index) {
+        waveform[index] = static_cast<std::int8_t>(std::lround(
+            127.0 * std::sin(
+                2.0 * std::numbers::pi * index / waveform.size())));
+    }
+    mgstc::engine::OpllApproximationOptions options;
+    options.max_workers = 1;
+    options.effort = mgstc::engine::OpllApproximationEffort::Thorough;
+    options.profile = mgstc::engine::OpllApproximationProfile::Compact;
+    options.control =
+        std::make_shared<mgstc::engine::OpllApproximationControl>();
+    options.control->requestCancel();
+    const auto pre_cancelled =
+        approximateSccWaveformWithOpllResult(waveform, options);
+    REQUIRE_EQ(
+        pre_cancelled.completion,
+        mgstc::engine::OpllApproximationCompletion::Cancelled);
+    REQUIRE_EQ(pre_cancelled.candidates.empty(), true);
+
+    options.control =
+        std::make_shared<mgstc::engine::OpllApproximationControl>();
+    mgstc::engine::OpllApproximationResult scc_result;
+    std::thread scc_worker([&] {
+        scc_result =
+            approximateSccWaveformWithOpllResult(waveform, options);
+    });
+    while (options.control->progress().completed == 0) {
+        std::this_thread::yield();
+    }
+    options.control->requestCancel();
+    scc_worker.join();
+    REQUIRE_EQ(
+        scc_result.completion,
+        mgstc::engine::OpllApproximationCompletion::Cancelled);
+    REQUIRE_EQ(scc_result.candidates.empty(), true);
+
+    mgstc::engine::WavePcm pcm;
+    pcm.sample_rate = 8'000;
+    pcm.mono_samples.resize(400);
+    for (std::size_t index = 0; index < pcm.mono_samples.size(); ++index) {
+        pcm.mono_samples[index] = static_cast<float>(
+            std::sin(
+                2.0 * std::numbers::pi * 200.0 * index / pcm.sample_rate));
+    }
+    constexpr std::array wav_cancel_phases{
+        mgstc::engine::OpllApproximationPhase::RepresentativeCycle,
+        mgstc::engine::OpllApproximationPhase::ShortTimbre,
+        mgstc::engine::OpllApproximationPhase::FullEnvelope,
+    };
+    for (const auto requested_phase : wav_cancel_phases) {
+        options.control =
+            std::make_shared<mgstc::engine::OpllApproximationControl>();
+        mgstc::engine::OpllApproximationResult wav_result;
+        std::atomic<bool> wav_done{false};
+        std::thread wav_worker([&] {
+            wav_result = approximateWavePcmWithOpllResult(pcm, options);
+            wav_done.store(true, std::memory_order_release);
+        });
+        bool observed_phase = false;
+        while (!wav_done.load(std::memory_order_acquire)) {
+            if (options.control->progress().phase == requested_phase) {
+                observed_phase = true;
+                options.control->requestCancel();
+                break;
+            }
+            std::this_thread::yield();
+        }
+        if (!observed_phase) {
+            options.control->requestCancel();
+        }
+        wav_worker.join();
+        REQUIRE_EQ(observed_phase, true);
+        REQUIRE_EQ(
+            wav_result.completion,
+            mgstc::engine::OpllApproximationCompletion::Cancelled);
+        REQUIRE_EQ(wav_result.candidates.empty(), true);
+        const auto cancelled = options.control->progress();
+        REQUIRE_EQ(
+            cancelled.phase,
+            mgstc::engine::OpllApproximationPhase::Cancelled);
+        REQUIRE_EQ(cancelled.completed <= cancelled.total, true);
+    }
 }
 
 void testDefaultCompositeTimbreHasThreeAudibleSources() {
@@ -2840,6 +3382,7 @@ void testCompositeSavedTimbreRevisionAndNumberAssignment() {
     const auto opll_id = library.add(opll, 11);
 
     auto composite = defaultCompositeTimbre();
+    composite.favorite = true;
     composite.layers[1].base_timbre =
         makeSavedTimbreReference(*library.find(scc_id));
     composite.layers[1].base_timbre->number_mode =
@@ -2930,7 +3473,7 @@ void testCompositeTimbreLibraryRoundTripAndRevision() {
 
     auto composite = defaultCompositeTimbre();
     composite.name = "Unicode Composite";
-    composite.tags = "lead layered";
+    composite.tags = {"lead", "layered"};
     composite.memo = "round-trip\nmemo";
     composite.layers[1].base_timbre =
         makeSavedTimbreReference(*timbres.find(scc_id));
@@ -2979,6 +3522,15 @@ void testCompositeTimbreLibraryRoundTripAndRevision() {
     REQUIRE_EQ(
         loaded->find(id)->revision,
         static_cast<std::uint32_t>(1));
+    const auto revision_before_touch = loaded->find(id)->revision;
+    REQUIRE_EQ(loaded->touch(id, 110), true);
+    REQUIRE_EQ(
+        loaded->find(id)->last_used_unix_seconds,
+        static_cast<std::int64_t>(110));
+    REQUIRE_EQ(
+        loaded->find(id)->use_count,
+        static_cast<std::uint32_t>(1));
+    REQUIRE_EQ(loaded->find(id)->revision, revision_before_touch);
 
     auto renamed = composite;
     renamed.name = "Updated Composite";
@@ -2995,13 +3547,13 @@ void testCompositeTimbreLibraryRoundTripAndRevision() {
 
     REQUIRE_EQ(
         CompositeTimbreLibrary::deserialize(
-            "MGSTC_COMPOSITE_TIMBRE_LIBRARY\t2\r\n",
+            "MGSTC_COMPOSITE_TIMBRE_LIBRARY\t3\r\n",
             &error)
             .has_value(),
-        false);
+        true);
     REQUIRE_EQ(
         CompositeTimbreLibrary::deserialize(
-            "MGSTC_COMPOSITE_TIMBRE_LIBRARY\t1\r\n"
+            "MGSTC_COMPOSITE_TIMBRE_LIBRARY\t3\r\n"
             "C\t1\t2\t3\t1\t0Z\r\n",
             &error)
             .has_value(),
@@ -3201,13 +3753,16 @@ int main() {
         {"MgsOpllDefinitionImportExportRoundTrip", testMgsOpllDefinitionImportExportRoundTrip},
         {"MgsSccDefinitionImportExportRoundTrip", testMgsSccDefinitionImportExportRoundTrip},
         {"TimbreLibraryCrudAndVersionedRoundTrip", testTimbreLibraryCrudAndVersionedRoundTrip},
+        {"TimbreTagsNormalizeMatchAndCollectUsage", testTimbreTagsNormalizeMatchAndCollectUsage},
         {"TimbreLibrarySelectedExportAndNonDestructiveImport", testTimbreLibrarySelectedExportAndNonDestructiveImport},
         {"WavePcmCycleConvertsToScc", testWavePcmCycleConvertsToScc},
         {"WaveCycleProducesValidOpllApproximation", testWaveCycleProducesValidOpllApproximation},
-        {"SccSineApproximationMatchesKeyboardPitch", testSccSineApproximationMatchesKeyboardPitch},
+        {"SccApproximationMatchesSameRuntimeMidiPitch", testSccApproximationMatchesSameRuntimeMidiPitch},
         {"SineReferencePeriodIsNotOctaveDoubled", testSineReferencePeriodIsNotOctaveDoubled},
         {"OpllToSccReferenceCapturePitchAndCycle", testOpllToSccReferenceCapturePitchAndCycle},
         {"WavePcmProducesDeterministicTimedOpllApproximation", testWavePcmProducesDeterministicTimedOpllApproximation},
+        {"OpllThoroughCompactProgressAndWorkerDeterminism", testOpllThoroughCompactProgressAndWorkerDeterminism},
+        {"OpllControlledCancellationDiscardsCandidates", testOpllControlledCancellationDiscardsCandidates},
         {"DefaultCompositeTimbreHasThreeAudibleSources", testDefaultCompositeTimbreHasThreeAudibleSources},
         {"CompositeLayerRemovalReusesFreedChannel", testCompositeLayerRemovalReusesFreedChannel},
         {"EnvelopeTimelineInspectorRangeNormalization", testEnvelopeTimelineInspectorRangeNormalization},

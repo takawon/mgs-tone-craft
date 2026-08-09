@@ -119,12 +119,13 @@ struct CompositeLayer {
 };
 
 struct CompositeTimbre {
-    static constexpr std::uint32_t kFormatVersion = 3;
+    static constexpr std::uint32_t kFormatVersion = 5;
 
     std::uint32_t format_version{kFormatVersion};
     std::string name;
-    std::string tags;
+    std::vector<std::string> tags;
     std::string memo;
+    bool favorite{};
     std::vector<CompositeLayer> layers;
 
     friend bool operator==(const CompositeTimbre&, const CompositeTimbre&)

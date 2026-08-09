@@ -18,11 +18,13 @@ struct TimbreLibraryEntry {
     std::uint64_t id{};
     TimbreCategory category{TimbreCategory::Opll};
     std::string name;
-    std::string tags;
+    std::vector<std::string> tags;
     std::string memo;
     bool favorite{};
     std::int64_t created_unix_seconds{};
     std::int64_t updated_unix_seconds{};
+    std::int64_t last_used_unix_seconds{};
+    std::uint32_t use_count{};
     std::uint32_t data_version{1};
     std::uint32_t revision{1};
     std::array<std::uint8_t, 8> opll_registers{};
@@ -31,7 +33,7 @@ struct TimbreLibraryEntry {
 
 class TimbreLibrary {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 2;
+    static constexpr std::uint32_t kSchemaVersion = 4;
 
     [[nodiscard]] const std::vector<TimbreLibraryEntry>& entries() const
         noexcept;
@@ -47,6 +49,11 @@ public:
         const TimbreLibraryEntry& replacement,
         std::int64_t now_unix_seconds);
     bool erase(std::uint64_t id);
+    bool touch(std::uint64_t id, std::int64_t now_unix_seconds);
+    std::size_t rewriteTag(
+        std::string_view source,
+        std::string_view replacement,
+        std::int64_t now_unix_seconds);
 
     [[nodiscard]] std::string serialize() const;
     [[nodiscard]] std::optional<std::string> serializeEntry(

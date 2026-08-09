@@ -163,46 +163,75 @@ bool parseHexByte(
     return true;
 }
 
-void appendOperator(
+std::string singleLineComment(std::string_view text) {
+    std::string result(text);
+    std::replace(result.begin(), result.end(), '\r', ' ');
+    std::replace(result.begin(), result.end(), '\n', ' ');
+    return result;
+}
+
+void appendOperatorLine(
     std::ostringstream& output,
     const OpllOperatorParameters& parameters) {
-    output
-        << static_cast<int>(parameters.attack_rate) << ", "
-        << static_cast<int>(parameters.decay_rate) << ", "
-        << static_cast<int>(parameters.sustain_level) << ", "
-        << static_cast<int>(parameters.release_rate) << ", "
-        << static_cast<int>(parameters.key_scale_level) << ", "
-        << static_cast<int>(parameters.multiplier) << ", "
-        << (parameters.amplitude_modulation ? 1 : 0) << ", "
-        << (parameters.pitch_modulation ? 1 : 0) << ", "
-        << (parameters.sustained_tone ? 1 : 0) << ", "
-        << (parameters.key_rate_scaling ? 1 : 0) << ", "
-        << (parameters.waveform ? 1 : 0);
+    const std::array<int, 11> values{
+        parameters.attack_rate,
+        parameters.decay_rate,
+        parameters.sustain_level,
+        parameters.release_rate,
+        parameters.key_scale_level,
+        parameters.multiplier,
+        parameters.amplitude_modulation ? 1 : 0,
+        parameters.pitch_modulation ? 1 : 0,
+        parameters.sustained_tone ? 1 : 0,
+        parameters.key_rate_scaling ? 1 : 0,
+        parameters.waveform ? 1 : 0,
+    };
+    output << "  ";
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        output << std::setw(2) << values[index];
+        if (index + 1 < values.size()) {
+            output << ",";
+        }
+    }
 }
 
 }  // namespace
 
 std::string formatMgsOpllDefinition(
     const OpllPatchParameters& patch,
-    std::uint16_t number) {
+    std::uint16_t number,
+    std::string_view voice_name) {
     std::ostringstream output;
-    output << "@v" << number << " = {\r\n  "
+    output << "@v" << number << " = {";
+    const auto comment = singleLineComment(voice_name);
+    if (!comment.empty()) {
+        output << " ; " << comment;
+    }
+    output << "\r\n; TL FB\r\n  "
+           << std::setw(2)
            << static_cast<int>(patch.modulator.total_level)
-           << ", "
+           << ","
+           << std::setw(2)
            << static_cast<int>(patch.feedback)
-           << ",\r\n  ";
-    appendOperator(output, patch.modulator);
-    output << ",\r\n  ";
-    appendOperator(output, patch.carrier);
-    output << "\r\n}\r\n";
+           << ",\r\n; AR DR SL RR KL MT AM VB EG KR DT\r\n";
+    appendOperatorLine(output, patch.modulator);
+    output << ",\r\n";
+    appendOperatorLine(output, patch.carrier);
+    output << " }\r\n";
     return output.str();
 }
 
 std::string formatMgsSccDefinition(
     const SccWaveform& waveform,
-    std::uint16_t number) {
+    std::uint16_t number,
+    std::string_view voice_name) {
     std::ostringstream output;
-    output << "@s" << number << " = {\r\n";
+    output << "@s" << number << " = {";
+    const auto comment = singleLineComment(voice_name);
+    if (!comment.empty()) {
+        output << " ; " << comment;
+    }
+    output << "\r\n";
     output << std::hex << std::setfill('0');
     for (std::size_t index = 0; index < waveform.size(); ++index) {
         if (index % 8 == 0) {
