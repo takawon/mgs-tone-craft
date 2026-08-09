@@ -4,13 +4,15 @@
 #include <array>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <cstring>
-#include <future>
 #include <limits>
-#include <map>
 #include <memory>
+#include <mutex>
 #include <numbers>
+#include <set>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -18,7 +20,90 @@
 #include "mgstc/engine/note_pitch.hpp"
 
 namespace mgstc::engine {
+
+struct OpllApproximationCoordinator {
+    explicit OpllApproximationCoordinator(
+        const OpllApproximationOptions& options,
+        std::uint64_t total)
+        : control(options.control
+              ? options.control
+              : std::make_shared<OpllApproximationControl>()) {
+        control->state_->completed.store(0, std::memory_order_relaxed);
+        control->state_->total.store(total, std::memory_order_release);
+        control->state_->phase.store(
+            OpllApproximationPhase::Idle,
+            std::memory_order_release);
+    }
+
+    [[nodiscard]] bool cancelled() const noexcept {
+        return control->state_->cancel_requested.load(
+            std::memory_order_acquire);
+    }
+
+    void setPhase(OpllApproximationPhase phase) noexcept {
+        control->state_->phase.store(phase, std::memory_order_release);
+    }
+
+    void advance(std::uint64_t work) noexcept {
+        const auto total =
+            control->state_->total.load(std::memory_order_relaxed);
+        const auto previous =
+            control->state_->completed.load(std::memory_order_relaxed);
+        control->state_->completed.store(
+            std::min(total, previous + work),
+            std::memory_order_release);
+    }
+
+    void finish(bool was_cancelled) noexcept {
+        if (was_cancelled) {
+            control->state_->phase.store(
+                OpllApproximationPhase::Cancelled,
+                std::memory_order_release);
+            return;
+        }
+        const auto total =
+            control->state_->total.load(std::memory_order_relaxed);
+        control->state_->completed.store(total, std::memory_order_release);
+        control->state_->phase.store(
+            OpllApproximationPhase::Completed,
+            std::memory_order_release);
+    }
+
+    std::shared_ptr<OpllApproximationControl> control;
+};
+
+std::vector<OpllPatchParameters> searchWaveCycleWithOpll(
+    std::span<const float> cycle,
+    const OpllApproximationOptions& options,
+    OpllApproximationCoordinator* coordinator,
+    std::size_t evaluation_budget,
+    OpllApproximationPhase phase);
+
 namespace {
+
+constexpr std::size_t kSteadyBatchSize = 256;
+constexpr std::size_t kFullWaveBatchSize = 32;
+constexpr std::size_t kStandardSteadyBatchSize = 5'000;
+constexpr std::size_t kStandardFullWaveBatchSize = 360;
+
+struct SearchBudgets {
+    std::size_t representative{};
+    std::size_t short_timbre{};
+    std::size_t full_envelope{};
+};
+
+SearchBudgets searchBudgets(const OpllApproximationOptions& options) {
+    if (options.profile == OpllApproximationProfile::Compact) {
+        return SearchBudgets{384, 192, 16};
+    }
+    return options.effort == OpllApproximationEffort::Thorough
+        ? SearchBudgets{48'000, 48'000, 6'000}
+        : SearchBudgets{5'000, 2'100, 360};
+}
+
+std::uint64_t fullWaveWeight(std::size_t samples) {
+    return 1U + static_cast<std::uint64_t>((samples + 4'095U) / 4'096U);
+}
 
 std::uint16_t u16(std::span<const std::uint8_t> bytes, std::size_t offset) {
     return static_cast<std::uint16_t>(
@@ -178,6 +263,42 @@ std::array<float, 32> resampleCycle32(
     return result;
 }
 
+std::array<float, 32> resampleWindow32(
+    std::span<const float> samples,
+    std::size_t begin,
+    std::size_t length) {
+    std::array<float, 32> result{};
+    if (length < 2 || begin + length > samples.size()) {
+        return result;
+    }
+    double mean{};
+    for (std::size_t index = 0; index < length; ++index) {
+        mean += samples[begin + index];
+    }
+    mean /= static_cast<double>(length);
+    float peak{};
+    for (std::size_t index = 0; index < length; ++index) {
+        peak = std::max(
+            peak,
+            std::abs(samples[begin + index] - static_cast<float>(mean)));
+    }
+    const float scale = peak > 1.0e-6F ? 1.0F / peak : 1.0F;
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        const double position =
+            static_cast<double>(index) * length / result.size();
+        const auto first = static_cast<std::size_t>(position) % length;
+        const auto second = (first + 1) % length;
+        const float fraction =
+            static_cast<float>(position - std::floor(position));
+        const float a =
+            (samples[begin + first] - static_cast<float>(mean)) * scale;
+        const float b =
+            (samples[begin + second] - static_cast<float>(mean)) * scale;
+        result[index] = a * (1.0F - fraction) + b * fraction;
+    }
+    return result;
+}
+
 struct OpllDeleter {
     void operator()(OPLL* chip) const noexcept {
         OPLL_delete(chip);
@@ -207,52 +328,6 @@ std::vector<float> synthesizePeriodicAudition(
         phase += step;
         while (phase >= static_cast<double>(cycle.size())) {
             phase -= static_cast<double>(cycle.size());
-        }
-    }
-    removeDcAndNormalize(result);
-    return result;
-}
-
-std::vector<float> renderOpllAudition(
-    const OpllPatchParameters& patch,
-    std::uint8_t midi_note,
-    std::size_t sample_count) {
-    std::vector<float> result(sample_count, 0.0F);
-    NotePitch pitch{};
-    if (!notePitch(midi_note, pitch)) {
-        return result;
-    }
-    std::unique_ptr<OPLL, OpllDeleter> chip(
-        OPLL_new(kChipClock, kAuditionSampleRate));
-    if (!chip) {
-        return result;
-    }
-    OPLL_reset(chip.get());
-    OPLL_setChipType(chip.get(), 0);
-    OPLL_resetPatch(chip.get(), OPLL_2413_TONE);
-    const auto registers = encodeOpllPatch(patch);
-    for (std::size_t index = 0; index < registers.size(); ++index) {
-        OPLL_writeReg(
-            chip.get(),
-            static_cast<std::uint32_t>(index),
-            registers[index]);
-    }
-    OPLL_writeReg(
-        chip.get(),
-        0x10,
-        static_cast<std::uint8_t>(pitch.opll.f_number & 0xFF));
-    OPLL_writeReg(chip.get(), 0x30, 0x00);
-    const auto pitch_register = static_cast<std::uint8_t>(
-        ((pitch.opll.f_number >> 8) & 1)
-        | ((pitch.opll.block & 7) << 1)
-        | 0x10);
-    OPLL_writeReg(chip.get(), 0x20, pitch_register);
-    for (std::size_t index = 0;
-         index < kAuditionWarmup + sample_count;
-         ++index) {
-        const float sample = static_cast<float>(OPLL_calc(chip.get()));
-        if (index >= kAuditionWarmup) {
-            result[index - kAuditionWarmup] = sample;
         }
     }
     removeDcAndNormalize(result);
@@ -311,32 +386,19 @@ float periodWindowDistance(
     }
     const std::size_t target_begin =
         (target.size() - period_samples) / 2;
-    std::vector<float> target_period(
-        target.begin() + static_cast<std::ptrdiff_t>(target_begin),
-        target.begin()
-            + static_cast<std::ptrdiff_t>(target_begin + period_samples));
-    const auto target_cycle = resampleCycle32(target_period);
-    float best = std::numeric_limits<float>::max();
-    const std::size_t max_shift = std::min(period_samples, generated.size() / 2);
-    for (std::size_t shift = 0; shift < max_shift; ++shift) {
-        if (shift + period_samples > generated.size()) {
-            break;
-        }
-        std::vector<float> generated_period(
-            generated.begin() + static_cast<std::ptrdiff_t>(shift),
-            generated.begin()
-                + static_cast<std::ptrdiff_t>(shift + period_samples));
-        best = std::min(
-            best,
-            cyclePairDistance(target_cycle, resampleCycle32(generated_period)));
-    }
-    return best;
+    const auto target_cycle =
+        resampleWindow32(target, target_begin, period_samples);
+    const std::size_t generated_begin =
+        (generated.size() - period_samples) / 2;
+    return cyclePairDistance(
+        target_cycle,
+        resampleWindow32(generated, generated_begin, period_samples));
 }
 
 constexpr std::uint32_t kOpllClock = kChipClock;
 constexpr std::uint32_t kOpllFitSampleRate = kAuditionSampleRate;
 constexpr std::size_t kEnvelopeBins = 32;
-constexpr std::size_t kSpectralBins = 64;
+constexpr std::size_t kSpectralBins = 80;
 constexpr std::size_t kSpectralFrames = 3;
 constexpr std::array<std::size_t, 3> kFftSizes{256, 1024, 4096};
 
@@ -357,27 +419,30 @@ struct OpllFitTarget {
     std::vector<float> samples;
     TimedAudioFeatures features;
     float fundamental_hz{261.625565F};
-    std::uint8_t midi_note{60};
     std::size_t key_off_sample{std::numeric_limits<std::size_t>::max()};
+    std::size_t render_offset_sample{};
 };
 
-std::uint8_t nearestMidiNote(float frequency_hz) {
-    if (!(frequency_hz > 0.0F) || !std::isfinite(frequency_hz)) {
-        return 60;
+OpllPitch closestOpllPitch(float frequency_hz) noexcept {
+    OpllPitch best{1, 0};
+    double best_error = std::numeric_limits<double>::max();
+    const double target = std::max(1.0, static_cast<double>(frequency_hz));
+    for (std::uint8_t block = 0; block < 8; ++block) {
+        const double scale =
+            static_cast<double>(kOpllClock)
+            / (72.0 * static_cast<double>(1U << (19 - block)));
+        const auto f_number = static_cast<std::uint16_t>(std::clamp(
+            static_cast<int>(std::lround(target / scale)),
+            1,
+            511));
+        const double rendered = static_cast<double>(f_number) * scale;
+        const double error = std::abs(std::log2(rendered / target));
+        if (error < best_error) {
+            best_error = error;
+            best = OpllPitch{f_number, block};
+        }
     }
-    const double note =
-        69.0 + 12.0 * std::log2(static_cast<double>(frequency_hz) / 440.0);
-    return static_cast<std::uint8_t>(std::clamp(
-        static_cast<int>(std::lround(note)),
-        24,
-        119));
-}
-
-float midiFrequency(std::uint8_t midi_note) {
-    return static_cast<float>(
-        440.0 * std::pow(
-            2.0,
-            (static_cast<double>(midi_note) - 69.0) / 12.0));
+    return best;
 }
 
 std::vector<float> resampleAudio(
@@ -644,71 +709,17 @@ float featureDistance(
     return spectral + envelope * 0.7F;
 }
 
-// Score OPLL patches by rendering at the same MIDI note as the SCC/cycle
-// reference and comparing both broadband features and one SCC-period window.
-class SameMidiScoreContext {
+class SteadyOpllRenderer {
 public:
-    SameMidiScoreContext(
-        std::span<const float> cycle,
-        float fundamental_hz,
-        std::uint8_t midi_note)
-        : fundamental_hz_(fundamental_hz),
-          midi_note_(midi_note),
-          period_samples_(std::clamp<std::size_t>(
-              static_cast<std::size_t>(std::llround(
-                  static_cast<double>(kAuditionSampleRate)
-                  / std::max(static_cast<double>(fundamental_hz), 1.0))),
-              16,
-              kAuditionSamples / 2)),
-          target_(synthesizePeriodicAudition(
-              cycle,
-              fundamental_hz,
-              kAuditionSamples)),
-          target_features_(timedFeatures(target_, fundamental_hz_)) {}
-
-    float score(const OpllPatchParameters& patch) {
-        const auto registers = encodeOpllPatch(patch);
-        if (const auto found = cache_.find(registers);
-            found != cache_.end()) {
-            return found->second;
-        }
-        const auto generated =
-            renderOpllAudition(patch, midi_note_, kAuditionSamples);
-        TimedFeatureWorkspace workspace;
-        float distance = featureDistance(
-            target_features_,
-            timedFeatures(generated, fundamental_hz_, workspace));
-        distance += periodWindowDistance(
-                        target_,
-                        generated,
-                        period_samples_)
-            * 1.25F;
-        cache_.emplace(registers, distance);
-        return distance;
-    }
-
-private:
-    float fundamental_hz_;
-    std::uint8_t midi_note_;
-    std::size_t period_samples_;
-    std::vector<float> target_;
-    TimedAudioFeatures target_features_;
-    std::map<std::array<std::uint8_t, 8>, float> cache_;
-};
-
-class OpllTimedRenderer {
-public:
-    OpllTimedRenderer()
+    SteadyOpllRenderer()
         : chip_(OPLL_new(kOpllClock, kOpllFitSampleRate)) {}
 
     const std::vector<float>& render(
         const OpllPatchParameters& patch,
-        std::uint8_t midi_note,
-        std::size_t sample_count,
-        std::size_t key_off_sample) {
+        OpllPitch pitch,
+        std::size_t sample_count) {
         result_.assign(sample_count, 0.0F);
-        NotePitch pitch{};
-        if (!chip_ || !notePitch(midi_note, pitch)) {
+        if (!chip_) {
             return result_;
         }
         OPLL_reset(chip_.get());
@@ -724,21 +735,130 @@ public:
         OPLL_writeReg(
             chip_.get(),
             0x10,
-            static_cast<std::uint8_t>(pitch.opll.f_number & 0xFF));
+            static_cast<std::uint8_t>(pitch.f_number & 0xFF));
+        OPLL_writeReg(chip_.get(), 0x30, 0x00);
+        OPLL_writeReg(
+            chip_.get(),
+            0x20,
+            static_cast<std::uint8_t>(
+                ((pitch.f_number >> 8) & 1)
+                | ((pitch.block & 7) << 1)
+                | 0x10));
+        for (std::size_t index = 0;
+             index < kAuditionWarmup + sample_count;
+             ++index) {
+            const float sample = static_cast<float>(OPLL_calc(chip_.get()));
+            if (index >= kAuditionWarmup) {
+                result_[index - kAuditionWarmup] = sample;
+            }
+        }
+        removeDcAndNormalize(result_);
+        return result_;
+    }
+
+private:
+    std::unique_ptr<OPLL, OpllDeleter> chip_;
+    std::vector<float> result_;
+};
+
+// Score OPLL patches by rendering at the same MIDI note as the SCC/cycle
+// reference and comparing both broadband features and one SCC-period window.
+class SameMidiScoreContext {
+public:
+    SameMidiScoreContext(
+        std::span<const float> cycle,
+        float fundamental_hz,
+        std::uint8_t midi_note)
+        : fundamental_hz_(fundamental_hz),
+          period_samples_(std::clamp<std::size_t>(
+              static_cast<std::size_t>(std::llround(
+                  static_cast<double>(kAuditionSampleRate)
+                  / std::max(static_cast<double>(fundamental_hz), 1.0))),
+              16,
+              kAuditionSamples / 2)),
+          target_(synthesizePeriodicAudition(
+              cycle,
+              fundamental_hz,
+              kAuditionSamples)),
+          target_features_(timedFeatures(target_, fundamental_hz_)) {
+        NotePitch note_pitch{};
+        if (notePitch(midi_note, note_pitch)) {
+            opll_pitch_ = note_pitch.opll;
+        }
+    }
+
+    float score(const OpllPatchParameters& patch) {
+        const auto& generated =
+            renderer_.render(patch, opll_pitch_, kAuditionSamples);
+        float distance = featureDistance(
+            target_features_,
+            timedFeatures(generated, fundamental_hz_, feature_workspace_));
+        distance += periodWindowDistance(
+                        target_,
+                        generated,
+                        period_samples_)
+            * 1.25F;
+        return distance;
+    }
+
+private:
+    float fundamental_hz_;
+    std::size_t period_samples_;
+    std::vector<float> target_;
+    TimedAudioFeatures target_features_;
+    OpllPitch opll_pitch_{};
+    SteadyOpllRenderer renderer_;
+    TimedFeatureWorkspace feature_workspace_;
+};
+
+class OpllTimedRenderer {
+public:
+    OpllTimedRenderer()
+        : chip_(OPLL_new(kOpllClock, kOpllFitSampleRate)) {}
+
+    const std::vector<float>& render(
+        const OpllPatchParameters& patch,
+        float frequency_hz,
+        std::size_t sample_count,
+        std::size_t key_off_sample,
+        std::size_t render_offset_sample) {
+        result_.assign(sample_count, 0.0F);
+        if (!chip_) {
+            return result_;
+        }
+        OPLL_reset(chip_.get());
+        OPLL_setChipType(chip_.get(), 0);
+        OPLL_resetPatch(chip_.get(), OPLL_2413_TONE);
+        const auto registers = encodeOpllPatch(patch);
+        for (std::size_t index = 0; index < registers.size(); ++index) {
+            OPLL_writeReg(
+                chip_.get(),
+                static_cast<std::uint32_t>(index),
+                registers[index]);
+        }
+        const auto pitch = closestOpllPitch(frequency_hz);
+        OPLL_writeReg(
+            chip_.get(),
+            0x10,
+            static_cast<std::uint8_t>(pitch.f_number & 0xFF));
         OPLL_writeReg(chip_.get(), 0x30, 0x00);
         const std::uint8_t pitch_without_key = static_cast<std::uint8_t>(
-            ((pitch.opll.f_number >> 8) & 1)
-            | ((pitch.opll.block & 7) << 1));
+            ((pitch.f_number >> 8) & 1)
+            | ((pitch.block & 7) << 1));
         OPLL_writeReg(
             chip_.get(),
             0x20,
             static_cast<std::uint8_t>(pitch_without_key | 0x10));
-        for (std::size_t index = 0; index < sample_count; ++index) {
+        for (std::size_t index = 0;
+             index < render_offset_sample + sample_count;
+             ++index) {
             if (index == key_off_sample) {
                 OPLL_writeReg(chip_.get(), 0x20, pitch_without_key);
             }
-            result_[index] =
-                static_cast<float>(OPLL_calc(chip_.get()));
+            const float sample = static_cast<float>(OPLL_calc(chip_.get()));
+            if (index >= render_offset_sample) {
+                result_[index - render_offset_sample] = sample;
+            }
         }
         removeDcAndNormalize(result_);
         return result_;
@@ -755,30 +875,30 @@ public:
         : target_(target),
           fundamental_hz_(target.fundamental_hz) {}
 
-    void remember(
-        const OpllPatchParameters& patch,
-        float distance) {
-        cache_.insert_or_assign(encodeOpllPatch(patch), distance);
-    }
-
     float score(const OpllPatchParameters& patch) {
-        const auto registers = encodeOpllPatch(patch);
-        if (const auto found = cache_.find(registers);
-            found != cache_.end()) {
-            return found->second;
-        }
         const auto& rendered = renderer_.render(
             patch,
-            target_.midi_note,
+            target_.fundamental_hz,
             target_.samples.size(),
-            target_.key_off_sample);
-        const float distance = featureDistance(
+            target_.key_off_sample,
+            target_.render_offset_sample);
+        float distance = featureDistance(
             target_.features,
             timedFeatures(
                 rendered,
                 fundamental_hz_,
                 feature_workspace_));
-        cache_.emplace(registers, distance);
+        const auto period_samples = std::clamp<std::size_t>(
+            static_cast<std::size_t>(std::llround(
+                static_cast<double>(kOpllFitSampleRate)
+                / std::max(1.0, static_cast<double>(fundamental_hz_)))),
+            16,
+            std::max<std::size_t>(16, target_.samples.size() / 2));
+        distance += periodWindowDistance(
+                        target_.samples,
+                        rendered,
+                        period_samples)
+            * 0.35F;
         return distance;
     }
 
@@ -787,8 +907,175 @@ private:
     float fundamental_hz_;
     OpllTimedRenderer renderer_;
     TimedFeatureWorkspace feature_workspace_;
-    std::map<std::array<std::uint8_t, 8>, float> cache_;
 };
+
+struct ScoredOpllPatch {
+    float distance{};
+    std::array<std::uint8_t, 8> registers{};
+    OpllPatchParameters patch{};
+};
+
+template <typename ContextFactory>
+class OpllScoreExecutor {
+public:
+    using Context = decltype(std::declval<ContextFactory&>()());
+
+    OpllScoreExecutor(ContextFactory make_context, std::size_t max_workers) {
+        const unsigned hardware = std::thread::hardware_concurrency();
+        worker_capacity_ = std::min<std::size_t>(
+            std::clamp<std::size_t>(max_workers, 1, 8),
+            hardware == 0 ? 4U : hardware);
+        contexts_.reserve(worker_capacity_);
+        for (std::size_t worker = 0; worker < worker_capacity_; ++worker) {
+            contexts_.push_back(
+                std::make_unique<Context>(make_context()));
+        }
+        if (worker_capacity_ == 1) {
+            return;
+        }
+        workers_.reserve(worker_capacity_);
+        try {
+            for (std::size_t worker = 0; worker < worker_capacity_; ++worker) {
+                workers_.emplace_back([this, worker] {
+                    workerLoop(worker);
+                });
+            }
+        } catch (const std::system_error&) {
+            // The already-created workers remain usable. Missing deterministic
+            // worker chunks are scored synchronously by score().
+        }
+    }
+
+    OpllScoreExecutor(const OpllScoreExecutor&) = delete;
+    OpllScoreExecutor& operator=(const OpllScoreExecutor&) = delete;
+
+    ~OpllScoreExecutor() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        work_ready_.notify_all();
+        for (auto& worker : workers_) {
+            worker.join();
+        }
+    }
+
+    void score(std::span<ScoredOpllPatch> batch) {
+        if (batch.empty()) {
+            return;
+        }
+        const std::size_t active_workers =
+            std::min(worker_capacity_, batch.size());
+        if (active_workers == 1) {
+            scoreChunk(batch, 0, active_workers);
+            return;
+        }
+
+        {
+            std::lock_guard lock(mutex_);
+            batch_data_ = batch.data();
+            batch_size_ = batch.size();
+            active_workers_ = active_workers;
+            completed_workers_ = 0;
+            ++generation_;
+        }
+        work_ready_.notify_all();
+
+        // A failed thread launch leaves a suffix of deterministic worker
+        // indices. Run exactly those chunks on the submitting thread.
+        for (std::size_t worker = workers_.size();
+             worker < active_workers;
+             ++worker) {
+            scoreChunk(batch, worker, active_workers);
+        }
+
+        std::unique_lock lock(mutex_);
+        work_done_.wait(lock, [&] {
+            return completed_workers_ == workers_.size();
+        });
+    }
+
+private:
+    void scoreChunk(
+        std::span<ScoredOpllPatch> batch,
+        std::size_t worker,
+        std::size_t worker_count) {
+        const std::size_t chunk_size =
+            (batch.size() + worker_count - 1) / worker_count;
+        const std::size_t begin = worker * chunk_size;
+        const std::size_t end = std::min(begin + chunk_size, batch.size());
+        auto& context = *contexts_[worker];
+        for (std::size_t index = begin; index < end; ++index) {
+            batch[index].distance = context.score(batch[index].patch);
+        }
+    }
+
+    void workerLoop(std::size_t worker) {
+        std::uint64_t observed_generation{};
+        for (;;) {
+            std::span<ScoredOpllPatch> batch;
+            std::size_t active_workers{};
+            {
+                std::unique_lock lock(mutex_);
+                work_ready_.wait(lock, [&] {
+                    return stopping_ || generation_ != observed_generation;
+                });
+                if (stopping_) {
+                    return;
+                }
+                observed_generation = generation_;
+                batch = {batch_data_, batch_size_};
+                active_workers = active_workers_;
+            }
+            if (worker < active_workers) {
+                scoreChunk(batch, worker, active_workers);
+            }
+            {
+                std::lock_guard lock(mutex_);
+                ++completed_workers_;
+            }
+            work_done_.notify_one();
+        }
+    }
+
+    std::size_t worker_capacity_{1};
+    std::vector<std::unique_ptr<Context>> contexts_;
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable work_ready_;
+    std::condition_variable work_done_;
+    ScoredOpllPatch* batch_data_{};
+    std::size_t batch_size_{};
+    std::size_t active_workers_{};
+    std::size_t completed_workers_{};
+    std::uint64_t generation_{};
+    bool stopping_{};
+};
+
+template <typename Executor>
+bool scoreOpllSubBatches(
+    std::vector<ScoredOpllPatch>& candidates,
+    Executor& executor,
+    std::size_t batch_size,
+    std::uint64_t weight,
+    OpllApproximationCoordinator* coordinator) {
+    for (std::size_t begin = 0; begin < candidates.size();
+         begin += batch_size) {
+        if (coordinator && coordinator->cancelled()) {
+            return false;
+        }
+        const std::size_t count =
+            std::min(batch_size, candidates.size() - begin);
+        executor.score(
+            std::span<ScoredOpllPatch>(candidates).subspan(begin, count));
+        // A sub-batch is published only after every worker has completed.
+        if (coordinator) {
+            coordinator->advance(
+                static_cast<std::uint64_t>(count) * weight);
+        }
+    }
+    return true;
+}
 
 std::size_t detectKeyOff(
     const std::array<float, kEnvelopeBins>& envelope,
@@ -850,13 +1137,542 @@ OpllFitTarget makeFitTarget(
         cycle_analysis.estimated_frequency_hz > 0.0F
             ? cycle_analysis.estimated_frequency_hz
             : 261.625565F;
-    target.midi_note = nearestMidiNote(target.fundamental_hz);
     target.features = timedFeatures(
         target.samples,
         target.fundamental_hz);
     target.key_off_sample =
         detectKeyOff(target.features.envelope, target.samples.size());
     return target;
+}
+
+OpllFitTarget makeTimbreTarget(const OpllFitTarget& full_target) {
+    OpllFitTarget target{};
+    target.fundamental_hz = full_target.fundamental_hz;
+    target.key_off_sample = std::numeric_limits<std::size_t>::max();
+    if (full_target.samples.empty()) {
+        return target;
+    }
+    constexpr std::size_t maximum_samples = 4'096;
+    const std::size_t length =
+        std::min(maximum_samples, full_target.samples.size());
+    // Skip only a bounded onset interval. Rendering applies the same offset,
+    // keeping target and candidate envelope time aligned without making the
+    // cheap phase scale with a long source WAV.
+    const std::size_t best_begin = std::min<std::size_t>(
+        1'024,
+        full_target.samples.size() - length);
+    target.render_offset_sample = best_begin;
+    target.samples.assign(
+        full_target.samples.begin() + static_cast<std::ptrdiff_t>(best_begin),
+        full_target.samples.begin()
+            + static_cast<std::ptrdiff_t>(best_begin + length));
+    removeDcAndNormalize(target.samples);
+    target.features = timedFeatures(target.samples, target.fundamental_hz);
+    return target;
+}
+
+std::vector<OpllPatchParameters> searchTimedOpll(
+    const OpllFitTarget& target,
+    std::span<const float> representative_cycle,
+    const OpllApproximationOptions& options,
+    OpllApproximationCoordinator* coordinator,
+    const SearchBudgets& budgets) {
+    // Cheap timbre phase: 92 seeds + 8 * (81 + 72 + 32 + 4*4 + 16)
+    // = 1,828 probes before register deduplication.
+    const std::size_t evaluation_budget = budgets.short_timbre;
+    const std::size_t steady_batch_size =
+        options.effort == OpllApproximationEffort::Standard
+        ? kStandardSteadyBatchSize
+        : kSteadyBatchSize;
+    const std::size_t full_batch_size =
+        options.effort == OpllApproximationEffort::Standard
+        ? kStandardFullWaveBatchSize
+        : kFullWaveBatchSize;
+    constexpr std::size_t beam_width = 8;
+    constexpr std::size_t result_capacity = 6;
+    const auto timbre_target = makeTimbreTarget(target);
+    std::size_t evaluations{};
+    std::set<std::array<std::uint8_t, 8>> seen;
+    std::vector<ScoredOpllPatch> short_scored;
+    // OPLL_new performs emu2413's one-time table initialization. Complete it
+    // on this thread before any worker constructs its private context.
+    TimedOpllScoreContext priming_context(timbre_target);
+    static_cast<void>(priming_context);
+    const auto make_context = [&timbre_target] {
+        return TimedOpllScoreContext(timbre_target);
+    };
+    const auto less = [](
+                          const ScoredOpllPatch& left,
+                          const ScoredOpllPatch& right) {
+        if (left.distance != right.distance) {
+            return left.distance < right.distance;
+        }
+        return left.registers < right.registers;
+    };
+    const auto admit = [&](
+                           const OpllPatchParameters& patch,
+                           std::vector<ScoredOpllPatch>& batch) {
+        const auto registers = encodeOpllPatch(patch);
+        if (evaluations >= evaluation_budget || !seen.insert(registers).second) {
+            return;
+        }
+        ++evaluations;
+        batch.push_back(ScoredOpllPatch{0.0F, registers, patch});
+    };
+    const auto retain = [&](std::vector<ScoredOpllPatch> candidates) {
+        std::sort(candidates.begin(), candidates.end(), less);
+        if (candidates.size() > beam_width) {
+            candidates.resize(beam_width);
+        }
+        return candidates;
+    };
+    std::vector<ScoredOpllPatch> seed_batch;
+    const auto seed = [&](const OpllPatchParameters& patch) {
+        admit(patch, seed_batch);
+    };
+
+    for (const auto& patch : searchWaveCycleWithOpll(
+             representative_cycle,
+             options,
+             coordinator,
+             budgets.representative,
+             OpllApproximationPhase::RepresentativeCycle)) {
+        seed(patch);
+    }
+    if (coordinator && coordinator->cancelled()) {
+        return {};
+    }
+    seed(defaultOpllPatch());
+    for (std::uint8_t instrument = 1; instrument <= 15; ++instrument) {
+        if (const auto rom = ym2413RomPatch(instrument)) {
+            seed(*rom);
+        }
+    }
+    std::uint32_t random = 0x5749464DU;
+    const auto next_random = [&]() {
+        random = random * 1664525U + 1013904223U;
+        return random;
+    };
+    for (int index = 0; index < 64; ++index) {
+        auto candidate = defaultOpllPatch();
+        std::uint32_t bits = next_random();
+        candidate.modulator.multiplier = bits & 15;
+        candidate.carrier.multiplier = (bits >> 4) & 15;
+        candidate.feedback = (bits >> 8) & 7;
+        candidate.modulator.waveform = ((bits >> 11) & 1) != 0;
+        candidate.carrier.waveform = ((bits >> 12) & 1) != 0;
+        candidate.modulator.pitch_modulation = ((bits >> 13) & 1) != 0;
+        candidate.carrier.pitch_modulation = ((bits >> 14) & 1) != 0;
+        candidate.modulator.amplitude_modulation = ((bits >> 15) & 1) != 0;
+        candidate.carrier.amplitude_modulation = ((bits >> 16) & 1) != 0;
+        candidate.modulator.sustained_tone = ((bits >> 17) & 1) != 0;
+        candidate.carrier.sustained_tone = ((bits >> 18) & 1) != 0;
+        candidate.modulator.key_rate_scaling = ((bits >> 19) & 1) != 0;
+        candidate.carrier.key_rate_scaling = ((bits >> 20) & 1) != 0;
+        candidate.modulator.key_scale_level = (bits >> 21) & 3;
+        candidate.carrier.key_scale_level = (bits >> 23) & 3;
+        bits = next_random();
+        candidate.modulator.total_level = bits & 63;
+        candidate.modulator.attack_rate = (bits >> 6) & 15;
+        candidate.modulator.decay_rate = (bits >> 10) & 15;
+        candidate.modulator.sustain_level = (bits >> 14) & 15;
+        candidate.modulator.release_rate = (bits >> 18) & 15;
+        candidate.carrier.attack_rate = (bits >> 22) & 15;
+        candidate.carrier.decay_rate = (bits >> 26) & 15;
+        bits = next_random();
+        candidate.carrier.sustain_level = bits & 15;
+        candidate.carrier.release_rate = (bits >> 4) & 15;
+        seed(candidate);
+    }
+    if (coordinator) {
+        coordinator->setPhase(OpllApproximationPhase::ShortTimbre);
+    }
+    // Do not keep the short-target pool alive during the nested
+    // representative-cycle search; each homogeneous phase owns one pool.
+    OpllScoreExecutor short_executor(make_context, options.max_workers);
+    if (!scoreOpllSubBatches(
+            seed_batch,
+            short_executor,
+            steady_batch_size,
+            1,
+            coordinator)) {
+        return {};
+    }
+    short_scored.insert(
+        short_scored.end(), seed_batch.begin(), seed_batch.end());
+    std::vector<ScoredOpllPatch> beam = retain(std::move(seed_batch));
+    const auto run_stage = [&](auto generate) {
+        std::vector<ScoredOpllPatch> batch;
+        for (const auto& parent : beam) {
+            generate(parent.patch, [&](const OpllPatchParameters& candidate) {
+                admit(candidate, batch);
+            });
+        }
+        if (!scoreOpllSubBatches(
+                batch,
+                short_executor,
+                steady_batch_size,
+                1,
+                coordinator)) {
+            return false;
+        }
+        short_scored.insert(
+            short_scored.end(), batch.begin(), batch.end());
+        std::vector<ScoredOpllPatch> next = beam;
+        next.insert(next.end(), batch.begin(), batch.end());
+        beam = retain(std::move(next));
+        return true;
+    };
+
+    constexpr std::array<std::uint8_t, 9> multipliers{
+        0, 1, 2, 3, 4, 6, 8, 12, 15};
+    if (!run_stage([&](const OpllPatchParameters& base, auto emit) {
+        for (const auto modulator : multipliers) {
+            for (const auto carrier : multipliers) {
+                auto candidate = base;
+                candidate.modulator.multiplier = modulator;
+                candidate.carrier.multiplier = carrier;
+                emit(candidate);
+            }
+        }
+    })) return {};
+    constexpr std::array<std::uint8_t, 9> levels{
+        0, 8, 16, 24, 32, 40, 48, 56, 63};
+    if (!run_stage([&](const OpllPatchParameters& base, auto emit) {
+        for (const auto level : levels) {
+            for (std::uint8_t feedback = 0; feedback < 8; ++feedback) {
+                auto candidate = base;
+                candidate.modulator.total_level = level;
+                candidate.feedback = feedback;
+                emit(candidate);
+            }
+        }
+    })) return {};
+    if (!run_stage([](const OpllPatchParameters& base, auto emit) {
+        for (int waveform = 0; waveform < 4; ++waveform) {
+            for (std::uint8_t feedback = 0; feedback < 8; ++feedback) {
+                auto candidate = base;
+                candidate.modulator.waveform = (waveform & 1) != 0;
+                candidate.carrier.waveform = (waveform & 2) != 0;
+                candidate.feedback = feedback;
+                emit(candidate);
+            }
+        }
+    })) return {};
+    if (!run_stage([](const OpllPatchParameters& base, auto emit) {
+        for (int value = 0; value < 4; ++value) {
+            auto candidate = base;
+            candidate.modulator.amplitude_modulation = (value & 1) != 0;
+            candidate.carrier.amplitude_modulation = (value & 2) != 0;
+            emit(candidate);
+        }
+    })) return {};
+    if (!run_stage([](const OpllPatchParameters& base, auto emit) {
+        for (int value = 0; value < 4; ++value) {
+            auto candidate = base;
+            candidate.modulator.pitch_modulation = (value & 1) != 0;
+            candidate.carrier.pitch_modulation = (value & 2) != 0;
+            emit(candidate);
+        }
+    })) return {};
+    if (!run_stage([](const OpllPatchParameters& base, auto emit) {
+        for (int value = 0; value < 4; ++value) {
+            auto candidate = base;
+            candidate.modulator.sustained_tone = (value & 1) != 0;
+            candidate.carrier.sustained_tone = (value & 2) != 0;
+            emit(candidate);
+        }
+    })) return {};
+    if (!run_stage([](const OpllPatchParameters& base, auto emit) {
+        for (int value = 0; value < 4; ++value) {
+            auto candidate = base;
+            candidate.modulator.key_rate_scaling = (value & 1) != 0;
+            candidate.carrier.key_rate_scaling = (value & 2) != 0;
+            emit(candidate);
+        }
+    })) return {};
+    if (!run_stage([](const OpllPatchParameters& base, auto emit) {
+        for (std::uint8_t modulator = 0; modulator < 4; ++modulator) {
+            for (std::uint8_t carrier = 0; carrier < 4; ++carrier) {
+                auto candidate = base;
+                candidate.modulator.key_scale_level = modulator;
+                candidate.carrier.key_scale_level = carrier;
+                emit(candidate);
+            }
+        }
+    })) return {};
+
+    // Thorough uses deterministic full-register restarts after the complete
+    // Standard path. Decoding arbitrary register bytes spans the legal patch
+    // space and prevents later stages from starving on duplicate mutations.
+    if (options.effort == OpllApproximationEffort::Thorough) {
+        std::sort(short_scored.begin(), short_scored.end(), less);
+        std::vector<ScoredOpllPatch> broad_beam = short_scored;
+        if (broad_beam.size() > 24) {
+            broad_beam.resize(24);
+        }
+        std::vector<ScoredOpllPatch> pair_local_batch;
+        for (const auto& parent : broad_beam) {
+            for (int delta = -2; delta <= 2; ++delta) {
+                auto candidate = parent.patch;
+                candidate.modulator.multiplier =
+                    static_cast<std::uint8_t>(std::clamp(
+                        static_cast<int>(
+                            parent.patch.modulator.multiplier)
+                            + delta,
+                        0,
+                        15));
+                candidate.carrier.multiplier =
+                    static_cast<std::uint8_t>(std::clamp(
+                        static_cast<int>(parent.patch.carrier.multiplier)
+                            - delta,
+                        0,
+                        15));
+                candidate.modulator.total_level =
+                    static_cast<std::uint8_t>(std::clamp(
+                        static_cast<int>(
+                            parent.patch.modulator.total_level)
+                            + delta * 2,
+                        0,
+                        63));
+                admit(candidate, pair_local_batch);
+            }
+        }
+        if (!scoreOpllSubBatches(
+                pair_local_batch,
+                short_executor,
+                steady_batch_size,
+                1,
+                coordinator)) {
+            return {};
+        }
+        short_scored.insert(
+            short_scored.end(),
+            pair_local_batch.begin(),
+            pair_local_batch.end());
+        while (evaluations < evaluation_budget) {
+            std::vector<ScoredOpllPatch> batch;
+            batch.reserve(steady_batch_size);
+            while (batch.size() < steady_batch_size
+                   && evaluations < evaluation_budget) {
+                std::array<std::uint8_t, 8> registers{};
+                for (auto& value : registers) {
+                    value = static_cast<std::uint8_t>(next_random() >> 24);
+                }
+                admit(decodeOpllPatch(registers), batch);
+            }
+            if (!scoreOpllSubBatches(
+                    batch,
+                    short_executor,
+                    steady_batch_size,
+                    1,
+                    coordinator)) {
+                return {};
+            }
+            short_scored.insert(
+                short_scored.end(), batch.begin(), batch.end());
+            std::vector<ScoredOpllPatch> next = beam;
+            next.insert(next.end(), batch.begin(), batch.end());
+            beam = retain(std::move(next));
+        }
+    }
+
+    // Full-length phase: 8 promoted timbres + 3 * (4 * 16 + 8 * 5)
+    // = 320 probes before register deduplication.
+    const std::size_t full_evaluation_budget = budgets.full_envelope;
+    constexpr std::size_t full_beam_width = 3;
+    std::size_t full_evaluations{};
+    std::set<std::array<std::uint8_t, 8>> full_seen;
+    std::vector<ScoredOpllPatch> full_scored;
+    TimedOpllScoreContext full_priming_context(target);
+    static_cast<void>(full_priming_context);
+    const auto make_full_context = [&target] {
+        return TimedOpllScoreContext(target);
+    };
+    OpllScoreExecutor full_executor(make_full_context, options.max_workers);
+    const auto admit_full = [&](
+                                const OpllPatchParameters& patch,
+                                std::vector<ScoredOpllPatch>& batch) {
+        const auto registers = encodeOpllPatch(patch);
+        if (full_evaluations >= full_evaluation_budget
+            || !full_seen.insert(registers).second) {
+            return;
+        }
+        ++full_evaluations;
+        batch.push_back(ScoredOpllPatch{0.0F, registers, patch});
+    };
+    const auto retain_full = [&](std::vector<ScoredOpllPatch> candidates) {
+        std::sort(candidates.begin(), candidates.end(), less);
+        if (candidates.size() > full_beam_width) {
+            candidates.resize(full_beam_width);
+        }
+        return candidates;
+    };
+    std::vector<ScoredOpllPatch> promoted_batch;
+    for (const auto& entry : beam) {
+        admit_full(entry.patch, promoted_batch);
+    }
+    if (coordinator) {
+        coordinator->setPhase(OpllApproximationPhase::FullEnvelope);
+    }
+    const auto full_weight = fullWaveWeight(target.samples.size());
+    if (!scoreOpllSubBatches(
+            promoted_batch,
+            full_executor,
+            full_batch_size,
+            full_weight,
+            coordinator)) {
+        return {};
+    }
+    full_scored.insert(
+        full_scored.end(),
+        promoted_batch.begin(),
+        promoted_batch.end());
+    std::vector<ScoredOpllPatch> full_beam =
+        retain_full(std::move(promoted_batch));
+    const auto run_full_stage = [&](auto generate) {
+        std::vector<ScoredOpllPatch> batch;
+        for (const auto& parent : full_beam) {
+            generate(parent.patch, [&](const OpllPatchParameters& candidate) {
+                admit_full(candidate, batch);
+            });
+        }
+        if (!scoreOpllSubBatches(
+                batch,
+                full_executor,
+                full_batch_size,
+                full_weight,
+                coordinator)) {
+            return false;
+        }
+        full_scored.insert(full_scored.end(), batch.begin(), batch.end());
+        std::vector<ScoredOpllPatch> next = full_beam;
+        next.insert(next.end(), batch.begin(), batch.end());
+        full_beam = retain_full(std::move(next));
+        return true;
+    };
+
+    constexpr std::array<std::uint8_t, 4> eg{0, 5, 10, 15};
+    run_full_stage([&](const OpllPatchParameters& base, auto emit) {
+        for (const auto attack : eg) {
+            for (const auto decay : eg) {
+                auto candidate = base;
+                candidate.modulator.attack_rate = attack;
+                candidate.modulator.decay_rate = decay;
+                emit(candidate);
+            }
+        }
+    });
+    run_full_stage([&](const OpllPatchParameters& base, auto emit) {
+        for (const auto sustain : eg) {
+            for (const auto release : eg) {
+                auto candidate = base;
+                candidate.modulator.sustain_level = sustain;
+                candidate.modulator.release_rate = release;
+                emit(candidate);
+            }
+        }
+    });
+    run_full_stage([&](const OpllPatchParameters& base, auto emit) {
+        for (const auto attack : eg) {
+            for (const auto decay : eg) {
+                auto candidate = base;
+                candidate.carrier.attack_rate = attack;
+                candidate.carrier.decay_rate = decay;
+                emit(candidate);
+            }
+        }
+    });
+    run_full_stage([&](const OpllPatchParameters& base, auto emit) {
+        for (const auto sustain : eg) {
+            for (const auto release : eg) {
+                auto candidate = base;
+                candidate.carrier.sustain_level = sustain;
+                candidate.carrier.release_rate = release;
+                emit(candidate);
+            }
+        }
+    });
+
+    // Quantization-aware ±2 refinement runs only after all four joint EG
+    // stages; the full-phase upper bound reserves all 120 probes.
+    const auto refine_local = [&](auto member) {
+        run_full_stage([&](const OpllPatchParameters& base, auto emit) {
+            const int center = member(base);
+            for (int delta = -2; delta <= 2; ++delta) {
+                auto candidate = base;
+                member(candidate) = static_cast<std::uint8_t>(
+                    std::clamp(center + delta, 0, 15));
+                emit(candidate);
+            }
+        });
+    };
+    refine_local([](auto& patch) -> auto& {
+        return patch.modulator.attack_rate;
+    });
+    refine_local([](auto& patch) -> auto& {
+        return patch.modulator.decay_rate;
+    });
+    refine_local([](auto& patch) -> auto& {
+        return patch.modulator.sustain_level;
+    });
+    refine_local([](auto& patch) -> auto& {
+        return patch.modulator.release_rate;
+    });
+    refine_local([](auto& patch) -> auto& {
+        return patch.carrier.attack_rate;
+    });
+    refine_local([](auto& patch) -> auto& {
+        return patch.carrier.decay_rate;
+    });
+    refine_local([](auto& patch) -> auto& {
+        return patch.carrier.sustain_level;
+    });
+    refine_local([](auto& patch) -> auto& {
+        return patch.carrier.release_rate;
+    });
+
+    if (coordinator && coordinator->cancelled()) {
+        return {};
+    }
+    if (options.effort == OpllApproximationEffort::Thorough) {
+        while (full_evaluations < full_evaluation_budget) {
+            std::vector<ScoredOpllPatch> batch;
+            batch.reserve(full_batch_size);
+            while (batch.size() < full_batch_size
+                   && full_evaluations < full_evaluation_budget) {
+                std::array<std::uint8_t, 8> registers{};
+                for (auto& value : registers) {
+                    value = static_cast<std::uint8_t>(next_random() >> 24);
+                }
+                admit_full(decodeOpllPatch(registers), batch);
+            }
+            if (!scoreOpllSubBatches(
+                    batch,
+                    full_executor,
+                    full_batch_size,
+                    full_weight,
+                    coordinator)) {
+                return {};
+            }
+            full_scored.insert(
+                full_scored.end(), batch.begin(), batch.end());
+        }
+    }
+
+    std::sort(full_scored.begin(), full_scored.end(), less);
+    std::vector<OpllPatchParameters> result;
+    result.reserve(result_capacity);
+    for (const auto& entry : full_scored) {
+        result.push_back(entry.patch);
+        if (result.size() == result_capacity) {
+            break;
+        }
+    }
+    if (result.empty()) {
+        result.push_back(defaultOpllPatch());
+    }
+    return result;
 }
 
 }  // namespace
@@ -1039,6 +1855,21 @@ OpllPatchParameters approximateWaveCycleWithOpll(
 
 std::vector<OpllPatchParameters> approximateWaveCycleCandidatesWithOpll(
     std::span<const float> cycle) {
+    return approximateWaveCycleCandidatesWithOpll(
+        cycle,
+        OpllApproximationOptions{});
+}
+
+std::vector<OpllPatchParameters> searchWaveCycleWithOpll(
+    std::span<const float> cycle,
+    const OpllApproximationOptions& options,
+    OpllApproximationCoordinator* coordinator,
+    std::size_t evaluation_budget,
+    OpllApproximationPhase phase) {
+    const std::size_t steady_batch_size =
+        options.effort == OpllApproximationEffort::Standard
+        ? kStandardSteadyBatchSize
+        : kSteadyBatchSize;
     const auto normalized = normalizedCycle(cycle);
     if (normalized.size() < 2) {
         return {defaultOpllPatch()};
@@ -1048,10 +1879,18 @@ std::vector<OpllPatchParameters> approximateWaveCycleCandidatesWithOpll(
         return {defaultOpllPatch()};
     }
     const float fundamental_hz = sccFrequencyHz(pitch.psg_scc_period);
-    SameMidiScoreContext scoring(
+    SameMidiScoreContext priming_context(
         normalized,
         fundamental_hz,
         kAuditionMidiNote);
+    static_cast<void>(priming_context);
+    const auto make_context = [&normalized, fundamental_hz] {
+        return SameMidiScoreContext(
+            normalized,
+            fundamental_hz,
+            kAuditionMidiNote);
+    };
+    OpllScoreExecutor score_executor(make_context, options.max_workers);
     const auto prepare = [](OpllPatchParameters patch) {
         patch.modulator.amplitude_modulation = false;
         patch.carrier.amplitude_modulation = false;
@@ -1071,40 +1910,46 @@ std::vector<OpllPatchParameters> approximateWaveCycleCandidatesWithOpll(
         patch.carrier.release_rate = 8;
         return patch;
     };
-    struct ScoredPatch {
-        float distance{std::numeric_limits<float>::max()};
-        OpllPatchParameters patch{};
-    };
-    std::array<ScoredPatch, 8> leaders{};
-    std::size_t leader_count{};
-    const auto score = [&](const OpllPatchParameters& patch) {
-        return scoring.score(patch);
-    };
-    auto consider = [&](const OpllPatchParameters& patch) {
-        const ScoredPatch entry{score(patch), patch};
-        std::size_t position{};
-        while (position < leader_count
-               && leaders[position].distance <= entry.distance) {
-            ++position;
+    // Upper bound before register deduplication:
+    // 402 seeds + 12 * (256 + 72 + 32 + 4 + 19) = 4,998.
+    constexpr std::size_t beam_width = 12;
+    std::size_t evaluations{};
+    std::set<std::array<std::uint8_t, 8>> seen;
+    std::vector<ScoredOpllPatch> all_scored;
+    const auto less = [](
+                          const ScoredOpllPatch& left,
+                          const ScoredOpllPatch& right) {
+        if (left.distance != right.distance) {
+            return left.distance < right.distance;
         }
-        if (position >= leaders.size()) {
+        return left.registers < right.registers;
+    };
+    const auto admit = [&](
+                           const OpllPatchParameters& patch,
+                           std::vector<ScoredOpllPatch>& batch) {
+        const auto registers = encodeOpllPatch(patch);
+        if (evaluations >= evaluation_budget || !seen.insert(registers).second) {
             return;
         }
-        const std::size_t new_count =
-            std::min(leaders.size(), leader_count + 1);
-        for (std::size_t index = new_count - 1;
-             index > position;
-             --index) {
-            leaders[index] = leaders[index - 1];
+        ++evaluations;
+        batch.push_back(ScoredOpllPatch{0.0F, registers, patch});
+    };
+    const auto retain = [&](std::vector<ScoredOpllPatch> candidates) {
+        std::sort(candidates.begin(), candidates.end(), less);
+        if (candidates.size() > beam_width) {
+            candidates.resize(beam_width);
         }
-        leaders[position] = entry;
-        leader_count = new_count;
+        return candidates;
+    };
+    std::vector<ScoredOpllPatch> seed_batch;
+    const auto seed = [&](const OpllPatchParameters& patch) {
+        admit(patch, seed_batch);
     };
 
-    consider(prepare(defaultOpllPatch()));
+    seed(prepare(defaultOpllPatch()));
     for (std::uint8_t instrument = 1; instrument <= 15; ++instrument) {
         if (const auto rom = ym2413RomPatch(instrument)) {
-            consider(prepare(*rom));
+            seed(prepare(*rom));
         }
     }
 
@@ -1134,476 +1979,355 @@ std::vector<OpllPatchParameters> approximateWaveCycleCandidatesWithOpll(
             ((bits >> 6) & 3) == 1;
         candidate.carrier.pitch_modulation =
             ((bits >> 8) & 3) == 1;
-        consider(candidate);
+        seed(candidate);
     }
 
     // Insurance: always evaluate MULTI 1 and 2 with quiet modulator.
-    for (const std::uint8_t car_mul : {1, 2}) {
+    for (const std::uint8_t car_mul :
+         std::array<std::uint8_t, 2>{1, 2}) {
         auto candidate = prepare(defaultOpllPatch());
         candidate.modulator.multiplier = 0;
         candidate.carrier.multiplier = car_mul;
         candidate.modulator.total_level = 63;
         candidate.feedback = 0;
-        consider(candidate);
+        seed(candidate);
     }
+    if (coordinator) {
+        coordinator->setPhase(phase);
+    }
+    if (!scoreOpllSubBatches(
+            seed_batch,
+            score_executor,
+            steady_batch_size,
+            1,
+            coordinator)) {
+        return {};
+    }
+    all_scored.insert(
+        all_scored.end(),
+        seed_batch.begin(),
+        seed_batch.end());
+    std::vector<ScoredOpllPatch> beam = retain(std::move(seed_batch));
+    const auto run_stage = [&](auto generate) {
+        std::vector<ScoredOpllPatch> batch;
+        for (const auto& parent : beam) {
+            generate(parent.patch, [&](const OpllPatchParameters& candidate) {
+                admit(candidate, batch);
+            });
+        }
+        if (!scoreOpllSubBatches(
+                batch,
+                score_executor,
+                steady_batch_size,
+                1,
+                coordinator)) {
+            return false;
+        }
+        all_scored.insert(all_scored.end(), batch.begin(), batch.end());
+        std::vector<ScoredOpllPatch> next = beam;
+        next.insert(next.end(), batch.begin(), batch.end());
+        beam = retain(std::move(next));
+        return true;
+    };
 
-    const auto initial_leaders = leaders;
-    const std::size_t initial_count = leader_count;
-    for (std::size_t seed = 0;
-         seed < std::min<std::size_t>(initial_count, 4);
-         ++seed) {
-        auto best = initial_leaders[seed].patch;
-        float best_distance = initial_leaders[seed].distance;
-        auto improve = [&](OpllPatchParameters candidate) {
-            const float distance = score(candidate);
-            if (distance < best_distance) {
-                best_distance = distance;
-                best = candidate;
-            }
-        };
-        for (int round = 0; round < 1; ++round) {
-            for (std::uint8_t value = 0; value < 16; ++value) {
-                auto candidate = best;
-                candidate.modulator.multiplier = value;
-                improve(candidate);
-            }
-            for (std::uint8_t value = 0; value < 16; ++value) {
-                auto candidate = best;
-                candidate.carrier.multiplier = value;
-                improve(candidate);
-            }
-            for (std::uint8_t value = 0; value < 64; ++value) {
-                auto candidate = best;
-                candidate.modulator.total_level = value;
-                improve(candidate);
-            }
-            for (std::uint8_t value = 0; value < 8; ++value) {
-                auto candidate = best;
-                candidate.feedback = value;
-                improve(candidate);
-            }
-            for (int value = 0; value < 4; ++value) {
-                auto candidate = best;
-                candidate.modulator.waveform = (value & 1) != 0;
-                candidate.carrier.waveform = (value & 2) != 0;
-                improve(candidate);
-            }
-            for (int value = 0; value < 4; ++value) {
-                auto candidate = best;
-                candidate.modulator.pitch_modulation = (value & 1) != 0;
-                candidate.carrier.pitch_modulation = (value & 2) != 0;
-                improve(candidate);
+    // Joint operator-ratio search preserves alternatives that greedy
+    // one-register-at-a-time refinement cannot reach.
+    if (!run_stage([](const OpllPatchParameters& base, auto emit) {
+        for (std::uint8_t mod = 0; mod < 16; ++mod) {
+            for (std::uint8_t car = 0; car < 16; ++car) {
+                auto candidate = base;
+                candidate.modulator.multiplier = mod;
+                candidate.carrier.multiplier = car;
+                emit(candidate);
             }
         }
-        consider(best);
+    })) return {};
+    constexpr std::array<std::uint8_t, 9> levels{
+        0, 8, 16, 24, 32, 40, 48, 56, 63};
+    if (!run_stage([&](const OpllPatchParameters& base, auto emit) {
+        for (const auto level : levels) {
+            for (std::uint8_t feedback = 0; feedback < 8; ++feedback) {
+                auto candidate = base;
+                candidate.modulator.total_level = level;
+                candidate.feedback = feedback;
+                emit(candidate);
+            }
+        }
+    })) return {};
+    if (!run_stage([](const OpllPatchParameters& base, auto emit) {
+        for (int waveforms = 0; waveforms < 4; ++waveforms) {
+            for (std::uint8_t feedback = 0; feedback < 8; ++feedback) {
+                auto candidate = base;
+                candidate.modulator.waveform = (waveforms & 1) != 0;
+                candidate.carrier.waveform = (waveforms & 2) != 0;
+                candidate.feedback = feedback;
+                emit(candidate);
+            }
+        }
+    })) return {};
+    if (!run_stage([](const OpllPatchParameters& base, auto emit) {
+        for (int modulation = 0; modulation < 4; ++modulation) {
+            auto candidate = base;
+            candidate.modulator.pitch_modulation = (modulation & 1) != 0;
+            candidate.carrier.pitch_modulation = (modulation & 2) != 0;
+            emit(candidate);
+        }
+    })) return {};
+    if (!run_stage([](const OpllPatchParameters& base, auto emit) {
+        const int center = base.modulator.total_level;
+        for (int delta = -4; delta <= 4; ++delta) {
+            auto candidate = base;
+            candidate.modulator.total_level = static_cast<std::uint8_t>(
+                std::clamp(center + delta, 0, 63));
+            emit(candidate);
+        }
+        for (int delta = -2; delta <= 2; ++delta) {
+            auto mod = base;
+            mod.modulator.multiplier = static_cast<std::uint8_t>(
+                std::clamp(
+                    static_cast<int>(base.modulator.multiplier) + delta,
+                    0,
+                    15));
+            emit(mod);
+            auto car = base;
+            car.carrier.multiplier = static_cast<std::uint8_t>(
+                std::clamp(
+                    static_cast<int>(base.carrier.multiplier) + delta,
+                    0,
+                    15));
+            emit(car);
+        }
+    })) return {};
+
+    if (options.effort == OpllApproximationEffort::Thorough) {
+        // Re-open the beam after the complete Standard path, then perform a
+        // joint ratio/level neighborhood before fixed-seed restarts.
+        std::sort(all_scored.begin(), all_scored.end(), less);
+        std::vector<ScoredOpllPatch> broad_beam = all_scored;
+        if (broad_beam.size() > 48) {
+            broad_beam.resize(48);
+        }
+        std::vector<ScoredOpllPatch> pair_local_batch;
+        for (const auto& parent : broad_beam) {
+            for (int delta = -2; delta <= 2; ++delta) {
+                auto candidate = parent.patch;
+                candidate.modulator.multiplier =
+                    static_cast<std::uint8_t>(std::clamp(
+                        static_cast<int>(
+                            parent.patch.modulator.multiplier)
+                            + delta,
+                        0,
+                        15));
+                candidate.carrier.multiplier =
+                    static_cast<std::uint8_t>(std::clamp(
+                        static_cast<int>(parent.patch.carrier.multiplier)
+                            - delta,
+                        0,
+                        15));
+                candidate.modulator.total_level =
+                    static_cast<std::uint8_t>(std::clamp(
+                        static_cast<int>(
+                            parent.patch.modulator.total_level)
+                            + delta * 2,
+                        0,
+                        63));
+                admit(candidate, pair_local_batch);
+            }
+        }
+        if (!scoreOpllSubBatches(
+                pair_local_batch,
+                score_executor,
+                steady_batch_size,
+                1,
+                coordinator)) {
+            return {};
+        }
+        all_scored.insert(
+            all_scored.end(),
+            pair_local_batch.begin(),
+            pair_local_batch.end());
+        while (evaluations < evaluation_budget) {
+            std::vector<ScoredOpllPatch> batch;
+            batch.reserve(steady_batch_size);
+            while (batch.size() < steady_batch_size
+                   && evaluations < evaluation_budget) {
+                std::array<std::uint8_t, 8> registers{};
+                for (auto& value : registers) {
+                    value = static_cast<std::uint8_t>(next_random() >> 24);
+                }
+                admit(prepare(decodeOpllPatch(registers)), batch);
+            }
+            if (!scoreOpllSubBatches(
+                    batch,
+                    score_executor,
+                    steady_batch_size,
+                    1,
+                    coordinator)) {
+                return {};
+            }
+            all_scored.insert(
+                all_scored.end(), batch.begin(), batch.end());
+            std::vector<ScoredOpllPatch> next = beam;
+            next.insert(next.end(), batch.begin(), batch.end());
+            beam = retain(std::move(next));
+        }
     }
 
+    std::sort(all_scored.begin(), all_scored.end(), less);
     std::vector<OpllPatchParameters> result;
-    result.reserve(leader_count);
-    for (std::size_t index = 0; index < leader_count; ++index) {
-        const auto registers = encodeOpllPatch(leaders[index].patch);
-        const bool duplicate = std::any_of(
-            result.begin(),
-            result.end(),
-            [&](const OpllPatchParameters& existing) {
-                return encodeOpllPatch(existing) == registers;
-            });
-        if (!duplicate) {
-            result.push_back(leaders[index].patch);
+    result.reserve(beam_width);
+    for (const auto& entry : all_scored) {
+        result.push_back(entry.patch);
+        if (result.size() == beam_width) {
+            break;
         }
     }
     if (result.empty()) {
         result.push_back(defaultOpllPatch());
     }
     return result;
+}
+
+OpllApproximationControl::OpllApproximationControl()
+    : state_(std::make_shared<State>()) {}
+
+void OpllApproximationControl::requestCancel() noexcept {
+    state_->cancel_requested.store(true, std::memory_order_release);
+}
+
+bool OpllApproximationControl::cancelRequested() const noexcept {
+    return state_->cancel_requested.load(std::memory_order_acquire);
+}
+
+OpllApproximationProgress OpllApproximationControl::progress() const noexcept {
+    OpllApproximationProgress result;
+    result.phase = state_->phase.load(std::memory_order_acquire);
+    result.completed = state_->completed.load(std::memory_order_acquire);
+    result.total = state_->total.load(std::memory_order_acquire);
+    result.cancel_requested =
+        state_->cancel_requested.load(std::memory_order_acquire);
+    return result;
+}
+
+OpllApproximationResult approximateWaveCycleWithOpllResult(
+    std::span<const float> cycle,
+    const OpllApproximationOptions& options) {
+    const std::size_t budget =
+        options.profile == OpllApproximationProfile::Compact
+        ? 384U
+        : (options.effort == OpllApproximationEffort::Thorough
+               ? 160'000U
+               : 5'000U);
+    OpllApproximationCoordinator coordinator(options, budget);
+    if (coordinator.cancelled()) {
+        coordinator.finish(true);
+        return {OpllApproximationCompletion::Cancelled, {}};
+    }
+    auto candidates = searchWaveCycleWithOpll(
+        cycle,
+        options,
+        &coordinator,
+        budget,
+        OpllApproximationPhase::SteadyTimbre);
+    const bool cancelled = coordinator.cancelled();
+    coordinator.finish(cancelled);
+    return {
+        cancelled
+            ? OpllApproximationCompletion::Cancelled
+            : OpllApproximationCompletion::Completed,
+        cancelled ? std::vector<OpllPatchParameters>{}
+                  : std::move(candidates)};
+}
+
+std::vector<OpllPatchParameters> approximateWaveCycleCandidatesWithOpll(
+    std::span<const float> cycle,
+    const OpllApproximationOptions& options) {
+    return approximateWaveCycleWithOpllResult(cycle, options).candidates;
 }
 
 std::vector<OpllPatchParameters>
 approximateSccWaveformCandidatesWithOpll(const SccWaveform& waveform) {
+    return approximateSccWaveformCandidatesWithOpll(
+        waveform,
+        OpllApproximationOptions{});
+}
+
+std::vector<OpllPatchParameters>
+approximateSccWaveformCandidatesWithOpll(
+    const SccWaveform& waveform,
+    const OpllApproximationOptions& options) {
+    return approximateSccWaveformWithOpllResult(waveform, options).candidates;
+}
+
+OpllApproximationResult approximateSccWaveformWithOpllResult(
+    const SccWaveform& waveform,
+    const OpllApproximationOptions& options) {
     std::array<float, 32> cycle{};
     for (std::size_t index = 0; index < cycle.size(); ++index) {
         cycle[index] = static_cast<float>(waveform[index]) / 128.0F;
     }
-    return approximateWaveCycleCandidatesWithOpll(cycle);
+    return approximateWaveCycleWithOpllResult(cycle, options);
 }
 
 std::vector<OpllPatchParameters> approximateWavePcmCandidatesWithOpll(
     const WavePcm& pcm) {
+    return approximateWavePcmCandidatesWithOpll(
+        pcm,
+        OpllApproximationOptions{});
+}
+
+std::vector<OpllPatchParameters> approximateWavePcmCandidatesWithOpll(
+    const WavePcm& pcm,
+    const OpllApproximationOptions& options) {
+    return approximateWavePcmWithOpllResult(pcm, options).candidates;
+}
+
+OpllApproximationResult approximateWavePcmWithOpllResult(
+    const WavePcm& pcm,
+    const OpllApproximationOptions& options) {
     const auto cycle_analysis = analyzeWaveCycle(pcm);
     if (cycle_analysis.cycle.size() < 2) {
-        return {defaultOpllPatch()};
+        OpllApproximationCoordinator coordinator(options, 0);
+        const bool cancelled = coordinator.cancelled();
+        coordinator.finish(cancelled);
+        return {
+            cancelled
+                ? OpllApproximationCompletion::Cancelled
+                : OpllApproximationCompletion::Completed,
+            cancelled ? std::vector<OpllPatchParameters>{}
+                      : std::vector<OpllPatchParameters>{defaultOpllPatch()}};
     }
     const auto target = makeFitTarget(pcm, cycle_analysis);
     if (target.samples.size() < 2) {
-        return {approximateWaveCycleWithOpll(cycle_analysis.cycle)};
+        return approximateWaveCycleWithOpllResult(
+            cycle_analysis.cycle, options);
     }
-
-    struct ScoredPatch {
-        float distance{std::numeric_limits<float>::max()};
-        OpllPatchParameters patch{};
-    };
-    constexpr std::size_t leader_capacity = 6;
-    std::array<ScoredPatch, leader_capacity> leaders{};
-    std::size_t leader_count{};
-    // Besides caching the global candidates, constructing this context before
-    // worker launch completes emu2413's one-time global table initialization.
-    TimedOpllScoreContext initial_scoring(target);
-    const auto score = [&](const OpllPatchParameters& patch) {
-        return initial_scoring.score(patch);
-    };
-    auto considerScored = [&](const ScoredPatch& entry) {
-        std::size_t position{};
-        while (position < leader_count
-               && leaders[position].distance <= entry.distance) {
-            ++position;
-        }
-        if (position >= leaders.size()) {
-            return;
-        }
-        const std::size_t new_count =
-            std::min(leaders.size(), leader_count + 1);
-        for (std::size_t index = new_count - 1;
-             index > position;
-             --index) {
-            leaders[index] = leaders[index - 1];
-        }
-        leaders[position] = entry;
-        leader_count = new_count;
-    };
-    const auto consider = [&](const OpllPatchParameters& patch) {
-        considerScored(ScoredPatch{score(patch), patch});
-    };
-
-    std::vector<OpllPatchParameters> seed_patches;
-    seed_patches.reserve(64);
-    seed_patches.push_back(
-        approximateWaveCycleWithOpll(cycle_analysis.cycle));
-    seed_patches.push_back(defaultOpllPatch());
-    for (std::uint8_t instrument = 1; instrument <= 15; ++instrument) {
-        if (const auto rom = ym2413RomPatch(instrument)) {
-            seed_patches.push_back(*rom);
-        }
+    const auto budgets = searchBudgets(options);
+    const std::uint64_t total =
+        budgets.representative + budgets.short_timbre
+        + static_cast<std::uint64_t>(budgets.full_envelope)
+            * fullWaveWeight(target.samples.size());
+    OpllApproximationCoordinator coordinator(options, total);
+    if (coordinator.cancelled()) {
+        coordinator.finish(true);
+        return {OpllApproximationCompletion::Cancelled, {}};
     }
-
-    // A fixed generator makes the global coverage reproducible while sampling
-    // every category of the YM2413 custom patch, including its envelope.
-    std::uint32_t random = 0x5749464DU;  // "WIFM"
-    const auto next_random = [&]() {
-        random = random * 1664525U + 1013904223U;
-        return random;
-    };
-    for (int index = 0; index < 32; ++index) {
-        OpllPatchParameters candidate = defaultOpllPatch();
-        std::uint32_t bits = next_random();
-        candidate.modulator.multiplier =
-            static_cast<std::uint8_t>(bits & 15);
-        candidate.carrier.multiplier =
-            static_cast<std::uint8_t>((bits >> 4) & 15);
-        candidate.feedback =
-            static_cast<std::uint8_t>((bits >> 8) & 7);
-        candidate.modulator.waveform = ((bits >> 11) & 1) != 0;
-        candidate.carrier.waveform = ((bits >> 12) & 1) != 0;
-        candidate.modulator.pitch_modulation = ((bits >> 13) & 1) != 0;
-        candidate.carrier.pitch_modulation = ((bits >> 14) & 1) != 0;
-        candidate.modulator.amplitude_modulation = ((bits >> 15) & 1) != 0;
-        candidate.carrier.amplitude_modulation = ((bits >> 16) & 1) != 0;
-        candidate.modulator.sustained_tone = ((bits >> 17) & 1) != 0;
-        candidate.carrier.sustained_tone = ((bits >> 18) & 1) != 0;
-        candidate.modulator.key_rate_scaling = ((bits >> 19) & 1) != 0;
-        candidate.carrier.key_rate_scaling = ((bits >> 20) & 1) != 0;
-        candidate.modulator.key_scale_level =
-            static_cast<std::uint8_t>((bits >> 21) & 3);
-        candidate.carrier.key_scale_level =
-            static_cast<std::uint8_t>((bits >> 23) & 3);
-
-        bits = next_random();
-        candidate.modulator.total_level =
-            static_cast<std::uint8_t>(bits & 63);
-        candidate.modulator.attack_rate =
-            static_cast<std::uint8_t>((bits >> 6) & 15);
-        candidate.modulator.decay_rate =
-            static_cast<std::uint8_t>((bits >> 10) & 15);
-        candidate.modulator.sustain_level =
-            static_cast<std::uint8_t>((bits >> 14) & 15);
-        candidate.modulator.release_rate =
-            static_cast<std::uint8_t>((bits >> 18) & 15);
-        candidate.carrier.attack_rate =
-            static_cast<std::uint8_t>((bits >> 22) & 15);
-        candidate.carrier.decay_rate =
-            static_cast<std::uint8_t>((bits >> 26) & 15);
-
-        bits = next_random();
-        candidate.carrier.sustain_level =
-            static_cast<std::uint8_t>(bits & 15);
-        candidate.carrier.release_rate =
-            static_cast<std::uint8_t>((bits >> 4) & 15);
-        seed_patches.push_back(candidate);
-    }
-
-    // Score seeds in parallel, then merge in seed order so ties stay
-    // deterministic (identical to sequential consider() order).
-    std::vector<ScoredPatch> scored_seeds(seed_patches.size());
-    std::vector<std::future<void>> seed_jobs;
-    seed_jobs.reserve(seed_patches.size());
-    std::size_t launched = 0;
-    try {
-        for (std::size_t index = 0; index < seed_patches.size(); ++index) {
-            seed_jobs.push_back(std::async(
-                std::launch::async,
-                [&target, &seed_patches, &scored_seeds, index] {
-                    TimedOpllScoreContext local_scoring(target);
-                    scored_seeds[index] = ScoredPatch{
-                        local_scoring.score(seed_patches[index]),
-                        seed_patches[index]};
-                }));
-            ++launched;
-        }
-    } catch (const std::system_error&) {
-        // Keep already-launched jobs; remainder scored below.
-    }
-    for (auto& job : seed_jobs) {
-        job.get();
-    }
-    for (std::size_t index = 0; index < launched; ++index) {
-        considerScored(scored_seeds[index]);
-        initial_scoring.remember(
-            scored_seeds[index].patch,
-            scored_seeds[index].distance);
-    }
-    for (std::size_t index = launched;
-         index < seed_patches.size();
-         ++index) {
-        consider(seed_patches[index]);
-    }
-
-    const auto initial_leaders = leaders;
-    const std::size_t initial_count = leader_count;
-    constexpr std::array<std::uint8_t, 6> envelope_coarse{
-        0, 3, 6, 9, 12, 15};
-    const auto refineSeed = [&](ScoredPatch initial) {
-        TimedOpllScoreContext scoring(target);
-        scoring.remember(initial.patch, initial.distance);
-        auto best = initial.patch;
-        float best_distance = initial.distance;
-        const auto improve = [&](OpllPatchParameters candidate) {
-            const float distance = scoring.score(candidate);
-            if (distance < best_distance) {
-                best_distance = distance;
-                best = candidate;
-            }
-        };
-        const auto searchByte = [&](
-            auto member,
-            std::span<const std::uint8_t> values) {
-            for (const std::uint8_t value : values) {
-                auto candidate = best;
-                member(candidate) = value;
-                improve(candidate);
-            }
-        };
-
-        // First fit the time-varying hardware envelope at coarse resolution.
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.modulator.attack_rate;
-            },
-            envelope_coarse);
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.modulator.decay_rate;
-            },
-            envelope_coarse);
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.modulator.sustain_level;
-            },
-            envelope_coarse);
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.modulator.release_rate;
-            },
-            envelope_coarse);
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.carrier.attack_rate;
-            },
-            envelope_coarse);
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.carrier.decay_rate;
-            },
-            envelope_coarse);
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.carrier.sustain_level;
-            },
-            envelope_coarse);
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.carrier.release_rate;
-            },
-            envelope_coarse);
-
-        std::array<std::uint8_t, 16> values16{};
-        for (std::uint8_t value = 0; value < values16.size(); ++value) {
-            values16[value] = value;
-        }
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.modulator.multiplier;
-            },
-            values16);
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.carrier.multiplier;
-            },
-            values16);
-
-        constexpr std::array<std::uint8_t, 9> level_coarse{
-            0, 8, 16, 24, 32, 40, 48, 56, 63};
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.modulator.total_level;
-            },
-            level_coarse);
-        constexpr std::array<std::uint8_t, 8> feedback_values{
-            0, 1, 2, 3, 4, 5, 6, 7};
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.feedback;
-            },
-            feedback_values);
-
-        for (int value = 0; value < 4; ++value) {
-            auto candidate = best;
-            candidate.modulator.waveform = (value & 1) != 0;
-            candidate.carrier.waveform = (value & 2) != 0;
-            improve(candidate);
-        }
-        for (int value = 0; value < 4; ++value) {
-            auto candidate = best;
-            candidate.modulator.pitch_modulation = (value & 1) != 0;
-            candidate.carrier.pitch_modulation = (value & 2) != 0;
-            improve(candidate);
-        }
-        for (int value = 0; value < 4; ++value) {
-            auto candidate = best;
-            candidate.modulator.amplitude_modulation = (value & 1) != 0;
-            candidate.carrier.amplitude_modulation = (value & 2) != 0;
-            improve(candidate);
-        }
-        for (int value = 0; value < 4; ++value) {
-            auto candidate = best;
-            candidate.modulator.sustained_tone = (value & 1) != 0;
-            candidate.carrier.sustained_tone = (value & 2) != 0;
-            improve(candidate);
-        }
-        for (int value = 0; value < 4; ++value) {
-            auto candidate = best;
-            candidate.modulator.key_rate_scaling = (value & 1) != 0;
-            candidate.carrier.key_rate_scaling = (value & 2) != 0;
-            improve(candidate);
-        }
-        constexpr std::array<std::uint8_t, 4> ksl_values{0, 1, 2, 3};
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.modulator.key_scale_level;
-            },
-            ksl_values);
-        searchByte(
-            [](auto& patch) -> auto& {
-                return patch.carrier.key_scale_level;
-            },
-            ksl_values);
-
-        // Quantization-aware final refinement around every envelope register.
-        const auto refine = [&](auto member) {
-            const int center = member(best);
-            std::array<std::uint8_t, 5> nearby{};
-            for (int index = 0; index < 5; ++index) {
-                nearby[static_cast<std::size_t>(index)] =
-                    static_cast<std::uint8_t>(
-                        std::clamp(center + index - 2, 0, 15));
-            }
-            searchByte(member, nearby);
-        };
-        refine([](auto& patch) -> auto& {
-            return patch.modulator.attack_rate;
-        });
-        refine([](auto& patch) -> auto& {
-            return patch.modulator.decay_rate;
-        });
-        refine([](auto& patch) -> auto& {
-            return patch.modulator.sustain_level;
-        });
-        refine([](auto& patch) -> auto& {
-            return patch.modulator.release_rate;
-        });
-        refine([](auto& patch) -> auto& {
-            return patch.carrier.attack_rate;
-        });
-        refine([](auto& patch) -> auto& {
-            return patch.carrier.decay_rate;
-        });
-        refine([](auto& patch) -> auto& {
-            return patch.carrier.sustain_level;
-        });
-        refine([](auto& patch) -> auto& {
-            return patch.carrier.release_rate;
-        });
-        return ScoredPatch{best_distance, best};
-    };
-
-    const std::size_t seed_count =
-        std::min<std::size_t>(initial_count, 3);
-    std::vector<std::future<ScoredPatch>> refinements;
-    refinements.reserve(seed_count);
-    try {
-        for (std::size_t seed = 0; seed < seed_count; ++seed) {
-            refinements.push_back(std::async(
-                std::launch::async,
-                refineSeed,
-                initial_leaders[seed]));
-        }
-    } catch (const std::system_error&) {
-        // A restricted runtime may refuse to create all worker threads.
-        // Already-started seeds are joined below and the remainder use the
-        // identical refinement routine synchronously.
-    }
-    // Merge in the original seed order so equal-distance tie handling and
-    // candidate ordering stay deterministic regardless of thread completion.
-    for (auto& refinement : refinements) {
-        considerScored(refinement.get());
-    }
-    for (std::size_t seed = refinements.size();
-         seed < seed_count;
-         ++seed) {
-        considerScored(refineSeed(initial_leaders[seed]));
-    }
-    std::vector<OpllPatchParameters> result;
-    result.reserve(leader_count);
-    for (std::size_t index = 0; index < leader_count; ++index) {
-        const auto registers = encodeOpllPatch(leaders[index].patch);
-        const bool duplicate = std::any_of(
-            result.begin(),
-            result.end(),
-            [&](const OpllPatchParameters& existing) {
-                return encodeOpllPatch(existing) == registers;
-            });
-        if (!duplicate) {
-            result.push_back(leaders[index].patch);
-        }
-    }
-    if (result.empty()) {
-        result.push_back(defaultOpllPatch());
-    }
-    return result;
+    auto candidates = searchTimedOpll(
+        target, cycle_analysis.cycle, options, &coordinator, budgets);
+    const bool cancelled = coordinator.cancelled();
+    coordinator.finish(cancelled);
+    return {
+        cancelled
+            ? OpllApproximationCompletion::Cancelled
+            : OpllApproximationCompletion::Completed,
+        cancelled ? std::vector<OpllPatchParameters>{}
+                  : std::move(candidates)};
 }
 
 OpllPatchParameters approximateWavePcmWithOpll(
     const WavePcm& pcm) {
     auto candidates = approximateWavePcmCandidatesWithOpll(pcm);
-    return candidates.front();
+    return candidates.empty() ? defaultOpllPatch() : candidates.front();
 }
 
 }  // namespace mgstc::engine

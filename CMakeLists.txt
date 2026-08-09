@@ -10,6 +10,7 @@ project(
 )
 
 option(MGSTC_BUILD_TESTS "Build engine tests" ON)
+option(MGSTC_BUILD_BENCHMARKS "Build explicit performance benchmarks" OFF)
 
 # About shows MGSTC_DOC_VERSION. Prefer local SPECIFICATION.md when present
 # (private working tree). Public checkouts use the tracked VERSION file.
@@ -143,7 +144,9 @@ add_library(mgstc_engine STATIC
     src/engine/scc_waveform.cpp
     src/engine/shared_state.cpp
     src/engine/sinc_rate_conv.cpp
+    src/engine/stereo_sample_rate_converter.cpp
     src/engine/timbre_library.cpp
+    src/engine/timbre_tags.cpp
     src/engine/track_runtime.cpp
     src/engine/voice_allocator.cpp
     src/engine/wave_import.cpp
@@ -178,7 +181,8 @@ target_include_directories(mgstc_engine
 target_compile_features(mgstc_engine PUBLIC cxx_std_20)
 
 if(MSVC)
-    target_compile_options(mgstc_engine PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(
+        mgstc_engine PRIVATE /W4 /permissive- /EHsc /utf-8)
 else()
     target_compile_options(mgstc_engine PRIVATE -Wall -Wextra -Wpedantic)
 endif()
@@ -258,6 +262,9 @@ if(WIN32)
 
         target_sources(
             mgstc PRIVATE
+                assets/MGSTC_icon.rc
+                src/app/juce/asio_audio_sink.cpp
+                src/app/juce/asio_audio_sink.hpp
                 src/app/juce/main.cpp
         )
         target_link_libraries(
@@ -276,6 +283,7 @@ if(WIN32)
             PRIVATE
                 JUCE_WEB_BROWSER=0
                 JUCE_USE_CURL=0
+                JUCE_ASIO=1
                 JUCE_MODAL_LOOPS_PERMITTED=1
                 MGSTC_DOC_VERSION="${MGSTC_DOC_VERSION}"
         )
@@ -328,6 +336,32 @@ if(MGSTC_BUILD_TESTS)
     add_test(NAME mgstc_engine_tests COMMAND mgstc_engine_tests)
 
     add_executable(
+        mgstc_stereo_sample_rate_converter_tests
+        tests/cpp/stereo_sample_rate_converter_tests.cpp
+    )
+    target_link_libraries(
+        mgstc_stereo_sample_rate_converter_tests PRIVATE mgstc_engine
+    )
+    target_compile_features(
+        mgstc_stereo_sample_rate_converter_tests PRIVATE cxx_std_20
+    )
+    if(MSVC)
+        target_compile_options(
+            mgstc_stereo_sample_rate_converter_tests PRIVATE
+                /W4 /permissive- /EHsc
+        )
+    else()
+        target_compile_options(
+            mgstc_stereo_sample_rate_converter_tests PRIVATE
+                -Wall -Wextra -Wpedantic
+        )
+    endif()
+    add_test(
+        NAME mgstc_stereo_sample_rate_converter_tests
+        COMMAND mgstc_stereo_sample_rate_converter_tests
+    )
+
+    add_executable(
         mgstc_chip_level_probe
         tests/cpp/chip_level_probe.cpp
     )
@@ -345,6 +379,28 @@ if(MGSTC_BUILD_TESTS)
     else()
         target_compile_options(
             mgstc_chip_level_probe PRIVATE -Wall -Wextra -Wpedantic
+        )
+    endif()
+endif()
+
+if(MGSTC_BUILD_BENCHMARKS)
+    add_executable(
+        mgstc_wave_import_benchmark
+        tests/cpp/wave_import_benchmark.cpp
+    )
+    target_link_libraries(
+        mgstc_wave_import_benchmark PRIVATE mgstc_engine
+    )
+    target_compile_features(
+        mgstc_wave_import_benchmark PRIVATE cxx_std_20
+    )
+    if(MSVC)
+        target_compile_options(
+            mgstc_wave_import_benchmark PRIVATE /W4 /permissive- /EHsc
+        )
+    else()
+        target_compile_options(
+            mgstc_wave_import_benchmark PRIVATE -Wall -Wextra -Wpedantic
         )
     endif()
 endif()

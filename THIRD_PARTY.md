@@ -18,6 +18,21 @@
 - JUCEモジュールが同梱するzlib、pnglib、jpeglib、HarfBuzzなどの各依存は、
   JUCEソース内の`LICENSE.md`および各ディレクトリのライセンス表示に従う。
 
+### ASIO SDK
+
+任意のASIO音声出力には、JUCE 8.0.15の`juce_audio_devices`に同梱される
+Steinberg ASIO SDK 2.3ヘッダーを使用する。外部SDKは追加取得しない。
+
+| 項目 | 値 |
+|---|---|
+| 権利者 | Steinberg Media Technologies GmbH |
+| ライセンス | Steinberg ASIO License またはGPLv3。本プロジェクトはGPLv3側で使用 |
+| 用途 | ASIOドライバー列挙、音声コールバック、ドライバー設定画面 |
+
+ソースのライセンスはJUCE取得ツリー内
+`modules/juce_audio_devices/native/asio/LICENSE.txt`にあり、Windows配布ZIPには
+`licenses/Steinberg-ASIO-SDK-LICENSE.txt`として同梱する。
+
 ## 音源エミュレータ
 
 音源プレビューでは、Digital Sound Antiquesによる次のMITライセンス実装を

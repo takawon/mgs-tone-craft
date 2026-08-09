@@ -18,8 +18,9 @@ struct NotePitch {
     friend bool operator==(const NotePitch&, const NotePitch&) = default;
 };
 
-// The common editor note number follows MIDI numbering (C4 == 60).
-// MGSDRV/YM2413's useful shared range is C1..B8.
+// The editor uses MIDI-like integer positions (C1 == 24, C4 == 60), while
+// octave labels and chip pitches follow MGSDRV o1..o8 rather than concert-
+// pitch correction. The shared range contains all 96 MGSDRV notes.
 [[nodiscard]] bool notePitch(
     std::uint8_t midi_note,
     NotePitch& output) noexcept;

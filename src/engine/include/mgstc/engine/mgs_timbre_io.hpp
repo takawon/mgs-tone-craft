@@ -22,11 +22,13 @@ struct MgsSccDefinition {
 
 [[nodiscard]] std::string formatMgsOpllDefinition(
     const OpllPatchParameters& patch,
-    std::uint16_t number);
+    std::uint16_t number,
+    std::string_view voice_name);
 
 [[nodiscard]] std::string formatMgsSccDefinition(
     const SccWaveform& waveform,
-    std::uint16_t number);
+    std::uint16_t number,
+    std::string_view voice_name);
 
 [[nodiscard]] std::optional<MgsOpllDefinition>
 parseMgsOpllDefinition(std::string_view text);
