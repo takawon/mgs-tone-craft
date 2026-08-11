@@ -9,6 +9,38 @@ MGSCで使える定義テキストの作成を支援します。
 
 **現状は Alpha（機能限定の公開）です。** 仕様や操作性は今後変わることがあります。
 
+### 総合画面
+
+![総合画面](docs/screenshots/main.png)
+
+※画面は開発中のものです
+
+### OPLL 音色エディタ
+
+![OPLL 音色エディタ](docs/screenshots/opll-editor.png)
+
+※画面は開発中のものです
+
+### SCC 音色エディタ
+
+![SCC 音色エディタ](docs/screenshots/scc-editor.png)
+
+※画面は開発中のものです
+
+### アプリ設定（MIDI / Output）
+
+![アプリ設定 MIDI](docs/screenshots/settings-midi.png)
+
+![アプリ設定 Output](docs/screenshots/settings-output.png)
+
+※画面は開発中のものです
+
+### 音色ライブラリ管理
+
+![音色ライブラリ管理](docs/screenshots/library-manager.png)
+
+※画面は開発中のものです
+
 ## Alpha でできること（概要）
 
 - **SCC単音色**: 32サンプル波形の編集、プリセット／マージ、タグ付きライブラリ保存、`@s`定義の確認・入出力

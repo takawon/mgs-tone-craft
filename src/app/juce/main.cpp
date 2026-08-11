@@ -6756,6 +6756,46 @@ public:
     }
 };
 
+enum class SnapshotResult : int {
+    Success = 0,
+    MissingContent = 10,
+    InvalidImage = 11,
+    DirectoryFailure = 12,
+    StreamFailure = 13,
+    PngFailure = 14,
+    InvalidPath = 15,
+    WindowRoutingFailure = 16,
+};
+
+[[nodiscard]] SnapshotResult writeComponentPngSnapshot(
+    juce::Component& component,
+    const juce::File& output_file) {
+    if (component.getWidth() <= 0 || component.getHeight() <= 0) {
+        return SnapshotResult::MissingContent;
+    }
+    const auto image = component.createComponentSnapshot(
+        component.getLocalBounds(),
+        true,
+        1.0F);
+    if (!image.isValid()) {
+        return SnapshotResult::InvalidImage;
+    }
+    if (output_file.getParentDirectory().createDirectory().failed()) {
+        return SnapshotResult::DirectoryFailure;
+    }
+    auto stream = output_file.createOutputStream();
+    if (stream == nullptr || !stream->openedOk()) {
+        return SnapshotResult::StreamFailure;
+    }
+    if (!stream->setPosition(0) || !stream->truncate()) {
+        return SnapshotResult::StreamFailure;
+    }
+    juce::PNGImageFormat format;
+    return format.writeImageToStream(image, *stream)
+        ? SnapshotResult::Success
+        : SnapshotResult::PngFailure;
+}
+
 class PerformanceKeyboard final
     : public juce::Component,
       private juce::MidiKeyboardState::Listener,
@@ -6872,7 +6912,13 @@ public:
     }
 
     void showSettingsDialog() {
-        showAppSettings();
+        static_cast<void>(showAppSettings(0, nullptr));
+    }
+
+    [[nodiscard]] SnapshotResult captureSettingsTab(
+        int initial_tab,
+        const juce::File& output_file) {
+        return showAppSettings(initial_tab, &output_file);
     }
 
     [[nodiscard]] bool shouldConsumeKeyPress(
@@ -6994,7 +7040,9 @@ private:
     static constexpr int kScreenMidiChannel = 15;
     static constexpr int kPcMidiChannel = 16;
 
-    void showAppSettings(int initial_tab = 0) {
+    [[nodiscard]] SnapshotResult showAppSettings(
+        int initial_tab,
+        const juce::File* capture_file) {
         syncMidiControls();
 
         class SettingsContent final : public juce::Component {
@@ -7349,6 +7397,13 @@ private:
         dialog->centreWithSize(
             content->getWidth(), content->getHeight() + 32);
 
+        if (capture_file != nullptr) {
+            const auto result =
+                writeComponentPngSnapshot(*content, *capture_file);
+            delete dialog;
+            return result;
+        }
+
         juce::Component::SafePointer<PerformanceKeyboard> safe(this);
         juce::Component::SafePointer<juce::DialogWindow> safe_dialog(
             dialog);
@@ -7376,7 +7431,8 @@ private:
                 }
                 juce::MessageManager::callAsync([safe] {
                     if (safe != nullptr) {
-                        safe->showAppSettings(0);
+                        static_cast<void>(
+                            safe->showAppSettings(0, nullptr));
                     }
                 });
             };
@@ -7474,6 +7530,7 @@ private:
         };
 
         dialog->enterModalState(true, nullptr, true);
+        return SnapshotResult::Success;
     }
 
     struct HeldNote {
@@ -9783,6 +9840,13 @@ public:
 
     void prepareVisualInspection() {
         startAudition();
+    }
+
+    [[nodiscard]] SnapshotResult captureSettingsTab(
+        int initial_tab,
+        const juce::File& output_file) {
+        return performance_keyboard_.captureSettingsTab(
+            initial_tab, output_file);
     }
 
     void refreshExternalState() {
@@ -12406,6 +12470,13 @@ public:
         updateStatus(
             juce::String::fromUTF8(
                 "目視検査: 確定（緑）と候補（橙破線）を重ね表示"));
+    }
+
+    [[nodiscard]] SnapshotResult captureSettingsTab(
+        int initial_tab,
+        const juce::File& output_file) {
+        return performance_keyboard_.captureSettingsTab(
+            initial_tab, output_file);
     }
 
     void refreshExternalState() {
@@ -16315,6 +16386,13 @@ public:
         static_cast<void>(auditionOneSecond());
     }
 
+    [[nodiscard]] SnapshotResult captureSettingsTab(
+        int initial_tab,
+        const juce::File& output_file) {
+        return performance_keyboard_.captureSettingsTab(
+            initial_tab, output_file);
+    }
+
     void refreshExternalState() {
         synchronizeMasterVolumeSlider(
             master_volume_, master_volume_revision_, audio_service_);
@@ -18388,17 +18466,6 @@ private:
     std::optional<double> audition_stop_time_ms_;
 };
 
-enum class SnapshotResult : int {
-    Success = 0,
-    MissingContent = 10,
-    InvalidImage = 11,
-    DirectoryFailure = 12,
-    StreamFailure = 13,
-    PngFailure = 14,
-    InvalidPath = 15,
-    WindowRoutingFailure = 16,
-};
-
 class MainWindow final : public juce::DocumentWindow {
 public:
     MainWindow(
@@ -18462,6 +18529,28 @@ public:
                            getContentComponent())) {
             composite->prepareVisualInspection();
         }
+    }
+
+    [[nodiscard]] SnapshotResult captureSettingsTab(
+        int initial_tab,
+        const juce::File& output_file) {
+        if (auto* opll = dynamic_cast<OpllEditorComponent*>(
+                getContentComponent())) {
+            return opll->captureSettingsTab(
+                initial_tab, output_file);
+        }
+        if (auto* scc = dynamic_cast<SccEditorComponent*>(
+                getContentComponent())) {
+            return scc->captureSettingsTab(
+                initial_tab, output_file);
+        }
+        if (auto* composite =
+                dynamic_cast<CompositeEditorComponent*>(
+                    getContentComponent())) {
+            return composite->captureSettingsTab(
+                initial_tab, output_file);
+        }
+        return SnapshotResult::MissingContent;
     }
 
     void refreshExternalState() {
@@ -18656,31 +18745,7 @@ public:
             editor->prepareVisualInspection();
         }
 
-        const auto image = content->createComponentSnapshot(
-            content->getLocalBounds(),
-            true,
-            1.0F);
-        if (!image.isValid()) {
-            return SnapshotResult::InvalidImage;
-        }
-
-        if (output_file.getParentDirectory()
-                .createDirectory()
-                .failed()) {
-            return SnapshotResult::DirectoryFailure;
-        }
-        auto stream = output_file.createOutputStream();
-        if (stream == nullptr || !stream->openedOk()) {
-            return SnapshotResult::StreamFailure;
-        }
-        if (!stream->setPosition(0) || !stream->truncate()) {
-            return SnapshotResult::StreamFailure;
-        }
-
-        juce::PNGImageFormat format;
-        return format.writeImageToStream(image, *stream)
-            ? SnapshotResult::Success
-            : SnapshotResult::PngFailure;
+        return writeComponentPngSnapshot(*content, output_file);
     }
 
     void closeButtonPressed() override {
@@ -18790,7 +18855,17 @@ public:
             }
             snapshot_file_ = juce::File::getCurrentWorkingDirectory()
                 .getChildFile(snapshot_path);
-            snapshot_window_->prepareVisualInspection();
+            auto capture_target = arguments
+                .getValueForOption("--capture-target")
+                .trim()
+                .toLowerCase();
+            if (capture_target.isEmpty()) {
+                capture_target = "editor";
+            }
+            snapshot_target_ = capture_target;
+            if (snapshot_target_ == "editor") {
+                snapshot_window_->prepareVisualInspection();
+            }
             startTimer(500);
         }
     }
@@ -19219,11 +19294,53 @@ private:
             quit();
             return;
         }
-        const auto result = snapshot_window_ != nullptr
-            ? snapshot_window_->writeContentSnapshot(snapshot_file_)
-            : SnapshotResult::MissingContent;
+        SnapshotResult result = SnapshotResult::MissingContent;
+        if (snapshot_target_ == "settings-midi") {
+            result = snapshot_window_ != nullptr
+                ? snapshot_window_->captureSettingsTab(
+                    0, snapshot_file_)
+                : SnapshotResult::MissingContent;
+        } else if (snapshot_target_ == "settings-output") {
+            result = snapshot_window_ != nullptr
+                ? snapshot_window_->captureSettingsTab(
+                    1, snapshot_file_)
+                : SnapshotResult::MissingContent;
+        } else if (snapshot_target_ == "library") {
+            result = captureLibraryManagerSnapshot(snapshot_file_);
+        } else if (snapshot_window_ != nullptr) {
+            result = snapshot_window_->writeContentSnapshot(
+                snapshot_file_);
+        }
         setApplicationReturnValue(static_cast<int>(result));
         quit();
+    }
+
+    [[nodiscard]] SnapshotResult captureLibraryManagerSnapshot(
+        const juce::File& output_file) {
+        juce::InterProcessLock::ScopedLockType lock(
+            tag_management_lock_);
+        std::string error;
+        auto timbres = loadTimbreLibrary(&error);
+        auto composites = loadCompositeTimbreLibrary(&error);
+        if (!lock.isLocked() || !timbres || !composites
+            || midi_service_ == nullptr
+            || audio_service_ == nullptr) {
+            return SnapshotResult::MissingContent;
+        }
+        LibraryManagerContent content(
+            LibraryManagerKind::Scc,
+            std::move(*timbres),
+            std::move(*composites),
+            *midi_service_,
+            *audio_service_,
+            [](std::string, std::string) {},
+            [](LibraryManagerKind, std::uint64_t) {},
+            [](LibraryManagerKind, std::uint64_t) {},
+            [] {},
+            [](LibraryManagerKind, std::uint64_t, std::uint8_t) {},
+            [](LibraryManagerKind, std::uint8_t) {},
+            [] {});
+        return writeComponentPngSnapshot(content, output_file);
     }
 
     std::unique_ptr<MainWindow> main_window_;
@@ -19235,6 +19352,7 @@ private:
     mgstc::app::UiHangWatchdog hang_watchdog_;
     juce::String primary_editor_{"main"};
     juce::String active_editor_{"main"};
+    juce::String snapshot_target_{"editor"};
     bool routing_test_mode_{};
     bool routing_test_passed_{};
     bool close_confirmation_pending_{};
