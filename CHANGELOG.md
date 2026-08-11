@@ -19,6 +19,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 参考資料に [MAmidiMEmoNEMO readMe](https://github.com/uniskie/MSX_DOCUMENTS/blob/main/MAmidiMEmoNEMO/readMe.md)（uniskie）を追加
+
 ## [0.165] - 2026-08-11
 
 `0.101` 以降の公開 Alpha 向けまとめ（GitHub Releases 更新用）。
