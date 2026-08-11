@@ -2,6 +2,12 @@
 param(
     [ValidateSet("main", "scc", "opll")]
     [string]$Editor = "scc",
+    [ValidateSet(
+        "editor",
+        "settings-midi",
+        "settings-output",
+        "library")]
+    [string]$Target = "editor",
     [string]$OutputPath = ""
 )
 
@@ -14,9 +20,15 @@ if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $suffix = switch ($Target) {
+        "settings-midi" { "settings-midi" }
+        "settings-output" { "settings-output" }
+        "library" { "library-manager" }
+        default { "$Editor-editor" }
+    }
     $OutputPath = Join-Path `
         $projectRoot `
-        "build\ui-captures\$Editor-editor.png"
+        "build\ui-captures\$suffix.png"
 } elseif (-not [IO.Path]::IsPathRooted($OutputPath)) {
     $OutputPath = Join-Path $projectRoot $OutputPath
 }
@@ -28,6 +40,7 @@ New-Item -ItemType Directory -Path $outputDirectory -Force |
 
 $arguments = @(
     "--editor=$Editor"
+    "--capture-target=$Target"
     '"--capture-ui={0}"' -f $absoluteOutput
 )
 $process = Start-Process `
