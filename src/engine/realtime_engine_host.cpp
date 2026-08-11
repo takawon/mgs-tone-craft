@@ -310,6 +310,12 @@ void RealtimeEngineHost::applyPendingCommands() noexcept {
                 reject(command.type);
             }
             break;
+        case EngineCommandType::SilenceTrack:
+            if (!programs_[active_program_].engine.session().forceMuteTrack(
+                    command.track)) {
+                reject(command.type);
+            }
+            break;
         case EngineCommandType::Stop:
         case EngineCommandType::HardReset:
             programs_[active_program_].engine.hardReset();

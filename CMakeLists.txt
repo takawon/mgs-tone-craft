@@ -265,6 +265,8 @@ if(WIN32)
                 assets/MGSTC_icon.rc
                 src/app/juce/asio_audio_sink.cpp
                 src/app/juce/asio_audio_sink.hpp
+                src/app/juce/ui_hang_watchdog.cpp
+                src/app/juce/ui_hang_watchdog.hpp
                 src/app/juce/main.cpp
         )
         target_link_libraries(

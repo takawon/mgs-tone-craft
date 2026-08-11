@@ -167,9 +167,18 @@ bool RuntimeSession::queueKeyOff(std::uint8_t track) noexcept {
     return true;
 }
 
+bool RuntimeSession::forceMuteTrack(std::uint8_t track) noexcept {
+    if (track >= kTrackCount) {
+        return false;
+    }
+    force_mute_pending_[track] = true;
+    return true;
+}
+
 void RuntimeSession::gateUntilNoteOn() noexcept {
     audition_gated_ = true;
     audition_track_running_.fill(false);
+    force_mute_pending_.fill(false);
 }
 
 void RuntimeSession::resetForKeyOn() noexcept {
@@ -182,6 +191,7 @@ void RuntimeSession::resetForKeyOn() noexcept {
     }
     pending_keys_.fill(PendingKey::None);
     audition_track_running_.fill(false);
+    force_mute_pending_.fill(false);
     psg_sequence_muted_.fill(false);
     psg_period_pending_ = false;
 }
@@ -210,6 +220,52 @@ TickResult RuntimeSession::processTick() {
 
     for (std::uint8_t track = 0; track < kTrackCount; ++track) {
         auto& runtime = tracks_[track];
+        if (force_mute_pending_[track]) {
+            force_mute_pending_[track] = false;
+            if (pending_keys_[track] == PendingKey::Off
+                || pending_keys_[track] == PendingKey::On
+                || audition_track_running_[track]) {
+                pending_keys_[track] = PendingKey::Off;
+            }
+            if (pending_keys_[track] == PendingKey::Off
+                && current_notes_[track] >= 24
+                && current_notes_[track] <= 119) {
+                NotePitch pitch{};
+                if (notePitch(current_notes_[track], pitch)) {
+                    if (track < 3 && !runtime.rateEnvelope()) {
+                        psg_sequence_muted_[track] = true;
+                    } else if (track >= 3 && track < 8) {
+                        static_cast<void>(mapper_.writeSccKey(
+                            track, false, tick_, writes_));
+                    } else if (track >= 8) {
+                        static_cast<void>(mapper_.writeOpllPitch(
+                            track, pitch.opll, false, tick_, writes_));
+                    }
+                }
+            }
+            const auto map_error = mapper_.mapMeaningEvent(
+                track,
+                MeaningEvent{
+                    tick_,
+                    MeaningEventKind::Volume,
+                    0,
+                    0,
+                },
+                tick_,
+                writes_);
+            if (map_error != MapError::None) {
+                return {
+                    tick_,
+                    track,
+                    SequenceError::None,
+                    map_error,
+                };
+            }
+            runtime.keyOff(track < 8);
+            audition_track_running_[track] = false;
+            pending_keys_[track] = PendingKey::None;
+            continue;
+        }
         if (audition_gated_
             && !audition_track_running_[track]
             && pending_keys_[track] == PendingKey::None) {

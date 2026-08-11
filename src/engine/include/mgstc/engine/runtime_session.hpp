@@ -77,6 +77,8 @@ public:
         std::uint8_t midi_note) noexcept;
     [[nodiscard]] bool queueKeyOn(std::uint8_t track) noexcept;
     [[nodiscard]] bool queueKeyOff(std::uint8_t track) noexcept;
+    // Force the track silent after key-off hang (e.g. OPLL RR=0).
+    [[nodiscard]] bool forceMuteTrack(std::uint8_t track) noexcept;
 
     // Program snapshots are prepared before they are auditioned.  Gating
     // prevents their envelopes from producing writes until NoteOn arrives.
@@ -112,6 +114,7 @@ private:
     std::array<std::uint8_t, kTrackCount> track_attenuation_{};
     std::array<PendingKey, kTrackCount> pending_keys_{};
     std::array<bool, kTrackCount> audition_track_running_{};
+    std::array<bool, kTrackCount> force_mute_pending_{};
     std::array<bool, 3> psg_sequence_muted_{};
     std::array<std::uint8_t, kTrackCount> current_notes_{};
     std::array<std::uint8_t, 3> psg_tone_noise_modes_{};

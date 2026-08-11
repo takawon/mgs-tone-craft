@@ -49,6 +49,11 @@ Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") `
     -Destination (Join-Path $stageDir "README.md")
 Copy-Item -LiteralPath (Join-Path $projectRoot "THIRD_PARTY.md") `
     -Destination (Join-Path $stageDir "THIRD_PARTY.md")
+$changelog = Join-Path $projectRoot "CHANGELOG.md"
+if (Test-Path -LiteralPath $changelog) {
+    Copy-Item -LiteralPath $changelog `
+        -Destination (Join-Path $stageDir "CHANGELOG.md")
+}
 
 $licensesDir = Join-Path $stageDir "licenses"
 New-Item -ItemType Directory -Path $licensesDir -Force | Out-Null

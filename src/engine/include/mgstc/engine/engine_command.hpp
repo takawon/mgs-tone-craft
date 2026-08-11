@@ -10,6 +10,7 @@ enum class EngineCommandType : std::uint8_t {
     LoadProgram,
     NoteOn,
     NoteOff,
+    SilenceTrack,
     Stop,
     HardReset,
     SetMixerGains,
@@ -54,6 +55,16 @@ struct EngineCommand {
         std::uint8_t track) noexcept {
         return {
             .type = EngineCommandType::NoteOff,
+            .track = track,
+        };
+    }
+
+    // Key-off may leave OPLL sounding when RR is 0. SilenceTrack forces
+    // the track output to mute without rewriting the edited patch.
+    [[nodiscard]] static EngineCommand silenceTrack(
+        std::uint8_t track) noexcept {
+        return {
+            .type = EngineCommandType::SilenceTrack,
             .track = track,
         };
     }
