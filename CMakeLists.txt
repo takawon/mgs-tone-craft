@@ -137,6 +137,7 @@ add_library(mgstc_engine STATIC
     src/engine/note_pitch.cpp
     src/engine/opll_envelope_trace.cpp
     src/engine/opll_patch.cpp
+    src/engine/opll_register_auto.cpp
     src/engine/pc_keyboard.cpp
     src/engine/realtime_engine_host.cpp
     src/engine/register_mapper.cpp

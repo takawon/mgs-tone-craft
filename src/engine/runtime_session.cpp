@@ -54,6 +54,9 @@ bool RuntimeSession::clearTrack(std::uint8_t track) noexcept {
         return false;
     }
     tracks_[track].clear();
+    track_detune_[track] = 0;
+    track_micro_detune_[track] = 0;
+    track_patch_[track].reset();
     return true;
 }
 
@@ -67,6 +70,31 @@ bool RuntimeSession::setTrackVolume(
     if (track < 3) {
         psg_modes_[track].setFixedVolume(volume);
     }
+    return true;
+}
+
+bool RuntimeSession::setTrackDetune(
+    std::uint8_t track,
+    std::int16_t detune,
+    std::int32_t micro_detune) noexcept {
+    if (track >= kTrackCount) {
+        return false;
+    }
+    track_detune_[track] = detune;
+    track_micro_detune_[track] = micro_detune;
+    return true;
+}
+
+bool RuntimeSession::setTrackPatch(
+    std::uint8_t track,
+    std::optional<std::uint8_t> patch) noexcept {
+    if (track >= kTrackCount) {
+        return false;
+    }
+    if (patch && *patch > 31) {
+        return false;
+    }
+    track_patch_[track] = patch;
     return true;
 }
 
@@ -313,6 +341,24 @@ TickResult RuntimeSession::processTick() {
                         map_error,
                     };
                 }
+                map_error = applyTrackPatch(track);
+                if (map_error != MapError::None) {
+                    return {
+                        tick_,
+                        track,
+                        SequenceError::None,
+                        map_error,
+                    };
+                }
+                map_error = applyTrackDetunes(track);
+                if (map_error != MapError::None) {
+                    return {
+                        tick_,
+                        track,
+                        SequenceError::None,
+                        map_error,
+                    };
+                }
                 map_error = psg_modes_[track].keyOn(
                     track,
                     psg_hardware_,
@@ -357,13 +403,49 @@ TickResult RuntimeSession::processTick() {
                         map_error,
                     };
                 }
+                map_error = applyTrackPatch(track);
+                if (map_error != MapError::None) {
+                    return {
+                        tick_,
+                        track,
+                        SequenceError::None,
+                        map_error,
+                    };
+                }
+                map_error = applyTrackDetunes(track);
+                if (map_error != MapError::None) {
+                    return {
+                        tick_,
+                        track,
+                        SequenceError::None,
+                        map_error,
+                    };
+                }
             } else {
-                const auto map_error = mapper_.writeOpllPitch(
+                auto map_error = mapper_.writeOpllPitch(
                     track,
                     pitch.opll,
                     true,
                     tick_,
                     writes_);
+                if (map_error != MapError::None) {
+                    return {
+                        tick_,
+                        track,
+                        SequenceError::None,
+                        map_error,
+                    };
+                }
+                map_error = applyTrackPatch(track);
+                if (map_error != MapError::None) {
+                    return {
+                        tick_,
+                        track,
+                        SequenceError::None,
+                        map_error,
+                    };
+                }
+                map_error = applyTrackDetunes(track);
                 if (map_error != MapError::None) {
                     return {
                         tick_,
@@ -488,6 +570,45 @@ TickResult RuntimeSession::processTick() {
     const TickResult result{tick_, 0, SequenceError::None, MapError::None};
     ++tick_;
     return result;
+}
+
+MapError RuntimeSession::applyTrackDetunes(std::uint8_t track) {
+    const auto apply_delta = [this, track](std::int32_t delta) -> MapError {
+        if (delta == 0) {
+            return MapError::None;
+        }
+        return mapper_.mapMeaningEvent(
+            track,
+            MeaningEvent{
+                tick_,
+                MeaningEventKind::FrequencyDelta,
+                delta,
+                0,
+            },
+            tick_,
+            writes_);
+    };
+    auto error = apply_delta(track_detune_[track]);
+    if (error != MapError::None) {
+        return error;
+    }
+    return apply_delta(track_micro_detune_[track]);
+}
+
+MapError RuntimeSession::applyTrackPatch(std::uint8_t track) {
+    if (!track_patch_[track] || track < 3) {
+        return MapError::None;
+    }
+    return mapper_.mapMeaningEvent(
+        track,
+        MeaningEvent{
+            tick_,
+            MeaningEventKind::Patch,
+            *track_patch_[track],
+            0,
+        },
+        tick_,
+        writes_);
 }
 
 }  // namespace mgstc::engine
