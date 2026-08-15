@@ -364,6 +364,49 @@ TimbreNumberResolution resolveTimbreNumbers(
         assign(index, reference, *available, false);
     }
 
+    for (std::size_t index = 0;
+         index < timbre.layers.size();
+         ++index) {
+        const auto& layer = timbre.layers[index];
+        if (layer.source == TimbreSource::Psg) {
+            continue;
+        }
+        for (const auto& event : layer.timbre_automation) {
+            if (event.kind != EnvelopeEventKind::Timbre
+                || event.timbre_pick != TimbrePick::Library
+                || event.target_library_id == 0) {
+                continue;
+            }
+            const TimbreKey key{
+                layer.source, event.target_library_id};
+            if (assigned.contains(key)) {
+                continue;
+            }
+            const auto source = sourceIndex(layer.source);
+            std::optional<std::uint8_t> available;
+            for (unsigned int candidate = minimum_number;
+                 candidate <= maximum_number;
+                 ++candidate) {
+                const auto number =
+                    static_cast<std::uint8_t>(candidate);
+                if (!occupied[source].contains(number)) {
+                    available = number;
+                    break;
+                }
+            }
+            if (!available) {
+                result.warnings.push_back(
+                    std::string(sourceName(layer.source))
+                    + " has no free timbre numbers");
+                continue;
+            }
+            SavedTimbreReference reference;
+            reference.library_id = event.target_library_id;
+            reference.source = layer.source;
+            assign(index, reference, *available, false);
+        }
+    }
+
     std::sort(
         result.assignments.begin(),
         result.assignments.end(),
@@ -371,6 +414,111 @@ TimbreNumberResolution resolveTimbreNumbers(
             return left.layer_index < right.layer_index;
         });
     return result;
+}
+
+std::optional<std::uint8_t> assignedNumberForLibraryId(
+    const TimbreNumberResolution& numbers,
+    std::uint64_t library_id) noexcept {
+    if (library_id == 0) {
+        return std::nullopt;
+    }
+    for (const auto& assignment : numbers.assignments) {
+        if (assignment.library_id == library_id) {
+            return assignment.number;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint8_t> envelopeEventTimbreNumber(
+    const EnvelopeEvent& event,
+    const TimbreNumberResolution* numbers) noexcept {
+    if (event.kind != EnvelopeEventKind::Timbre) {
+        return std::nullopt;
+    }
+    if (event.timbre_pick == TimbrePick::OpllRom) {
+        if (event.value < 0 || event.value > 14) {
+            return std::nullopt;
+        }
+        return static_cast<std::uint8_t>(event.value);
+    }
+    if (numbers != nullptr && event.target_library_id != 0) {
+        if (const auto assigned = assignedNumberForLibraryId(
+                *numbers, event.target_library_id)) {
+            return assigned;
+        }
+    }
+    if (event.value < 0 || event.value > 31) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint8_t>(event.value);
+}
+
+std::optional<std::uint8_t> layerBasePatchNumber(
+    const CompositeLayer& layer,
+    const TimbreNumberResolution* numbers) noexcept {
+    if (layerUsesOpllRomBase(layer)) {
+        return *layer.base_opll_rom;
+    }
+    if (!layer.base_timbre) {
+        return std::nullopt;
+    }
+    if (numbers != nullptr) {
+        if (const auto assigned = assignedNumberForLibraryId(
+                *numbers, layer.base_timbre->library_id)) {
+            return assigned;
+        }
+    }
+    if (layer.base_timbre->manual_number) {
+        return layer.base_timbre->manual_number;
+    }
+    return std::nullopt;
+}
+
+bool layerEnvelopeHasPatchSlide(
+    const CompositeLayer& layer,
+    const TimbreNumberResolution* numbers) noexcept {
+    if (layer.source == TimbreSource::Psg) {
+        return false;
+    }
+    const auto base = layerBasePatchNumber(layer, numbers);
+    for (const auto& event : layer.timbre_automation) {
+        if (event.kind != EnvelopeEventKind::Timbre) {
+            continue;
+        }
+        const auto number = envelopeEventTimbreNumber(event, numbers);
+        if (!number) {
+            continue;
+        }
+        if (!base || *number != *base) {
+            return true;
+        }
+        // Same number but different pick kind still counts as a slide.
+        if (layerUsesOpllRomBase(layer)) {
+            if (event.timbre_pick != TimbrePick::OpllRom) {
+                return true;
+            }
+        } else if (layer.base_timbre
+                   && event.timbre_pick == TimbrePick::OpllRom) {
+            return true;
+        } else if (layer.base_timbre
+                   && event.timbre_pick == TimbrePick::Library
+                   && event.target_library_id != 0
+                   && event.target_library_id
+                       != layer.base_timbre->library_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool envelopeEventReferencesLibrary(
+    const EnvelopeEvent& event,
+    std::uint64_t library_id) noexcept {
+    return event.kind == EnvelopeEventKind::Timbre
+        && event.timbre_pick == TimbrePick::Library
+        && event.target_library_id != 0
+        && event.target_library_id == library_id;
 }
 
 std::vector<TimbreUse> findTimbreUses(
@@ -385,8 +533,16 @@ std::vector<TimbreUse> findTimbreUses(
              layer_index < composite.layers.size();
              ++layer_index) {
             const auto& layer = composite.layers[layer_index];
-            if (!layer.base_timbre
-                || layer.base_timbre->library_id != library_id) {
+            const bool base_match = layer.base_timbre
+                && layer.base_timbre->library_id == library_id;
+            const bool envelope_match = std::any_of(
+                layer.timbre_automation.begin(),
+                layer.timbre_automation.end(),
+                [library_id](const EnvelopeEvent& event) {
+                    return envelopeEventReferencesLibrary(
+                        event, library_id);
+                });
+            if (!base_match && !envelope_match) {
                 continue;
             }
             uses.push_back(
@@ -408,19 +564,24 @@ std::size_t updateTimbreReferences(
     std::size_t updated{};
     for (auto& composite : composites) {
         for (auto& layer : composite.layers) {
-            if (!layer.base_timbre
-                || layer.base_timbre->library_id != entry.id
-                || layer.source != replacement.source) {
-                continue;
+            if (layer.base_timbre
+                && layer.base_timbre->library_id == entry.id
+                && layer.source == replacement.source) {
+                const auto number_mode =
+                    layer.base_timbre->number_mode;
+                const auto manual_number =
+                    layer.base_timbre->manual_number;
+                layer.base_timbre = replacement;
+                layer.base_timbre->number_mode = number_mode;
+                layer.base_timbre->manual_number = manual_number;
+                ++updated;
             }
-            const auto number_mode =
-                layer.base_timbre->number_mode;
-            const auto manual_number =
-                layer.base_timbre->manual_number;
-            layer.base_timbre = replacement;
-            layer.base_timbre->number_mode = number_mode;
-            layer.base_timbre->manual_number = manual_number;
-            ++updated;
+            for (const auto& event : layer.timbre_automation) {
+                if (envelopeEventReferencesLibrary(event, entry.id)) {
+                    ++updated;
+                    break;
+                }
+            }
         }
     }
     return updated;

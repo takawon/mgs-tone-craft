@@ -36,6 +36,7 @@
 #include "mgstc/engine/note_pitch.hpp"
 #include "mgstc/engine/opll_envelope_trace.hpp"
 #include "mgstc/engine/opll_patch.hpp"
+#include "mgstc/engine/opll_register_auto.hpp"
 #include "mgstc/engine/pc_keyboard.hpp"
 #include "mgstc/engine/register_mapper.hpp"
 #include "mgstc/engine/realtime_engine_host.hpp"
@@ -299,7 +300,7 @@ void testAdjacentVolumesAreOneTickApart() {
         }));
 }
 
-void testObservedFourCountHolds() {
+void testFourCountHoldsCompat() {
     SequenceEnvelopeRuntime runtime({
         0xEF, 0x04,
         0xED, 0x04,
@@ -3263,6 +3264,268 @@ void testEnvelopeTimelineInspectorRangeNormalization() {
     REQUIRE_EQ(timeline.loop_end_count.has_value(), false);
 }
 
+void testStartDelayMillisecondsFollowsMgscTempoForRAndRPercent() {
+    using namespace mgstc::engine;
+
+    // SPEC §6.5.4 (0.200): r% = absolute 1/60s ticks (tempo-independent);
+    // r = 240000/(tempo*n) ms (tempo-dependent).
+    const auto ms = [](StartDelayForm form, std::uint32_t value, int tempo) {
+        return static_cast<int>(
+            std::lround(startDelayMilliseconds(form, value, tempo)));
+    };
+
+    REQUIRE_EQ(ms(StartDelayForm::NoteLength, 4, 120), 500);
+    REQUIRE_EQ(ms(StartDelayForm::NoteLength, 4, 60), 1000);
+
+    // r% wall-clock must not change when tempo changes.
+    REQUIRE_EQ(ms(StartDelayForm::AbsoluteTicks, 48, 120), 800);
+    REQUIRE_EQ(ms(StartDelayForm::AbsoluteTicks, 48, 60), 800);
+    REQUIRE_EQ(ms(StartDelayForm::AbsoluteTicks, 30, 200), 500);
+
+    REQUIRE_EQ(
+        startDelayGridCounts(StartDelayForm::AbsoluteTicks, 24, 120),
+        24U);
+    REQUIRE_EQ(
+        startDelayGridCounts(StartDelayForm::NoteLength, 4, 120),
+        30U);
+}
+
+void testOpllRegisterAutoExclusivityAndExpandFlags() {
+    using namespace mgstc::engine;
+
+    auto timbre = defaultCompositeTimbre();
+    REQUIRE_EQ(timbre.layers.size() >= 3, true);
+    auto second = timbre.layers[2];
+    second.name = "OPLL Layer 2";
+    second.channel = 1;
+    timbre.layers.push_back(second);
+
+    // layer2: TL only. layer3: TL (duplicate) + FB — exclusivity clears TL on 3.
+    timbre.layers[2].opll_tl_auto = {
+        .mode = OpllRegisterAutoMode::Rise,
+        .start_count = 0,
+        .depth = 8,
+        .change_speed = 1,
+        .coarseness = 1,
+        .stop_position = 8,
+    };
+    timbre.layers[3].opll_tl_auto = {
+        .mode = OpllRegisterAutoMode::Lfo,
+        .start_count = 0,
+        .depth = 5,
+        .change_speed = 1,
+        .coarseness = 1,
+        .stop_position = 5,
+    };
+    timbre.layers[3].opll_fb_auto = {
+        .mode = OpllRegisterAutoMode::Rise,
+        .start_count = 0,
+        .depth = 3,
+        .change_speed = 1,
+        .coarseness = 1,
+        .stop_position = 3,
+    };
+
+    REQUIRE_EQ(
+        opllRegisterAutoOwnerLayer(
+            timbre, OpllRegisterAutoTarget::TotalLevel),
+        std::optional<std::size_t>{2});
+    REQUIRE_EQ(
+        opllRegisterAutoOwnedByLayer(
+            timbre, 3, OpllRegisterAutoTarget::TotalLevel),
+        false);
+    REQUIRE_EQ(
+        opllRegisterAutoOwnedByLayer(
+            timbre, 3, OpllRegisterAutoTarget::Feedback),
+        true);
+
+    REQUIRE_EQ(enforceOpllRegisterAutoExclusivity(timbre), true);
+    REQUIRE_EQ(timbre.layers[2].opll_tl_auto.active(), true);
+    REQUIRE_EQ(timbre.layers[3].opll_tl_auto.active(), false);
+    REQUIRE_EQ(timbre.layers[3].opll_fb_auto.active(), true);
+
+    timbre.layers[2].envelope_timeline = {.length_counts = 4};
+    timbre.layers[2].base_timbre = SavedTimbreReference{
+        .library_id = 1,
+        .revision = 1,
+        .name = "orig",
+        .source = TimbreSource::Opll,
+        .opll_registers = {0, 0, 0xC0, 0xF8, 0, 0, 0, 0},
+    };
+    const auto both = expandOpllLayerRegisterAutos(
+        timbre.layers[2], nullptr, true, true);
+    const auto tl_only = expandOpllLayerRegisterAutos(
+        timbre.layers[2], nullptr, true, false);
+    const auto none = expandOpllLayerRegisterAutos(
+        timbre.layers[2], nullptr, false, false);
+    REQUIRE_EQ(none.empty(), true);
+    REQUIRE_EQ(tl_only.empty(), false);
+    REQUIRE_EQ(both.size() >= tl_only.size(), true);
+    for (const auto& event : tl_only) {
+        REQUIRE_EQ(event.value, 2);
+    }
+}
+
+void testOpllRegisterAutoRiseExpandsToYInMgsc() {
+    using namespace mgstc::engine;
+
+    auto layer = defaultCompositeTimbre().layers[2];
+    REQUIRE_EQ(layer.source == TimbreSource::Opll, true);
+    layer.volume = 15;
+    layer.envelope_timeline = {.length_counts = 20};
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+    };
+    layer.opll_tl_auto = {
+        .mode = OpllRegisterAutoMode::Rise,
+        .start_count = 2,
+        .depth = 10,
+        .change_speed = 5,
+        .coarseness = 2,
+        .stop_position = 20,
+    };
+    // Preserve upper KSL bits from base register 2 if present.
+    if (!layer.base_timbre) {
+        layer.base_timbre = SavedTimbreReference{};
+        layer.base_timbre->source = TimbreSource::Opll;
+        layer.base_timbre->library_id = 1;
+        layer.base_timbre->revision = 1;
+    }
+    layer.base_timbre->source = TimbreSource::Opll;
+    layer.base_timbre->library_id = 1;
+    layer.base_timbre->opll_registers[2] = 0x80;  // MOD KSL=2, TL=0
+    layer.base_timbre->opll_registers[3] = 0x58;  // CAR KSL=1, waves, FB=0
+
+    const auto events = expandOpllLayerRegisterAutos(layer, nullptr);
+    REQUIRE_EQ(events.size(), 3U);
+    REQUIRE_EQ(events[0].count, 2U);
+    REQUIRE_EQ(events[0].value, 2);
+    REQUIRE_EQ(events[0].secondary, 0x80 | 10);
+    REQUIRE_EQ(events[1].count, 4U);
+    REQUIRE_EQ(events[1].secondary, 0x80 | 15);
+    REQUIRE_EQ(events[2].count, 6U);
+    REQUIRE_EQ(events[2].secondary, 0x80 | 20);
+
+    const auto formatted = formatMgsCompositeEnvelope(layer, 5);
+    REQUIRE_EQ(formatted.valid(), true);
+    // 0x8A = 138 with KSL preserved from 0x80 | 10
+    REQUIRE_EQ(formatted.body.find("y2,138") != std::string::npos, true);
+    REQUIRE_EQ(formatted.body.find("y2,143") != std::string::npos, true);
+    REQUIRE_EQ(formatted.body.find("y2,148") != std::string::npos, true);
+}
+
+void testOpllRegisterAutoPacksFromActiveOriginalAndSkipsRom() {
+    using namespace mgstc::engine;
+
+    TimbreLibrary library;
+    TimbreLibraryEntry patch_a;
+    patch_a.category = TimbreCategory::Opll;
+    patch_a.name = "A";
+    patch_a.opll_registers[2] = 0x80;  // KSL=2
+    patch_a.opll_registers[3] = 0x10;  // CAR wave, FB=0
+    const auto id_a = library.add(patch_a, 1);
+
+    TimbreLibraryEntry patch_b;
+    patch_b.category = TimbreCategory::Opll;
+    patch_b.name = "B";
+    patch_b.opll_registers[2] = 0xC0;  // KSL=3
+    patch_b.opll_registers[3] = 0x48;  // CAR KSL=1, MOD wave, FB=0
+    const auto id_b = library.add(patch_b, 2);
+
+    auto layer = defaultCompositeTimbre().layers[2];
+    layer.envelope_timeline = {.length_counts = 30};
+    layer.base_timbre = makeSavedTimbreReference(*library.find(id_a));
+    layer.timbre_automation = {
+        {
+            .kind = EnvelopeEventKind::Timbre,
+            .value = 0,
+            .count = 5,
+            .timbre_pick = TimbrePick::OpllRom,
+        },
+        {
+            .kind = EnvelopeEventKind::Timbre,
+            .value = 0,
+            .count = 10,
+            .target_library_id = id_b,
+            .timbre_pick = TimbrePick::Library,
+        },
+        {
+            .kind = EnvelopeEventKind::RegisterWrite,
+            .value = 2,
+            .secondary = 0xC5,  // manual y on B's reg2 before auto at 12
+            .count = 11,
+        },
+    };
+    layer.opll_tl_auto = {
+        .mode = OpllRegisterAutoMode::FreeCurve,
+        .start_count = 0,
+        .coarseness = 1,
+        .free_curve = {20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 30},
+    };
+    layer.opll_fb_auto = {
+        .mode = OpllRegisterAutoMode::FreeCurve,
+        .start_count = 0,
+        .coarseness = 5,
+        .free_curve = {3, 3, 4},  // counts 0, 5, 10
+    };
+
+    REQUIRE_EQ(opllRegisterAutoAvailableAt(layer, 0), true);
+    REQUIRE_EQ(opllRegisterAutoAvailableAt(layer, 5), false);
+    REQUIRE_EQ(opllRegisterAutoAvailableAt(layer, 10), true);
+
+    REQUIRE_EQ(
+        packOpllRegisterAutoByte(
+            OpllRegisterAutoTarget::TotalLevel, 0x80, 20),
+        0x94);
+    REQUIRE_EQ(
+        packOpllRegisterAutoByte(
+            OpllRegisterAutoTarget::Feedback, 0x48, 4),
+        0x4C);
+
+    const auto events = expandOpllLayerRegisterAutos(layer, &library);
+    // count 0: TL y2 from A (0x80|20=0x94), FB y3 from A (0x10|3=0x13)
+    // count 5: ROM — no emit (even though schedules have values)
+    // count 10: TL from B (0xC0|20=0xD4), FB from B (0x48|4=0x4C)
+    // count 11: manual y only (not in auto expand)
+    // count 12: TL from running image after manual (0xC5 high bits | 30)
+    bool saw_c0_tl = false;
+    bool saw_c5_rom = false;
+    bool saw_c10_tl = false;
+    bool saw_c10_fb = false;
+    bool saw_c12_tl = false;
+    for (const auto& event : events) {
+        if (event.count == 0 && event.value == 2) {
+            REQUIRE_EQ(event.secondary, 0x94);
+            saw_c0_tl = true;
+        }
+        if (event.count == 0 && event.value == 3) {
+            REQUIRE_EQ(event.secondary, 0x13);
+        }
+        if (event.count == 5) {
+            saw_c5_rom = true;
+        }
+        if (event.count == 10 && event.value == 2) {
+            REQUIRE_EQ(event.secondary, 0xD4);
+            saw_c10_tl = true;
+        }
+        if (event.count == 10 && event.value == 3) {
+            REQUIRE_EQ(event.secondary, 0x4C);
+            saw_c10_fb = true;
+        }
+        if (event.count == 12 && event.value == 2) {
+            // After @B load (0xC0) then manual y2,197 (0xC5), TL auto 30
+            // → (0xC5 & 0xC0) | 30 = 0xDE
+            REQUIRE_EQ(event.secondary, 0xDE);
+            saw_c12_tl = true;
+        }
+    }
+    REQUIRE_EQ(saw_c0_tl, true);
+    REQUIRE_EQ(saw_c5_rom, false);
+    REQUIRE_EQ(saw_c10_tl, true);
+    REQUIRE_EQ(saw_c10_fb, true);
+    REQUIRE_EQ(saw_c12_tl, true);
+}
+
 void testCompositeEnvelopeFormatsOneSharedMgscLoop() {
     using namespace mgstc::engine;
 
@@ -3328,6 +3591,30 @@ void testCompositeEnvelopeFormatsOneSharedMgscLoop() {
     REQUIRE_EQ(
         incomplete.hasIssue(MgsEnvelopeIssue::IncompleteLoop),
         true);
+
+    layer.envelope_timeline.loop_start_count.reset();
+    layer.envelope_timeline.loop_end_count.reset();
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+    };
+    layer.pitch_envelope.events.clear();
+    layer.timbre_automation.clear();
+    layer.envelope_timeline.length_counts = 1;
+    const auto fit = maxEnvelopeLengthFittingBodyLimit(layer, 255);
+    REQUIRE_EQ(fit >= 1, true);
+    layer.envelope_timeline.length_counts = fit;
+    const auto at_fit = formatMgsCompositeEnvelope(layer, 4, 255);
+    REQUIRE_EQ(at_fit.valid(), true);
+    REQUIRE_EQ(at_fit.body.size() <= 255, true);
+    if (fit < EnvelopeTimeline::kMaximumLengthCounts
+        && fit < kMgscEnvelopeUiLengthCap) {
+        layer.envelope_timeline.length_counts = fit + 1;
+        const auto over = formatMgsCompositeEnvelope(layer, 4, 255);
+        REQUIRE_EQ(
+            over.hasIssue(MgsEnvelopeIssue::DefinitionLengthExceeded),
+            true);
+    }
+    REQUIRE_EQ(fit <= kMgscEnvelopeUiLengthCap, true);
 }
 
 void testCompositeSoloPitchAndChannelValidation() {
@@ -3694,7 +3981,7 @@ int main() {
     const std::vector<std::pair<std::string, std::function<void()>>> tests{
         {"TickClockSplitsVariableCallbacks", testTickClockSplitsVariableCallbacks},
         {"AdjacentVolumesAreOneTickApart", testAdjacentVolumesAreOneTickApart},
-        {"ObservedFourCountHolds", testObservedFourCountHolds},
+        {"FourCountHoldsCompat", testFourCountHoldsCompat},
         {"PatchAndRegisterWriteAreZeroTime", testPatchAndRegisterWriteAreZeroTime},
         {"RampUsesIntegerRemainderDistribution", testRampUsesIntegerRemainderDistribution},
         {"FrequencyDeltasAreSignedAndCumulativeEvents", testFrequencyDeltasAreSignedAndCumulativeEvents},
@@ -3766,6 +4053,13 @@ int main() {
         {"DefaultCompositeTimbreHasThreeAudibleSources", testDefaultCompositeTimbreHasThreeAudibleSources},
         {"CompositeLayerRemovalReusesFreedChannel", testCompositeLayerRemovalReusesFreedChannel},
         {"EnvelopeTimelineInspectorRangeNormalization", testEnvelopeTimelineInspectorRangeNormalization},
+        {"OpllRegisterAutoRiseExpandsToYInMgsc", testOpllRegisterAutoRiseExpandsToYInMgsc},
+        {"OpllRegisterAutoExclusivityAndExpandFlags",
+         testOpllRegisterAutoExclusivityAndExpandFlags},
+        {"StartDelayMillisecondsFollowsMgscTempoForRAndRPercent",
+         testStartDelayMillisecondsFollowsMgscTempoForRAndRPercent},
+        {"OpllRegisterAutoPacksFromActiveOriginalAndSkipsRom",
+         testOpllRegisterAutoPacksFromActiveOriginalAndSkipsRom},
         {"CompositeEnvelopeFormatsOneSharedMgscLoop", testCompositeEnvelopeFormatsOneSharedMgscLoop},
         {"CompositeSoloPitchAndChannelValidation", testCompositeSoloPitchAndChannelValidation},
         {"CompositeSavedTimbreRevisionAndNumberAssignment", testCompositeSavedTimbreRevisionAndNumberAssignment},

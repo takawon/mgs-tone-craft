@@ -30,8 +30,8 @@ class EnvelopeReferenceTests(unittest.TestCase):
             ],
         )
 
-    def test_vgm_observed_key_on_and_four_count_holds(self):
-        # TEST.VGM: key-on-relative frames 0, 4, 8, 12, 16.
+    def test_four_count_holds(self):
+        # EC-002: tests/fixtures/envelope_compat_manifest.json
         state = EnvelopeState(
             bytes.fromhex("EF 04 ED 04 E8 04 E4 04 00")
         )

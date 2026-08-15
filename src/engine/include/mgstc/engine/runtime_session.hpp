@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -53,6 +54,15 @@ public:
     [[nodiscard]] bool setTrackVolume(
         std::uint8_t track,
         std::uint8_t volume) noexcept;
+    // Track MML `\` and `@\` (applied at key-on before @e `\`).
+    [[nodiscard]] bool setTrackDetune(
+        std::uint8_t track,
+        std::int16_t detune,
+        std::int32_t micro_detune) noexcept;
+    // Track-side required `@n` / ROM patch (applied at key-on).
+    [[nodiscard]] bool setTrackPatch(
+        std::uint8_t track,
+        std::optional<std::uint8_t> patch) noexcept;
     [[nodiscard]] bool setTrackAttenuation(
         std::uint8_t track,
         std::uint8_t attenuation) noexcept;
@@ -112,6 +122,9 @@ private:
     Tick tick_{};
     std::array<TrackRuntime, kTrackCount> tracks_{};
     std::array<std::uint8_t, kTrackCount> track_attenuation_{};
+    std::array<std::int16_t, kTrackCount> track_detune_{};
+    std::array<std::int32_t, kTrackCount> track_micro_detune_{};
+    std::array<std::optional<std::uint8_t>, kTrackCount> track_patch_{};
     std::array<PendingKey, kTrackCount> pending_keys_{};
     std::array<bool, kTrackCount> audition_track_running_{};
     std::array<bool, kTrackCount> force_mute_pending_{};
@@ -129,6 +142,9 @@ private:
     EventBuffer meaning_events_;
     RegisterWriteBuffer writes_;
     RegisterMapper mapper_;
+
+    [[nodiscard]] MapError applyTrackDetunes(std::uint8_t track);
+    [[nodiscard]] MapError applyTrackPatch(std::uint8_t track);
 };
 
 }  // namespace mgstc::engine

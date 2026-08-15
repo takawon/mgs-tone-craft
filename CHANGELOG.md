@@ -19,8 +19,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 操作していないときに数秒フリーズすることがある問題: PC音声デバイスの異常からの自動復帰を別スレッドへ移し、復帰中もUIが反応するようにしました
+- 応答しない音声デバイスがあるとアプリの終了や出力切替が止まることがある問題: デバイスの停止待ちを有限にしました
+- 未保存の確認ダイアログがまれに表示されないままになる問題: マウス解放待ちに期限を設けました
+
 ### Changed
 
+- ハング検知ログ（`%LOCALAPPDATA%\MgsToneCraft\hang-*.log`）に、固まった時点でアプリが行っていた処理名と経過時間、および段階（検知／未回復／回復）を記録するようにしました
 - 参考資料に [MAmidiMEmoNEMO readMe](https://github.com/uniskie/MSX_DOCUMENTS/blob/main/MAmidiMEmoNEMO/readMe.md)（uniskie）を追加
 
 ## [0.165] - 2026-08-11

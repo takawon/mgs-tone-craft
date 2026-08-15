@@ -29,11 +29,17 @@ RealtimeEngineHost::~RealtimeEngineHost() {
 
 ProgramEdit RealtimeEngineHost::beginProgramEdit() {
     // All construction and destruction stays on the UI thread.
-    EngineCore fresh;
-    applyOutputRouting(fresh);
+    // Skip EngineCore construction when every slot is busy so rapid 1s
+    // preview edits cannot stall the message thread.
     for (std::uint8_t index = 0; index < kProgramSlotCount; ++index) {
-        auto expected = ProgramSlotState::Free;
         auto& slot = programs_[index];
+        if (slot.state.load(std::memory_order_relaxed)
+            != ProgramSlotState::Free) {
+            continue;
+        }
+        EngineCore fresh;
+        applyOutputRouting(fresh);
+        auto expected = ProgramSlotState::Free;
         if (!slot.state.compare_exchange_strong(
                 expected,
                 ProgramSlotState::Editing,

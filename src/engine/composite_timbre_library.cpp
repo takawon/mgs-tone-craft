@@ -125,6 +125,8 @@ public:
         unsignedInteger(
             static_cast<std::uint32_t>(value.secondary), 4);
         unsignedInteger(value.count, 4);
+        unsignedInteger(value.target_library_id, 8);
+        enumeration(value.timbre_pick);
     }
 
     void timeline(const EnvelopeTimeline& value) {
@@ -174,6 +176,10 @@ public:
         }
         string(value.memo);
         boolean(value.favorite);
+        unsignedInteger(
+            static_cast<std::uint16_t>(std::clamp(
+                value.playback_tempo, kMgscTempoMin, kMgscTempoMax)),
+            2);
         unsignedInteger(value.layers.size(), 4);
         for (const auto& layer : value.layers) {
             string(layer.name);
@@ -189,11 +195,20 @@ public:
             unsignedInteger(
                 static_cast<std::uint16_t>(layer.detune),
                 2);
-            unsignedInteger(layer.start_delay_counts, 4);
+            unsignedInteger(
+                static_cast<std::uint32_t>(layer.micro_detune),
+                4);
+            enumeration(layer.start_delay_form);
+            unsignedInteger(layer.start_delay_value, 4);
             unsignedInteger(layer.volume, 1);
-            boolean(layer.base_timbre.has_value());
-            if (layer.base_timbre) {
+            if (layer.base_opll_rom) {
+                unsignedInteger(2, 1); // base kind: OPLL ROM
+                unsignedInteger(*layer.base_opll_rom, 1);
+            } else if (layer.base_timbre) {
+                unsignedInteger(1, 1); // base kind: library
                 reference(*layer.base_timbre);
+            } else {
+                unsignedInteger(0, 1); // base kind: none
             }
             envelope(layer.volume_envelope);
             envelope(layer.pitch_envelope);
@@ -203,6 +218,21 @@ public:
                 event(event_value);
             }
             timeline(layer.envelope_timeline);
+            registerAuto(layer.opll_tl_auto);
+            registerAuto(layer.opll_fb_auto);
+        }
+    }
+
+    void registerAuto(const OpllRegisterAutoLane& value) {
+        enumeration(value.mode);
+        unsignedInteger(value.start_count, 4);
+        unsignedInteger(value.depth, 1);
+        unsignedInteger(value.change_speed, 1);
+        unsignedInteger(value.coarseness, 1);
+        unsignedInteger(value.stop_position, 1);
+        unsignedInteger(value.free_curve.size(), 4);
+        for (const auto point : value.free_curve) {
+            unsignedInteger(point, 1);
         }
     }
 
@@ -277,10 +307,25 @@ public:
     }
 
     bool event(EnvelopeEvent& value) {
-        return enumeration(value.kind, 6)
-            && integer(value.value, 4)
-            && integer(value.secondary, 4)
-            && integer(value.count, 4);
+        if (!enumeration(value.kind, 6)
+            || !integer(value.value, 4)
+            || !integer(value.secondary, 4)
+            || !integer(value.count, 4)) {
+            return false;
+        }
+        if (format_version_ < 6) {
+            value.target_library_id = 0;
+            value.timbre_pick = TimbrePick::Library;
+            return true;
+        }
+        std::uint8_t pick{};
+        if (!integer(value.target_library_id, 8)
+            || !integer(pick, 1)
+            || pick > 1) {
+            return false;
+        }
+        value.timbre_pick = static_cast<TimbrePick>(pick);
+        return true;
     }
 
     bool timeline(EnvelopeTimeline& value) {
@@ -372,7 +417,9 @@ public:
     bool timbre(CompositeTimbre& value) {
         std::uint32_t layer_count{};
         if (!integer(format_version_, 4)
-            || format_version_ != CompositeTimbre::kFormatVersion
+            || format_version_
+                < CompositeTimbre::kMinimumReadableFormatVersion
+            || format_version_ > CompositeTimbre::kFormatVersion
             || !string(value.name)) {
             return false;
         }
@@ -390,8 +437,20 @@ public:
         value.tags = parseTimbreTags(
             serializeTimbreTags(value.tags));
         if (!string(value.memo)
-            || !boolean(value.favorite)
-            || !integer(layer_count, 4)
+            || !boolean(value.favorite)) {
+            return false;
+        }
+        if (format_version_ >= 10) {
+            std::uint16_t tempo{};
+            if (!integer(tempo, 2)) {
+                return false;
+            }
+            value.playback_tempo = std::clamp(
+                static_cast<int>(tempo), kMgscTempoMin, kMgscTempoMax);
+        } else {
+            value.playback_tempo = kMgscDefaultTempo;
+        }
+        if (!integer(layer_count, 4)
             || layer_count > 1024) {
             return false;
         }
@@ -400,10 +459,10 @@ public:
             EnvelopeTimeline legacy_volume_timeline;
             EnvelopeTimeline legacy_pitch_timeline;
             EnvelopeTimeline legacy_timbre_timeline;
-            bool has_reference{};
             std::uint8_t relative{};
             std::uint16_t detune{};
             std::uint32_t automation_count{};
+            std::uint32_t legacy_delay_counts{};
             if (!string(layer.name)
                 || !enumeration(layer.source, 2)
                 || !integer(layer.channel, 1)
@@ -411,23 +470,70 @@ public:
                 || !boolean(layer.muted)
                 || !boolean(layer.solo)
                 || !integer(relative, 1)
-                || !integer(detune, 2)
-                || !integer(layer.start_delay_counts, 4)
-                || !integer(layer.volume, 1)
-                || !boolean(has_reference)) {
+                || !integer(detune, 2)) {
                 return false;
             }
             layer.relative_semitones =
                 static_cast<std::int8_t>(relative);
             layer.detune = static_cast<std::int16_t>(detune);
-            if (has_reference) {
-                SavedTimbreReference reference_value;
-                if (!reference(reference_value)) {
+            if (format_version_ >= 11) {
+                std::uint32_t micro{};
+                if (!integer(micro, 4)) {
                     return false;
                 }
-                layer.base_timbre = std::move(reference_value);
+                layer.micro_detune = static_cast<std::int32_t>(micro);
             } else {
-                layer.base_timbre.reset();
+                layer.micro_detune = 0;
+            }
+            if (format_version_ >= 9) {
+                if (!enumeration(layer.start_delay_form, 1)
+                    || !integer(layer.start_delay_value, 4)) {
+                    return false;
+                }
+            } else if (!integer(legacy_delay_counts, 4)) {
+                return false;
+            } else {
+                layer.start_delay_form =
+                    StartDelayForm::AbsoluteTicks;
+                layer.start_delay_value = legacy_delay_counts;
+            }
+            if (!integer(layer.volume, 1)) {
+                return false;
+            }
+            layer.base_timbre.reset();
+            layer.base_opll_rom.reset();
+            if (format_version_ >= 12) {
+                std::uint8_t base_kind{};
+                if (!integer(base_kind, 1)) {
+                    return false;
+                }
+                if (base_kind == 1) {
+                    SavedTimbreReference reference_value;
+                    if (!reference(reference_value)) {
+                        return false;
+                    }
+                    layer.base_timbre = std::move(reference_value);
+                } else if (base_kind == 2) {
+                    std::uint8_t rom{};
+                    if (!integer(rom, 1) || rom > 14) {
+                        return false;
+                    }
+                    layer.base_opll_rom = rom;
+                } else if (base_kind != 0) {
+                    return false;
+                }
+            } else {
+                bool has_reference{};
+                if (!boolean(has_reference)) {
+                    return false;
+                }
+                if (has_reference) {
+                    SavedTimbreReference reference_value;
+                    if (!reference(reference_value)) {
+                        return false;
+                    }
+                    layer.base_timbre = std::move(reference_value);
+                }
             }
             if (!envelope(
                     layer.volume_envelope,
@@ -457,9 +563,45 @@ public:
                        && !timeline(layer.envelope_timeline)) {
                 return false;
             }
+            if (format_version_ >= 7) {
+                if (!registerAuto(layer.opll_tl_auto)
+                    || !registerAuto(layer.opll_fb_auto)) {
+                    return false;
+                }
+            } else {
+                layer.opll_tl_auto = {};
+                layer.opll_fb_auto = {};
+            }
         }
         value.format_version = CompositeTimbre::kFormatVersion;
         return position_ == data_.size();
+    }
+
+    bool registerAuto(OpllRegisterAutoLane& value) {
+        std::uint32_t curve_size{};
+        if (!enumeration(value.mode, 4)
+            || !integer(value.start_count, 4)
+            || !integer(value.depth, 1)
+            || !integer(value.change_speed, 1)
+            || !integer(value.coarseness, 1)
+            || !integer(value.stop_position, 1)
+            || !integer(curve_size, 4)
+            || curve_size > kMaximumCollectionSize) {
+            return false;
+        }
+        if (value.coarseness == 0) {
+            value.coarseness = 1;
+        }
+        if (value.change_speed == 0) {
+            value.change_speed = 1;
+        }
+        value.free_curve.resize(curve_size);
+        for (auto& point : value.free_curve) {
+            if (!integer(point, 1)) {
+                return false;
+            }
+        }
+        return true;
     }
 
 private:

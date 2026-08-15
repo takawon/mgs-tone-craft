@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Independent behavioral reference for MGS sequence-envelope execution.
+"""Behavioral reference for MGSC sequence-envelope compatibility.
 
-This project-authored model was written from observed input/output behavior.
-It contains no MGSDRV source code, binary data, disassembly, or extracted code.
-It emits logical events before track/master-volume conversion and before
-chip-specific register mapping.
+Project-authored model used by tests and the C++ runtime port. Emits logical
+events before track/master-volume conversion and before chip-specific register
+mapping. See docs/ENVELOPE_COMPAT.md for the implementation chain.
 """
 
 from __future__ import annotations

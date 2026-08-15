@@ -21,6 +21,10 @@ namespace {
 std::atomic<std::uint8_t> g_pc_audio_hint{kUiHangHintUnknown};
 std::atomic<std::uint8_t> g_sound_output_hint{kUiHangHintUnknown};
 
+constexpr const char* kIdleActivity = "idle (message loop)";
+std::atomic<const char*> g_ui_activity{kIdleActivity};
+std::atomic<std::int64_t> g_ui_activity_started_ms{0};
+
 [[nodiscard]] std::int64_t steadyNowMs() noexcept {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -80,6 +84,36 @@ void publishUiHangSoundOutputHint(std::uint8_t kind) noexcept {
     g_sound_output_hint.store(kind, std::memory_order_relaxed);
 }
 
+void setUiActivity(const char* label) noexcept {
+    g_ui_activity.store(
+        label != nullptr ? label : kIdleActivity,
+        std::memory_order_relaxed);
+    g_ui_activity_started_ms.store(
+        steadyNowMs(), std::memory_order_relaxed);
+}
+
+const char* uiActivityLabel() noexcept {
+    const auto* label = g_ui_activity.load(std::memory_order_relaxed);
+    return label != nullptr ? label : kIdleActivity;
+}
+
+ScopedUiActivity::ScopedUiActivity(const char* label) noexcept
+    : previous_label_(g_ui_activity.load(std::memory_order_relaxed)),
+      previous_started_ms_(
+          g_ui_activity_started_ms.load(std::memory_order_relaxed)) {
+    setUiActivity(label);
+}
+
+ScopedUiActivity::~ScopedUiActivity() {
+    // Restore the outer scope with its own start time so nesting does not
+    // reset how long the outer call has already been running.
+    g_ui_activity.store(
+        previous_label_ != nullptr ? previous_label_ : kIdleActivity,
+        std::memory_order_relaxed);
+    g_ui_activity_started_ms.store(
+        previous_started_ms_, std::memory_order_relaxed);
+}
+
 UiHangWatchdog::UiHangWatchdog() = default;
 
 UiHangWatchdog::~UiHangWatchdog() {
@@ -93,6 +127,8 @@ void UiHangWatchdog::start(int hang_threshold_ms) {
         : kDefaultHangThresholdMs;
     hang_threshold_ms_.store(threshold, std::memory_order_relaxed);
     hang_reported_.store(false, std::memory_order_relaxed);
+    escalation_reported_ = false;
+    peak_hang_ms_ = 0;
     last_heartbeat_ms_.store(steadyNowMs(), std::memory_order_relaxed);
     running_.store(true, std::memory_order_release);
     startTimer(kDefaultHeartbeatIntervalMs);
@@ -130,16 +166,28 @@ void UiHangWatchdog::watchdogLoop() {
             static_cast<std::int64_t>(
                 hang_threshold_ms_.load(std::memory_order_relaxed));
         if (age_ms >= threshold) {
+            peak_hang_ms_ = age_ms;
             if (!hang_reported_.exchange(true, std::memory_order_acq_rel)) {
-                writeHangReport(age_ms);
+                writeHangReport("detected", age_ms);
+            } else if (
+                !escalation_reported_
+                && age_ms >= threshold * kEscalationFactor) {
+                escalation_reported_ = true;
+                writeHangReport("still-hung", age_ms);
             }
-        } else {
-            hang_reported_.store(false, std::memory_order_relaxed);
+        } else if (hang_reported_.exchange(false, std::memory_order_acq_rel)) {
+            // Recovery record: a bounded stall ends here, a deadlock never
+            // reaches this branch.
+            writeHangReport("recovered", peak_hang_ms_);
+            escalation_reported_ = false;
+            peak_hang_ms_ = 0;
         }
     }
 }
 
-void UiHangWatchdog::writeHangReport(std::int64_t hung_ms) const noexcept {
+void UiHangWatchdog::writeHangReport(
+    const char* stage,
+    std::int64_t hung_ms) const noexcept {
     wchar_t dir[MAX_PATH]{};
     if (!ensureHangLogDirectory(dir, std::size(dir))) {
         return;
@@ -148,17 +196,21 @@ void UiHangWatchdog::writeHangReport(std::int64_t hung_ms) const noexcept {
     SYSTEMTIME utc{};
     GetSystemTime(&utc);
     wchar_t path[MAX_PATH]{};
+    wchar_t stage_suffix[32]{};
+    static_cast<void>(_snwprintf_s(
+        stage_suffix, _TRUNCATE, L"%hs", stage != nullptr ? stage : "detected"));
     if (_snwprintf_s(
             path,
             _TRUNCATE,
-            L"%s\\hang-%04u%02u%02u-%02u%02u%02u.log",
+            L"%s\\hang-%04u%02u%02u-%02u%02u%02u-%s.log",
             dir,
             static_cast<unsigned>(utc.wYear),
             static_cast<unsigned>(utc.wMonth),
             static_cast<unsigned>(utc.wDay),
             static_cast<unsigned>(utc.wHour),
             static_cast<unsigned>(utc.wMinute),
-            static_cast<unsigned>(utc.wSecond))
+            static_cast<unsigned>(utc.wSecond),
+            stage_suffix)
         < 0) {
         return;
     }
@@ -175,15 +227,22 @@ void UiHangWatchdog::writeHangReport(std::int64_t hung_ms) const noexcept {
         return;
     }
 
-    char body[768]{};
+    const auto* activity = uiActivityLabel();
+    const auto activity_ms = steadyNowMs()
+        - g_ui_activity_started_ms.load(std::memory_order_relaxed);
+
+    char body[1024]{};
     const int written = _snprintf_s(
         body,
         _TRUNCATE,
         "MGS Tone Craft UI hang diagnostic\r\n"
         "timestamp_utc: %04u-%02u-%02uT%02u:%02u:%02uZ\r\n"
+        "stage: %s\r\n"
         "hang_duration_ms: %lld\r\n"
         "threshold_ms: %d\r\n"
         "note: message thread did not pump (heartbeat stale)\r\n"
+        "ui_activity: %s\r\n"
+        "ui_activity_ms: %lld\r\n"
         "pc_audio: %s\r\n"
         "sound_output: %s\r\n"
         "doc_version: " MGSTC_DOC_VERSION "\r\n",
@@ -193,8 +252,11 @@ void UiHangWatchdog::writeHangReport(std::int64_t hung_ms) const noexcept {
         static_cast<unsigned>(utc.wHour),
         static_cast<unsigned>(utc.wMinute),
         static_cast<unsigned>(utc.wSecond),
+        stage != nullptr ? stage : "detected",
         static_cast<long long>(hung_ms),
         hang_threshold_ms_.load(std::memory_order_relaxed),
+        activity,
+        static_cast<long long>(activity_ms),
         pcAudioHintText(
             g_pc_audio_hint.load(std::memory_order_relaxed)),
         soundOutputHintText(

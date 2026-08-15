@@ -43,12 +43,47 @@ WAVEFORMATEX makeFormat() noexcept {
 struct WasapiAudioSink::Impl {
     engine::SpscQueue<AudioSinkStatus, 64> statuses;
     std::atomic<bool> running{};
+    std::atomic<bool> abandoned{};
     std::atomic<std::int32_t> startup_result{E_FAIL};
     std::thread worker;
     HANDLE stop_event{};
     HANDLE ready_event{};
+    HANDLE exit_event{};
     engine::RealtimeEngineHost* engine{};
     std::atomic<std::uint32_t> master_volume_percent{100};
+
+    Impl() {
+        // Manual-reset and owned for the whole Impl lifetime, so an abandoned
+        // worker never waits on a handle the sink already closed.
+        stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ready_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        exit_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    }
+
+    ~Impl() {
+        // Never self-join: an abandoned worker can be the last owner.
+        if (worker.joinable()
+            && worker.get_id() != std::this_thread::get_id()) {
+            if (stop_event != nullptr) {
+                SetEvent(stop_event);
+            }
+            worker.join();
+        }
+        for (HANDLE* handle : {&stop_event, &ready_event, &exit_event}) {
+            if (*handle != nullptr) {
+                CloseHandle(*handle);
+                *handle = nullptr;
+            }
+        }
+    }
+
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+
+    [[nodiscard]] bool eventsReady() const noexcept {
+        return stop_event != nullptr && ready_event != nullptr
+            && exit_event != nullptr;
+    }
 
     void applyMasterVolume(std::span<float> samples) const noexcept {
         const auto percent = master_volume_percent.load(
@@ -76,6 +111,15 @@ struct WasapiAudioSink::Impl {
     }
 
     void run() noexcept {
+        runWorker();
+        // Last thing the worker does: lets stop() tell "left the device calls"
+        // from "still stuck inside one".
+        if (exit_event != nullptr) {
+            SetEvent(exit_event);
+        }
+    }
+
+    void runWorker() noexcept {
         const auto com_result =
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const bool com_initialized = SUCCEEDED(com_result);
@@ -115,13 +159,50 @@ struct WasapiAudioSink::Impl {
 
         const auto format = makeFormat();
         if (SUCCEEDED(result)) {
-            result = client->Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                kStreamFlags,
-                0,
-                0,
-                &format,
-                nullptr);
+            // Prefer shared-mode low latency when IAudioClient3 is
+            // available; otherwise ask for ~10ms instead of OS default
+            // (period 0). Fall back safely so startup still works.
+            result = E_FAIL;
+            ComPtr<IAudioClient3> client3;
+            if (SUCCEEDED(client.As(&client3))) {
+                UINT32 default_period_frames = 0;
+                UINT32 fundamental_period_frames = 0;
+                UINT32 min_period_frames = 0;
+                UINT32 max_period_frames = 0;
+                if (SUCCEEDED(client3->GetSharedModeEnginePeriod(
+                        &format,
+                        &default_period_frames,
+                        &fundamental_period_frames,
+                        &min_period_frames,
+                        &max_period_frames))
+                    && min_period_frames > 0) {
+                    result = client3->InitializeSharedAudioStream(
+                        kStreamFlags,
+                        min_period_frames,
+                        &format,
+                        nullptr);
+                }
+            }
+            if (FAILED(result)) {
+                // REFERENCE_TIME is 100ns units; 10ms = 100000.
+                constexpr REFERENCE_TIME kSharedBufferDuration = 100'000;
+                result = client->Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    kStreamFlags,
+                    kSharedBufferDuration,
+                    0,
+                    &format,
+                    nullptr);
+            }
+            if (FAILED(result)) {
+                result = client->Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    kStreamFlags,
+                    0,
+                    0,
+                    &format,
+                    nullptr);
+            }
         }
         if (SUCCEEDED(result)) {
             result = client->SetEventHandle(audio_event);
@@ -173,7 +254,8 @@ struct WasapiAudioSink::Impl {
         bool underrun_reported = false;
         while (true) {
             const auto wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
-            if (wait == WAIT_OBJECT_0) {
+            if (wait == WAIT_OBJECT_0
+                || abandoned.load(std::memory_order_acquire)) {
                 break;
             }
             if (wait != WAIT_OBJECT_0 + 1) {
@@ -205,6 +287,13 @@ struct WasapiAudioSink::Impl {
                 push(AudioSinkStatusType::DeviceError, result);
                 break;
             }
+            if (abandoned.load(std::memory_order_acquire)) {
+                // A replacement sink owns the engine now: release the buffer
+                // silently instead of rendering twice.
+                static_cast<void>(render_client->ReleaseBuffer(
+                    available, AUDCLNT_BUFFERFLAGS_SILENT));
+                break;
+            }
             auto samples = std::span<float>(
                 reinterpret_cast<float*>(buffer),
                 static_cast<std::size_t>(available) * 2);
@@ -230,7 +319,7 @@ struct WasapiAudioSink::Impl {
 };
 
 WasapiAudioSink::WasapiAudioSink()
-    : impl_(std::make_unique<Impl>()) {}
+    : impl_(std::make_shared<Impl>()) {}
 
 WasapiAudioSink::~WasapiAudioSink() {
     stop();
@@ -238,22 +327,20 @@ WasapiAudioSink::~WasapiAudioSink() {
 
 bool WasapiAudioSink::start(
     engine::RealtimeEngineHost& engine) {
-    if (impl_->worker.joinable()) {
+    if (impl_->worker.joinable() || !impl_->eventsReady()) {
         return false;
     }
-    impl_->stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    impl_->ready_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!impl_->stop_event || !impl_->ready_event) {
-        stop();
-        return false;
-    }
+    ResetEvent(impl_->stop_event);
+    ResetEvent(impl_->ready_event);
+    ResetEvent(impl_->exit_event);
     impl_->engine = &engine;
     impl_->startup_result.store(E_FAIL, std::memory_order_relaxed);
-    impl_->worker = std::thread([this]() {
-        impl_->run();
+    impl_->worker = std::thread([self = impl_]() {
+        self->run();
     });
 
-    const auto wait = WaitForSingleObject(impl_->ready_event, 5'000);
+    const auto wait =
+        WaitForSingleObject(impl_->ready_event, kStartWaitMs);
     const bool started = wait == WAIT_OBJECT_0
         && SUCCEEDED(static_cast<HRESULT>(
             impl_->startup_result.load(std::memory_order_acquire)));
@@ -264,22 +351,44 @@ bool WasapiAudioSink::start(
 }
 
 void WasapiAudioSink::stop() noexcept {
-    if (impl_->stop_event) {
+    if (impl_->stop_event != nullptr) {
         SetEvent(impl_->stop_event);
     }
     if (impl_->worker.joinable()) {
-        impl_->worker.join();
-    }
-    if (impl_->ready_event) {
-        CloseHandle(impl_->ready_event);
-        impl_->ready_event = nullptr;
-    }
-    if (impl_->stop_event) {
-        CloseHandle(impl_->stop_event);
-        impl_->stop_event = nullptr;
+        // A device call inside the worker (GetBuffer / Initialize / Stop) can
+        // stall for seconds when the endpoint changes. Bound the wait and
+        // abandon rather than freezing the caller — the message thread reaches
+        // here from device switches and shutdown.
+        const auto wait = impl_->exit_event != nullptr
+            ? WaitForSingleObject(impl_->exit_event, kStopWaitMs)
+            : WAIT_FAILED;
+        if (wait == WAIT_OBJECT_0) {
+            impl_->worker.join();
+        } else {
+            abandonStuckWorker();
+            return;
+        }
     }
     impl_->engine = nullptr;
     impl_->running.store(false, std::memory_order_release);
+}
+
+void WasapiAudioSink::abandonStuckWorker() noexcept {
+    // The worker keeps its own Impl (and event handles) alive and exits as soon
+    // as the stuck call returns; it renders nothing more once abandoned.
+    impl_->abandoned.store(true, std::memory_order_release);
+    impl_->running.store(false, std::memory_order_release);
+    impl_->worker.detach();
+    const auto volume =
+        impl_->master_volume_percent.load(std::memory_order_relaxed);
+    try {
+        impl_ = std::make_shared<Impl>();
+        impl_->master_volume_percent.store(
+            volume, std::memory_order_relaxed);
+    } catch (...) {
+        // Out of memory: keep the abandoned Impl. It is muted and not
+        // joinable, so start() will simply refuse until memory recovers.
+    }
 }
 
 bool WasapiAudioSink::running() const noexcept {
