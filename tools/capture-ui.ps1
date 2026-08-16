@@ -4,6 +4,7 @@ param(
     [string]$Editor = "scc",
     [ValidateSet(
         "editor",
+        "settings-view",
         "settings-midi",
         "settings-output",
         "library")]
@@ -21,6 +22,7 @@ if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
 
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $suffix = switch ($Target) {
+        "settings-view" { "settings-view" }
         "settings-midi" { "settings-midi" }
         "settings-output" { "settings-output" }
         "library" { "library-manager" }

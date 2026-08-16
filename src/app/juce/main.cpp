@@ -1128,6 +1128,218 @@ enum class OpllConversionQuality {
     thorough,
 };
 
+// Discrete UI scale (View setting + optional per-editor session override).
+// Global percent is INI-persisted; layout/fonts read the active factor via UiMetrics.
+namespace UiScale {
+constexpr int kDefaultPercent = 100;
+constexpr std::array<int, 3> kSteps{75, 100, 125};
+
+inline int global_percent = kDefaultPercent;
+inline int active_percent = kDefaultPercent;
+inline float active_factor = 1.0F;
+
+inline std::vector<std::function<void()>> global_listeners;
+
+[[nodiscard]] inline juce::File settingsIniFile() {
+    return applicationDataDirectory().getChildFile("settings-v1.ini");
+}
+
+[[nodiscard]] inline int nearestStep(int percent) noexcept {
+    int best = kDefaultPercent;
+    int best_dist = std::abs(percent - best);
+    for (const int step : kSteps) {
+        const int dist = std::abs(percent - step);
+        if (dist < best_dist) {
+            best = step;
+            best_dist = dist;
+        }
+    }
+    return best;
+}
+
+[[nodiscard]] inline bool isStep(int percent) noexcept {
+    for (const int step : kSteps) {
+        if (step == percent) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] inline float factorFromPercent(int percent) noexcept {
+    return static_cast<float>(nearestStep(percent)) / 100.0F;
+}
+
+[[nodiscard]] inline int nextLarger(int percent) noexcept {
+    const int clamped = nearestStep(percent);
+    for (const int step : kSteps) {
+        if (step > clamped) {
+            return step;
+        }
+    }
+    return clamped;
+}
+
+[[nodiscard]] inline int nextSmaller(int percent) noexcept {
+    const int clamped = nearestStep(percent);
+    for (int i = static_cast<int>(kSteps.size()) - 1; i >= 0; --i) {
+        if (kSteps[static_cast<std::size_t>(i)] < clamped) {
+            return kSteps[static_cast<std::size_t>(i)];
+        }
+    }
+    return clamped;
+}
+
+[[nodiscard]] inline int sx(int value) noexcept {
+    return juce::jmax(
+        1, juce::roundToInt(static_cast<float>(value) * active_factor));
+}
+
+void applyLayoutMetrics(float factor); // defined after UiLayout
+
+inline void setActivePercent(int percent) {
+    active_percent = nearestStep(percent);
+    active_factor = factorFromPercent(active_percent);
+    applyLayoutMetrics(active_factor);
+}
+
+inline void loadGlobalFromIni() {
+    const auto file = settingsIniFile();
+    int value = kDefaultPercent;
+    if (file.existsAsFile()) {
+        value = static_cast<int>(GetPrivateProfileIntW(
+            L"Application",
+            L"UiScalePercent",
+            kDefaultPercent,
+            file.getFullPathName().toWideCharPointer()));
+    }
+    // Only exact steps {75,100,125} are accepted. Invalid values (including
+    // legacy 50) stay at default 100% for this session; do not rewrite INI.
+    global_percent = isStep(value) ? value : kDefaultPercent;
+    setActivePercent(global_percent);
+}
+
+inline void saveGlobalToIni() {
+    const auto file = settingsIniFile();
+    if (file.getParentDirectory().createDirectory().failed()) {
+        return;
+    }
+    const auto path = file.getFullPathName();
+    const auto value = juce::String(global_percent);
+    static_cast<void>(WritePrivateProfileStringW(
+        L"Application",
+        L"SchemaVersion",
+        L"1",
+        path.toWideCharPointer()));
+    static_cast<void>(WritePrivateProfileStringW(
+        L"Application",
+        L"UiScalePercent",
+        value.toWideCharPointer(),
+        path.toWideCharPointer()));
+    static_cast<void>(WritePrivateProfileStringW(
+        nullptr, nullptr, nullptr, path.toWideCharPointer()));
+}
+
+inline void addGlobalListener(std::function<void()> listener) {
+    global_listeners.push_back(std::move(listener));
+}
+
+inline void notifyGlobalListeners() {
+    for (auto& listener : global_listeners) {
+        if (listener) {
+            listener();
+        }
+    }
+}
+
+// Persist + apply to metrics, then refresh every registered root (editors + dialogs).
+inline void setGlobalPercent(int percent, bool persist) {
+    global_percent = nearestStep(percent);
+    if (persist) {
+        saveGlobalToIni();
+    }
+    setActivePercent(global_percent);
+    notifyGlobalListeners();
+}
+
+// Settings / library / tags / other dialogs must never inherit an editor's
+// Ctrl± session override via process-global metrics.
+inline void forceGlobalForNonEditorUi() {
+    setActivePercent(global_percent);
+}
+
+[[nodiscard]] inline bool modalUiBlocksEditorScale() {
+    return juce::ModalComponentManager::getInstance()
+               ->getNumModalComponents()
+        > 0;
+}
+
+// Only the active editor window may push session scale into shared metrics.
+// Background editors and any open modal must not leak Ctrl± into dialogs or
+// newly created windows.
+[[nodiscard]] inline bool editorMayDriveProcessScale(
+    const juce::Component& editor) {
+    if (modalUiBlocksEditorScale()) {
+        return false;
+    }
+    if (auto* top = editor.getTopLevelComponent()) {
+        if (auto* window =
+                dynamic_cast<const juce::TopLevelWindow*>(top)) {
+            return window->isActiveWindow();
+        }
+    }
+    return false;
+}
+
+inline void syncEditorDrivenActivePercent(
+    const juce::Component& editor,
+    int effective_percent) {
+    if (modalUiBlocksEditorScale()) {
+        // Any modal (settings, library, tags, AlertWindow, …) owns the UI
+        // context — keep process metrics on View/INI global, never Ctrl±.
+        forceGlobalForNonEditorUi();
+        return;
+    }
+    if (editorMayDriveProcessScale(editor)) {
+        setActivePercent(effective_percent);
+    }
+}
+
+[[nodiscard]] inline bool tryHandleEditorScaleKey(
+    const juce::KeyPress& key,
+    std::optional<int>& session_override_percent,
+    const std::function<void(int effective_percent)>& apply) {
+    if (!key.getModifiers().isCommandDown()
+        || key.getModifiers().isAltDown()) {
+        return false;
+    }
+    const auto code = key.getKeyCode();
+    // Keep Ctrl+C/V/Z/Y for timbre edit; only handle zoom keys here.
+    if (code == 'c' || code == 'C' || code == 'v' || code == 'V'
+        || code == 'z' || code == 'Z' || code == 'y' || code == 'Y') {
+        return false;
+    }
+    const int current = session_override_percent.value_or(global_percent);
+    if (code == '=' || code == '+'
+        || code == juce::KeyPress::numberPadAdd) {
+        session_override_percent = nextLarger(current);
+        apply(*session_override_percent);
+        return true;
+    }
+    if (code == '-' || code == juce::KeyPress::numberPadSubtract) {
+        session_override_percent = nextSmaller(current);
+        apply(*session_override_percent);
+        return true;
+    }
+    if (code == '0' || code == juce::KeyPress::numberPad0) {
+        session_override_percent.reset();
+        apply(global_percent);
+        return true;
+    }
+    return false;
+}
+} // namespace UiScale
+
 // UI type scale — exactly four roles (px heights; face = Windows message font).
 //   title   : window / page title
 //   heading : panel / section header
@@ -1148,7 +1360,7 @@ namespace UiFonts {
     return "Segoe UI";
 }
 
-[[nodiscard]] inline float bodyHeight() {
+[[nodiscard]] inline float unscaledBodyHeight() {
     NONCLIENTMETRICSW metrics{};
     metrics.cbSize = sizeof(metrics);
     float pixels = 18.0F;
@@ -1165,17 +1377,25 @@ namespace UiFonts {
     return juce::jmax(18.0F, pixels);
 }
 
+[[nodiscard]] inline float bodyHeight() {
+    // Floor so 75% remains usable where possible.
+    return juce::jmax(12.0F, unscaledBodyHeight() * UiScale::active_factor);
+}
+
 [[nodiscard]] inline float headingHeight() {
-    return bodyHeight() * 1.15F;
+    return juce::jmax(13.0F, bodyHeight() * 1.15F);
 }
 
 [[nodiscard]] inline float titleHeight() {
-    return juce::jmax(26.0F, bodyHeight() * 1.45F);
+    return juce::jmax(
+        14.0F,
+        juce::jmax(26.0F, unscaledBodyHeight() * 1.45F)
+            * UiScale::active_factor);
 }
 
 [[nodiscard]] inline float denseHeight() {
-    // ~14.6px at body=18; timeline/OPLL EG frames are ≥16px.
-    return juce::jmax(13.0F, bodyHeight() * 0.8125F);
+    // ~14.6px at body=18; timeline/OPLL EG frames are ≥16px at 100%.
+    return juce::jmax(10.0F, bodyHeight() * 0.8125F);
 }
 
 // Match LookAndFeel_V4 TextButton: min(heading, height×0.6), never below body.
@@ -1223,8 +1443,16 @@ namespace UiFonts {
 inline void setMgscPreviewText(
     juce::TextEditor& editor,
     const juce::String& text) {
+    const auto font = mono();
+    editor.setFont(font);
     editor.setText(text, false);
-    editor.applyFontToAllText(mono());
+    editor.applyFontToAllText(font);
+}
+
+inline void refreshMgscPreviewFont(juce::TextEditor& editor) {
+    const auto font = mono();
+    editor.setFont(font);
+    editor.applyFontToAllText(font);
 }
 
 // Compatibility aliases used across the UI.
@@ -1276,6 +1504,7 @@ inline void styleDenseField(juce::TextEditor& editor) {
 }
 } // namespace UiFonts
 
+
 class SwitchLookAndFeel final : public juce::LookAndFeel_V4 {
 public:
     void drawToggleButton(
@@ -1286,11 +1515,23 @@ public:
         auto bounds = button.getLocalBounds().toFloat();
         const auto enabled = button.isEnabled();
         const auto active = button.getToggleState();
+        // Design tokens match UiLayout::Base::switch* (scaled via UiScale).
+        // Keep magic bases identical to UiLayout::Base::{switchTrackW,H,Thumb,LabelPad}.
+        const auto track_w =
+            static_cast<float>(UiScale::sx(34));
+        const auto track_h =
+            static_cast<float>(UiScale::sx(18));
+        const auto thumb =
+            static_cast<float>(UiScale::sx(14));
+        const auto label_pad =
+            static_cast<float>(UiScale::sx(8));
+        const auto track_pad =
+            juce::jmax(1.0F, (track_h - thumb) * 0.5F);
         const auto switch_bounds = juce::Rectangle<float>(
             bounds.getX(),
-            bounds.getCentreY() - 9.0F,
-            34.0F,
-            18.0F);
+            bounds.getCentreY() - track_h * 0.5F,
+            track_w,
+            track_h);
         auto track = active
             ? juce::Colour(0xFF2FA9D6)
             : juce::Colour(0xFF4C5863);
@@ -1301,16 +1542,20 @@ public:
             track = track.withMultipliedAlpha(0.45F);
         }
         graphics.setColour(track);
-        graphics.fillRoundedRectangle(switch_bounds, 9.0F);
+        graphics.fillRoundedRectangle(
+            switch_bounds, track_h * 0.5F);
 
         const auto thumb_x = active
-            ? switch_bounds.getRight() - 16.0F
-            : switch_bounds.getX() + 2.0F;
+            ? switch_bounds.getRight() - thumb - track_pad
+            : switch_bounds.getX() + track_pad;
         graphics.setColour(
             juce::Colours::white.withMultipliedAlpha(
                 enabled ? 0.95F : 0.45F));
         graphics.fillEllipse(
-            thumb_x, switch_bounds.getY() + 2.0F, 14.0F, 14.0F);
+            thumb_x,
+            switch_bounds.getY() + track_pad,
+            thumb,
+            thumb);
 
         const auto label_colour =
             (should_draw_highlight && enabled)
@@ -1318,19 +1563,31 @@ public:
                 : juce::Colour(0xFFE6EDF3);
         graphics.setColour(
             label_colour.withMultipliedAlpha(enabled ? 1.0F : 0.45F));
-        graphics.setFont(UiFonts::make(
+        const auto font = UiFonts::make(
             UiFonts::controlTextHeight(
-                static_cast<float>(button.getHeight()))));
+                static_cast<float>(button.getHeight())));
+        graphics.setFont(font);
+        // Track | labelPad | label — same formula as UiLayout::switchControlWidth.
+        const auto label_bounds = juce::Rectangle<float>(
+            switch_bounds.getRight() + label_pad,
+            switch_bounds.getY(),
+            juce::jmax(
+                0.0F,
+                bounds.getRight()
+                    - (switch_bounds.getRight() + label_pad)),
+            switch_bounds.getHeight());
         graphics.drawFittedText(
             button.getButtonText(),
-            button.getLocalBounds().withTrimmedLeft(42),
+            label_bounds.toNearestInt(),
             juce::Justification::centredLeft,
             1);
 
         if (button.hasKeyboardFocus(true)) {
             graphics.setColour(juce::Colour(kUiHoverAccent));
             graphics.drawRoundedRectangle(
-                bounds.reduced(0.5F), 4.0F, 1.0F);
+                bounds.reduced(0.5F),
+                static_cast<float>(UiScale::sx(4)),
+                1.0F);
         }
     }
 };
@@ -1377,7 +1634,7 @@ public:
         cancel_.setButtonText(juce::String::fromUTF8("キャンセル"));
         cancel_.onClick = [this] { closeDialog(0); };
         addAndMakeVisible(cancel_);
-        setSize(400, 150);
+        setSize(UiScale::sx(400), UiScale::sx(150));
     }
 
     ~OpllConversionQualityContent() override {
@@ -1385,15 +1642,16 @@ public:
     }
 
     void resized() override {
-        auto area = getLocalBounds().reduced(18);
-        auto quality = area.removeFromTop(32);
-        standard_label_.setBounds(quality.removeFromLeft(86));
-        quality.removeFromLeft(10);
+        auto area = getLocalBounds().reduced(UiScale::sx(18));
+        auto quality = area.removeFromTop(UiScale::sx(34));
+        standard_label_.setBounds(
+            quality.removeFromLeft(UiScale::sx(86)));
+        quality.removeFromLeft(UiScale::sx(8));
         quality_toggle_.setBounds(quality);
-        auto buttons = area.removeFromBottom(34);
-        cancel_.setBounds(buttons.removeFromRight(112));
-        buttons.removeFromRight(8);
-        convert_.setBounds(buttons.removeFromRight(112));
+        auto buttons = area.removeFromBottom(UiScale::sx(36));
+        cancel_.setBounds(buttons.removeFromRight(UiScale::sx(112)));
+        buttons.removeFromRight(UiScale::sx(6));
+        convert_.setBounds(buttons.removeFromRight(UiScale::sx(112)));
     }
 
 private:
@@ -1491,7 +1749,7 @@ public:
         addAndMakeVisible(cancel_);
 
         startTimerHz(30);
-        setSize(320, 402);
+        setSize(UiScale::sx(320), UiScale::sx(402));
     }
 
     ~ConversionBusyContent() override {
@@ -1590,11 +1848,37 @@ public:
     void closeButtonPressed() override {
         exitModalState(0);
     }
+
+    void activeWindowStatusChanged() override {
+        juce::DialogWindow::activeWindowStatusChanged();
+        if (!isActiveWindow()) {
+            return;
+        }
+        // Keep LookAndFeel / UiFonts / UiLayout on View (global) scale while
+        // any non-editor dialog is the active surface.
+        UiScale::forceGlobalForNonEditorUi();
+        if (auto* content = getContentComponent()) {
+            content->sendLookAndFeelChange();
+            content->resized();
+            content->repaint();
+        }
+    }
+
+    void resized() override {
+        UiScale::forceGlobalForNonEditorUi();
+        juce::DialogWindow::resized();
+    }
+
+    void paint(juce::Graphics& graphics) override {
+        UiScale::forceGlobalForNonEditorUi();
+        juce::DialogWindow::paint(graphics);
+    }
 };
 
 void showOpllConversionQualityDialog(
     juce::Component* anchor,
     OpllConversionQualityContent::ConvertCallback callback) {
+    UiScale::forceGlobalForNonEditorUi();
     auto* dialog = new ModalDialogWindow(
         juce::String::fromUTF8("OPLL変換品質"),
         juce::Colour(0xFF1B222C));
@@ -1903,10 +2187,16 @@ public:
         addAndMakeVisible(cancel_);
 
         rebuildFilteredChips();
-        setSize(560, 560);
+        setSize(UiScale::sx(560), UiScale::sx(560));
+    }
+
+    void paint(juce::Graphics& graphics) override {
+        UiScale::forceGlobalForNonEditorUi();
+        juce::Component::paint(graphics);
     }
 
     void resized() override {
+        UiScale::forceGlobalForNonEditorUi();
         auto area = getLocalBounds().reduced(16);
         filter_.setBounds(area.removeFromTop(32));
         area.removeFromTop(8);
@@ -2058,6 +2348,7 @@ void showTagSelectionDialog(
     std::vector<std::string> selected,
     bool allow_custom,
     TagSelectionContent::SelectionCallback callback) {
+    UiScale::forceGlobalForNonEditorUi();
     auto* dialog = new ModalDialogWindow(
         title, juce::Colour(0xFF1B222C));
     auto* content = new TagSelectionContent(
@@ -2158,7 +2449,7 @@ public:
         addAndMakeVisible(cancel_);
 
         updateState();
-        setSize(560, embedded_ ? 460 : 420);
+        setSize(UiScale::sx(560), UiScale::sx(embedded_ ? 460 : 420));
     }
 
     void setCustomTags(std::vector<TagChoice> custom_tags) {
@@ -2169,7 +2460,13 @@ public:
         updateState();
     }
 
+    void paint(juce::Graphics& graphics) override {
+        UiScale::forceGlobalForNonEditorUi();
+        juce::Component::paint(graphics);
+    }
+
     void resized() override {
+        UiScale::forceGlobalForNonEditorUi();
         constexpr int pad = 10;
         constexpr int title_h = 30;
         constexpr int gap_xs = 4;
@@ -2343,6 +2640,7 @@ void showTagManagementDialog(
     juce::Component* anchor,
     std::vector<TagChoice> custom_tags,
     TagManagementContent::ApplyCallback callback) {
+    UiScale::forceGlobalForNonEditorUi();
     auto* dialog = new ModalDialogWindow(
         juce::String::fromUTF8("独自タグ管理"),
         juce::Colour(0xFF1B222C));
@@ -2532,7 +2830,6 @@ public:
 
     void paint(juce::Graphics& g) override {
         if (logo_.isValid()) {
-            // Source logo is 1024x1024; show at 25% (256x256).
             g.drawImageWithin(
                 logo_,
                 logo_bounds_.getX(),
@@ -2545,53 +2842,74 @@ public:
     }
 
     void resized() override {
-        auto area = getLocalBounds().reduced(12);
-        constexpr int kLogo = 256;
-        constexpr int kGapLogoTitle = 12;
-        constexpr int kTitleH = 28;
-        constexpr int kSubtitleH = 24;
-        constexpr int kGapDetail = 8;
-        constexpr int kDetailH = 48;
-        constexpr int kFooterRow = 22;
+        auto area = getLocalBounds().reduced(UiScale::sx(12));
+        const int footer_row = UiScale::sx(22);
+        const int title_h = UiScale::sx(28);
+        const int subtitle_h = UiScale::sx(24);
+        const int gap_logo_title = UiScale::sx(8);
+        const int gap_detail = UiScale::sx(8);
+        const int detail_h = UiScale::sx(48);
 
-        x_.setBounds(area.removeFromBottom(kFooterRow));
-        github_.setBounds(area.removeFromBottom(kFooterRow));
-        copyright_.setBounds(area.removeFromBottom(kFooterRow));
+        // Natural (100%) asset size; shrink only when the panel is too small.
+        const int logo_w = logo_.isValid()
+            ? juce::jmax(1, logo_.getWidth())
+            : UiScale::sx(256);
+        const int logo_h = logo_.isValid()
+            ? juce::jmax(1, logo_.getHeight())
+            : UiScale::sx(256);
 
-        const int stackH =
-            kLogo + kGapLogoTitle + kTitleH + kSubtitleH;
-        const int groupH = stackH + kGapDetail + kDetailH;
-        const bool compact = area.getHeight() < groupH;
+        x_.setBounds(area.removeFromBottom(footer_row));
+        github_.setBounds(area.removeFromBottom(footer_row));
+        copyright_.setBounds(area.removeFromBottom(footer_row));
 
-        int logoY;
-        if (compact) {
-            logoY = area.getY();
-        } else {
-            logoY = area.getY()
-                + (area.getHeight() - groupH) / 2;
+        int display_logo_w = logo_w;
+        int display_logo_h = logo_h;
+        const int chrome_h = title_h + subtitle_h + gap_logo_title
+            + gap_detail + detail_h;
+        if (logo_w > area.getWidth()
+            || logo_h > juce::jmax(1, area.getHeight() - chrome_h)) {
+            const float fit = juce::jmin(
+                static_cast<float>(area.getWidth())
+                    / static_cast<float>(logo_w),
+                static_cast<float>(
+                    juce::jmax(1, area.getHeight() - chrome_h))
+                    / static_cast<float>(logo_h));
+            display_logo_w = juce::jmax(
+                1, juce::roundToInt(static_cast<float>(logo_w) * fit));
+            display_logo_h = juce::jmax(
+                1, juce::roundToInt(static_cast<float>(logo_h) * fit));
         }
+
+        const int display_stack_h =
+            display_logo_h + gap_logo_title + title_h + subtitle_h;
+        const int display_group_h =
+            display_stack_h + gap_detail + detail_h;
+        const int logo_y = (area.getHeight() < display_group_h)
+            ? area.getY()
+            : area.getY() + (area.getHeight() - display_group_h) / 2;
 
         logo_bounds_ = juce::Rectangle<int>(
                            area.getX(),
-                           logoY,
+                           logo_y,
                            area.getWidth(),
-                           kLogo)
-                           .withSizeKeepingCentre(kLogo, kLogo);
+                           display_logo_h)
+                           .withSizeKeepingCentre(
+                               display_logo_w, display_logo_h);
         title_.setBounds(
             area.getX(),
-            logoY + kLogo + kGapLogoTitle,
+            logo_y + display_logo_h + gap_logo_title,
             area.getWidth(),
-            kTitleH);
+            title_h);
         subtitle_.setBounds(
             area.getX(),
-            logoY + kLogo + kGapLogoTitle + kTitleH,
+            logo_y + display_logo_h + gap_logo_title + title_h,
             area.getWidth(),
-            kSubtitleH);
+            subtitle_h);
         detail_.setBounds(
             area.getX(),
-            logoY + stackH + kGapDetail,
+            logo_y + display_stack_h + gap_detail,
             area.getWidth(),
-            kDetailH);
+            detail_h);
     }
 
 private:
@@ -2928,22 +3246,17 @@ public:
             const auto& display_wave = reference_waveform_
                 ? *reference_waveform_
                 : waveform_;
-            const auto text = juce::String::formatted(
-                "%02d : %d (0x%02X)",
+            const auto text = formatSampleValueLabel(
                 selected_index_,
-                static_cast<int>(
-                    display_wave[static_cast<std::size_t>(
-                        selected_index_)]),
-                static_cast<unsigned int>(
-                    static_cast<std::uint8_t>(
-                        display_wave[static_cast<std::size_t>(
-                            selected_index_)])));
+                display_wave[static_cast<std::size_t>(selected_index_)]);
             graphics.setColour(juce::Colours::white);
             graphics.drawText(
                 text,
                 getLocalBounds().removeFromTop(24),
                 juce::Justification::centredRight);
         }
+
+        drawHoverValuePopup(graphics);
     }
 
     void mouseDown(const juce::MouseEvent& event) override {
@@ -2951,6 +3264,7 @@ public:
         if (!graphBounds().contains(event.getPosition())) {
             mouse_edit_active_ = false;
             updateEditCursor(event.getPosition());
+            updateHoverFromMouse(event.getPosition());
             return;
         }
         // DEC/HEX入力欄にフォーカスが残っているとPCキー演奏が抑制される。
@@ -2969,6 +3283,7 @@ public:
         }
         drag_start_ = waveform_;
         updateFromMouse(event.position);
+        updateHoverFromMouse(event.getPosition());
     }
 
     void mouseDrag(const juce::MouseEvent& event) override {
@@ -2978,11 +3293,13 @@ public:
         }
         setMouseCursor(juce::MouseCursor::CrosshairCursor);
         updateFromMouse(event.position);
+        updateHoverFromMouse(event.getPosition());
     }
 
     void mouseUp(const juce::MouseEvent& event) override {
         if (!mouse_edit_active_) {
             updateEditCursor(event.getPosition());
+            updateHoverFromMouse(event.getPosition());
             return;
         }
         mouse_edit_active_ = false;
@@ -2990,15 +3307,24 @@ public:
             on_commit_(drag_start_, waveform_);
         }
         updateEditCursor(event.getPosition());
+        updateHoverFromMouse(event.getPosition());
     }
 
     void mouseMove(const juce::MouseEvent& event) override {
         updateEditCursor(event.getPosition());
+        updateHoverFromMouse(event.getPosition());
     }
 
     void mouseExit(const juce::MouseEvent&) override {
-        if (!mouse_edit_active_) {
-            setMouseCursor(juce::MouseCursor::NormalCursor);
+        if (mouse_edit_active_) {
+            return;
+        }
+        setMouseCursor(juce::MouseCursor::NormalCursor);
+        if (hover_mouse_pos_ || hover_index_ >= 0 || hover_value_) {
+            hover_mouse_pos_.reset();
+            hover_index_ = -1;
+            hover_value_.reset();
+            repaint();
         }
     }
 
@@ -3036,6 +3362,124 @@ private:
         } else {
             setMouseCursor(juce::MouseCursor::NormalCursor);
         }
+    }
+
+    [[nodiscard]] int sampleIndexAtX(float x) const {
+        const auto graph = graphBounds();
+        if (graph.isEmpty()) {
+            return 0;
+        }
+        const auto relative_x = juce::jlimit(
+            0.0F,
+            static_cast<float>(graph.getWidth() - 1),
+            x - static_cast<float>(graph.getX()));
+        return juce::jlimit(
+            0,
+            static_cast<int>(waveform_.size()) - 1,
+            static_cast<int>(
+                relative_x * waveform_.size()
+                / static_cast<float>(graph.getWidth())));
+    }
+
+    // Invert sampleY: graph Y → signed sample (−128…127), same as draw edit.
+    [[nodiscard]] static std::int8_t sampleValueAtY(
+        float y,
+        juce::Rectangle<int> graph) {
+        if (graph.isEmpty()) {
+            return 0;
+        }
+        const auto normalized_y = juce::jlimit(
+            0.0F,
+            1.0F,
+            (y - static_cast<float>(graph.getY()))
+                / static_cast<float>(graph.getHeight()));
+        return static_cast<std::int8_t>(juce::jlimit(
+            -128,
+            127,
+            juce::roundToInt(127.0F - normalized_y * 255.0F)));
+    }
+
+    void updateHoverFromMouse(juce::Point<int> position) {
+        const auto graph = graphBounds();
+        const bool over_graph = graph.contains(position);
+        if (!over_graph && !mouse_edit_active_) {
+            if (hover_mouse_pos_ || hover_index_ >= 0) {
+                hover_mouse_pos_.reset();
+                hover_index_ = -1;
+                hover_value_.reset();
+                repaint();
+            }
+            return;
+        }
+        const auto index = sampleIndexAtX(
+            static_cast<float>(position.x));
+        const auto value = sampleValueAtY(
+            static_cast<float>(position.y), graph);
+        if (hover_mouse_pos_
+            && *hover_mouse_pos_ == position
+            && hover_index_ == index
+            && hover_value_
+            && *hover_value_ == value) {
+            return;
+        }
+        hover_mouse_pos_ = position;
+        hover_index_ = index;
+        hover_value_ = value;
+        repaint();
+    }
+
+    [[nodiscard]] static juce::String formatSampleValueLabel(
+        int index,
+        std::int8_t sample) {
+        return juce::String::formatted(
+            "%02d : %d (0x%02X)",
+            index,
+            static_cast<int>(sample),
+            static_cast<unsigned int>(
+                static_cast<std::uint8_t>(sample)));
+    }
+
+    void drawHoverValuePopup(juce::Graphics& graphics) const {
+        if (!hover_mouse_pos_ || hover_index_ < 0 || !hover_value_) {
+            return;
+        }
+        const auto graph = graphBounds();
+        if (graph.isEmpty()) {
+            return;
+        }
+        const auto text = formatSampleValueLabel(
+            hover_index_, *hover_value_);
+        const auto font = UiFonts::body(true);
+        graphics.setFont(font);
+        const int pad_x = UiScale::sx(6);
+        const int pad_y = UiScale::sx(2);
+        const int text_w = juce::jmax(
+            UiScale::sx(24),
+            juce::GlyphArrangement::getStringWidthInt(font, text)
+                + pad_x * 2);
+        const int text_h = juce::jmax(
+            UiScale::sx(18),
+            juce::roundToInt(font.getHeight()) + pad_y * 2);
+        auto box = juce::Rectangle<int>(
+            hover_mouse_pos_->x + UiScale::sx(12),
+            hover_mouse_pos_->y - text_h - UiScale::sx(8),
+            text_w,
+            text_h);
+        box.setX(juce::jlimit(
+            graph.getX(),
+            graph.getRight() - text_w,
+            box.getX()));
+        box.setY(juce::jlimit(
+            graph.getY(),
+            graph.getBottom() - text_h,
+            box.getY()));
+        graphics.setColour(juce::Colour(0xEE151A20));
+        graphics.fillRoundedRectangle(box.toFloat(), 3.0F);
+        graphics.setColour(juce::Colour(kUiHoverAccent));
+        graphics.drawRoundedRectangle(box.toFloat(), 3.0F, 1.0F);
+        graphics.setColour(juce::Colour(0xFFE6EDF3));
+        graphics.drawText(
+            text, box, juce::Justification::centred, false);
     }
 
     static void configureValueEditor(
@@ -3166,19 +3610,10 @@ private:
             static_cast<int>(
                 relative_x * waveform_.size()
                 / static_cast<float>(graph.getWidth())));
-        const auto normalized_y = juce::jlimit(
-            0.0F,
-            1.0F,
-            (position.y - static_cast<float>(graph.getY()))
-                / static_cast<float>(graph.getHeight()));
-        const auto value = juce::jlimit(
-            -128,
-            127,
-            juce::roundToInt(127.0F - normalized_y * 255.0F));
+        const auto next = sampleValueAtY(position.y, graph);
         selected_index_ = index;
         auto& sample =
             waveform_[static_cast<std::size_t>(index)];
-        const auto next = static_cast<std::int8_t>(value);
         if (sample == next) {
             repaint();
             return;
@@ -3209,6 +3644,9 @@ private:
     std::array<std::unique_ptr<juce::TextEditor>, 32>
         hex_editors_;
     int selected_index_{-1};
+    int hover_index_{-1};
+    std::optional<std::int8_t> hover_value_;
+    std::optional<juce::Point<int>> hover_mouse_pos_;
     bool mouse_edit_active_{};
     mgstc::engine::SccApplyRange apply_range_{
         mgstc::engine::SccApplyRange::All};
@@ -4334,6 +4772,8 @@ private:
 
 // UI spacing scale (4px base). New controls should use these values.
 namespace UiLayout {
+// Unscaled design tokens (100%). Runtime values below are multiplied by UiScale.
+namespace Base {
 constexpr int xs = 4;
 constexpr int sm = 8;
 constexpr int md = 12;
@@ -4349,6 +4789,10 @@ constexpr int rowGap = 8;
 constexpr int controlGap = 6;
 constexpr int iconButton = 40;
 constexpr int masterVolumeSize = 48;
+constexpr int switchTrackW = 34;
+constexpr int switchTrackH = 18;
+constexpr int switchThumb = 14;
+constexpr int switchLabelPad = 8; // track right → label
 constexpr int textButtonH = 36;
 constexpr int fieldH = 34;
 constexpr int titleH = 36;
@@ -4372,37 +4816,253 @@ constexpr int commandStackH = 108;
 constexpr int commandSummaryH = 36;
 constexpr int envelopePreviewH = 48; // 2-line selectable MGSC preview
 constexpr int editSubLaneLabelW = 44;
-constexpr int setupValueLabelW = 64; // 相対音程 など
+constexpr int setupValueLabelW = 64; // relative pitch etc.
 constexpr int editMarkerLaneH = 16; // @ / y: no vertical value extent
 constexpr int registerAutoLaneH = 44;
-// Setup column: title + name/ch + timbre + 自動/手動+音色番号 + 相対音程
-// + \/@\ + 休符(r)/v. Keep channel lanes tall enough for controls.
-constexpr int compositeSetupContentH =
-    compositeToolRowH + xs
-    + fieldH + xs
-    + fieldH + xs
-    + fieldH + xs
-    + fieldH + xs
-    + fieldH + xs
-    + fieldH;
-constexpr int compositeChannelLaneH =
-    compositeSetupContentH + xs * 2 + 4 + 6; // inner pad + setup reduce + frame
 constexpr int compositeMixLaneH = 104;
 constexpr int compositeEditLaneH = 520;
-constexpr int compositeEditLaneOpllExtraH = registerAutoLaneH * 2;
+constexpr int registerAutoLanePairExtra = 44 * 2;
 constexpr int compositeSetupColumnW = 420;
-constexpr int compositeLaneLabelW = compositeSetupColumnW;
 constexpr int countColumnMinW = 28;
 constexpr int countColumnMaxW = 72;
 constexpr int compositeTimbrePickW = 360;
 constexpr int compositeTimbrePickH = 220;
-constexpr int compositeLayerLibraryH =
-    panelPad * 2 + libraryTitleH + sm + fieldH * 2 + sm + fieldH;
+constexpr int settingsDialogW = 500;
+constexpr int settingsDialogH = 720;
+constexpr int libraryManagerW = 1100;
+constexpr int libraryManagerH = 700;
+constexpr int channelLaneInnerPad = 4;
+constexpr int channelLaneFrame = 6;
+} // namespace Base
+
+inline int xs = Base::xs;
+inline int sm = Base::sm;
+inline int md = Base::md;
+inline int lg = Base::lg;
+inline int xl = Base::xl;
+
+inline int pageMargin = Base::pageMargin;
+inline int pageMarginPaint = Base::pageMarginPaint;
+inline int panelGap = Base::panelGap;
+inline int panelRadius = Base::panelRadius;
+inline int panelPad = Base::panelPad;
+inline int rowGap = Base::rowGap;
+inline int controlGap = Base::controlGap;
+inline int iconButton = Base::iconButton;
+inline int masterVolumeSize = Base::masterVolumeSize;
+inline int switchTrackW = Base::switchTrackW;
+inline int switchTrackH = Base::switchTrackH;
+inline int switchThumb = Base::switchThumb;
+inline int switchLabelPad = Base::switchLabelPad;
+inline int textButtonH = Base::textButtonH;
+inline int fieldH = Base::fieldH;
+inline int titleH = Base::titleH;
+inline int descriptionH = Base::descriptionH;
+inline int keyboardH = Base::keyboardH;
+inline int keyboardGap = Base::keyboardGap;
+inline int statusH = Base::statusH;
+inline int toolbarH = Base::toolbarH;
+
+inline int editorWindowW = Base::editorWindowW;
+inline int editorWindowH = Base::editorWindowH;
+inline int libraryWidth = Base::libraryWidth;
+inline int libraryTitleH = Base::libraryTitleH;
+inline int libraryMemoH = Base::libraryMemoH;
+inline int libraryButtonH = Base::libraryButtonH;
+inline int libraryButtonMinW = Base::libraryButtonMinW;
+inline int libraryManageButtonW = Base::libraryManageButtonW;
+inline int compositeToolRowH = Base::compositeToolRowH;
+inline int compositeToolGap = Base::compositeToolGap;
+inline int commandStackH = Base::commandStackH;
+inline int commandSummaryH = Base::commandSummaryH;
+inline int envelopePreviewH = Base::envelopePreviewH;
+inline int editSubLaneLabelW = Base::editSubLaneLabelW;
+inline int setupValueLabelW = Base::setupValueLabelW;
+inline int editMarkerLaneH = Base::editMarkerLaneH;
+inline int registerAutoLaneH = Base::registerAutoLaneH;
+inline int compositeSetupContentH = 0;
+inline int compositeChannelLaneH = 0;
+inline int compositeMixLaneH = Base::compositeMixLaneH;
+inline int compositeEditLaneH = Base::compositeEditLaneH;
+inline int compositeEditLaneOpllExtraH = Base::registerAutoLanePairExtra;
+inline int compositeSetupColumnW = Base::compositeSetupColumnW;
+inline int compositeLaneLabelW = Base::compositeSetupColumnW;
+inline int countColumnMinW = Base::countColumnMinW;
+inline int countColumnMaxW = Base::countColumnMaxW;
+inline int compositeTimbrePickW = Base::compositeTimbrePickW;
+inline int compositeTimbrePickH = Base::compositeTimbrePickH;
+inline int compositeLayerLibraryH = 0;
+inline int settingsDialogW = Base::settingsDialogW;
+inline int settingsDialogH = Base::settingsDialogH;
+inline int libraryManagerW = Base::libraryManagerW;
+inline int libraryManagerH = Base::libraryManagerH;
+
 constexpr juce::uint32 panelFill = 0xFF29323C;
 constexpr juce::uint32 panelStroke = 0xFF435160;
 constexpr juce::uint32 pageFill = 0xFF20262E;
 constexpr juce::uint32 pageFillBottom = 0xFF161B22;
+
+inline void recomputeDerived() {
+    compositeSetupContentH =
+        compositeToolRowH + xs
+        + fieldH + xs
+        + fieldH + xs
+        + fieldH + xs
+        + fieldH + xs
+        + fieldH + xs
+        + fieldH;
+    compositeChannelLaneH =
+        compositeSetupContentH + xs * 2
+        + UiScale::sx(Base::channelLaneInnerPad)
+        + UiScale::sx(Base::channelLaneFrame);
+    compositeLaneLabelW = compositeSetupColumnW;
+    compositeEditLaneOpllExtraH = registerAutoLaneH * 2;
+    compositeLayerLibraryH =
+        panelPad * 2 + libraryTitleH + sm + fieldH * 2 + sm + fieldH;
+}
+
+inline void applyScale(float factor) {
+    auto s = [factor](int value) {
+        return juce::jmax(
+            1, juce::roundToInt(static_cast<float>(value) * factor));
+    };
+    xs = s(Base::xs);
+    sm = s(Base::sm);
+    md = s(Base::md);
+    lg = s(Base::lg);
+    xl = s(Base::xl);
+    pageMargin = s(Base::pageMargin);
+    pageMarginPaint = s(Base::pageMarginPaint);
+    panelGap = s(Base::panelGap);
+    panelRadius = s(Base::panelRadius);
+    panelPad = s(Base::panelPad);
+    rowGap = s(Base::rowGap);
+    controlGap = s(Base::controlGap);
+    iconButton = s(Base::iconButton);
+    masterVolumeSize = s(Base::masterVolumeSize);
+    switchTrackW = s(Base::switchTrackW);
+    switchTrackH = s(Base::switchTrackH);
+    switchThumb = s(Base::switchThumb);
+    switchLabelPad = s(Base::switchLabelPad);
+    textButtonH = s(Base::textButtonH);
+    fieldH = s(Base::fieldH);
+    titleH = s(Base::titleH);
+    descriptionH = s(Base::descriptionH);
+    keyboardH = s(Base::keyboardH);
+    keyboardGap = s(Base::keyboardGap);
+    statusH = s(Base::statusH);
+    toolbarH = s(Base::toolbarH);
+    editorWindowW = s(Base::editorWindowW);
+    editorWindowH = s(Base::editorWindowH);
+    libraryWidth = s(Base::libraryWidth);
+    libraryTitleH = s(Base::libraryTitleH);
+    libraryMemoH = s(Base::libraryMemoH);
+    libraryButtonH = s(Base::libraryButtonH);
+    libraryButtonMinW = s(Base::libraryButtonMinW);
+    libraryManageButtonW = s(Base::libraryManageButtonW);
+    compositeToolRowH = s(Base::compositeToolRowH);
+    compositeToolGap = s(Base::compositeToolGap);
+    commandStackH = s(Base::commandStackH);
+    commandSummaryH = s(Base::commandSummaryH);
+    envelopePreviewH = s(Base::envelopePreviewH);
+    editSubLaneLabelW = s(Base::editSubLaneLabelW);
+    setupValueLabelW = s(Base::setupValueLabelW);
+    editMarkerLaneH = s(Base::editMarkerLaneH);
+    registerAutoLaneH = s(Base::registerAutoLaneH);
+    compositeMixLaneH = s(Base::compositeMixLaneH);
+    compositeEditLaneH = s(Base::compositeEditLaneH);
+    compositeSetupColumnW = s(Base::compositeSetupColumnW);
+    countColumnMinW = s(Base::countColumnMinW);
+    countColumnMaxW = s(Base::countColumnMaxW);
+    compositeTimbrePickW = s(Base::compositeTimbrePickW);
+    compositeTimbrePickH = s(Base::compositeTimbrePickH);
+    settingsDialogW = s(Base::settingsDialogW);
+    settingsDialogH = s(Base::settingsDialogH);
+    libraryManagerW = s(Base::libraryManagerW);
+    libraryManagerH = s(Base::libraryManagerH);
+    recomputeDerived();
+}
+
+// Preferred width for a SwitchLookAndFeel toggle: track + pad + label + trailing xs.
+[[nodiscard]] inline int switchControlWidth(
+    const juce::String& label,
+    int control_height = -1) {
+    if (control_height < 0) {
+        control_height = textButtonH;
+    }
+    const auto font = UiFonts::make(
+        UiFonts::controlTextHeight(
+            static_cast<float>(control_height)));
+    const int text_w =
+        juce::GlyphArrangement::getStringWidthInt(font, label);
+    return switchTrackW + switchLabelPad + text_w + xs;
+}
+
+struct UiLayoutInit final {
+    UiLayoutInit() { applyScale(1.0F); }
+};
+inline UiLayoutInit ui_layout_init{};
 } // namespace UiLayout
+
+inline void UiScale::applyLayoutMetrics(float factor) {
+    UiLayout::applyScale(factor);
+}
+
+// Defined near MainWindow; editors/dialogs call it after preferred-size changes.
+void clampWindowToDisplayWorkArea(juce::ResizableWindow& window);
+
+// Apply active metrics' preferred content size and refresh LookAndFeel fonts.
+inline void applyScaledContentSize(
+    juce::Component& content,
+    int preferred_w,
+    int preferred_h,
+    bool clamp_host_window) {
+    content.setSize(preferred_w, preferred_h);
+    content.sendLookAndFeelChange();
+    content.resized();
+    content.repaint();
+    if (!clamp_host_window) {
+        return;
+    }
+    if (auto* top = content.getTopLevelComponent()) {
+        if (auto* window = dynamic_cast<juce::ResizableWindow*>(top)) {
+            // Preferred size may exceed the work area; clamp keeps chrome visible.
+            window->setSize(
+                juce::jmax(preferred_w, window->getWidth()),
+                juce::jmax(preferred_h, window->getHeight()));
+            // Always set to preferred first so shrink works too.
+            window->setSize(preferred_w, preferred_h);
+            clampWindowToDisplayWorkArea(*window);
+        }
+    }
+}
+
+// Top-right chrome: settings / master volume / optional immediate audition.
+// Icon buttons use the same UiLayout::iconButton size as Open/Save/Copy/Paste.
+inline void layoutEditorTopRightChrome(
+    int host_width,
+    juce::DrawableButton& settings,
+    juce::Slider& master_volume,
+    juce::DrawableButton* immediate_audition = nullptr) {
+    using namespace UiLayout;
+    const int top = pageMargin;
+    int right = host_width - pageMargin;
+    settings.setBounds(right - iconButton, top, iconButton, iconButton);
+    right -= iconButton + controlGap;
+    const int vol_top = juce::jmax(
+        0, top - (masterVolumeSize - iconButton) / 2);
+    master_volume.setBounds(
+        right - masterVolumeSize,
+        vol_top,
+        masterVolumeSize,
+        masterVolumeSize);
+    right -= masterVolumeSize + controlGap;
+    if (immediate_audition != nullptr) {
+        immediate_audition->setBounds(
+            right - iconButton, top, iconButton, iconButton);
+    }
+}
+
 
 void paintPageBackground(
     juce::Graphics& graphics,
@@ -4495,27 +5155,27 @@ void layoutTimbreLibraryPanel(
     area.removeFromTop(sm);
     auto filter_options = area.removeFromTop(fieldH);
     widgets.favorite_only.setBounds(
-        filter_options.removeFromLeft(100));
+        filter_options.removeFromLeft(UiScale::sx(100)));
     filter_options.removeFromLeft(controlGap);
     widgets.ab_audition.setBounds(
-        filter_options.removeFromLeft(48));
+        filter_options.removeFromLeft(UiScale::sx(48)));
     filter_options.removeFromLeft(controlGap);
     widgets.sort.setBounds(filter_options);
     area.removeFromTop(sm);
 
     auto list_row = area.removeFromTop(fieldH + xs);
     widgets.library_delete.setBounds(
-        list_row.removeFromRight(54));
+        list_row.removeFromRight(UiScale::sx(54)));
     list_row.removeFromRight(controlGap);
     widgets.library_load.setBounds(
-        list_row.removeFromRight(54));
+        list_row.removeFromRight(UiScale::sx(54)));
     list_row.removeFromRight(controlGap);
     widgets.list.setBounds(list_row);
     area.removeFromTop(sm);
 
     auto name_row = area.removeFromTop(fieldH);
     widgets.library_rename.setBounds(
-        name_row.removeFromRight(88));
+        name_row.removeFromRight(UiScale::sx(88)));
     name_row.removeFromRight(controlGap);
     widgets.name.setBounds(name_row);
     area.removeFromTop(sm);
@@ -4547,14 +5207,14 @@ void layoutTimbreLibraryPanel(
     widgets.library_export.setBounds(file_row);
 
     area.removeFromTop(sm);
-    widgets.mgsc_title.setBounds(area.removeFromTop(24));
+    widgets.mgsc_title.setBounds(area.removeFromTop(libraryTitleH));
     area.removeFromTop(xs);
     auto number_row = area.removeFromTop(fieldH);
     widgets.output_number_label.setBounds(
-        number_row.removeFromLeft(118));
+        number_row.removeFromLeft(UiScale::sx(118)));
     number_row.removeFromLeft(sm);
     widgets.output_number.setBounds(
-        number_row.removeFromLeft(54));
+        number_row.removeFromLeft(UiScale::sx(54)));
     area.removeFromTop(sm);
     widgets.mgsc_preview.setBounds(area);
 }
@@ -4597,27 +5257,27 @@ void layoutCompositeLibraryPanel(
     area.removeFromTop(sm);
     auto filter_options = area.removeFromTop(fieldH);
     widgets.favorite_only.setBounds(
-        filter_options.removeFromLeft(100));
+        filter_options.removeFromLeft(UiScale::sx(100)));
     filter_options.removeFromLeft(controlGap);
     widgets.ab_audition.setBounds(
-        filter_options.removeFromLeft(48));
+        filter_options.removeFromLeft(UiScale::sx(48)));
     filter_options.removeFromLeft(controlGap);
     widgets.sort.setBounds(filter_options);
     area.removeFromTop(sm);
 
     auto list_row = area.removeFromTop(fieldH + xs);
     widgets.library_delete.setBounds(
-        list_row.removeFromRight(54));
+        list_row.removeFromRight(UiScale::sx(54)));
     list_row.removeFromRight(controlGap);
     widgets.library_load.setBounds(
-        list_row.removeFromRight(54));
+        list_row.removeFromRight(UiScale::sx(54)));
     list_row.removeFromRight(controlGap);
     widgets.list.setBounds(list_row);
     area.removeFromTop(sm);
 
     auto name_row = area.removeFromTop(fieldH);
     widgets.library_rename.setBounds(
-        name_row.removeFromRight(88));
+        name_row.removeFromRight(UiScale::sx(88)));
     name_row.removeFromRight(controlGap);
     widgets.name.setBounds(name_row);
     area.removeFromTop(sm);
@@ -7479,6 +8139,7 @@ private:
     [[nodiscard]] SnapshotResult showAppSettings(
         int initial_tab,
         const juce::File* capture_file) {
+        UiScale::forceGlobalForNonEditorUi();
         syncMidiControls();
 
         class SettingsContent final : public juce::Component {
@@ -7492,6 +8153,26 @@ private:
                   audio_service_(audio_service) {
                 tabs_.setOutline(0);
                 addAndMakeVisible(tabs_);
+
+                auto* view_page = new juce::Component();
+                ui_scale_label_.setText(
+                    juce::String::fromUTF8("画面の大きさ"),
+                    juce::dontSendNotification);
+                ui_scale_label_.setColour(
+                    juce::Label::textColourId,
+                    juce::Colour(0xFFE6EDF3));
+                ui_scale_label_.setTooltip(
+                    juce::String::fromUTF8(
+                        "編集画面・ダイアログなどアプリ全体の表示倍率。"
+                        "ウィンドウの位置とサイズは保存しません。"));
+                view_page->addAndMakeVisible(ui_scale_label_);
+                ui_scale_.addItem("125%", 125);
+                ui_scale_.addItem("100%", 100);
+                ui_scale_.addItem("75%", 75);
+                ui_scale_.setSelectedId(
+                    UiScale::global_percent, juce::dontSendNotification);
+                ui_scale_.setTooltip(ui_scale_label_.getTooltip());
+                view_page->addAndMakeVisible(ui_scale_);
 
                 auto* midi_page = new juce::Component();
                 midi_help_.setText(
@@ -7685,6 +8366,11 @@ private:
                 output_page->addAndMakeVisible(output_status_);
 
                 tabs_.addTab(
+                    "View",
+                    juce::Colour(0xFF243040),
+                    view_page,
+                    true);
+                tabs_.addTab(
                     "MIDI",
                     juce::Colour(0xFF243040),
                     midi_page,
@@ -7700,35 +8386,54 @@ private:
                     new AboutPanel(),
                     true);
                 tabs_.setCurrentTabIndex(
-                    juce::jlimit(0, 2, initial_tab),
+                    juce::jlimit(0, 3, initial_tab),
                     juce::dontSendNotification);
 
                 close_.setButtonText(
                     juce::String::fromUTF8("閉じる"));
                 addAndMakeVisible(close_);
-                setSize(500, 720);
+                setSize(
+                    UiLayout::settingsDialogW,
+                    UiLayout::settingsDialogH);
+            }
+
+            void paint(juce::Graphics& graphics) override {
+                UiScale::forceGlobalForNonEditorUi();
+                juce::Component::paint(graphics);
             }
 
             void resized() override {
-                auto area = getLocalBounds().reduced(10);
-                auto bottom = area.removeFromBottom(34);
-                close_.setBounds(bottom.removeFromRight(96));
-                area.removeFromBottom(8);
+                UiScale::forceGlobalForNonEditorUi();
+                auto area = getLocalBounds().reduced(UiLayout::panelPad);
+                auto bottom = area.removeFromBottom(UiLayout::fieldH);
+                close_.setBounds(bottom.removeFromRight(UiScale::sx(96)));
+                area.removeFromBottom(UiLayout::sm);
                 tabs_.setBounds(area);
+                tabs_.setTabBarDepth(UiLayout::fieldH);
 
-                if (auto* midi_page = tabs_.getTabContentComponent(0)) {
-                    auto page = midi_page->getLocalBounds().reduced(12);
-                    midi_help_.setBounds(page.removeFromTop(56));
-                    page.removeFromTop(8);
-                    midi_input_.setBounds(page.removeFromTop(28));
-                    page.removeFromTop(12);
-                    auto row = page.removeFromTop(30);
-                    apply_midi_.setBounds(row.removeFromLeft(96));
-                    row.removeFromLeft(8);
-                    refresh_.setBounds(row.removeFromLeft(96));
+                if (auto* view_page = tabs_.getTabContentComponent(0)) {
+                    auto page = view_page->getLocalBounds().reduced(UiLayout::md);
+                    ui_scale_label_.setBounds(
+                        page.removeFromTop(UiLayout::fieldH));
+                    page.removeFromTop(UiLayout::sm);
+                    ui_scale_.setBounds(
+                        page.removeFromTop(UiLayout::fieldH).removeFromLeft(
+                            UiScale::sx(160)));
+                }
+                if (auto* midi_page = tabs_.getTabContentComponent(1)) {
+                    auto page = midi_page->getLocalBounds().reduced(UiLayout::md);
+                    midi_help_.setBounds(page.removeFromTop(UiScale::sx(56)));
+                    page.removeFromTop(UiLayout::sm);
+                    midi_input_.setBounds(
+                        page.removeFromTop(UiScale::sx(28)));
+                    page.removeFromTop(UiLayout::md);
+                    auto row = page.removeFromTop(UiScale::sx(30));
+                    apply_midi_.setBounds(row.removeFromLeft(UiScale::sx(96)));
+                    row.removeFromLeft(UiLayout::sm);
+                    refresh_.setBounds(row.removeFromLeft(UiScale::sx(96)));
                 }
                 if (auto* output_page =
-                        tabs_.getTabContentComponent(1)) {
+                        tabs_.getTabContentComponent(2)) {
                     auto page =
                         output_page->getLocalBounds().reduced(12);
                     pc_audio_help_.setBounds(page.removeFromTop(48));
@@ -7793,6 +8498,8 @@ private:
 
             juce::TabbedComponent tabs_{
                 juce::TabbedButtonBar::TabsAtTop};
+            juce::Label ui_scale_label_;
+            juce::ComboBox ui_scale_;
             juce::Label midi_help_;
             juce::ComboBox midi_input_;
             juce::TextButton apply_midi_;
@@ -7846,6 +8553,32 @@ private:
         juce::Component::SafePointer<SettingsContent> safe_content(
             content);
 
+        content->ui_scale_.onChange = [safe_content, safe_dialog] {
+            if (safe_content == nullptr) {
+                return;
+            }
+            const int percent = safe_content->ui_scale_.getSelectedId();
+            if (!UiScale::isStep(percent)
+                || percent == UiScale::global_percent) {
+                return;
+            }
+            // Clears editor session overrides via listeners; scales all roots.
+            UiScale::setGlobalPercent(percent, true);
+            safe_content->setSize(
+                UiLayout::settingsDialogW,
+                UiLayout::settingsDialogH);
+            safe_content->sendLookAndFeelChange();
+            safe_content->resized();
+            if (safe_dialog != nullptr) {
+                safe_dialog->setSize(
+                    safe_content->getWidth(),
+                    safe_content->getHeight() + 32);
+                safe_dialog->centreWithSize(
+                    safe_dialog->getWidth(),
+                    safe_dialog->getHeight());
+                clampWindowToDisplayWorkArea(*safe_dialog);
+            }
+        };
         content->apply_midi_.onClick = [safe, safe_content] {
             if (safe == nullptr || safe_content == nullptr) {
                 return;
@@ -7868,7 +8601,7 @@ private:
                 juce::MessageManager::callAsync([safe] {
                     if (safe != nullptr) {
                         static_cast<void>(
-                            safe->showAppSettings(0, nullptr));
+                            safe->showAppSettings(1, nullptr));
                     }
                 });
             };
@@ -8409,7 +9142,32 @@ public:
             [this] { return textEntryHasFocusWithin(*this); });
         addChildComponent(performance_keyboard_);
 
-        setSize(1100, 700);
+        setSize(
+            UiLayout::libraryManagerW,
+            UiLayout::libraryManagerH);
+        {
+            juce::Component::SafePointer<LibraryManagerContent> safe(this);
+            UiScale::addGlobalListener([safe] {
+                if (safe == nullptr) {
+                    return;
+                }
+                UiScale::forceGlobalForNonEditorUi();
+                safe->setSize(
+                    UiLayout::libraryManagerW,
+                    UiLayout::libraryManagerH);
+                safe->sendLookAndFeelChange();
+                safe->resized();
+                if (auto* top = safe->getTopLevelComponent()) {
+                    if (auto* window =
+                            dynamic_cast<juce::ResizableWindow*>(top)) {
+                        window->setSize(
+                            safe->getWidth(),
+                            safe->getHeight() + 32);
+                        clampWindowToDisplayWorkArea(*window);
+                    }
+                }
+            });
+        }
     }
 
     ~LibraryManagerContent() override {
@@ -8419,11 +9177,19 @@ public:
         }
     }
 
+    void paint(juce::Graphics& graphics) override {
+        UiScale::forceGlobalForNonEditorUi();
+        juce::Component::paint(graphics);
+    }
+
     void resized() override {
+        UiScale::forceGlobalForNonEditorUi();
         tabs_.setBounds(getLocalBounds());
+        tabs_.setTabBarDepth(UiLayout::fieldH);
     }
 
     bool keyPressed(const juce::KeyPress& key) override {
+        // Scale shortcuts are editor-only (Composite / SCC / OPLL).
         if (performance_keyboard_.shouldConsumeKeyPress(key)) {
             performance_keyboard_.pollPerformanceInput();
             return true;
@@ -8540,6 +9306,7 @@ void showLibraryManagerDialog(
     LibraryManagerContent::NoteOnCallback note_on,
     LibraryManagerContent::NoteOffCallback note_off,
     LibraryManagerContent::AllNotesOffCallback all_notes_off) {
+    UiScale::forceGlobalForNonEditorUi();
     auto* dialog = new ModalDialogWindow(
         juce::String::fromUTF8("ライブラリ管理"),
         juce::Colour(0xFF1B222C));
@@ -8559,7 +9326,11 @@ void showLibraryManagerDialog(
     dialog->setUsingNativeTitleBar(true);
     dialog->setContentOwned(content, true);
     dialog->setResizable(true, true);
-    dialog->setResizeLimits(900, 560, 1600, 960);
+    dialog->setResizeLimits(
+        UiScale::sx(900),
+        UiScale::sx(560),
+        UiScale::sx(1600),
+        UiScale::sx(960));
     if (anchor != nullptr) {
         dialog->centreAroundComponent(
             anchor, content->getWidth(), content->getHeight() + 32);
@@ -9464,8 +10235,8 @@ public:
         auto area = getLocalBounds().reduced(xs, xs);
         auto title = area.removeFromTop(compositeToolRowH);
         source_.setBounds(title.removeFromLeft(48));
-        solo_.setBounds(title.removeFromRight(56));
-        mute_.setBounds(title.removeFromRight(70));
+        solo_.setBounds(title.removeFromRight(UiScale::sx(56)));
+        mute_.setBounds(title.removeFromRight(UiScale::sx(70)));
         enabled_.setBounds(title.removeFromRight(52));
         area.removeFromTop(xs);
         auto identity = area.removeFromTop(fieldH);
@@ -9479,7 +10250,7 @@ public:
         timbre_.setBounds(timbre_row);
         area.removeFromTop(xs);
         auto number_row = area.removeFromTop(fieldH);
-        number_mode_.setBounds(number_row.removeFromLeft(70));
+        number_mode_.setBounds(number_row.removeFromLeft(UiScale::sx(70)));
         number_row.removeFromLeft(controlGap);
         timbre_number_label_.setBounds(
             number_row.removeFromLeft(setupValueLabelW));
@@ -10122,6 +10893,14 @@ public:
         repaint();
     }
 
+    void refreshUiScaleFonts() {
+        tempo_label_.setFont(UiFonts::body());
+        UiFonts::styleBodyField(tempo_);
+        UiFonts::styleBodyField(value_);
+        UiFonts::refreshMgscPreviewFont(envelope_mml_preview_);
+        repaint();
+    }
+
     void appendScopeFrame(
         const mgstc::engine::OpllScopeFrame& frame,
         std::uint8_t midi_note) {
@@ -10144,16 +10923,16 @@ public:
         auto area = getLocalBounds().reduced(panelPad);
         // Single chrome row: help+tempo (paint) and channel add/remove.
         auto header = area.removeFromTop(compositeToolRowH);
-        tempo_.setBounds(header.removeFromRight(56));
-        tempo_label_.setBounds(header.removeFromRight(44));
+        tempo_.setBounds(header.removeFromRight(UiScale::sx(56)));
+        tempo_label_.setBounds(header.removeFromRight(UiScale::sx(44)));
         header.removeFromRight(sm);
-        opll_add_.setBounds(header.removeFromRight(76));
+        opll_add_.setBounds(header.removeFromRight(UiScale::sx(76)));
         header.removeFromRight(controlGap);
-        scc_add_.setBounds(header.removeFromRight(70));
+        scc_add_.setBounds(header.removeFromRight(UiScale::sx(70)));
         header.removeFromRight(controlGap);
-        psg_add_.setBounds(header.removeFromRight(70));
+        psg_add_.setBounds(header.removeFromRight(UiScale::sx(70)));
         header.removeFromRight(sm);
-        remove_layer_.setBounds(header.removeFromRight(92));
+        remove_layer_.setBounds(header.removeFromRight(UiScale::sx(92)));
 
         auto graph = graphArea();
         vertical_scroll_.setBounds(
@@ -13913,6 +14692,14 @@ public:
         syncControlsFromModel();
         setEditorBaseline();
         setSize(UiLayout::editorWindowW, UiLayout::editorWindowH);
+        {
+            juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+            UiScale::addGlobalListener([safe] {
+                if (safe != nullptr) {
+                    safe->onGlobalUiScaleChanged();
+                }
+            });
+        }
         engine_ready_ = audio_service.running() && configureEngine();
         startTimerHz(60);
         updateStatus(
@@ -14084,7 +14871,52 @@ public:
             || selected_composite_id_ != editor_baseline_id_;
     }
 
+
+    [[nodiscard]] int effectiveUiScalePercent() const noexcept {
+        return ui_scale_session_override_.value_or(UiScale::global_percent);
+    }
+
+    // Push this editor's effective scale into process metrics (activation /
+    // Ctrl±). Unlike paint/resized, this does not require isActiveWindow —
+    // the caller is making this editor the scale owner.
+    void syncProcessUiScale() {
+        UiScale::setActivePercent(effectiveUiScalePercent());
+    }
+
+    // Size content + host window from effective metrics (global unless this
+    // editor has a Ctrl± session override). Used when creating/showing.
+    void applyPreferredSizeForEffectiveScale() {
+        applyEditorUiScale(effectiveUiScalePercent());
+    }
+
+    void applyEditorUiScale(int percent) {
+        UiScale::setActivePercent(percent);
+        title_.setFont(UiFonts::title());
+        description_.setFont(UiFonts::body());
+        composite_library_title_.setFont(UiFonts::heading());
+        layer_library_title_.setFont(UiFonts::heading());
+        layer_library_hint_.setFont(UiFonts::body());
+        UiFonts::styleBodyField(name_);
+        UiFonts::styleBodyField(composite_filter_);
+        for (auto& editor : layer_name_) {
+            UiFonts::styleBodyField(editor);
+        }
+        timeline_.refreshUiScaleFonts();
+        applyScaledContentSize(
+            *this,
+            UiLayout::editorWindowW,
+            UiLayout::editorWindowH,
+            true);
+    }
+
+    void onGlobalUiScaleChanged() {
+        ui_scale_session_override_.reset();
+        applyEditorUiScale(UiScale::global_percent);
+    }
+
     void paint(juce::Graphics& graphics) override {
+        UiScale::syncEditorDrivenActivePercent(
+            *this, effectiveUiScalePercent());
         paintPageBackground(graphics, getLocalBounds());
         paintRoundedPanelFrame(graphics, editor_panel_bounds_);
         paintRoundedPanelFrame(graphics, composite_library_bounds_);
@@ -14092,23 +14924,32 @@ public:
     }
 
     void resized() override {
+        UiScale::syncEditorDrivenActivePercent(
+            *this, effectiveUiScalePercent());
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(pageMargin);
         title_.setBounds(
             area.getX(),
             area.getY(),
-            juce::jmax(120, area.getWidth() - 430),
+            juce::jmax(120, area.getWidth() - UiScale::sx(430)),
             titleH);
         description_.setBounds(
             area.getX(),
             area.getY() + titleH,
-            juce::jmax(120, area.getWidth() - 430),
+            juce::jmax(120, area.getWidth() - UiScale::sx(430)),
             descriptionH);
-        settings_.setBounds(getWidth() - 58, pageMargin, 34, 34);
-        master_volume_.setBounds(
-            getWidth() - 112, pageMargin - 5, masterVolumeSize, masterVolumeSize);
-        open_opll_.setBounds(getWidth() - 220, pageMargin + 3, 92, 28);
-        open_scc_.setBounds(getWidth() - 314, pageMargin + 3, 88, 28);
+        layoutEditorTopRightChrome(
+            getWidth(), settings_, master_volume_);
+        open_opll_.setBounds(
+            getWidth() - UiScale::sx(220),
+            pageMargin + UiScale::sx(3),
+            UiScale::sx(92),
+            textButtonH);
+        open_scc_.setBounds(
+            getWidth() - UiScale::sx(314),
+            pageMargin + UiScale::sx(3),
+            UiScale::sx(88),
+            textButtonH);
         area.removeFromTop(titleH + descriptionH);
 
         auto keyboard_area = area.removeFromBottom(keyboardH);
@@ -14162,6 +15003,12 @@ public:
     }
 
     bool keyPressed(const juce::KeyPress& key) override {
+        if (UiScale::tryHandleEditorScaleKey(
+                key,
+                ui_scale_session_override_,
+                [this](int percent) { applyEditorUiScale(percent); })) {
+            return true;
+        }
         if (textEntryHasFocusWithin(*this)) {
             return false;
         }
@@ -15735,6 +16582,7 @@ private:
     bool composite_ab_next_b_{true};
     std::vector<std::string> composite_filter_tags_;
     mgstc::engine::CompositeTimbre editor_baseline_;
+    std::optional<int> ui_scale_session_override_;
     std::optional<std::uint64_t> editor_baseline_id_;
     std::array<std::vector<std::uint64_t>, 3>
         timbre_library_ids_;
@@ -16359,7 +17207,10 @@ public:
             slider.setValue(initial, juce::dontSendNotification);
             slider.setSliderStyle(juce::Slider::LinearHorizontal);
             slider.setTextBoxStyle(
-                juce::Slider::TextBoxRight, false, 52, 22);
+                juce::Slider::TextBoxRight,
+                false,
+                UiScale::sx(56),
+                UiScale::sx(22));
             slider.setTooltip(tip);
             slider.onValueChange = [this] {
                 applyBackgroundToGraph();
@@ -16689,6 +17540,14 @@ public:
             },
             400);
         setSize(UiLayout::editorWindowW, UiLayout::editorWindowH);
+        {
+            juce::Component::SafePointer<SccEditorComponent> safe(this);
+            UiScale::addGlobalListener([safe] {
+                if (safe != nullptr) {
+                    safe->onGlobalUiScaleChanged();
+                }
+            });
+        }
         engine_ready_ = audio_service.running()
             && configureEngine(false);
         startTimerHz(60);
@@ -16909,21 +17768,82 @@ public:
         background_visible_.setLookAndFeel(nullptr);
     }
 
+
+    [[nodiscard]] int effectiveUiScalePercent() const noexcept {
+        return ui_scale_session_override_.value_or(UiScale::global_percent);
+    }
+
+    void syncProcessUiScale() {
+        UiScale::setActivePercent(effectiveUiScalePercent());
+    }
+
+    void applyPreferredSizeForEffectiveScale() {
+        applyEditorUiScale(effectiveUiScalePercent());
+    }
+
+    void applyEditorUiScale(int percent) {
+        UiScale::setActivePercent(percent);
+        title_.setFont(UiFonts::title());
+        description_.setFont(UiFonts::body());
+        library_title_.setFont(UiFonts::heading());
+        mgsc_title_.setFont(UiFonts::heading());
+        UiFonts::styleBodyField(library_filter_);
+        UiFonts::styleBodyField(name_);
+        UiFonts::styleBodyField(memo_);
+        UiFonts::styleBodyField(output_number_);
+        for (auto* label :
+             {&background_opacity_label_,
+              &background_x_label_,
+              &background_y_label_,
+              &background_w_label_,
+              &background_h_label_}) {
+            label->setFont(UiFonts::body());
+        }
+        for (auto* slider :
+             {&background_opacity_,
+              &background_x_,
+              &background_y_,
+              &background_width_,
+              &background_height_}) {
+            slider->setTextBoxStyle(
+                juce::Slider::TextBoxRight,
+                false,
+                UiScale::sx(56),
+                UiScale::sx(22));
+        }
+        UiFonts::refreshMgscPreviewFont(mgsc_preview_);
+        applyScaledContentSize(
+            *this,
+            UiLayout::editorWindowW,
+            UiLayout::editorWindowH,
+            true);
+    }
+
+    void onGlobalUiScaleChanged() {
+        ui_scale_session_override_.reset();
+        applyEditorUiScale(UiScale::global_percent);
+    }
+
     void paint(juce::Graphics& graphics) override {
+        UiScale::syncEditorDrivenActivePercent(
+            *this, effectiveUiScalePercent());
         paintPageBackground(graphics, getLocalBounds());
         paintRoundedPanelFrame(graphics, editor_panel_bounds_);
         paintRoundedPanelFrame(graphics, library_panel_bounds_);
     }
 
     void resized() override {
+        UiScale::syncEditorDrivenActivePercent(
+            *this, effectiveUiScalePercent());
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(pageMargin);
         title_.setBounds(area.removeFromTop(titleH));
         description_.setBounds(area.removeFromTop(descriptionH));
-        settings_.setBounds(getWidth() - 58, pageMargin, 34, 34);
-        master_volume_.setBounds(
-            getWidth() - 112, pageMargin - 5, masterVolumeSize, masterVolumeSize);
-        immediate_audition_.setBounds(getWidth() - 146, pageMargin, 34, 34);
+        layoutEditorTopRightChrome(
+            getWidth(),
+            settings_,
+            master_volume_,
+            &immediate_audition_);
         area.removeFromTop(md);
 
         auto keyboard_area = area.removeFromBottom(keyboardH);
@@ -16937,7 +17857,7 @@ public:
         status_.setBounds(area.removeFromBottom(statusH));
         area.removeFromBottom(sm);
 
-        constexpr int background_block_h =
+        const int background_block_h =
             fieldH + xs + fieldH + xs + fieldH;
         auto background_block = area.removeFromBottom(background_block_h);
         area.removeFromBottom(sm);
@@ -16955,54 +17875,62 @@ public:
         file_row.removeFromLeft(controlGap);
         redo_.setBounds(file_row.removeFromLeft(iconButton));
         file_row.removeFromLeft(lg - xs);
-        import_wave_.setBounds(file_row.removeFromLeft(66));
+        import_wave_.setBounds(file_row.removeFromLeft(UiScale::sx(66)));
         file_row.removeFromLeft(sm);
-        import_audacity_.setBounds(file_row.removeFromLeft(184));
+        import_audacity_.setBounds(file_row.removeFromLeft(UiScale::sx(184)));
         file_row.removeFromLeft(sm);
-        open_opll_.setBounds(file_row.removeFromLeft(120));
+        open_opll_.setBounds(file_row.removeFromLeft(UiScale::sx(120)));
         file_row.removeFromLeft(sm);
         convert_to_opll_.setBounds(file_row.removeFromLeft(iconButton));
         area.removeFromTop(sm);
 
-        auto preset_row = area.removeFromTop(38);
-        auto preset_bounds = preset_row.removeFromLeft(240);
+        auto preset_row = area.removeFromTop(textButtonH);
+        auto preset_bounds = preset_row.removeFromLeft(UiScale::sx(240));
         preset_.setBounds(preset_bounds);
         auto preview_bounds = preset_bounds;
-        preview_bounds.removeFromRight(24);
+        preview_bounds.removeFromRight(UiScale::sx(24));
         preset_preview_.setBounds(
-            preview_bounds.removeFromRight(76).reduced(xs, xs));
+            preview_bounds.removeFromRight(UiScale::sx(76)).reduced(xs, xs));
         preset_preview_.toFront(false);
         preset_row.removeFromLeft(sm);
-        harmonic_.setBounds(preset_row.removeFromLeft(230));
+        harmonic_.setBounds(preset_row.removeFromLeft(UiScale::sx(230)));
         preset_row.removeFromLeft(sm);
-        apply_range_.setBounds(preset_row.removeFromLeft(110));
+        apply_range_.setBounds(preset_row.removeFromLeft(UiScale::sx(110)));
         preset_row.removeFromLeft(sm);
-        apply_preset_.setBounds(preset_row.removeFromLeft(70));
+        apply_preset_.setBounds(preset_row.removeFromLeft(UiScale::sx(70)));
         preset_row.removeFromLeft(controlGap);
-        cancel_preview_.setBounds(preset_row.removeFromLeft(56));
+        cancel_preview_.setBounds(preset_row.removeFromLeft(UiScale::sx(56)));
         preset_row.removeFromLeft(sm);
-        ab_audition_.setBounds(preset_row.removeFromLeft(52));
+        ab_audition_.setBounds(preset_row.removeFromLeft(UiScale::sx(52)));
 
         area.removeFromTop(sm);
-        auto merge_row = area.removeFromTop(38);
-        merge_enabled_.setBounds(merge_row.removeFromLeft(176));
+        auto merge_row = area.removeFromTop(textButtonH);
+        // Switch widths from measured label + shared track/pad (75/100/125).
+        auto place_merge_switch = [&](juce::ToggleButton& toggle) {
+            toggle.setBounds(merge_row.removeFromLeft(
+                switchControlWidth(
+                    toggle.getButtonText(), textButtonH)));
+        };
+        place_merge_switch(merge_enabled_);
         merge_row.removeFromLeft(sm);
-        merge_amount_.setBounds(merge_row.removeFromLeft(210));
+        merge_amount_.setBounds(merge_row.removeFromLeft(UiScale::sx(210)));
         merge_row.removeFromLeft(sm);
-        auto_phase_.setBounds(merge_row.removeFromLeft(104));
-        polarity_.setBounds(merge_row.removeFromLeft(112));
-        preserve_volume_.setBounds(merge_row.removeFromLeft(104));
-        merge_row.removeFromLeft(md);
-        preset_flip_h_.setBounds(merge_row.removeFromLeft(88));
+        place_merge_switch(auto_phase_);
         merge_row.removeFromLeft(controlGap);
-        preset_flip_v_.setBounds(merge_row.removeFromLeft(88));
+        place_merge_switch(polarity_);
+        merge_row.removeFromLeft(controlGap);
+        place_merge_switch(preserve_volume_);
+        merge_row.removeFromLeft(md);
+        place_merge_switch(preset_flip_h_);
+        merge_row.removeFromLeft(controlGap);
+        place_merge_switch(preset_flip_v_);
 
         area.removeFromTop(md);
         editor_panel_bounds_ = area;
-        constexpr int button_size = 42;
-        constexpr int cursor_pad_w = 86;
-        constexpr int scale_bar_w = 62;
-        constexpr int tool_column_w =
+        const int button_size = iconButton;
+        const int cursor_pad_w = button_size * 2 + controlGap;
+        const int scale_bar_w = UiScale::sx(62);
+        const int tool_column_w =
             cursor_pad_w + controlGap + scale_bar_w;
         auto editor_row = area.reduced(panelPad);
         graph_.setBounds(
@@ -17018,68 +17946,77 @@ public:
         wave_tools.removeFromLeft(controlGap);
         invert_.setBounds(wave_tools.removeFromLeft(button_size));
 
-        auto cursor_area = tool_area.removeFromLeft(cursor_pad_w);
+        // Cross-pad sits immediately above Average / Normalize / Invert.
+        const int pad_h = button_size * 3 + controlGap * 2;
+        auto cursor_strip = tool_area.removeFromBottom(pad_h);
+        auto cursor_area = cursor_strip.removeFromLeft(cursor_pad_w);
+        const int pad_step = button_size + controlGap;
         shift_up_.setBounds(
             cursor_area.getCentreX() - button_size / 2,
-            cursor_area.getY() + 54,
+            cursor_area.getY(),
             button_size,
             button_size);
         rotate_left_.setBounds(
             cursor_area.getX(),
-            cursor_area.getY() + 102,
+            cursor_area.getY() + pad_step,
             button_size,
             button_size);
         rotate_right_.setBounds(
             cursor_area.getRight() - button_size,
-            cursor_area.getY() + 102,
+            cursor_area.getY() + pad_step,
             button_size,
             button_size);
         shift_down_.setBounds(
             cursor_area.getCentreX() - button_size / 2,
-            cursor_area.getY() + 150,
+            cursor_area.getY() + pad_step * 2,
             button_size,
             button_size);
+
         auto scale_area =
-            tool_area.removeFromRight(scale_bar_w).reduced(5, 44);
-        scale_reset_.setBounds(scale_area.removeFromBottom(34));
+            tool_area.removeFromRight(scale_bar_w).reduced(
+                UiScale::sx(5), UiScale::sx(8));
+        // Extend the scale bar beside the cross-pad strip.
+        scale_area.setBottom(cursor_strip.getBottom());
+        scale_reset_.setBounds(scale_area.removeFromBottom(textButtonH));
         scale_area.removeFromBottom(sm);
         vertical_scale_.setBounds(scale_area);
 
         auto background_tools = background_block.removeFromTop(fieldH);
         background_load_.setBounds(
-            background_tools.removeFromLeft(84));
+            background_tools.removeFromLeft(UiScale::sx(96)));
         background_tools.removeFromLeft(controlGap);
         background_clear_.setBounds(
-            background_tools.removeFromLeft(84));
+            background_tools.removeFromLeft(UiScale::sx(96)));
         background_tools.removeFromLeft(sm);
         background_visible_.setBounds(
-            background_tools.removeFromLeft(120));
+            background_tools.removeFromLeft(
+                switchControlWidth(
+                    background_visible_.getButtonText(), fieldH)));
         background_tools.removeFromLeft(sm);
         background_opacity_label_.setBounds(
-            background_tools.removeFromLeft(48));
-        background_opacity_.setBounds(
-            background_tools.removeFromLeft(130));
+            background_tools.removeFromLeft(UiScale::sx(56)));
+        background_opacity_.setBounds(background_tools);
         background_block.removeFromTop(xs);
         auto background_pos = background_block.removeFromTop(fieldH);
         const auto pos_half =
             (background_pos.getWidth() - md) / 2;
         auto x_area = background_pos.removeFromLeft(pos_half);
-        background_x_label_.setBounds(x_area.removeFromLeft(18));
+        background_x_label_.setBounds(x_area.removeFromLeft(UiScale::sx(22)));
         background_x_.setBounds(x_area);
         background_pos.removeFromLeft(md);
         background_y_label_.setBounds(
-            background_pos.removeFromLeft(18));
+            background_pos.removeFromLeft(UiScale::sx(22)));
         background_y_.setBounds(background_pos);
         background_block.removeFromTop(xs);
         auto background_size = background_block;
         const auto size_half =
             (background_size.getWidth() - md) / 2;
         auto w_area = background_size.removeFromLeft(size_half);
-        background_w_label_.setBounds(w_area.removeFromLeft(18));
+        background_w_label_.setBounds(w_area.removeFromLeft(UiScale::sx(22)));
         background_width_.setBounds(w_area);
         background_size.removeFromLeft(md);
         background_h_label_.setBounds(
-            background_size.removeFromLeft(18));
+            background_size.removeFromLeft(UiScale::sx(22)));
         background_height_.setBounds(background_size);
 
         layoutTimbreLibraryPanel(
@@ -17112,6 +18049,12 @@ public:
     }
 
     bool keyPressed(const juce::KeyPress& key) override {
+        if (UiScale::tryHandleEditorScaleKey(
+                key,
+                ui_scale_session_override_,
+                [this](int percent) { applyEditorUiScale(percent); })) {
+            return true;
+        }
         if (isCommandLetter(key, 'v')) {
             pasteClipboard();
             return true;
@@ -19044,6 +19987,7 @@ private:
     juce::TooltipWindow tooltip_window_;
     SwitchLookAndFeel switch_look_and_feel_;
     SccWaveform scc_wave_{};
+    std::optional<int> ui_scale_session_override_;
     std::vector<SccWaveform> history_;
     std::size_t history_cursor_{};
     juce::Label title_;
@@ -19586,20 +20530,22 @@ public:
         graphics.setColour(juce::Colour(0xFF9BA8B2));
         graphics.drawText(
             "0s",
-            getLocalBounds().reduced(5).removeFromBottom(15),
+            getLocalBounds().reduced(UiScale::sx(5)).removeFromBottom(
+                UiScale::sx(15)),
             juce::Justification::bottomLeft);
         graphics.drawText(
             "4s",
-            getLocalBounds().reduced(5).removeFromBottom(15),
+            getLocalBounds().reduced(UiScale::sx(5)).removeFromBottom(
+                UiScale::sx(15)),
             juce::Justification::bottomRight);
         graphics.setColour(juce::Colour(0xFFD98A8A));
         graphics.drawText(
             "KO 1s",
             juce::Rectangle<int>(
-                juce::roundToInt(key_off_x) + 4,
-                getHeight() - 21,
-                42,
-                16),
+                juce::roundToInt(key_off_x) + UiScale::sx(4),
+                getHeight() - UiScale::sx(21),
+                UiScale::sx(42),
+                UiScale::sx(16)),
             juce::Justification::centredLeft);
 
         constexpr std::array<const char*, 4> section_names{
@@ -19614,7 +20560,7 @@ public:
                     + section_width * static_cast<float>(index),
                 graph.getY(),
                 section_width,
-                18.0F);
+                static_cast<float>(UiScale::sx(18)));
             if (drag_parameter_
                 && parameterIndex(*drag_parameter_) == index) {
                 graphics.setColour(
@@ -19932,42 +20878,60 @@ public:
     void paint(juce::Graphics& graphics) override {
         const auto bounds =
             getLocalBounds().toFloat().reduced(0.5F);
+        const auto radius =
+            static_cast<float>(UiScale::sx(9));
         graphics.setColour(juce::Colour(0xFF29323C));
-        graphics.fillRoundedRectangle(bounds, 9.0F);
+        graphics.fillRoundedRectangle(bounds, radius);
         graphics.setColour(juce::Colour(0xFF435160));
-        graphics.drawRoundedRectangle(bounds, 9.0F, 1.0F);
+        graphics.drawRoundedRectangle(bounds, radius, 1.0F);
     }
 
     void resized() override {
-        auto area = getLocalBounds().reduced(14);
-        title_.setBounds(area.removeFromTop(28));
-        area.removeFromTop(6);
-        auto flag_area = area.removeFromTop(30);
+        title_.setFont(UiFonts::heading());
+        envelope_title_.setFont(UiFonts::body(true));
+        for (auto* label :
+             {&multiplier_label_,
+              &key_scale_level_label_,
+              &attack_rate_label_,
+              &decay_rate_label_,
+              &sustain_level_label_,
+              &release_rate_label_}) {
+            label->setFont(UiFonts::body());
+        }
+        auto area = getLocalBounds().reduced(UiScale::sx(14));
+        title_.setBounds(area.removeFromTop(UiScale::sx(28)));
+        area.removeFromTop(UiScale::sx(6));
+        auto flag_area = area.removeFromTop(UiScale::sx(30));
         const auto flag_width =
-            juce::jmax(54, flag_area.getWidth() / 5);
+            juce::jmax(UiScale::sx(54), flag_area.getWidth() / 5);
         for (auto& flag : flags_) {
             flag.setBounds(
                 flag_area.removeFromLeft(flag_width));
         }
-        area.removeFromTop(10);
-        auto basic_row = area.removeFromTop(36);
-        const auto basic_width = (basic_row.getWidth() - 8) / 2;
+        area.removeFromTop(UiScale::sx(10));
+        auto basic_row = area.removeFromTop(UiScale::sx(36));
+        const auto basic_gap = UiScale::sx(8);
+        const auto basic_width =
+            (basic_row.getWidth() - basic_gap) / 2;
         auto multiplier_area = basic_row.removeFromLeft(basic_width);
         multiplier_label_.setBounds(
-            multiplier_area.removeFromLeft(48));
+            multiplier_area.removeFromLeft(UiScale::sx(48)));
         multiplier_.setBounds(multiplier_area);
-        basic_row.removeFromLeft(8);
+        basic_row.removeFromLeft(basic_gap);
         key_scale_level_label_.setBounds(
-            basic_row.removeFromLeft(42));
+            basic_row.removeFromLeft(UiScale::sx(42)));
         key_scale_level_.setBounds(basic_row);
-        area.removeFromTop(10);
+        area.removeFromTop(UiScale::sx(10));
 
-        auto graph_area = area.removeFromBottom(112);
-        area.removeFromBottom(8);
+        auto graph_area = area.removeFromBottom(UiScale::sx(112));
+        area.removeFromBottom(UiScale::sx(8));
         auto envelope = area;
-        constexpr int gap = 8;
+        const int gap = UiScale::sx(8);
         const auto column_width =
             (envelope.getWidth() - gap * 3) / 4;
+        const int label_h = UiScale::sx(24);
+        const int text_box_w = UiScale::sx(46);
+        const int text_box_h = UiScale::sx(24);
         std::array<juce::Label*, 4> labels{
             &attack_rate_label_,
             &decay_rate_label_,
@@ -19980,16 +20944,33 @@ public:
             &release_rate_};
         for (std::size_t index = 0; index < sliders.size(); ++index) {
             auto column = envelope.removeFromLeft(column_width);
-            labels[index]->setBounds(column.removeFromTop(24));
+            labels[index]->setBounds(column.removeFromTop(label_h));
+            sliders[index]->setTextBoxStyle(
+                juce::Slider::TextBoxBelow,
+                false,
+                text_box_w,
+                text_box_h);
             sliders[index]->setBounds(column);
             if (index + 1 < sliders.size()) {
                 envelope.removeFromLeft(gap);
             }
         }
         envelope_title_.setBounds(
-            graph_area.removeFromTop(20));
-        graph_area.removeFromTop(3);
+            graph_area.removeFromTop(UiScale::sx(20)));
+        graph_area.removeFromTop(UiScale::sx(3));
         envelope_graph_.setBounds(graph_area);
+
+        // Horizontal MULT / KSL text boxes also follow scale.
+        multiplier_.setTextBoxStyle(
+            juce::Slider::TextBoxRight,
+            false,
+            text_box_w,
+            text_box_h);
+        key_scale_level_.setTextBoxStyle(
+            juce::Slider::TextBoxRight,
+            false,
+            text_box_w,
+            text_box_h);
     }
 
     std::function<void(bool commit)> onChange;
@@ -20039,8 +21020,8 @@ private:
                 ? juce::Slider::TextBoxBelow
                 : juce::Slider::TextBoxRight,
             false,
-            46,
-            24);
+            UiScale::sx(46),
+            UiScale::sx(24));
         // Text box Label is created lazily; apply after first layout via LAF.
         slider.setColour(
             juce::Slider::textBoxTextColourId,
@@ -20596,6 +21577,14 @@ public:
             },
             400);
         setSize(UiLayout::editorWindowW, UiLayout::editorWindowH);
+        {
+            juce::Component::SafePointer<OpllEditorComponent> safe(this);
+            UiScale::addGlobalListener([safe] {
+                if (safe != nullptr) {
+                    safe->onGlobalUiScaleChanged();
+                }
+            });
+        }
         engine_ready_ = audio_service.running()
             && configureEngine(false);
         startTimerHz(60);
@@ -20791,21 +21780,64 @@ public:
         library_manager_preview_patch_.reset();
     }
 
+
+    [[nodiscard]] int effectiveUiScalePercent() const noexcept {
+        return ui_scale_session_override_.value_or(UiScale::global_percent);
+    }
+
+    void syncProcessUiScale() {
+        UiScale::setActivePercent(effectiveUiScalePercent());
+    }
+
+    void applyPreferredSizeForEffectiveScale() {
+        applyEditorUiScale(effectiveUiScalePercent());
+    }
+
+    void applyEditorUiScale(int percent) {
+        UiScale::setActivePercent(percent);
+        title_.setFont(UiFonts::title());
+        description_.setFont(UiFonts::body());
+        library_title_.setFont(UiFonts::heading());
+        mgsc_title_.setFont(UiFonts::heading());
+        scope_title_.setFont(UiFonts::heading());
+        common_parameters_title_.setFont(UiFonts::heading());
+        UiFonts::styleBodyField(library_filter_);
+        UiFonts::styleBodyField(name_);
+        UiFonts::styleBodyField(memo_);
+        UiFonts::styleBodyField(output_number_);
+        UiFonts::refreshMgscPreviewFont(mgsc_preview_);
+        applyScaledContentSize(
+            *this,
+            UiLayout::editorWindowW,
+            UiLayout::editorWindowH,
+            true);
+    }
+
+    void onGlobalUiScaleChanged() {
+        ui_scale_session_override_.reset();
+        applyEditorUiScale(UiScale::global_percent);
+    }
+
     void paint(juce::Graphics& graphics) override {
+        UiScale::syncEditorDrivenActivePercent(
+            *this, effectiveUiScalePercent());
         paintPageBackground(graphics, getLocalBounds());
         paintRoundedPanelFrame(graphics, library_panel_bounds_);
         paintRoundedPanelFrame(graphics, common_parameter_bounds_);
     }
 
     void resized() override {
+        UiScale::syncEditorDrivenActivePercent(
+            *this, effectiveUiScalePercent());
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(pageMargin);
         title_.setBounds(area.removeFromTop(titleH));
         description_.setBounds(area.removeFromTop(descriptionH));
-        settings_.setBounds(getWidth() - 58, pageMargin, 34, 34);
-        master_volume_.setBounds(
-            getWidth() - 112, pageMargin - 5, masterVolumeSize, masterVolumeSize);
-        immediate_audition_.setBounds(getWidth() - 146, pageMargin, 34, 34);
+        layoutEditorTopRightChrome(
+            getWidth(),
+            settings_,
+            master_volume_,
+            &immediate_audition_);
         area.removeFromTop(sm);
 
         auto keyboard_area = area.removeFromBottom(keyboardH);
@@ -20824,47 +21856,47 @@ public:
         }
         toolbar.removeFromLeft(controlGap);
         import_wave_.setBounds(
-            toolbar.removeFromLeft(70));
+            toolbar.removeFromLeft(UiScale::sx(70)));
         toolbar.removeFromLeft(controlGap);
         import_audacity_.setBounds(
-            toolbar.removeFromLeft(154));
+            toolbar.removeFromLeft(UiScale::sx(154)));
         toolbar.removeFromLeft(md);
         wave_previous_.setBounds(
-            toolbar.removeFromLeft(40));
+            toolbar.removeFromLeft(iconButton));
         wave_candidate_label_.setBounds(
-            toolbar.removeFromLeft(112));
+            toolbar.removeFromLeft(UiScale::sx(112)));
         wave_next_.setBounds(
-            toolbar.removeFromLeft(40));
+            toolbar.removeFromLeft(iconButton));
         toolbar.removeFromLeft(sm);
         open_scc_.setBounds(
-            toolbar.removeFromLeft(120));
+            toolbar.removeFromLeft(UiScale::sx(120)));
         toolbar.removeFromLeft(sm);
         convert_to_scc_.setBounds(
             toolbar.removeFromLeft(iconButton));
         area.removeFromTop(sm);
 
-        auto preset_row = area.removeFromTop(38);
+        auto preset_row = area.removeFromTop(textButtonH);
         rom_preset_.setBounds(
-            preset_row.removeFromLeft(230));
+            preset_row.removeFromLeft(UiScale::sx(230)));
         preset_row.removeFromLeft(sm);
         rom_load_.setBounds(
-            preset_row.removeFromLeft(150));
+            preset_row.removeFromLeft(UiScale::sx(150)));
         area.removeFromTop(md);
 
-        common_parameter_bounds_ = area.removeFromTop(62);
+        common_parameter_bounds_ = area.removeFromTop(UiScale::sx(62));
         auto common_parameters = common_parameter_bounds_.reduced(panelPad, xs + 1);
         common_parameters_title_.setBounds(
-            common_parameters.removeFromTop(20));
+            common_parameters.removeFromTop(UiScale::sx(20)));
         auto common_row = common_parameters;
         const auto common_width = (common_row.getWidth() - panelGap) / 2;
         auto tl_area = common_row.removeFromLeft(common_width);
-        mod_total_level_label_.setBounds(tl_area.removeFromLeft(34));
+        mod_total_level_label_.setBounds(tl_area.removeFromLeft(UiScale::sx(34)));
         mod_total_level_.setBounds(tl_area);
         common_row.removeFromLeft(panelGap);
-        feedback_label_.setBounds(common_row.removeFromLeft(72));
+        feedback_label_.setBounds(common_row.removeFromLeft(UiScale::sx(72)));
         feedback_.setBounds(common_row);
         area.removeFromTop(sm);
-        auto operators = area.removeFromTop(408);
+        auto operators = area.removeFromTop(UiScale::sx(408));
         const auto panel_width =
             (operators.getWidth() - panelGap + xs) / 2;
         modulator_.setBounds(
@@ -20873,8 +21905,8 @@ public:
         carrier_.setBounds(operators);
 
         area.removeFromTop(md);
-        scope_title_.setBounds(area.removeFromTop(28));
-        scope_.setBounds(area.removeFromTop(110));
+        scope_title_.setBounds(area.removeFromTop(UiScale::sx(28)));
+        scope_.setBounds(area.removeFromTop(UiScale::sx(110)));
         area.removeFromTop(sm);
         status_.setBounds(area.removeFromTop(statusH));
 
@@ -20908,6 +21940,12 @@ public:
     }
 
     bool keyPressed(const juce::KeyPress& key) override {
+        if (UiScale::tryHandleEditorScaleKey(
+                key,
+                ui_scale_session_override_,
+                [this](int percent) { applyEditorUiScale(percent); })) {
+            return true;
+        }
         if (isCommandLetter(key, 'v')) {
             pasteClipboard();
             return true;
@@ -22606,6 +23644,7 @@ private:
     juce::TooltipWindow tooltip_window_;
     SwitchLookAndFeel switch_look_and_feel_;
     mgstc::engine::OpllPatchParameters patch_;
+    std::optional<int> ui_scale_session_override_;
     std::vector<mgstc::engine::OpllPatchParameters> history_;
     std::size_t history_cursor_{};
     std::vector<mgstc::engine::OpllPatchParameters>
@@ -23056,6 +24095,41 @@ public:
         }
     }
 
+    // Make process-global UiScale match this editor's effective percent
+    // (session override if any, else View/INI global).
+    void syncProcessUiScale() {
+        if (auto* opll =
+                dynamic_cast<OpllEditorComponent*>(
+                    getContentComponent())) {
+            opll->syncProcessUiScale();
+        } else if (auto* scc =
+                       dynamic_cast<SccEditorComponent*>(
+                           getContentComponent())) {
+            scc->syncProcessUiScale();
+        } else if (auto* composite =
+                       dynamic_cast<CompositeEditorComponent*>(
+                           getContentComponent())) {
+            composite->syncProcessUiScale();
+        }
+    }
+
+    // Resize content + window from this editor's effective metrics.
+    void applyPreferredSizeForEffectiveScale() {
+        if (auto* opll =
+                dynamic_cast<OpllEditorComponent*>(
+                    getContentComponent())) {
+            opll->applyPreferredSizeForEffectiveScale();
+        } else if (auto* scc =
+                       dynamic_cast<SccEditorComponent*>(
+                           getContentComponent())) {
+            scc->applyPreferredSizeForEffectiveScale();
+        } else if (auto* composite =
+                       dynamic_cast<CompositeEditorComponent*>(
+                           getContentComponent())) {
+            composite->applyPreferredSizeForEffectiveScale();
+        }
+    }
+
     void prepareToHide() {
         if (auto* scc = dynamic_cast<SccEditorComponent*>(
                 getContentComponent())) {
@@ -23256,6 +24330,7 @@ public:
     }
 
     void initialise(const juce::String& command_line) override {
+        UiScale::loadGlobalFromIni();
         juce::LookAndFeel::setDefaultLookAndFeel(&look_and_feel_);
         hang_watchdog_.start();
         audio_service_ = std::make_unique<SharedAudioService>();
@@ -23364,6 +24439,9 @@ private:
         auto& window = windowSlot(editor);
         const bool created = window == nullptr;
         if (created) {
+            // New editors always construct under View/INI global metrics —
+            // never under another editor's Ctrl± session override.
+            UiScale::forceGlobalForNonEditorUi();
             juce::String title = getApplicationName();
             if (editor == "scc") {
                 title += juce::String::fromUTF8(" - SCC音色エディタ");
@@ -23392,6 +24470,11 @@ private:
                 [this](const juce::String& active) {
                     activateEditor(active);
                 });
+        }
+        // Create or re-show: size from this window's effective scale (global
+        // unless it already has its own Ctrl± session override).
+        if (created || bring_to_front) {
+            window->applyPreferredSizeForEffectiveScale();
         }
         if (created || bring_to_front || active_editor_ != editor) {
             activateEditor(editor);
@@ -23750,6 +24833,9 @@ private:
             if (active_editor_ == editor) {
                 if (auto& window = windowSlot(editor);
                     window != nullptr) {
+                    // Modal may have forced global; restore this editor's
+                    // effective scale when it remains the active surface.
+                    window->syncProcessUiScale();
                     window->refreshExternalState();
                 }
                 continue;
@@ -23773,6 +24859,7 @@ private:
             }
             active_editor_ = editor;
             if (auto& window = windowSlot(editor); window != nullptr) {
+                window->syncProcessUiScale();
                 window->refreshExternalState();
             }
         }
@@ -23790,15 +24877,20 @@ private:
             return;
         }
         SnapshotResult result = SnapshotResult::MissingContent;
-        if (snapshot_target_ == "settings-midi") {
+        if (snapshot_target_ == "settings-view") {
             result = snapshot_window_ != nullptr
                 ? snapshot_window_->captureSettingsTab(
                     0, snapshot_file_)
                 : SnapshotResult::MissingContent;
-        } else if (snapshot_target_ == "settings-output") {
+        } else if (snapshot_target_ == "settings-midi") {
             result = snapshot_window_ != nullptr
                 ? snapshot_window_->captureSettingsTab(
                     1, snapshot_file_)
+                : SnapshotResult::MissingContent;
+        } else if (snapshot_target_ == "settings-output") {
+            result = snapshot_window_ != nullptr
+                ? snapshot_window_->captureSettingsTab(
+                    2, snapshot_file_)
                 : SnapshotResult::MissingContent;
         } else if (snapshot_target_ == "library") {
             result = captureLibraryManagerSnapshot(snapshot_file_);
