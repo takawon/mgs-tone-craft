@@ -25,6 +25,13 @@ void publishUiHangSoundOutputHint(std::uint8_t kind) noexcept;
 void setUiActivity(const char* label) noexcept;
 [[nodiscard]] const char* uiActivityLabel() noexcept;
 
+// Windows DefWindowProc size/move (title-bar drag, border resize) runs a
+// nested modal loop that stops JUCE timers from updating the hang heartbeat.
+// That is expected OS behaviour — suppress hang reports while it is active.
+void enterUiHangNativeModal() noexcept;
+void exitUiHangNativeModal() noexcept;
+[[nodiscard]] bool uiHangNativeModalActive() noexcept;
+
 class ScopedUiActivity final {
 public:
     explicit ScopedUiActivity(const char* label) noexcept;

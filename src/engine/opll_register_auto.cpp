@@ -282,6 +282,106 @@ OpllActiveTimbreAtCount opllActiveTimbreAt(
     return active;
 }
 
+std::optional<std::array<std::uint8_t, 8>> opllOriginalRegisterImageAt(
+    const CompositeLayer& layer,
+    std::uint32_t count,
+    const TimbreLibrary* library,
+    bool include_manual_y_at_count,
+    bool include_register_auto) noexcept {
+    if (layer.source != TimbreSource::Opll) {
+        return std::nullopt;
+    }
+
+    std::array<std::uint8_t, 8> registers{};
+    bool on_rom = false;
+    bool have_image = false;
+
+    const auto load_original = [&](std::uint64_t library_id) {
+        if (const auto regs = opllOriginalRegistersForLibraryId(
+                layer, library_id, library)) {
+            registers = *regs;
+            on_rom = false;
+            have_image = true;
+            return true;
+        }
+        have_image = false;
+        on_rom = false;
+        return false;
+    };
+
+    if (layer.base_timbre
+        && layer.base_timbre->source == TimbreSource::Opll) {
+        if (layer.base_timbre->library_id != 0) {
+            load_original(layer.base_timbre->library_id);
+        } else {
+            registers = layer.base_timbre->opll_registers;
+            on_rom = false;
+            have_image = true;
+        }
+    }
+
+    const auto automation = groupAutomation(layer);
+    for (std::uint32_t at = 0; at <= count; ++at) {
+        const auto found = automation.find(at);
+        if (found == automation.end()) {
+            continue;
+        }
+        // §7.5: @ then y at the same count.
+        for (const auto* event : found->second.timbres) {
+            if (event->timbre_pick == TimbrePick::OpllRom) {
+                if (event->value >= 0 && event->value <= 14) {
+                    on_rom = true;
+                    have_image = false;
+                }
+            } else if (event->target_library_id != 0) {
+                load_original(event->target_library_id);
+            }
+        }
+        const bool apply_y =
+            at < count || (at == count && include_manual_y_at_count);
+        if (!apply_y) {
+            continue;
+        }
+        for (const auto* event : found->second.register_writes) {
+            if (event->value < 0 || event->value > 7
+                || event->secondary < 0 || event->secondary > 255) {
+                continue;
+            }
+            registers[static_cast<std::size_t>(event->value)] =
+                static_cast<std::uint8_t>(event->secondary);
+            if (!on_rom) {
+                have_image = true;
+            }
+        }
+    }
+
+    if (on_rom || !have_image) {
+        return std::nullopt;
+    }
+
+    // §7.5: after manual y, TL/FB auto packs onto the held original image.
+    if (include_register_auto) {
+        const auto length = layer.envelope_timeline.length_counts;
+        if (const auto tl = opllRegisterAutoValueAt(
+                layer.opll_tl_auto,
+                OpllRegisterAutoTarget::TotalLevel,
+                count,
+                length)) {
+            registers[2] = packOpllRegisterAutoByte(
+                OpllRegisterAutoTarget::TotalLevel, registers[2], *tl);
+        }
+        if (const auto fb = opllRegisterAutoValueAt(
+                layer.opll_fb_auto,
+                OpllRegisterAutoTarget::Feedback,
+                count,
+                length)) {
+            registers[3] = packOpllRegisterAutoByte(
+                OpllRegisterAutoTarget::Feedback, registers[3], *fb);
+        }
+    }
+    return registers;
+}
+
 bool opllRegisterAutoAvailableAt(
     const CompositeLayer& layer,
     std::uint32_t count) noexcept {

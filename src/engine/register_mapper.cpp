@@ -713,7 +713,8 @@ MapError RegisterMapper::writeOpllPitch(
     OpllPitch pitch,
     bool key_on,
     Tick tick,
-    RegisterWriteBuffer& output) {
+    RegisterWriteBuffer& output,
+    bool sustain) {
     if (track < 8 || track >= kTrackCount) {
         return MapError::InvalidTrack;
     }
@@ -726,7 +727,8 @@ MapError RegisterMapper::writeOpllPitch(
     const auto high = static_cast<std::uint8_t>(
         ((pitch.f_number >> 8) & 0x01)
         | static_cast<std::uint8_t>(pitch.block << 1)
-        | (key_on ? 0x10 : 0x00));
+        | (key_on ? 0x10 : 0x00)
+        | (sustain ? 0x20 : 0x00));
 
     // MGSDRV writes the key/block register before the F-number low byte.
     auto error = emit(

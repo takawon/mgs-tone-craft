@@ -127,6 +127,7 @@ public:
         unsignedInteger(value.count, 4);
         unsignedInteger(value.target_library_id, 8);
         enumeration(value.timbre_pick);
+        boolean(value.after_loop_start);
     }
 
     void timeline(const EnvelopeTimeline& value) {
@@ -220,6 +221,20 @@ public:
             timeline(layer.envelope_timeline);
             registerAuto(layer.opll_tl_auto);
             registerAuto(layer.opll_fb_auto);
+            boolean(layer.software_lfo.enabled);
+            unsignedInteger(layer.software_lfo.delay, 1);
+            unsignedInteger(layer.software_lfo.depth, 1);
+            unsignedInteger(layer.software_lfo.speed, 1);
+            unsignedInteger(
+                static_cast<std::uint8_t>(layer.software_lfo.roughness), 1);
+            unsignedInteger(
+                static_cast<std::uint32_t>(layer.software_lfo.extra_roughness),
+                4);
+            unsignedInteger(layer.envelope_number, 1);
+            unsignedInteger(layer.key_off_hang, 1);
+            boolean(layer.pitch_sweep.enabled);
+            unsignedInteger(layer.pitch_sweep.value, 1);
+            boolean(layer.opll_sustain);
         }
     }
 
@@ -316,6 +331,7 @@ public:
         if (format_version_ < 6) {
             value.target_library_id = 0;
             value.timbre_pick = TimbrePick::Library;
+            value.after_loop_start = false;
             return true;
         }
         std::uint8_t pick{};
@@ -325,6 +341,13 @@ public:
             return false;
         }
         value.timbre_pick = static_cast<TimbrePick>(pick);
+        if (format_version_ >= 13) {
+            if (!boolean(value.after_loop_start)) {
+                return false;
+            }
+        } else {
+            value.after_loop_start = false;
+        }
         return true;
     }
 
@@ -571,6 +594,69 @@ public:
             } else {
                 layer.opll_tl_auto = {};
                 layer.opll_fb_auto = {};
+            }
+            layer.software_lfo = {};
+            if (format_version_ >= 14) {
+                std::uint8_t delay{};
+                std::uint8_t depth{};
+                std::uint8_t speed{};
+                std::uint8_t roughness{};
+                std::uint32_t extra{};
+                if (!boolean(layer.software_lfo.enabled)
+                    || !integer(delay, 1)
+                    || !integer(depth, 1)
+                    || !integer(speed, 1)
+                    || !integer(roughness, 1)
+                    || !integer(extra, 4)) {
+                    return false;
+                }
+                layer.software_lfo.delay = delay;
+                layer.software_lfo.depth = depth;
+                layer.software_lfo.speed = speed;
+                layer.software_lfo.roughness =
+                    static_cast<std::int8_t>(roughness);
+                layer.software_lfo.extra_roughness =
+                    static_cast<std::int32_t>(extra);
+                layer.software_lfo = clampSoftwareLfo(
+                    layer.software_lfo,
+                    layer.source != TimbreSource::Opll);
+            }
+            layer.envelope_number = 0;
+            layer.key_off_hang = 0;
+            layer.pitch_sweep = {};
+            layer.opll_sustain = false;
+            if (format_version_ >= 15) {
+                std::uint8_t envelope_number{};
+                std::uint8_t key_off_hang{};
+                std::uint8_t pitch_sweep_value{};
+                bool pitch_sweep_enabled{};
+                bool opll_sustain{};
+                if (!integer(envelope_number, 1)
+                    || !integer(key_off_hang, 1)
+                    || !boolean(pitch_sweep_enabled)
+                    || !integer(pitch_sweep_value, 1)
+                    || !boolean(opll_sustain)) {
+                    return false;
+                }
+                layer.envelope_number = std::min<std::uint8_t>(
+                    envelope_number, 31);
+                layer.key_off_hang = key_off_hang;
+                layer.pitch_sweep.enabled =
+                    pitch_sweep_enabled
+                    && layer.source != TimbreSource::Opll;
+                layer.pitch_sweep.value = pitch_sweep_value;
+                layer.opll_sustain =
+                    opll_sustain && layer.source == TimbreSource::Opll;
+                if (layer.pitch_sweep.enabled
+                    && layer.software_lfo.enabled) {
+                    layer.software_lfo.enabled = false;
+                }
+            }
+        }
+        if (format_version_ < 15) {
+            for (std::size_t index = 0; index < value.layers.size(); ++index) {
+                value.layers[index].envelope_number =
+                    static_cast<std::uint8_t>(std::min<std::size_t>(index, 31));
             }
         }
         value.format_version = CompositeTimbre::kFormatVersion;

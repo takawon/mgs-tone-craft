@@ -11,13 +11,17 @@ namespace mgstc::engine {
 namespace {
 
 struct CountState {
-    std::vector<std::string> timbre_tokens;
-    std::vector<std::string> pitch_tokens;
+    std::vector<std::string> before_timbre_tokens;
+    std::vector<std::string> before_pitch_tokens;
+    std::vector<std::string> after_timbre_tokens;
+    std::vector<std::string> after_pitch_tokens;
     std::optional<std::int32_t> volume;
 
     [[nodiscard]] bool boundary() const noexcept {
-        return !timbre_tokens.empty()
-            || !pitch_tokens.empty()
+        return !before_timbre_tokens.empty()
+            || !before_pitch_tokens.empty()
+            || !after_timbre_tokens.empty()
+            || !after_pitch_tokens.empty()
             || volume.has_value();
     }
 };
@@ -133,9 +137,10 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
             addIssueOnce(result, MgsEnvelopeIssue::InvalidPitch);
             continue;
         }
-        appendToken(
-            states[event.count].pitch_tokens,
-            "\\" + std::to_string(event.value));
+        auto& tokens = event.after_loop_start
+            ? states[event.count].after_pitch_tokens
+            : states[event.count].before_pitch_tokens;
+        appendToken(tokens, "\\" + std::to_string(event.value));
     }
 
     for (const auto& event : layer.timbre_automation) {
@@ -143,15 +148,16 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
             || (looping && event.count == effective_end)) {
             continue;
         }
+        auto& tokens = event.after_loop_start
+            ? states[event.count].after_timbre_tokens
+            : states[event.count].before_timbre_tokens;
         if (event.kind == EnvelopeEventKind::Timbre) {
             const auto number = envelopeEventTimbreNumber(event, numbers);
             if (!number) {
                 addIssueOnce(result, MgsEnvelopeIssue::InvalidTimbre);
                 continue;
             }
-            appendToken(
-                states[event.count].timbre_tokens,
-                "@" + std::to_string(*number));
+            appendToken(tokens, "@" + std::to_string(*number));
         } else if (event.kind == EnvelopeEventKind::RegisterWrite) {
             const auto maximum_register =
                 layer.source == TimbreSource::Psg ? 15 : 56;
@@ -165,7 +171,7 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
                 continue;
             }
             appendToken(
-                states[event.count].timbre_tokens,
+                tokens,
                 "y" + std::to_string(event.value)
                     + "," + std::to_string(event.secondary));
         }
@@ -173,6 +179,7 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
     // TL/FB auto authoring expands to standard yreg,data after manual y
     // at the same count (§7.5). Packs from the active original's register
     // image (base / @-slide + prior manual y). Skips ROM intervals.
+    // Autos always land in the before-`[` zone (first-pass only).
     if (layer.source == TimbreSource::Opll) {
         for (const auto& event :
              expandOpllLayerRegisterAutos(layer, library)) {
@@ -188,17 +195,19 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
                 continue;
             }
             appendToken(
-                states[event.count].timbre_tokens,
+                states[event.count].before_timbre_tokens,
                 "y" + std::to_string(event.value)
                     + "," + std::to_string(event.secondary));
         }
     }
-    // §6.5.1: when the envelope slides to another patch, prepend the
-    // track-side base `@` at count 0 (unless already present).
-    if (layerEnvelopeHasPatchSlide(layer, numbers)) {
+    // §6.5.1: prepend track-side base `@` at count 0 when the envelope
+    // slides to another patch and/or mutates original-tone regs (manual y /
+    // TL·FB auto). `@` reloads regs 0–7 so note/envelope start restores the
+    // base original. Skip if already leading.
+    if (layerEnvelopeNeedsLeadingBasePatch(layer, numbers)) {
         if (const auto base = layerBasePatchNumber(layer, numbers)) {
             const auto token = "@" + std::to_string(*base);
-            auto& leading = states[0].timbre_tokens;
+            auto& leading = states[0].before_timbre_tokens;
             const bool already = !leading.empty() && leading.front() == token;
             if (!already) {
                 leading.insert(leading.begin(), token);
@@ -219,13 +228,20 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
     std::int32_t current_volume = layer.volume;
     std::uint32_t cursor{};
     while (cursor < effective_end) {
+        // §6.2.3: before-`[` zero-time commands, then `[`, then after-`[`.
+        for (const auto& token : states[cursor].before_timbre_tokens) {
+            appendToken(tokens, token);
+        }
+        for (const auto& token : states[cursor].before_pitch_tokens) {
+            appendToken(tokens, token);
+        }
         if (looping && cursor == *timeline.loop_start_count) {
             appendToken(tokens, "[");
         }
-        for (const auto& token : states[cursor].timbre_tokens) {
+        for (const auto& token : states[cursor].after_timbre_tokens) {
             appendToken(tokens, token);
         }
-        for (const auto& token : states[cursor].pitch_tokens) {
+        for (const auto& token : states[cursor].after_pitch_tokens) {
             appendToken(tokens, token);
         }
         if (states[cursor].volume) {
@@ -245,10 +261,16 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
     if (looping) {
         appendToken(tokens, "]");
     } else {
-        for (const auto& token : states[effective_end].timbre_tokens) {
+        for (const auto& token : states[effective_end].before_timbre_tokens) {
             appendToken(tokens, token);
         }
-        for (const auto& token : states[effective_end].pitch_tokens) {
+        for (const auto& token : states[effective_end].before_pitch_tokens) {
+            appendToken(tokens, token);
+        }
+        for (const auto& token : states[effective_end].after_timbre_tokens) {
+            appendToken(tokens, token);
+        }
+        for (const auto& token : states[effective_end].after_pitch_tokens) {
             appendToken(tokens, token);
         }
         if (states[effective_end].volume) {
@@ -283,8 +305,23 @@ std::string formatMgsCompositeTrackSetup(
     }
     std::string line = std::to_string(track_number);
     line += " v" + std::to_string(static_cast<unsigned>(layer.volume));
+    if (layer.source != TimbreSource::Opll && layer.key_off_hang != 0) {
+        line += " k" + std::to_string(
+            static_cast<unsigned>(layer.key_off_hang));
+    }
+    if (layer.source == TimbreSource::Opll && layer.opll_sustain) {
+        line += " so";
+    }
     if (const auto number = layerBasePatchNumber(layer, numbers)) {
         line += " @" + std::to_string(static_cast<unsigned>(*number));
+    }
+    {
+        const auto envelope_number = std::min<std::uint8_t>(
+            layer.envelope_number, 31);
+        const bool rate =
+            layer.volume_envelope.kind == EnvelopeKind::Rate;
+        line += rate ? " @r" : " @e";
+        line += std::to_string(static_cast<unsigned>(envelope_number));
     }
     if (layer.detune != 0) {
         line += " \\" + std::to_string(static_cast<int>(layer.detune));
@@ -292,6 +329,25 @@ std::string formatMgsCompositeTrackSetup(
     if (layer.micro_detune != 0) {
         line += " @\\"
             + std::to_string(static_cast<int>(layer.micro_detune));
+    }
+    const bool pitch_sweep =
+        layer.pitch_sweep.enabled
+        && layer.source != TimbreSource::Opll;
+    if (pitch_sweep) {
+        line += " p" + std::to_string(
+            static_cast<unsigned>(layer.pitch_sweep.value));
+    } else if (layer.software_lfo.enabled) {
+        const auto lfo = clampSoftwareLfo(
+            layer.software_lfo, layer.source != TimbreSource::Opll);
+        line += " h"
+            + std::to_string(static_cast<unsigned>(lfo.delay)) + ","
+            + std::to_string(static_cast<unsigned>(lfo.depth)) + ","
+            + std::to_string(static_cast<unsigned>(lfo.speed)) + ","
+            + std::to_string(static_cast<int>(lfo.roughness));
+        if (layer.source != TimbreSource::Opll && lfo.extra_roughness != 0) {
+            line += " @p"
+                + std::to_string(static_cast<int>(lfo.extra_roughness));
+        }
     }
     if (layer.start_delay_value != 0) {
         if (layer.start_delay_form == StartDelayForm::NoteLength) {
