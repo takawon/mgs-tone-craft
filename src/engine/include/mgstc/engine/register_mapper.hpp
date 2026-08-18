@@ -106,7 +106,8 @@ public:
         OpllPitch pitch,
         bool key_on,
         Tick tick,
-        RegisterWriteBuffer& output);
+        RegisterWriteBuffer& output,
+        bool sustain = false);
 
     [[nodiscard]] MapError writeOpllRegister(
         std::uint8_t track,

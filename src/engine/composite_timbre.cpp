@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <string>
 #include <tuple>
 #include <utility>
 
@@ -62,6 +63,10 @@ CompositeTimbre defaultCompositeTimbre() {
         makeLayer("SCC Layer", TimbreSource::Scc, 0),
         makeLayer("OPLL Layer", TimbreSource::Opll, 0),
     };
+    for (std::size_t index = 0; index < timbre.layers.size(); ++index) {
+        timbre.layers[index].envelope_number =
+            static_cast<std::uint8_t>(std::min<std::size_t>(index, 31));
+    }
     return timbre;
 }
 
@@ -113,6 +118,20 @@ std::optional<std::uint8_t> firstAvailableChannel(
     }
     return static_cast<std::uint8_t>(
         std::distance(used_channels.begin(), available));
+}
+
+std::uint8_t nextFreeEnvelopeNumber(const CompositeTimbre& timbre) noexcept {
+    std::array<bool, 32> used{};
+    for (const auto& layer : timbre.layers) {
+        if (layer.envelope_number < used.size()) {
+            used[layer.envelope_number] = true;
+        }
+    }
+    const auto free = std::find(used.begin(), used.end(), false);
+    if (free == used.end()) {
+        return 0;
+    }
+    return static_cast<std::uint8_t>(std::distance(used.begin(), free));
 }
 
 bool removeCompositeLayer(
@@ -189,6 +208,25 @@ CompositeValidation validateCompositeTimbre(
                 + " is assigned more than once");
         }
         used[source][layer.channel] = true;
+    }
+    std::array<int, 32> envelope_users{};
+    for (const auto& layer : timbre.layers) {
+        if (layer.envelope_number > 31) {
+            result.warnings.push_back(
+                "Envelope number is outside 0-31");
+            continue;
+        }
+        ++envelope_users[layer.envelope_number];
+    }
+    for (std::size_t number = 0; number < envelope_users.size(); ++number) {
+        if (envelope_users[number] > 1) {
+            const auto digits = number < 10
+                ? std::string("0") + std::to_string(number)
+                : std::to_string(number);
+            result.warnings.push_back(
+                "@e" + digits
+                + " is used by more than one layer");
+        }
     }
     if (timbre.layers.empty()) {
         result.warnings.emplace_back(
@@ -510,6 +548,37 @@ bool layerEnvelopeHasPatchSlide(
         }
     }
     return false;
+}
+
+bool layerEnvelopeNeedsOriginalToneRestore(
+    const CompositeLayer& layer) noexcept {
+    if (layer.source != TimbreSource::Opll) {
+        return false;
+    }
+    // ROM `@n` selects an instrument number; it does not reload original
+    // timbre registers 0–7. TL/FB auto / original y are already restricted
+    // on ROM-base layers for this channel's sound.
+    if (layerUsesOpllRomBase(layer) || !layer.base_timbre) {
+        return false;
+    }
+    if (layer.opll_tl_auto.active() || layer.opll_fb_auto.active()) {
+        return true;
+    }
+    for (const auto& event : layer.timbre_automation) {
+        if (event.kind == EnvelopeEventKind::RegisterWrite
+            && event.value >= 0
+            && event.value <= 7) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool layerEnvelopeNeedsLeadingBasePatch(
+    const CompositeLayer& layer,
+    const TimbreNumberResolution* numbers) noexcept {
+    return layerEnvelopeHasPatchSlide(layer, numbers)
+        || layerEnvelopeNeedsOriginalToneRestore(layer);
 }
 
 bool envelopeEventReferencesLibrary(

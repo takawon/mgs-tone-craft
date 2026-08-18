@@ -268,6 +268,8 @@ if(WIN32)
                 src/app/juce/asio_audio_sink.hpp
                 src/app/juce/ui_hang_watchdog.cpp
                 src/app/juce/ui_hang_watchdog.hpp
+                src/app/juce/ui_layout.cpp
+                src/app/juce/ui_paint.cpp
                 src/app/juce/main.cpp
         )
         target_link_libraries(

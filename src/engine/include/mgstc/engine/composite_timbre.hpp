@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "mgstc/engine/pitch_sweep.hpp"
+#include "mgstc/engine/software_lfo.hpp"
 #include "mgstc/engine/timbre_library.hpp"
 
 namespace mgstc::engine {
@@ -66,6 +68,10 @@ struct EnvelopeEvent {
     std::uint32_t count{};
     std::uint64_t target_library_id{};
     TimbrePick timbre_pick{TimbrePick::Library};
+    // §6.2.3: at the loop-start count, false = before `[` (first pass only),
+    // true = after `[` (re-run on each `]` return). Ignored when the event's
+    // count is not the layer's loop_start_count.
+    bool after_loop_start{};
 
     friend bool operator==(const EnvelopeEvent&, const EnvelopeEvent&)
         = default;
@@ -227,6 +233,16 @@ struct CompositeLayer {
     StartDelayForm start_delay_form{StartDelayForm::AbsoluteTicks};
     std::uint32_t start_delay_value{};
     std::uint8_t volume{15};
+    // `@e` / `@r` definition number (0–31). New layers start at 00 sequential.
+    std::uint8_t envelope_number{};
+    // Track MML `k` (PSG/SCC). 0 = immediate key-off. Ignored with `@r` / HW EG.
+    std::uint8_t key_off_hang{};
+    // Track MML `p` (PSG/SCC). Mutually exclusive with `software_lfo`.
+    PitchSweepSettings pitch_sweep{};
+    // Track MML `so` when true. Unspecified / `sf` when false (OPLL only).
+    bool opll_sustain{};
+    // MGSDRV software LFO (pre-key-on `h` / `@p`). Disabled ⇒ no `h`.
+    SoftwareLfoSettings software_lfo{};
     SoftwareEnvelope volume_envelope;
     SoftwareEnvelope pitch_envelope;
     std::vector<EnvelopeEvent> timbre_automation;
@@ -242,7 +258,7 @@ struct CompositeLayer {
 };
 
 struct CompositeTimbre {
-    static constexpr std::uint32_t kFormatVersion = 12;
+    static constexpr std::uint32_t kFormatVersion = 15;
     static constexpr std::uint32_t kMinimumReadableFormatVersion = 5;
 
     std::uint32_t format_version{kFormatVersion};
@@ -310,6 +326,9 @@ struct TimbreUse {
     const CompositeTimbre& timbre,
     TimbreSource source) noexcept;
 
+[[nodiscard]] std::uint8_t nextFreeEnvelopeNumber(
+    const CompositeTimbre& timbre) noexcept;
+
 bool removeCompositeLayer(
     CompositeTimbre& timbre,
     std::size_t layer_index) noexcept;
@@ -352,6 +371,18 @@ void setEnvelopeTimelineRange(
     const TimbreNumberResolution* numbers = nullptr) noexcept;
 
 [[nodiscard]] bool layerEnvelopeHasPatchSlide(
+    const CompositeLayer& layer,
+    const TimbreNumberResolution* numbers = nullptr) noexcept;
+
+// True when the OPLL layer mutates original-tone regs 0–7 via manual `y`
+// and/or active TL/FB auto, so `@e` must re-establish the base original at
+// count 0 (§6.5.1). ROM-base layers are excluded (`@` ROM does not reload
+// original regs). Requires a library `base_timbre` to restore against.
+[[nodiscard]] bool layerEnvelopeNeedsOriginalToneRestore(
+    const CompositeLayer& layer) noexcept;
+
+// §6.5.1: patch slide and/or original-tone y / TL/FB auto → leading base `@`.
+[[nodiscard]] bool layerEnvelopeNeedsLeadingBasePatch(
     const CompositeLayer& layer,
     const TimbreNumberResolution* numbers = nullptr) noexcept;
 

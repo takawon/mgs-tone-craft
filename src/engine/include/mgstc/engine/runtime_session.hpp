@@ -9,6 +9,8 @@
 
 #include "mgstc/engine/envelope_rate.hpp"
 #include "mgstc/engine/envelope_sequence.hpp"
+#include "mgstc/engine/pitch_sweep.hpp"
+#include "mgstc/engine/software_lfo.hpp"
 #include "mgstc/engine/register_mapper.hpp"
 #include "mgstc/engine/shared_state.hpp"
 #include "mgstc/engine/track_runtime.hpp"
@@ -63,6 +65,22 @@ public:
     [[nodiscard]] bool setTrackPatch(
         std::uint8_t track,
         std::optional<std::uint8_t> patch) noexcept;
+    // MGSDRV software LFO (`h` / `@p`). `@p` is 16-bit 粗さ on PSG/SCC only.
+    [[nodiscard]] bool setTrackSoftwareLfo(
+        std::uint8_t track,
+        SoftwareLfoSettings settings) noexcept;
+    // Track MML `p` (PSG/SCC). Ignored on OPLL. Mutually exclusive with LFO.
+    [[nodiscard]] bool setTrackPitchSweep(
+        std::uint8_t track,
+        PitchSweepSettings settings) noexcept;
+    // Track MML `k` (PSG/SCC). 0 = immediate. Ignored with `@r` / hardware EG.
+    [[nodiscard]] bool setTrackKeyOffHang(
+        std::uint8_t track,
+        std::uint8_t hang_ticks) noexcept;
+    // Track MML `so` (OPLL sustain). Unspecified / `sf` when false.
+    [[nodiscard]] bool setTrackOpllSustain(
+        std::uint8_t track,
+        bool sustain) noexcept;
     [[nodiscard]] bool setTrackAttenuation(
         std::uint8_t track,
         std::uint8_t attenuation) noexcept;
@@ -125,6 +143,11 @@ private:
     std::array<std::int16_t, kTrackCount> track_detune_{};
     std::array<std::int32_t, kTrackCount> track_micro_detune_{};
     std::array<std::optional<std::uint8_t>, kTrackCount> track_patch_{};
+    std::array<SoftwareLfoRuntime, kTrackCount> track_lfo_{};
+    std::array<PitchSweepRuntime, kTrackCount> track_pitch_sweep_{};
+    std::array<std::uint8_t, kTrackCount> track_key_off_hang_{};
+    std::array<std::uint8_t, kTrackCount> key_off_hang_remaining_{};
+    std::array<bool, kTrackCount> track_opll_sustain_{};
     std::array<PendingKey, kTrackCount> pending_keys_{};
     std::array<bool, kTrackCount> audition_track_running_{};
     std::array<bool, kTrackCount> force_mute_pending_{};
@@ -145,6 +168,9 @@ private:
 
     [[nodiscard]] MapError applyTrackDetunes(std::uint8_t track);
     [[nodiscard]] MapError applyTrackPatch(std::uint8_t track);
+    [[nodiscard]] MapError applyTrackLfo(std::uint8_t track);
+    [[nodiscard]] MapError applyTrackPitchSweep(std::uint8_t track);
+    [[nodiscard]] bool keyOffHangApplies(std::uint8_t track) const noexcept;
 };
 
 }  // namespace mgstc::engine

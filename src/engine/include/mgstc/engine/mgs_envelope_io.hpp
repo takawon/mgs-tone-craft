@@ -41,7 +41,7 @@ struct MgsEnvelopeFormatResult {
     const TimbreLibrary* library = nullptr);
 
 // Track-side setup MML for the layer preview (no @e body).
-// Example: `9 v15 @16 \1 @\30 r8`
+// Example: `9 v15 @16 @e0 \1 @\30 r8`
 [[nodiscard]] std::string formatMgsCompositeTrackSetup(
     const CompositeLayer& layer,
     const TimbreNumberResolution* numbers = nullptr);

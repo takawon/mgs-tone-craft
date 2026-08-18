@@ -57,6 +57,11 @@ bool RuntimeSession::clearTrack(std::uint8_t track) noexcept {
     track_detune_[track] = 0;
     track_micro_detune_[track] = 0;
     track_patch_[track].reset();
+    track_lfo_[track].clear();
+    track_pitch_sweep_[track].clear();
+    track_key_off_hang_[track] = 0;
+    key_off_hang_remaining_[track] = 0;
+    track_opll_sustain_[track] = false;
     return true;
 }
 
@@ -95,6 +100,57 @@ bool RuntimeSession::setTrackPatch(
         return false;
     }
     track_patch_[track] = patch;
+    return true;
+}
+
+bool RuntimeSession::setTrackSoftwareLfo(
+    std::uint8_t track,
+    SoftwareLfoSettings settings) noexcept {
+    if (track >= kTrackCount) {
+        return false;
+    }
+    const bool extra_roughness = track < 8;
+    track_lfo_[track].setSettings(
+        clampSoftwareLfo(settings, extra_roughness), extra_roughness);
+    if (track_lfo_[track].enabled()) {
+        track_pitch_sweep_[track].clear();
+    }
+    return true;
+}
+
+bool RuntimeSession::setTrackPitchSweep(
+    std::uint8_t track,
+    PitchSweepSettings settings) noexcept {
+    if (track >= kTrackCount) {
+        return false;
+    }
+    if (track >= 8) {
+        settings.enabled = false;
+    }
+    track_pitch_sweep_[track].setSettings(settings);
+    if (track_pitch_sweep_[track].enabled()) {
+        track_lfo_[track].clear();
+    }
+    return true;
+}
+
+bool RuntimeSession::setTrackKeyOffHang(
+    std::uint8_t track,
+    std::uint8_t hang_ticks) noexcept {
+    if (track >= kTrackCount) {
+        return false;
+    }
+    track_key_off_hang_[track] = track < 8 ? hang_ticks : 0;
+    return true;
+}
+
+bool RuntimeSession::setTrackOpllSustain(
+    std::uint8_t track,
+    bool sustain) noexcept {
+    if (track >= kTrackCount) {
+        return false;
+    }
+    track_opll_sustain_[track] = track >= 8 && sustain;
     return true;
 }
 
@@ -217,6 +273,13 @@ void RuntimeSession::resetForKeyOn() noexcept {
     for (auto& track : tracks_) {
         track.resetForKeyOn();
     }
+    for (auto& lfo : track_lfo_) {
+        lfo.resetForKeyOn();
+    }
+    for (auto& sweep : track_pitch_sweep_) {
+        sweep.resetForKeyOn();
+    }
+    key_off_hang_remaining_.fill(0);
     pending_keys_.fill(PendingKey::None);
     audition_track_running_.fill(false);
     force_mute_pending_.fill(false);
@@ -250,6 +313,7 @@ TickResult RuntimeSession::processTick() {
         auto& runtime = tracks_[track];
         if (force_mute_pending_[track]) {
             force_mute_pending_[track] = false;
+            key_off_hang_remaining_[track] = 0;
             if (pending_keys_[track] == PendingKey::Off
                 || pending_keys_[track] == PendingKey::On
                 || audition_track_running_[track]) {
@@ -267,7 +331,12 @@ TickResult RuntimeSession::processTick() {
                             track, false, tick_, writes_));
                     } else if (track >= 8) {
                         static_cast<void>(mapper_.writeOpllPitch(
-                            track, pitch.opll, false, tick_, writes_));
+                            track,
+                            pitch.opll,
+                            false,
+                            tick_,
+                            writes_,
+                            track_opll_sustain_[track]));
                     }
                 }
             }
@@ -296,8 +365,15 @@ TickResult RuntimeSession::processTick() {
         }
         if (audition_gated_
             && !audition_track_running_[track]
-            && pending_keys_[track] == PendingKey::None) {
+            && pending_keys_[track] == PendingKey::None
+            && key_off_hang_remaining_[track] == 0) {
             continue;
+        }
+        bool hang_expired = false;
+        if (pending_keys_[track] != PendingKey::On
+            && key_off_hang_remaining_[track] > 0) {
+            --key_off_hang_remaining_[track];
+            hang_expired = key_off_hang_remaining_[track] == 0;
         }
         if (pending_keys_[track] == PendingKey::On) {
             if (track < 3) {
@@ -313,6 +389,9 @@ TickResult RuntimeSession::processTick() {
                 };
             }
             runtime.resetForKeyOn();
+            track_lfo_[track].resetForKeyOn();
+            track_pitch_sweep_[track].resetForKeyOn();
+            key_off_hang_remaining_[track] = 0;
             if (track < 3) {
                 auto map_error = mapper_.writePsgToneNoise(
                     track,
@@ -427,7 +506,8 @@ TickResult RuntimeSession::processTick() {
                     pitch.opll,
                     true,
                     tick_,
-                    writes_);
+                    writes_,
+                    track_opll_sustain_[track]);
                 if (map_error != MapError::None) {
                     return {
                         tick_,
@@ -455,69 +535,76 @@ TickResult RuntimeSession::processTick() {
                     };
                 }
             }
-        } else if (pending_keys_[track] == PendingKey::Off) {
-            NotePitch pitch{};
-            if (!notePitch(current_notes_[track], pitch)) {
-                return {
-                    tick_,
-                    track,
-                    SequenceError::None,
-                    MapError::InvalidValue,
-                };
-            }
-            if (track < 3 && !runtime.rateEnvelope()) {
-                psg_sequence_muted_[track] = true;
-                const auto map_error = mapper_.mapMeaningEvent(
-                    track,
-                    MeaningEvent{
-                        tick_,
-                        MeaningEventKind::Volume,
-                        0,
-                        0,
-                    },
-                    tick_,
-                    writes_);
-                if (map_error != MapError::None) {
+        } else if (pending_keys_[track] == PendingKey::Off
+                   || hang_expired) {
+            if (!hang_expired && keyOffHangApplies(track)) {
+                key_off_hang_remaining_[track] = track_key_off_hang_[track];
+            } else {
+                key_off_hang_remaining_[track] = 0;
+                NotePitch pitch{};
+                if (!notePitch(current_notes_[track], pitch)) {
                     return {
                         tick_,
                         track,
                         SequenceError::None,
-                        map_error,
+                        MapError::InvalidValue,
                     };
                 }
-            } else if (track >= 3 && track < 8) {
-                const auto map_error = mapper_.writeSccKey(
-                    track,
-                    false,
-                    tick_,
-                    writes_);
-                if (map_error != MapError::None) {
-                    return {
-                        tick_,
+                if (track < 3 && !runtime.rateEnvelope()) {
+                    psg_sequence_muted_[track] = true;
+                    const auto map_error = mapper_.mapMeaningEvent(
                         track,
-                        SequenceError::None,
-                        map_error,
-                    };
-                }
-            } else if (track >= 8) {
-                const auto map_error = mapper_.writeOpllPitch(
-                    track,
-                    pitch.opll,
-                    false,
-                    tick_,
-                    writes_);
-                if (map_error != MapError::None) {
-                    return {
+                        MeaningEvent{
+                            tick_,
+                            MeaningEventKind::Volume,
+                            0,
+                            0,
+                        },
                         tick_,
+                        writes_);
+                    if (map_error != MapError::None) {
+                        return {
+                            tick_,
+                            track,
+                            SequenceError::None,
+                            map_error,
+                        };
+                    }
+                } else if (track >= 3 && track < 8) {
+                    const auto map_error = mapper_.writeSccKey(
                         track,
-                        SequenceError::None,
-                        map_error,
-                    };
+                        false,
+                        tick_,
+                        writes_);
+                    if (map_error != MapError::None) {
+                        return {
+                            tick_,
+                            track,
+                            SequenceError::None,
+                            map_error,
+                        };
+                    }
+                } else if (track >= 8) {
+                    const auto map_error = mapper_.writeOpllPitch(
+                        track,
+                        pitch.opll,
+                        false,
+                        tick_,
+                        writes_,
+                        track_opll_sustain_[track]);
+                    if (map_error != MapError::None) {
+                        return {
+                            tick_,
+                            track,
+                            SequenceError::None,
+                            map_error,
+                        };
+                    }
                 }
-            }
-            runtime.keyOff(track < 8);
-            if (!runtime.rateEnvelope()) {
-                audition_track_running_[track] = false;
+                runtime.keyOff(track < 8);
+                if (!runtime.rateEnvelope()) {
+                    audition_track_running_[track] = false;
+                }
             }
         }
         pending_keys_[track] = PendingKey::None;
@@ -565,6 +652,19 @@ TickResult RuntimeSession::processTick() {
                 return {tick_, track, SequenceError::None, map_error};
             }
         }
+        if (audition_track_running_[track]) {
+            if (track_pitch_sweep_[track].enabled()) {
+                const auto sweep_error = applyTrackPitchSweep(track);
+                if (sweep_error != MapError::None) {
+                    return {tick_, track, SequenceError::None, sweep_error};
+                }
+            } else {
+                const auto lfo_error = applyTrackLfo(track);
+                if (lfo_error != MapError::None) {
+                    return {tick_, track, SequenceError::None, lfo_error};
+                }
+            }
+        }
     }
 
     const TickResult result{tick_, 0, SequenceError::None, MapError::None};
@@ -609,6 +709,59 @@ MapError RuntimeSession::applyTrackPatch(std::uint8_t track) {
         },
         tick_,
         writes_);
+}
+
+MapError RuntimeSession::applyTrackLfo(std::uint8_t track) {
+    if (!track_lfo_[track].enabled()) {
+        return MapError::None;
+    }
+    const auto delta = track_lfo_[track].advance();
+    if (delta == 0) {
+        return MapError::None;
+    }
+    return mapper_.mapMeaningEvent(
+        track,
+        MeaningEvent{
+            tick_,
+            MeaningEventKind::FrequencyDelta,
+            delta,
+            0,
+        },
+        tick_,
+        writes_);
+}
+
+MapError RuntimeSession::applyTrackPitchSweep(std::uint8_t track) {
+    if (!track_pitch_sweep_[track].enabled()) {
+        return MapError::None;
+    }
+    const auto delta = track_pitch_sweep_[track].advance();
+    if (delta == 0) {
+        return MapError::None;
+    }
+    return mapper_.mapMeaningEvent(
+        track,
+        MeaningEvent{
+            tick_,
+            MeaningEventKind::FrequencyDelta,
+            delta,
+            0,
+        },
+        tick_,
+        writes_);
+}
+
+bool RuntimeSession::keyOffHangApplies(std::uint8_t track) const noexcept {
+    if (track >= 8 || track_key_off_hang_[track] == 0) {
+        return false;
+    }
+    if (tracks_[track].rateEnvelope()) {
+        return false;
+    }
+    if (track < 3 && psg_modes_[track].hardwareEnabled()) {
+        return false;
+    }
+    return true;
 }
 
 }  // namespace mgstc::engine

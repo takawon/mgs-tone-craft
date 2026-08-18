@@ -40,6 +40,21 @@ opllOriginalRegistersForLibraryId(
     const CompositeLayer& layer,
     std::uint32_t count) noexcept;
 
+// Original-tone register image (regs 0–7) at `count`: base / @-slide
+// originals + manual y. When `include_manual_y_at_count` is false, y at
+// exactly `count` are omitted (baseline before same-step manual y).
+// When `include_register_auto` is true, TL/FB auto field values active at
+// `count` are packed onto regs 2/3 (same packing as expand). Still excludes
+// writing auto into the authoring model. nullopt when ROM is active or no
+// original image.
+[[nodiscard]] std::optional<std::array<std::uint8_t, 8>>
+opllOriginalRegisterImageAt(
+    const CompositeLayer& layer,
+    std::uint32_t count,
+    const TimbreLibrary* library = nullptr,
+    bool include_manual_y_at_count = true,
+    bool include_register_auto = false) noexcept;
+
 [[nodiscard]] bool opllRegisterAutoAvailableAt(
     const CompositeLayer& layer,
     std::uint32_t count) noexcept;
