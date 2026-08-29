@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <span>
 #include <utility>
 
 namespace mgstc::engine {
@@ -19,6 +20,52 @@ void SequenceEnvelopeRuntime::resetForKeyOn() noexcept {
     loop_position_ = 0;
     volume_ = 0;
     tick_ = 0;
+}
+
+void SequenceEnvelopeRuntime::resetForKeyOn(
+    std::uint8_t initial_volume) noexcept {
+    resetForKeyOn();
+    volume_ = initial_volume;
+}
+
+std::vector<std::uint8_t> sampleSequenceEnvelopeVolumes(
+    std::span<const std::uint8_t> bytecode,
+    std::size_t ticks,
+    std::uint8_t initial_volume) {
+    std::vector<std::uint8_t> copy(bytecode.begin(), bytecode.end());
+    SequenceEnvelopeRuntime runtime(std::move(copy), false);
+    runtime.resetForKeyOn(initial_volume);
+    EventBuffer buffer(8);
+    std::vector<std::uint8_t> volumes(ticks, 0);
+    for (std::size_t i = 0; i < ticks; ++i) {
+        buffer.clear();
+        static_cast<void>(runtime.processTick(buffer));
+        volumes[i] = runtime.volume();
+    }
+    return volumes;
+}
+
+std::vector<std::uint8_t> sampleAutomaticRampVolumes(
+    std::uint8_t origin,
+    std::uint8_t target,
+    std::uint32_t duration,
+    bool include_origin_letter) {
+    if (duration == 0) {
+        return {};
+    }
+    const auto clipped = std::min<std::uint32_t>(duration, 255);
+    std::vector<std::uint8_t> bytecode;
+    bytecode.reserve(3);
+    if (include_origin_letter) {
+        bytecode.push_back(static_cast<std::uint8_t>(origin & 0x0F));
+    }
+    bytecode.push_back(
+        static_cast<std::uint8_t>(0x20 | (target & 0x0F)));
+    bytecode.push_back(static_cast<std::uint8_t>(clipped));
+    const auto initial = include_origin_letter
+        ? std::uint8_t{0}
+        : origin;
+    return sampleSequenceEnvelopeVolumes(bytecode, clipped, initial);
 }
 
 bool SequenceEnvelopeRuntime::emit(
@@ -45,7 +92,10 @@ SequenceError SequenceEnvelopeRuntime::processTick(
     std::size_t instruction_budget) {
     if (wait_ != 0) {
         if (ramp_total_ != 0) {
-            const auto numerator = static_cast<std::uint32_t>(
+            // MGSDRV adds these values in the Z80 A register and discards
+            // carry before its 8-by-8-bit division.  Counts near 255 expose
+            // this wraparound, so do not widen the addition.
+            const auto numerator = static_cast<std::uint8_t>(
                 ramp_remainder_ + ramp_magnitude_);
             const auto quotient = numerator / ramp_total_;
             ramp_remainder_ = static_cast<std::uint16_t>(
@@ -141,9 +191,6 @@ SequenceError SequenceEnvelopeRuntime::processTick(
             std::uint8_t count = 0;
             if (!readByte(count)) {
                 return SequenceError::TruncatedCommand;
-            }
-            if (count == 0) {
-                return SequenceError::InvalidRampCount;
             }
             const auto target = static_cast<std::int32_t>(opcode & 0x0F);
             const auto delta = target - static_cast<std::int32_t>(volume_);

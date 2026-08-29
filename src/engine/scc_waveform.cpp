@@ -162,6 +162,21 @@ double normalizedCorrelation(
     return divisor <= kSilence ? 0.0 : product / divisor;
 }
 
+std::uint32_t nextRandom(std::uint32_t& state) noexcept {
+    state ^= state << 13U;
+    state ^= state >> 17U;
+    state ^= state << 5U;
+    return state;
+}
+
+std::uint32_t randomBelow(
+    std::uint32_t& state,
+    std::uint32_t upper_exclusive) noexcept {
+    return upper_exclusive == 0
+        ? 0
+        : nextRandom(state) % upper_exclusive;
+}
+
 }  // namespace
 
 SccWaveform generateSccPreset(
@@ -193,6 +208,48 @@ SccWaveform generateSccPreset(
     }
     removeDc(waveform);
     return quantizeFullRange(waveform);
+}
+
+SccRandomPresetRecipe makeSccRandomPresetRecipe(
+    std::uint32_t seed) noexcept {
+    std::uint32_t state = seed ^ 0x53434352U;
+    if (state == 0) {
+        state = 0x9E3779B9U;
+    }
+    std::array<SccWavePreset, 6> presets{
+        SccWavePreset::Sine,
+        SccWavePreset::Square,
+        SccWavePreset::Triangle,
+        SccWavePreset::Saw,
+        SccWavePreset::Pulse25,
+        SccWavePreset::Pulse12_5,
+    };
+    for (std::size_t last = presets.size(); last > 1; --last) {
+        const auto swap_index = static_cast<std::size_t>(
+            randomBelow(state, static_cast<std::uint32_t>(last)));
+        std::swap(presets[last - 1], presets[swap_index]);
+    }
+
+    SccRandomPresetRecipe recipe;
+    recipe.stage_count = static_cast<std::uint8_t>(
+        2U + randomBelow(state, 3U));
+    recipe.apply_range = static_cast<SccApplyRange>(
+        randomBelow(state, 3U));
+    for (std::size_t index = 0; index < recipe.stage_count; ++index) {
+        auto& stage = recipe.stages[index];
+        stage.preset = presets[index];
+        stage.harmonic = static_cast<SccHarmonic>(
+            randomBelow(state, 5U));
+        stage.flip_horizontal = randomBelow(state, 2U) != 0;
+        stage.flip_vertical = randomBelow(state, 2U) != 0;
+        stage.merge.amount =
+            static_cast<double>(20U + randomBelow(state, 61U)) / 100.0;
+        stage.merge.auto_phase = randomBelow(state, 2U) != 0;
+        stage.merge.allow_polarity_inversion =
+            randomBelow(state, 2U) != 0;
+        stage.merge.preserve_volume = randomBelow(state, 2U) != 0;
+    }
+    return recipe;
 }
 
 SccMergeResult mergeSccWaveforms(
@@ -282,6 +339,41 @@ SccMergeResult mergeSccWaveforms(
         .circular_shift = best_shift,
         .polarity_inverted = best_inverted,
     };
+}
+
+SccWaveform generateSccRandomPreset(
+    const SccRandomPresetRecipe& recipe) noexcept {
+    const auto count = std::clamp<std::size_t>(
+        recipe.stage_count, 2, kSccRandomPresetMaximumStages);
+    const auto make_stage_wave =
+        [](const SccRandomPresetStage& stage) {
+            auto waveform = generateSccPreset(
+                stage.preset, stage.harmonic);
+            if (stage.flip_horizontal) {
+                waveform = mirrorSccWaveform(waveform);
+            }
+            if (stage.flip_vertical) {
+                waveform = invertSccWaveform(waveform);
+            }
+            return waveform;
+        };
+    auto result = make_stage_wave(recipe.stages[0]);
+    for (std::size_t index = 1; index < count; ++index) {
+        result = mergeSccWaveforms(
+            result,
+            make_stage_wave(recipe.stages[index]),
+            recipe.stages[index].merge).waveform;
+    }
+    return result;
+}
+
+SccWaveform applySccRandomPreset(
+    const SccWaveform& current,
+    const SccRandomPresetRecipe& recipe) noexcept {
+    return applySccWaveformRange(
+        current,
+        generateSccRandomPreset(recipe),
+        recipe.apply_range);
 }
 
 SccWaveform averageSccWaveform(

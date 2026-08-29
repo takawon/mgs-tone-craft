@@ -64,6 +64,16 @@ public:
             std::string_view text,
             std::string* error = nullptr);
 
+    // Single-program .mgstc (library header + one entry). Used by the
+    // composite editor Open/Save/Copy/Paste chrome.
+    [[nodiscard]] static std::string serializeTimbreFile(
+        const CompositeTimbre& timbre,
+        std::int64_t now_unix_seconds);
+    [[nodiscard]] static std::optional<CompositeTimbre>
+        deserializeTimbreFile(
+            std::string_view text,
+            std::string* error = nullptr);
+
 private:
     std::vector<CompositeTimbreLibraryEntry> entries_;
     std::uint64_t next_id_{1};

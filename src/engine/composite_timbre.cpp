@@ -7,6 +7,8 @@
 #include <tuple>
 #include <utility>
 
+#include "mgstc/engine/scc_waveform.hpp"
+
 namespace mgstc::engine {
 namespace {
 
@@ -57,6 +59,7 @@ const char* sourceName(TimbreSource source) noexcept {
 
 CompositeTimbre defaultCompositeTimbre() {
     CompositeTimbre timbre;
+    timbre.format_version = CompositeTimbre::kFormatVersion;
     timbre.name = "New Composite Timbre";
     timbre.layers = {
         makeLayer("PSG Layer", TimbreSource::Psg, 0),
@@ -68,6 +71,30 @@ CompositeTimbre defaultCompositeTimbre() {
             static_cast<std::uint8_t>(std::min<std::size_t>(index, 31));
     }
     return timbre;
+}
+
+void seedDefaultLayerTimbre(CompositeLayer& layer) noexcept {
+    if (layer.source == TimbreSource::Opll) {
+        layer.base_timbre.reset();
+        layer.base_opll_rom = 0;
+        return;
+    }
+    if (layer.source != TimbreSource::Scc) {
+        return;
+    }
+    const auto waveform = generateSccPreset(
+        SccWavePreset::Triangle, SccHarmonic::One);
+    SavedTimbreReference reference;
+    reference.library_id = kSccTrianglePresetLibraryId;
+    reference.revision = 1;
+    reference.name = "Triangle";
+    reference.source = TimbreSource::Scc;
+    for (std::size_t index = 0; index < waveform.size(); ++index) {
+        reference.scc_waveform[index] =
+            static_cast<std::uint8_t>(waveform[index]);
+    }
+    layer.base_opll_rom.reset();
+    layer.base_timbre = std::move(reference);
 }
 
 bool layerIsAudible(
@@ -143,6 +170,29 @@ bool removeCompositeLayer(
     timbre.layers.erase(
         timbre.layers.begin() + static_cast<std::ptrdiff_t>(layer_index));
     return true;
+}
+
+std::optional<std::size_t> duplicateCompositeLayer(
+    CompositeTimbre& timbre,
+    std::size_t layer_index) {
+    if (layer_index >= timbre.layers.size()) {
+        return std::nullopt;
+    }
+    const auto source = timbre.layers[layer_index].source;
+    const auto free_channel = firstAvailableChannel(timbre, source);
+    if (!free_channel) {
+        return std::nullopt;
+    }
+    auto layer = timbre.layers[layer_index];
+    layer.channel = *free_channel;
+    layer.envelope_number = nextFreeEnvelopeNumber(timbre);
+    layer.name = std::string(sourceName(source)) + " Ch."
+        + std::to_string(static_cast<int>(layer.channel) + 1);
+    // TL/FB auto is chip-wide exclusive; the original keeps ownership.
+    layer.opll_tl_auto = {};
+    layer.opll_fb_auto = {};
+    timbre.layers.push_back(std::move(layer));
+    return timbre.layers.size() - 1;
 }
 
 void setEnvelopeTimelineRange(

@@ -50,7 +50,12 @@ class EnvelopeState:
 
         if self.wait:
             if self.ramp_total:
-                numerator = self.ramp_remainder + self.ramp_magnitude
+                # MGSDRV performs this addition in the Z80 A register.  The
+                # carry is discarded before the 8-by-8-bit division, which is
+                # observable for long ramps near count 255.
+                numerator = (
+                    self.ramp_remainder + self.ramp_magnitude
+                ) & 0xFF
                 quotient, self.ramp_remainder = divmod(
                     numerator, self.ramp_total
                 )
@@ -140,6 +145,15 @@ def simulate(data: bytes, ticks: int) -> list[Event]:
     for _ in range(ticks):
         state.tick()
     return state.events
+
+
+def automatic_volume_opcode(target: int, duration: int) -> bytes:
+    """Encode MGSC ``f=<n>`` as the MGSDRV 2n cc command."""
+    if not 0 <= target <= 15:
+        raise ValueError("target must be in 0..15")
+    if not 1 <= duration <= 255:
+        raise ValueError("duration must be in 1..255")
+    return bytes((0x20 | target, duration))
 
 
 def apply_common_attenuation(

@@ -18,6 +18,7 @@ void layoutEditorTopRightChrome(
     int host_width,
     juce::DrawableButton& settings,
     juce::Slider& master_volume,
+    juce::Label* master_volume_label = nullptr,
     juce::DrawableButton* immediate_audition = nullptr);
 
 void paintPageBackground(

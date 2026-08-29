@@ -13,6 +13,27 @@ namespace {
     return static_cast<std::uint8_t>(std::clamp(value, 0, 15));
 }
 
+// MGSDRV 3.20 OPLL `\`: add to F-Number, then keep it in the working
+// octave window used by the driver (YM2413 VGM of `f.e=3.\45.\-111`
+// on o5 c). 9-bit add without Block change lands in the wrong octave
+// for large deltas.
+constexpr int kOpllFnumOctaveLow = 0xAC;
+constexpr int kOpllFnumOctaveStep = 0xAD;
+constexpr int kOpllFnumOctaveHigh = 0x160;
+
+void applyOpllFrequencyDelta(int& f_number, int& block, int delta) noexcept {
+    f_number += delta;
+    while (f_number < kOpllFnumOctaveLow && block > 0) {
+        f_number += kOpllFnumOctaveStep;
+        --block;
+    }
+    while (f_number >= kOpllFnumOctaveHigh && block < 7) {
+        f_number -= kOpllFnumOctaveStep;
+        ++block;
+    }
+    f_number = std::clamp(f_number, 0, 0x01FF);
+}
+
 }  // namespace
 
 RegisterMapper::RegisterMapper() noexcept {
@@ -381,31 +402,19 @@ MapError RegisterMapper::mapOpll(
     case MeaningEventKind::FrequencyDelta: {
         const auto low_address = static_cast<std::uint8_t>(0x10 + channel);
         const auto high_address = static_cast<std::uint8_t>(0x20 + channel);
-        const auto current = static_cast<int>(
+        auto f_number = static_cast<int>(
             opll_mirror_[low_address]
             | ((opll_mirror_[high_address] & 0x01) << 8));
-        const auto f_number = std::clamp(
-            current + event.arg0,
-            0,
-            0x01FF);
+        auto block = static_cast<int>(
+            (opll_mirror_[high_address] >> 1) & 7);
+        applyOpllFrequencyDelta(f_number, block, event.arg0);
         const auto low = static_cast<std::uint8_t>(f_number & 0xFF);
         const auto high = static_cast<std::uint8_t>(
-            (opll_mirror_[high_address] & 0xFE)
+            (opll_mirror_[high_address] & 0x30)
+            | static_cast<std::uint8_t>(block << 1)
             | ((f_number >> 8) & 0x01));
+        // MGSDRV writes the key/block register before the F-number low byte.
         auto error = emit(
-            output,
-            tick,
-            ChipId::Opll,
-            0,
-            low_address,
-            low,
-            track,
-            WriteReason::Frequency);
-        if (error != MapError::None) {
-            return error;
-        }
-        opll_mirror_[low_address] = low;
-        error = emit(
             output,
             tick,
             ChipId::Opll,
@@ -414,8 +423,21 @@ MapError RegisterMapper::mapOpll(
             high,
             track,
             WriteReason::Frequency);
+        if (error != MapError::None) {
+            return error;
+        }
+        opll_mirror_[high_address] = high;
+        error = emit(
+            output,
+            tick,
+            ChipId::Opll,
+            0,
+            low_address,
+            low,
+            track,
+            WriteReason::Frequency);
         if (error == MapError::None) {
-            opll_mirror_[high_address] = high;
+            opll_mirror_[low_address] = low;
         }
         return error;
     }

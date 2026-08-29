@@ -8,6 +8,7 @@
 #include <functional>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -30,6 +31,7 @@
 #include "mgstc/engine/software_lfo.hpp"
 #include "mgstc/engine/pitch_sweep.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
+#include "mgstc/engine/mgs_composite_io.hpp"
 #include "mgstc/engine/emulator_sound_output.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/mamidi_memo_sound_output.hpp"
@@ -124,7 +126,9 @@ using mgstc::engine::applySccWaveformRange;
 using mgstc::engine::generateSccPreset;
 using mgstc::engine::formatMgsOpllDefinition;
 using mgstc::engine::formatMgsSccDefinition;
+using mgstc::engine::generateSccRandomPreset;
 using mgstc::engine::invertSccWaveform;
+using mgstc::engine::makeSccRandomPresetRecipe;
 using mgstc::engine::mergeSccWaveforms;
 using mgstc::engine::mirrorSccWaveform;
 using mgstc::engine::normalizeSccWaveform;
@@ -366,6 +370,173 @@ void testRampUsesIntegerRemainderDistribution() {
         }));
 }
 
+void testAutomaticVolumeOpcode() {
+    SequenceEnvelopeRuntime runtime({0x00, 0x2F, 0x04});
+    EventBuffer buffer(16);
+    REQUIRE_EQ(tick(runtime, buffer), std::vector<MeaningEvent>({
+        {0, MeaningEventKind::Volume, 0, 0},
+    }));
+    REQUIRE_EQ(tick(runtime, buffer), std::vector<MeaningEvent>({
+        {1, MeaningEventKind::Volume, 0, 0},
+    }));
+    REQUIRE_EQ(tick(runtime, buffer), std::vector<MeaningEvent>({
+        {2, MeaningEventKind::Volume, 3, 0},
+    }));
+}
+
+void testFToZeroOver100MatchesObservedDriverTicks() {
+    SequenceEnvelopeRuntime runtime({0x0F, 0x20, 100});
+    EventBuffer buffer(16);
+    std::vector<std::int32_t> actual;
+    for (int index = 0; index < 102; ++index) {
+        const auto events = tick(runtime, buffer);
+        REQUIRE_EQ(events.empty(), false);
+        actual.push_back(events.back().arg0);
+    }
+
+    std::vector<std::int32_t> expected;
+    const std::array<std::pair<int, int>, 16> runs{{
+        {15, 8}, {14, 7}, {13, 6}, {12, 7},
+        {11, 7}, {10, 6}, {9, 7}, {8, 7},
+        {7, 6}, {6, 7}, {5, 7}, {4, 6},
+        {3, 7}, {2, 7}, {1, 6}, {0, 1},
+    }};
+    for (const auto [volume, count] : runs) {
+        expected.insert(expected.end(), count, volume);
+    }
+    REQUIRE_EQ(actual, expected);
+}
+
+void testCount255RampUsesEightBitAccumulatorWrap() {
+    SequenceEnvelopeRuntime runtime({0x0C, 0x20, 0xFF});
+    EventBuffer buffer(16);
+    for (int index = 0; index < 257; ++index) {
+        const auto events = tick(runtime, buffer);
+        REQUIRE_EQ(events.empty(), false);
+        for (const auto& event : events) {
+            REQUIRE_EQ(event.kind, MeaningEventKind::Volume);
+            REQUIRE_EQ(event.arg0, 12);
+        }
+    }
+    REQUIRE_EQ(runtime.volume(), 12);
+}
+
+void testZeroCountRampConsumesItsExecutionTick() {
+    SequenceEnvelopeRuntime runtime({0x0C, 0x20, 0x00, 0x00});
+    EventBuffer buffer(16);
+    REQUIRE_EQ(tick(runtime, buffer), std::vector<MeaningEvent>({
+        {0, MeaningEventKind::Volume, 12, 0},
+    }));
+    REQUIRE_EQ(tick(runtime, buffer), std::vector<MeaningEvent>({
+        {1, MeaningEventKind::Volume, 12, 0},
+    }));
+    REQUIRE_EQ(tick(runtime, buffer), std::vector<MeaningEvent>({
+        {2, MeaningEventKind::Volume, 0, 0},
+    }));
+}
+
+void testObservedDuration50And5RampTicks() {
+    const auto expand = [](std::initializer_list<std::pair<int, int>> runs) {
+        std::vector<std::int32_t> values;
+        for (const auto [volume, count] : runs) {
+            values.insert(values.end(), count, volume);
+        }
+        return values;
+    };
+    const std::vector<std::pair<
+        std::vector<std::uint8_t>,
+        std::vector<std::int32_t>>> cases{
+        {
+            {0x0F, 0x20, 50},
+            expand({
+                {15, 5}, {14, 3}, {13, 3}, {12, 4},
+                {11, 3}, {10, 3}, {9, 4}, {8, 3},
+                {7, 3}, {6, 4}, {5, 3}, {4, 3},
+                {3, 4}, {2, 3}, {1, 3}, {0, 1},
+            }),
+        },
+        {
+            {0x0C, 0x20, 50},
+            expand({
+                {12, 6}, {11, 4}, {10, 4}, {9, 4},
+                {8, 4}, {7, 4}, {6, 5}, {5, 4},
+                {4, 4}, {3, 4}, {2, 4}, {1, 4}, {0, 1},
+            }),
+        },
+        {{0x0F, 0x20, 5}, {15, 15, 12, 9, 6, 3, 0}},
+        {{0x0C, 0x20, 5}, {12, 12, 10, 8, 5, 3, 0}},
+    };
+
+    for (const auto& [bytecode, expected] : cases) {
+        SequenceEnvelopeRuntime runtime(bytecode);
+        EventBuffer buffer(16);
+        std::vector<std::int32_t> actual;
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            const auto events = tick(runtime, buffer);
+            REQUIRE_EQ(events.empty(), false);
+            actual.push_back(events.back().arg0);
+        }
+        REQUIRE_EQ(actual, expected);
+    }
+}
+
+void testRampStepWidthsFollowEightBitRemainderPattern() {
+    const auto expand = [](std::initializer_list<std::pair<int, int>> runs) {
+        std::vector<std::int32_t> values;
+        for (const auto [volume, count] : runs) {
+            values.insert(values.end(), count, volume);
+        }
+        return values;
+    };
+    const auto collect = [](SequenceEnvelopeRuntime runtime, int ticks) {
+        EventBuffer buffer(16);
+        std::vector<std::int32_t> actual;
+        for (int index = 0; index < ticks; ++index) {
+            const auto events = tick(runtime, buffer);
+            REQUIRE_EQ(events.empty(), false);
+            actual.push_back(events.back().arg0);
+        }
+        return actual;
+    };
+
+    const auto rising = collect(SequenceEnvelopeRuntime({0x00, 0x2F, 50}), 52);
+    const auto falling = collect(SequenceEnvelopeRuntime({0x0F, 0x20, 50}), 52);
+    REQUIRE_EQ(
+        rising,
+        expand({
+            {0, 5}, {1, 3}, {2, 3}, {3, 4},
+            {4, 3}, {5, 3}, {6, 4}, {7, 3},
+            {8, 3}, {9, 4}, {10, 3}, {11, 3},
+            {12, 4}, {13, 3}, {14, 3}, {15, 1},
+        }));
+    for (std::size_t index = 0; index < rising.size(); ++index) {
+        REQUIRE_EQ(rising[index] + falling[index], 15);
+    }
+
+    REQUIRE_EQ(
+        collect(SequenceEnvelopeRuntime({0x03, 0x2F, 5}), 7),
+        (std::vector<std::int32_t>{3, 3, 5, 7, 10, 12, 15}));
+    REQUIRE_EQ(
+        collect(SequenceEnvelopeRuntime({0x00, 0x2C, 5}), 7),
+        (std::vector<std::int32_t>{0, 0, 2, 4, 7, 9, 12}));
+
+    const auto wrap_242 =
+        collect(SequenceEnvelopeRuntime({0x0F, 0x20, 242}), 244);
+    REQUIRE_EQ(wrap_242.back(), 2);
+    REQUIRE_EQ(
+        collect(SequenceEnvelopeRuntime({0x0F, 0x20, 0xFF}), 257).back(),
+        0);
+    REQUIRE_EQ(
+        collect(SequenceEnvelopeRuntime({0x0F, 0x20, 254}), 256).back(),
+        8);
+    const auto c254 =
+        collect(SequenceEnvelopeRuntime({0x0C, 0x20, 254}), 256);
+    REQUIRE_EQ(c254.size(), static_cast<std::size_t>(256));
+    for (const auto value : c254) {
+        REQUIRE_EQ(value, 12);
+    }
+}
+
 void testFrequencyDeltasAreSignedAndCumulativeEvents() {
     SequenceEnvelopeRuntime runtime({
         0x12, 0x03,
@@ -456,6 +627,218 @@ void testRateEnvelopeNativePhases() {
     REQUIRE_EQ(runtime.phase(), RatePhase::Release);
 }
 
+void testRateEnvelopeTestRateQuantizedKeyOff() {
+    RateEnvelopeRuntime runtime({
+        .attack_level = 0,
+        .attack_rate = 64,
+        .decay_rate = 32,
+        .sustain_level = 128,
+        .sustain_rate = 8,
+        .release_rate = 16,
+    });
+    const std::array<int, 8> on_volumes{4, 8, 12, 15, 13, 11, 9, 8};
+    for (const auto volume : on_volumes) {
+        REQUIRE_EQ(runtime.processTick().arg1, volume);
+    }
+    runtime.keyOff(true);
+    const std::array<int, 8> release_volumes{7, 6, 5, 4, 3, 2, 1, 0};
+    for (const auto volume : release_volumes) {
+        REQUIRE_EQ(runtime.processTick().arg1, volume);
+    }
+}
+
+void testTraceRateEnvelopePreviewKeyOff() {
+    // Keep sustain above 0 at the 1s preview key-off (SR=8 would hit 0 first).
+    const RateEnvelopeDefinition definition{
+        .attack_level = 0,
+        .attack_rate = 64,
+        .decay_rate = 32,
+        .sustain_level = 200,
+        .sustain_rate = 1,
+        .release_rate = 40,
+    };
+    const auto with_release =
+        mgstc::engine::traceRateEnvelope(definition, 15, true);
+    const auto hardware_key_off =
+        mgstc::engine::traceRateEnvelope(definition, 15, false);
+    REQUIRE_EQ(with_release.valid, true);
+    REQUIRE_EQ(hardware_key_off.valid, true);
+    REQUIRE_EQ(
+        mgstc::engine::RateEnvelopeTrace::kKeyOffSeconds * 2.0F,
+        mgstc::engine::RateEnvelopeTrace::kDurationSeconds);
+    const auto last = static_cast<float>(
+        mgstc::engine::RateEnvelopeTrace::kPointCount - 1);
+    auto index_at = [last](float seconds) {
+        return static_cast<std::size_t>(std::lround(
+            (seconds / mgstc::engine::RateEnvelopeTrace::kDurationSeconds)
+            * last));
+    };
+    const auto before = index_at(0.9F);
+    const auto after = index_at(1.5F);
+    REQUIRE_EQ(with_release.level[before] > 0.0F, true);
+    REQUIRE_EQ(
+        with_release.level[after] < hardware_key_off.level[after],
+        true);
+}
+
+void testRateEnvelopeHandleDragUpdatesCoupledParams() {
+    using namespace mgstc::engine;
+    RateEnvelopeDefinition definition{
+        .attack_level = 0,
+        .attack_rate = 64,
+        .decay_rate = 32,
+        .sustain_level = 128,
+        .sustain_rate = 0,
+        .release_rate = 16,
+    };
+    const auto layout = rateEnvelopeHandleLayout(definition, true);
+    REQUIRE_EQ(layout.handles[0].level, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(layout.handles[1].available, true);
+    REQUIRE_EQ(layout.handles[1].level, static_cast<std::uint8_t>(255));
+    REQUIRE_EQ(layout.handles[2].level, static_cast<std::uint8_t>(128));
+    REQUIRE_EQ(layout.handles[3].level, static_cast<std::uint8_t>(128));
+    REQUIRE_EQ(layout.handles[4].available, true);
+
+    const auto raised_start = applyRateEnvelopeHandleDrag(
+        definition,
+        RateEnvelopeHandleKind::AttackStart,
+        0.0F,
+        80,
+        true);
+    REQUIRE_EQ(raised_start.attack_level, static_cast<std::uint8_t>(80));
+    REQUIRE_EQ(raised_start.attack_rate, definition.attack_rate);
+
+    const auto slower_attack = applyRateEnvelopeHandleDrag(
+        definition,
+        RateEnvelopeHandleKind::AttackPeak,
+        0.2F,
+        255,
+        true);
+    REQUIRE_EQ(slower_attack.attack_rate < definition.attack_rate, true);
+    REQUIRE_EQ(slower_attack.attack_level, definition.attack_level);
+
+    const auto decay = applyRateEnvelopeHandleDrag(
+        definition,
+        RateEnvelopeHandleKind::DecayEnd,
+        0.25F,
+        180,
+        true);
+    REQUIRE_EQ(decay.sustain_level, static_cast<std::uint8_t>(180));
+    REQUIRE_EQ(decay.decay_rate > 0, true);
+
+    const auto sustain_drop = applyRateEnvelopeHandleDrag(
+        definition,
+        RateEnvelopeHandleKind::KeyOff,
+        1.0F,
+        40,
+        true);
+    REQUIRE_EQ(sustain_drop.sustain_rate > 0, true);
+    REQUIRE_EQ(sustain_drop.sustain_level, definition.sustain_level);
+
+    const auto slower_release = applyRateEnvelopeHandleDrag(
+        definition,
+        RateEnvelopeHandleKind::ReleaseEnd,
+        1.8F,
+        0,
+        true);
+    REQUIRE_EQ(slower_release.release_rate < definition.release_rate, true);
+    REQUIRE_EQ(slower_release.release_rate > 0, true);
+
+    const auto opll_layout = rateEnvelopeHandleLayout(definition, false);
+    REQUIRE_EQ(opll_layout.handles[4].available, false);
+}
+
+void testSeedDefaultLayerTimbreOpllViolinAndSccTriangle() {
+    using namespace mgstc::engine;
+    CompositeLayer opll;
+    opll.source = TimbreSource::Opll;
+    seedDefaultLayerTimbre(opll);
+    REQUIRE_EQ(opll.base_opll_rom.has_value(), true);
+    REQUIRE_EQ(*opll.base_opll_rom, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(opll.base_timbre.has_value(), false);
+
+    CompositeLayer scc;
+    scc.source = TimbreSource::Scc;
+    seedDefaultLayerTimbre(scc);
+    REQUIRE_EQ(scc.base_timbre.has_value(), true);
+    REQUIRE_EQ(scc.base_timbre->library_id, kSccTrianglePresetLibraryId);
+    REQUIRE_EQ(scc.base_timbre->name, std::string("Triangle"));
+    const auto expected = generateSccPreset(
+        SccWavePreset::Triangle, SccHarmonic::One);
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        REQUIRE_EQ(
+            scc.base_timbre->scc_waveform[index],
+            static_cast<std::uint8_t>(expected[index]));
+    }
+
+    CompositeLayer psg;
+    psg.source = TimbreSource::Psg;
+    seedDefaultLayerTimbre(psg);
+    REQUIRE_EQ(psg.base_timbre.has_value(), false);
+}
+
+void testRateEnvelopeMgscModeNoiseRoundTrip() {
+    using namespace mgstc::engine;
+    auto original = defaultCompositeTimbre();
+    auto& psg = original.layers[0];
+    psg.volume_envelope.kind = EnvelopeKind::Rate;
+    psg.name = "envelope name";
+    seedDefaultRateEnvelope(psg.volume_envelope.rate, TimbreSource::Psg);
+    psg.volume_envelope.rate.tone_mode = 3;
+    psg.volume_envelope.rate.noise = 17;
+    original.layers.resize(1);
+    auto scc = defaultCompositeTimbre().layers[1];
+    scc.volume_envelope.kind = EnvelopeKind::Rate;
+    scc.name = "SCC Ch.1";
+    scc.base_timbre = SavedTimbreReference{
+        .name = "SCC snapshot",
+        .source = TimbreSource::Scc,
+    };
+    seedDefaultRateEnvelope(scc.volume_envelope.rate, TimbreSource::Scc);
+    scc.volume_envelope.rate.tone_mode = 2;
+    scc.volume_envelope.rate.noise = 9;
+    const auto psg_def = formatMgsRateDefinition(psg, 0);
+    REQUIRE_EQ(psg_def.find("@r0 = { 3, 17, ") != std::string::npos, true);
+    REQUIRE_EQ(psg_def.find(" } ; envelope name") != std::string::npos, true);
+    const auto scc_def = formatMgsRateDefinition(scc, 1);
+    REQUIRE_EQ(scc_def.find("@r1 = { 0, 0, ") != std::string::npos, true);
+    REQUIRE_EQ(scc_def.find(" } ; SCC Ch.1") != std::string::npos, true);
+    const auto formatted = formatMgsComposite(original);
+    REQUIRE_EQ(formatted.valid(), true);
+    REQUIRE_EQ(formatted.source.find("@r0") != std::string::npos, true);
+    const auto parsed = parseMgsComposite(formatted.source);
+    REQUIRE_EQ(parsed.valid(), true);
+    REQUIRE_EQ(parsed.timbre.layers.size(), 1U);
+    REQUIRE_EQ(
+        parsed.timbre.layers[0].volume_envelope.kind, EnvelopeKind::Rate);
+    REQUIRE_EQ(parsed.timbre.layers[0].volume_envelope.rate.tone_mode, 3);
+    REQUIRE_EQ(parsed.timbre.layers[0].volume_envelope.rate.noise, 17);
+}
+
+void testCompositeRateEnvelopeFormat18RoundTrip() {
+    using namespace mgstc::engine;
+    auto composite = defaultCompositeTimbre();
+    composite.layers[0].volume_envelope.kind = EnvelopeKind::Rate;
+    seedDefaultRateEnvelope(
+        composite.layers[0].volume_envelope.rate, TimbreSource::Psg);
+    composite.layers[0].volume_envelope.rate.tone_mode = 2;
+    composite.layers[0].volume_envelope.rate.noise = 11;
+    CompositeTimbreLibrary library;
+    const auto id = library.add(composite, 1);
+    std::string error;
+    auto loaded = CompositeTimbreLibrary::deserialize(
+        library.serialize(), &error);
+    REQUIRE_EQ(loaded.has_value(), true);
+    REQUIRE_EQ(error.empty(), true);
+    const auto* found = loaded->find(id);
+    REQUIRE_EQ(found != nullptr, true);
+    REQUIRE_EQ(found->timbre.format_version, CompositeTimbre::kFormatVersion);
+    REQUIRE_EQ(
+        found->timbre.layers[0].volume_envelope.kind, EnvelopeKind::Rate);
+    REQUIRE_EQ(found->timbre.layers[0].volume_envelope.rate.tone_mode, 2);
+    REQUIRE_EQ(found->timbre.layers[0].volume_envelope.rate.noise, 11);
+}
+
 void testOpllKeyOffDoesNotStartSoftwareRelease() {
     RateEnvelopeRuntime runtime({
         .attack_level = 255,
@@ -478,6 +861,10 @@ void testVolumeCombination() {
     REQUIRE_EQ(sequenceOutputVolume(15, 15), 15);
     REQUIRE_EQ(sequenceOutputVolume(12, 10), 7);
     REQUIRE_EQ(sequenceOutputVolume(4, 8), 0);
+    REQUIRE_EQ(sequenceOutputVolume(15, 13), 13);
+    REQUIRE_EQ(sequenceOutputVolume(12, 13), 10);
+    REQUIRE_EQ(sequenceOutputVolume(15, 3), 3);
+    REQUIRE_EQ(sequenceOutputVolume(12, 3), 0);
     REQUIRE_EQ(sequenceOutputVolume(15, 12, 2, 1), 9);
 }
 
@@ -1585,6 +1972,96 @@ void testSccMergeFindsCircularPhaseAndPreservesLevel() {
     REQUIRE_EQ(result.waveform, current);
 }
 
+void testSccRandomPresetRecipesAreDeterministicAndCoverOptions() {
+    const auto first = makeSccRandomPresetRecipe(0x12345678U);
+    const auto second = makeSccRandomPresetRecipe(0x12345678U);
+    REQUIRE_EQ(first, second);
+    REQUIRE_EQ(first.stage_count >= 2, true);
+    REQUIRE_EQ(first.stage_count <= 4, true);
+    REQUIRE_EQ(
+        generateSccRandomPreset(first),
+        generateSccRandomPreset(second));
+
+    std::array<bool, 6> saw_preset{};
+    std::array<bool, 5> saw_harmonic{};
+    std::array<bool, 3> saw_range{};
+    std::array<bool, 5> saw_stage_count{};
+    std::array<bool, 2> saw_horizontal{};
+    std::array<bool, 2> saw_vertical{};
+    std::array<bool, 2> saw_auto_phase{};
+    std::array<bool, 2> saw_polarity{};
+    std::array<bool, 2> saw_preserve_volume{};
+    for (std::uint32_t seed = 0; seed < 4096; ++seed) {
+        const auto recipe = makeSccRandomPresetRecipe(seed);
+        REQUIRE_EQ(recipe.stage_count >= 2, true);
+        REQUIRE_EQ(recipe.stage_count <= 4, true);
+        saw_stage_count[recipe.stage_count] = true;
+        saw_range[static_cast<std::size_t>(recipe.apply_range)] = true;
+        std::array<bool, 6> used_in_recipe{};
+        for (std::size_t index = 0; index < recipe.stage_count; ++index) {
+            const auto& stage = recipe.stages[index];
+            const auto preset = static_cast<std::size_t>(stage.preset);
+            const auto harmonic = static_cast<std::size_t>(stage.harmonic);
+            REQUIRE_EQ(preset < saw_preset.size(), true);
+            REQUIRE_EQ(harmonic < saw_harmonic.size(), true);
+            REQUIRE_EQ(used_in_recipe[preset], false);
+            REQUIRE_EQ(stage.merge.amount >= 0.20, true);
+            REQUIRE_EQ(stage.merge.amount <= 0.80, true);
+            used_in_recipe[preset] = true;
+            saw_preset[preset] = true;
+            saw_harmonic[harmonic] = true;
+            saw_horizontal[stage.flip_horizontal ? 1U : 0U] = true;
+            saw_vertical[stage.flip_vertical ? 1U : 0U] = true;
+            saw_auto_phase[stage.merge.auto_phase ? 1U : 0U] = true;
+            saw_polarity[
+                stage.merge.allow_polarity_inversion ? 1U : 0U] = true;
+            saw_preserve_volume[
+                stage.merge.preserve_volume ? 1U : 0U] = true;
+        }
+    }
+    REQUIRE_EQ(
+        std::all_of(saw_preset.begin(), saw_preset.end(), [](bool value) {
+            return value;
+        }),
+        true);
+    REQUIRE_EQ(
+        std::all_of(saw_harmonic.begin(), saw_harmonic.end(), [](bool value) {
+            return value;
+        }),
+        true);
+    REQUIRE_EQ(saw_stage_count[2] && saw_stage_count[3] && saw_stage_count[4], true);
+    REQUIRE_EQ(
+        std::all_of(saw_range.begin(), saw_range.end(), [](bool value) {
+            return value;
+        }),
+        true);
+    for (const auto& values :
+         {saw_horizontal,
+          saw_vertical,
+          saw_auto_phase,
+          saw_polarity,
+          saw_preserve_volume}) {
+        REQUIRE_EQ(values[0] && values[1], true);
+    }
+
+    SccWaveform current{};
+    current.fill(static_cast<std::int8_t>(23));
+    auto left_recipe = first;
+    left_recipe.apply_range = SccApplyRange::LeftHalf;
+    const auto left = mgstc::engine::applySccRandomPreset(
+        current, left_recipe);
+    REQUIRE_EQ(
+        std::equal(left.begin() + 16, left.end(), current.begin() + 16),
+        true);
+    auto right_recipe = first;
+    right_recipe.apply_range = SccApplyRange::RightHalf;
+    const auto right = mgstc::engine::applySccRandomPreset(
+        current, right_recipe);
+    REQUIRE_EQ(
+        std::equal(right.begin(), right.begin() + 16, current.begin()),
+        true);
+}
+
 void testSccWaveformUtilityTransforms() {
     SccWaveform waveform{};
     waveform[0] = static_cast<std::int8_t>(-128);
@@ -1825,6 +2302,58 @@ void testSccFrequencyDeltaAndIgnoredY() {
     REQUIRE_EQ(output.writes()[0].port, static_cast<std::uint8_t>(1));
     REQUIRE_EQ(output.writes()[0].value, static_cast<std::uint8_t>(0xA8));
     REQUIRE_EQ(output.writes()[1].value, static_cast<std::uint8_t>(0x01));
+}
+
+void testOpllFrequencyDeltaKeepsMgsdrvOctaveWindow() {
+    RegisterMapper mapper;
+    RegisterWriteBuffer output(64);
+    REQUIRE_EQ(
+        mapper.writeOpllPitch(8, {0x0AC, 4}, true, 0, output, false),
+        MapError::None);
+
+    const auto read_pitch = [](const RegisterWriteBuffer& writes) {
+        int low = -1;
+        int high = -1;
+        for (const auto& write : writes.writes()) {
+            if (write.chip != ChipId::Opll) {
+                continue;
+            }
+            if (write.address == 0x10) {
+                low = write.value;
+            }
+            if (write.address == 0x20) {
+                high = write.value;
+            }
+        }
+        return std::pair<int, int>{
+            low | ((high & 1) << 8),
+            (high >> 1) & 7};
+    };
+    REQUIRE_EQ(read_pitch(output), (std::pair<int, int>{0x0AC, 4}));
+
+    constexpr std::array<int, 8> deltas{
+        45, -111, 80, -25, -28, 38, -21, -74};
+    constexpr std::array<std::pair<int, int>, 8> expected{{
+        {0x0D9, 4},
+        {0x117, 3},
+        {0x0BA, 4},
+        {0x14E, 3},
+        {0x132, 3},
+        {0x158, 3},
+        {0x143, 3},
+        {0x0F9, 3},
+    }};
+    for (std::size_t index = 0; index < deltas.size(); ++index) {
+        output.clear();
+        REQUIRE_EQ(
+            mapper.mapMeaningEvent(
+                8,
+                {0, MeaningEventKind::FrequencyDelta, deltas[index], 0},
+                0,
+                output),
+            MapError::None);
+        REQUIRE_EQ(read_pitch(output), expected[index]);
+    }
 }
 
 void testRegisterWriteBufferPreservesDuplicatesAndStopsAtCapacity() {
@@ -3282,6 +3811,118 @@ void testDefaultCompositeTimbreHasThreeAudibleSources() {
     REQUIRE_EQ(validation.opll_channels, 1);
 }
 
+void testMgsCompositeSourceRoundTrip() {
+    using namespace mgstc::engine;
+
+    auto original = defaultCompositeTimbre();
+    original.name = "MGSC composite";
+    original.playback_tempo = 180;
+
+    auto& scc = original.layers[1];
+    scc.base_timbre = SavedTimbreReference{
+        .library_id = 101,
+        .revision = 3,
+        .name = "SCC snapshot",
+        .source = TimbreSource::Scc,
+        .number_mode = TimbreNumberMode::Manual,
+        .manual_number = 15,
+        .scc_waveform = [] {
+            std::array<std::uint8_t, 32> bytes{};
+            const auto waveform =
+                generateSccPreset(SccWavePreset::Triangle, SccHarmonic::Two);
+            std::transform(
+                waveform.begin(),
+                waveform.end(),
+                bytes.begin(),
+                [](const auto sample) {
+                    return static_cast<std::uint8_t>(sample);
+                });
+            return bytes;
+        }(),
+    };
+    scc.relative_semitones = -5;
+    scc.detune = 2;
+    scc.micro_detune = -12;
+    scc.start_delay_form = StartDelayForm::NoteLength;
+    scc.start_delay_value = 8;
+    scc.envelope_timeline = {
+        .length_counts = 8,
+        .loop_start_count = 2,
+        .loop_end_count = 6,
+    };
+    scc.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {EnvelopeEventKind::Volume, 8, 0, 4},
+    };
+    scc.pitch_envelope.events = {
+        {EnvelopeEventKind::Pitch, -2, 0, 2, 0,
+         TimbrePick::Library, true},
+    };
+    scc.timbre_automation = {
+        {EnvelopeEventKind::Timbre, 15, 0, 3, 101},
+    };
+
+    auto& opll = original.layers[2];
+    opll.base_timbre = SavedTimbreReference{
+        .library_id = 202,
+        .revision = 2,
+        .name = "OPLL snapshot",
+        .source = TimbreSource::Opll,
+        .number_mode = TimbreNumberMode::Manual,
+        .manual_number = 16,
+        .opll_registers = encodeOpllPatch(defaultOpllPatch()),
+    };
+    opll.opll_sustain = true;
+    opll.software_lfo = {
+        .enabled = true,
+        .delay = 3,
+        .depth = 4,
+        .speed = 5,
+        .roughness = -2,
+        .extra_roughness = 0,
+    };
+
+    const auto formatted = formatMgsComposite(original);
+    REQUIRE_EQ(formatted.valid(), true);
+    REQUIRE_EQ(formatted.source.find("; #opll_mode 0") != std::string::npos, true);
+    REQUIRE_EQ(formatted.source.find("#opll_mode 9") == std::string::npos, true);
+    REQUIRE_EQ(formatted.source.find("; #tempo 180") != std::string::npos, true);
+    REQUIRE_EQ(formatted.source.find("#title") == std::string::npos, true);
+    REQUIRE_EQ(formatted.source.find("@s15") != std::string::npos, true);
+    REQUIRE_EQ(formatted.source.find("@v16") != std::string::npos, true);
+    REQUIRE_EQ(formatted.source.find("@e1") != std::string::npos, true);
+
+    const auto parsed = parseMgsComposite(formatted.source);
+    REQUIRE_EQ(parsed.valid(), true);
+    REQUIRE_EQ(parsed.timbre.name, original.name);
+    REQUIRE_EQ(parsed.timbre.playback_tempo, 180);
+    REQUIRE_EQ(parsed.timbre.layers.size(), 3U);
+    REQUIRE_EQ(
+        parsed.timbre.layers[1].base_timbre->scc_waveform,
+        scc.base_timbre->scc_waveform);
+    REQUIRE_EQ(
+        parsed.timbre.layers[2].base_timbre->opll_registers,
+        opll.base_timbre->opll_registers);
+    REQUIRE_EQ(parsed.timbre.layers[1].relative_semitones, -5);
+    REQUIRE_EQ(parsed.timbre.layers[1].detune, 2);
+    REQUIRE_EQ(parsed.timbre.layers[1].micro_detune, -12);
+    REQUIRE_EQ(
+        parsed.timbre.layers[1].start_delay_form,
+        StartDelayForm::NoteLength);
+    REQUIRE_EQ(parsed.timbre.layers[1].start_delay_value, 8U);
+    REQUIRE_EQ(
+        parsed.timbre.layers[1].envelope_timeline,
+        scc.envelope_timeline);
+    REQUIRE_EQ(
+        parsed.timbre.layers[1].pitch_envelope.events[0].after_loop_start,
+        true);
+    REQUIRE_EQ(
+        parsed.timbre.layers[1].timbre_automation[0].target_library_id,
+        parsed.timbre.layers[1].base_timbre->library_id);
+    REQUIRE_EQ(parsed.timbre.layers[2].opll_sustain, true);
+    REQUIRE_EQ(parsed.timbre.layers[2].software_lfo, opll.software_lfo);
+}
+
 void testCompositeLayerRemovalReusesFreedChannel() {
     using namespace mgstc::engine;
 
@@ -3313,6 +3954,43 @@ void testCompositeLayerRemovalReusesFreedChannel() {
     REQUIRE_EQ(
         firstAvailableChannel(timbre, TimbreSource::Psg).has_value(),
         false);
+}
+
+void testCompositeLayerDuplicateUsesLowestFreeSameSourceChannel() {
+    using namespace mgstc::engine;
+
+    auto timbre = defaultCompositeTimbre();
+    timbre.layers[1].volume_envelope.events.front().value = 9;
+    timbre.layers[1].relative_semitones = 12;
+
+    const auto copied = duplicateCompositeLayer(timbre, 1);
+    REQUIRE_EQ(copied.has_value(), true);
+    REQUIRE_EQ(*copied, 3U);
+    REQUIRE_EQ(timbre.layers.size(), 4U);
+    REQUIRE_EQ(timbre.layers[3].source, TimbreSource::Scc);
+    REQUIRE_EQ(timbre.layers[3].channel, std::uint8_t{1});
+    REQUIRE_EQ(timbre.layers[3].name, std::string("SCC Ch.2"));
+    REQUIRE_EQ(timbre.layers[3].envelope_number, std::uint8_t{3});
+    REQUIRE_EQ(timbre.layers[3].relative_semitones, std::int8_t{12});
+    REQUIRE_EQ(timbre.layers[3].volume_envelope.events.front().value, 9);
+    REQUIRE_EQ(timbre.layers[1].channel, std::uint8_t{0});
+
+    REQUIRE_EQ(duplicateCompositeLayer(timbre, 99).has_value(), false);
+
+    auto second_psg = timbre.layers[0];
+    second_psg.channel = 1;
+    timbre.layers.push_back(second_psg);
+    auto third_psg = second_psg;
+    third_psg.channel = 2;
+    timbre.layers.push_back(third_psg);
+    REQUIRE_EQ(duplicateCompositeLayer(timbre, 0).has_value(), false);
+
+    timbre.layers[2].opll_tl_auto.mode = OpllRegisterAutoMode::Rise;
+    const auto opll_copy = duplicateCompositeLayer(timbre, 2);
+    REQUIRE_EQ(opll_copy.has_value(), true);
+    REQUIRE_EQ(timbre.layers[*opll_copy].source, TimbreSource::Opll);
+    REQUIRE_EQ(timbre.layers[*opll_copy].opll_tl_auto.active(), false);
+    REQUIRE_EQ(timbre.layers[2].opll_tl_auto.active(), true);
 }
 
 void testEnvelopeTimelineInspectorRangeNormalization() {
@@ -3803,7 +4481,7 @@ void testCompositeEnvelopeFormatsOneSharedMgscLoop() {
         std::string(",,f:4.@17.\\-3.f:6.8"));
     REQUIRE_EQ(
         linear.definition,
-        std::string("@e3 = { ,,f:4.@17.\\-3.f:6.8 }\r\n"));
+        std::string("@e3 = { ,,f:4.@17.\\-3.f:6.8 } ; (SCC Ch.1)\r\n"));
 
     layer.envelope_timeline = {
         .length_counts = 8,
@@ -3882,7 +4560,7 @@ void testCompositeEnvelopeFormatsOneSharedMgscLoop() {
     REQUIRE_EQ(anchored.body.find("@5") > open, true);
     REQUIRE_EQ(anchored.body.find("\\2") > open, true);
 
-    const auto too_long = formatMgsCompositeEnvelope(layer, 4, 8);
+    const auto too_long = formatMgsCompositeEnvelope(layer, 4, 1);
     REQUIRE_EQ(
         too_long.hasIssue(
             MgsEnvelopeIssue::DefinitionLengthExceeded),
@@ -3902,21 +4580,371 @@ void testCompositeEnvelopeFormatsOneSharedMgscLoop() {
     layer.pitch_envelope.events.clear();
     layer.timbre_automation.clear();
     layer.envelope_timeline.length_counts = 1;
-    const auto fit = maxEnvelopeLengthFittingBodyLimit(layer, 255);
+    const auto fit = maxEnvelopeLengthFittingBodyLimit(layer);
     REQUIRE_EQ(fit >= 1, true);
     layer.envelope_timeline.length_counts = fit;
-    const auto at_fit = formatMgsCompositeEnvelope(layer, 4, 255);
+    const auto at_fit = formatMgsCompositeEnvelope(layer, 4);
     REQUIRE_EQ(at_fit.valid(), true);
-    REQUIRE_EQ(at_fit.body.size() <= 255, true);
-    if (fit < EnvelopeTimeline::kMaximumLengthCounts
-        && fit < kMgscEnvelopeUiLengthCap) {
-        layer.envelope_timeline.length_counts = fit + 1;
-        const auto over = formatMgsCompositeEnvelope(layer, 4, 255);
-        REQUIRE_EQ(
-            over.hasIssue(MgsEnvelopeIssue::DefinitionLengthExceeded),
-            true);
-    }
+    REQUIRE_EQ(
+        at_fit.compiled_bytes <= kMgscEnvelopeCompiledByteLimit, true);
     REQUIRE_EQ(fit <= kMgscEnvelopeUiLengthCap, true);
+}
+
+void testCompositeEnvelopeMgscOutputRules() {
+    using namespace mgstc::engine;
+
+    auto layer = defaultCompositeTimbre().layers.front();
+    layer.volume = 15;
+    layer.relative_semitones = 12;
+    layer.envelope_timeline = {.length_counts = 8};
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {EnvelopeEventKind::Volume, 15, 0, 1},
+        {EnvelopeEventKind::Volume, 14, 0, 2},
+        {EnvelopeEventKind::Volume, 13, 0, 3},
+        {EnvelopeEventKind::Volume, 13, 0, 4},
+        {EnvelopeEventKind::Volume, 13, 0, 5},
+        {EnvelopeEventKind::Volume, 13, 0, 6},
+        {EnvelopeEventKind::Volume, 13, 0, 7},
+    };
+    const auto coalesced = formatMgsCompositeEnvelope(
+        layer, 0, kMgscEnvelopeCompiledByteLimit, nullptr, nullptr, "Lead");
+    REQUIRE_EQ(coalesced.valid(), true);
+    REQUIRE_EQ(coalesced.body, std::string(",,f:2.e.d"));
+    REQUIRE_EQ(
+        coalesced.definition,
+        std::string(
+            "@e0 = { ,,f:2.e.d } ; Lead (PSG Ch.1) ※12度高い音階で演奏させる\r\n"));
+
+    layer.pitch_envelope.events = {
+        {EnvelopeEventKind::Pitch, 1, 0, 4},
+    };
+    const auto mid_split = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(mid_split.valid(), true);
+    REQUIRE_EQ(mid_split.body, std::string(",,f:2.e.d.\\1.d"));
+
+    layer.pitch_envelope.events.clear();
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {EnvelopeEventKind::Volume, 12, 0, 2},
+    };
+    layer.envelope_timeline = {
+        .length_counts = 8,
+        .loop_start_count = 2,
+        .loop_end_count = 6,
+    };
+    const auto looped = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(looped.valid(), true);
+    REQUIRE_EQ(looped.body.find(":4.]") != std::string::npos
+            || looped.body.find("c:4]") != std::string::npos,
+        true);
+    REQUIRE_EQ(looped.body.back() == ']', true);
+
+    layer.envelope_timeline = {.length_counts = 1};
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+    };
+    layer.pitch_envelope.events.clear();
+    for (std::uint32_t count = 0; count < 70; ++count) {
+        layer.pitch_envelope.events.push_back(
+            {EnvelopeEventKind::Pitch, 1, 0, count});
+    }
+    layer.envelope_timeline.length_counts = 70;
+    const auto wrapped = formatMgsCompositeEnvelope(
+        layer, 0, kMgscEnvelopeCompiledByteLimit, nullptr, nullptr, "Wrap");
+    REQUIRE_EQ(wrapped.valid(), true);
+    REQUIRE_EQ(wrapped.definition.find("\r\n\t") != std::string::npos, true);
+    REQUIRE_EQ(
+        wrapped.definition.find("@e0 = { ,, ; Wrap (PSG Ch.1)") == 0, true);
+    REQUIRE_EQ(wrapped.definition.find(" } ; ") == std::string::npos, true);
+    std::size_t line_begin = 0;
+    while (line_begin < wrapped.definition.size()) {
+        auto line_end = wrapped.definition.find("\r\n", line_begin);
+        if (line_end == std::string::npos) {
+            line_end = wrapped.definition.size();
+        }
+        REQUIRE_EQ(
+            line_end - line_begin <= kMgscEnvelopeSourceLineLimit, true);
+        if (line_end == wrapped.definition.size()) {
+            break;
+        }
+        line_begin = line_end + 2;
+    }
+    const auto parsed_wrap = parseMgsComposite(
+        "1 v15 @e0\n" + wrapped.definition);
+    REQUIRE_EQ(parsed_wrap.valid(), true);
+
+    layer.envelope_timeline = {.length_counts = 200};
+    layer.pitch_envelope.events.clear();
+    layer.volume_envelope.events.clear();
+    for (std::uint32_t count = 0; count < 130; ++count) {
+        layer.volume_envelope.events.push_back(
+            {EnvelopeEventKind::Volume,
+             (count % 2 == 0) ? 15 : 14,
+             0,
+             count});
+        layer.pitch_envelope.events.push_back(
+            {EnvelopeEventKind::Pitch, 1, 0, count});
+    }
+    const auto over_bytes = formatMgsCompositeEnvelope(layer, 0, 256);
+    REQUIRE_EQ(
+        over_bytes.hasIssue(MgsEnvelopeIssue::DefinitionLengthExceeded),
+        true);
+    REQUIRE_EQ(over_bytes.compiled_bytes > kMgscEnvelopeCompiledByteLimit, true);
+}
+
+void testCompositeAutomaticVolumeRoundTripsThroughMgsc() {
+    using namespace mgstc::engine;
+
+    auto layer = defaultCompositeTimbre().layers.front();
+    layer.volume = 15;
+    layer.envelope_timeline = {.length_counts = 20};
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 8,
+         .count = 10,
+         .automatic = true},
+    };
+    const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(formatted.valid(), true);
+    REQUIRE_EQ(formatted.body, std::string(",,f.8=10.8"));
+
+    const auto parsed = parseMgsComposite(
+        "1 v15 @e0\n@e0 = { ,,f.8=10.8:10 }\n");
+    REQUIRE_EQ(parsed.valid(), true);
+    REQUIRE_EQ(parsed.timbre.layers.size(), 1U);
+    const auto& events =
+        parsed.timbre.layers.front().volume_envelope.events;
+    REQUIRE_EQ(events.size(), 2U);
+    REQUIRE_EQ(events.front().count, 0U);
+    REQUIRE_EQ(events.front().value, 15);
+    REQUIRE_EQ(events.front().automatic, false);
+    REQUIRE_EQ(events.back().count, 10U);
+    REQUIRE_EQ(events.back().value, 8);
+    REQUIRE_EQ(events.back().automatic, true);
+
+    const auto parsed_bare = parseMgsComposite(
+        "1 v15 @e0\n@e0 = { ,,8=10.8:10 }\n");
+    REQUIRE_EQ(parsed_bare.valid(), true);
+    const auto& bare_events =
+        parsed_bare.timbre.layers.front().volume_envelope.events;
+    REQUIRE_EQ(bare_events.size(), 1U);
+    REQUIRE_EQ(bare_events.front().count, 10U);
+    REQUIRE_EQ(bare_events.front().value, 8);
+    REQUIRE_EQ(bare_events.front().automatic, true);
+
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 2},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 0,
+         .count = 6,
+         .automatic = true},
+    };
+    layer.envelope_timeline = {.length_counts = 8};
+    const auto held = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(held.valid(), true);
+    REQUIRE_EQ(held.body, std::string(",,f:2.0=4.0"));
+
+    const auto parsed_wrap = parseMgsComposite(
+        "1 v15 @e0\n@e0 = { ,,c.0=254 }\n");
+    REQUIRE_EQ(parsed_wrap.valid(), true);
+    const auto& wrap_events =
+        parsed_wrap.timbre.layers.front().volume_envelope.events;
+    REQUIRE_EQ(wrap_events.size(), 2U);
+    REQUIRE_EQ(wrap_events.front().count, 0U);
+    REQUIRE_EQ(wrap_events.front().value, 12);
+    REQUIRE_EQ(wrap_events.front().automatic, false);
+    REQUIRE_EQ(wrap_events.back().count, 254U);
+    REQUIRE_EQ(wrap_events.back().value, 0);
+    REQUIRE_EQ(wrap_events.back().automatic, true);
+
+    // Consecutive automatic targets keep emitting `=` (not a hold of the
+    // first target). Origin volume is not re-emitted between ramps.
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 8,
+         .count = 10,
+         .automatic = true},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 0,
+         .count = 20,
+         .automatic = true},
+    };
+    layer.envelope_timeline = {.length_counts = 24};
+    layer.pitch_envelope.events.clear();
+    const auto chained = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(chained.valid(), true);
+    REQUIRE_EQ(chained.body, std::string(",,f.8=10.0=10.0"));
+
+    // Zero-time commands inside an automatic span split the MGSC `=`
+    // output at interpolated volumes. After the command, continue with
+    // `target=<n>` only (a 1-count origin would add an extra step).
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 0,
+         .count = 10,
+         .automatic = true},
+    };
+    layer.pitch_envelope.events = {
+        {.kind = EnvelopeEventKind::Pitch, .value = 20, .count = 5},
+    };
+    layer.envelope_timeline = {.length_counts = 16};
+    const auto split = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(split.valid(), true);
+    REQUIRE_EQ(split.body, std::string(",,f.8=5.\\20.0=5.0"));
+    REQUIRE_EQ(layer.volume_envelope.events.size(), 2U);
+    REQUIRE_EQ(layer.volume_envelope.events.back().automatic, true);
+    REQUIRE_EQ(layer.volume_envelope.events.back().count, 10U);
+
+    const auto parsed_split = parseMgsComposite(
+        "1 v15 @e0\n@e0 = { ,,f.8=5.\\20.0=5.0:6 }\n");
+    REQUIRE_EQ(parsed_split.valid(), true);
+
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 0,
+         .count = 10,
+         .automatic = true},
+    };
+    layer.pitch_envelope.events = {
+        {.kind = EnvelopeEventKind::Pitch, .value = 20, .count = 3},
+        {.kind = EnvelopeEventKind::Pitch, .value = 10, .count = 7},
+    };
+    layer.envelope_timeline = {.length_counts = 16};
+    const auto two_cmds = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(two_cmds.valid(), true);
+    REQUIRE_EQ(two_cmds.body, std::string(",,f.b=3.\\20.5=4.\\10.0=3.0"));
+
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 8,
+         .count = 10,
+         .automatic = true},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 0,
+         .count = 20,
+         .automatic = true},
+    };
+    layer.pitch_envelope.events = {
+        {.kind = EnvelopeEventKind::Pitch, .value = 20, .count = 15},
+    };
+    layer.envelope_timeline = {.length_counts = 24};
+    const auto second_span = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(second_span.valid(), true);
+    REQUIRE_EQ(
+        second_span.body, std::string(",,f.8=10.4=5.\\20.0=5.0"));
+
+    layer.pitch_envelope.events = {
+        {.kind = EnvelopeEventKind::Pitch, .value = 20, .count = 5},
+    };
+    const auto first_span_cmd = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(first_span_cmd.valid(), true);
+    REQUIRE_EQ(
+        first_span_cmd.body, std::string(",,f.c=5.\\20.8=5.0=10.0"));
+
+    // Command 1 count after origin: emit a 1-count letter, not `=1`,
+    // and do not insert a junction origin before the next `=`.
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 3,
+         .count = 5,
+         .automatic = true},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 0,
+         .count = 15,
+         .automatic = true},
+    };
+    layer.pitch_envelope.events = {
+        {.kind = EnvelopeEventKind::Pitch, .value = 20, .count = 1},
+        {.kind = EnvelopeEventKind::Pitch, .value = 10, .count = 3},
+    };
+    layer.envelope_timeline = {.length_counts = 20};
+    const auto near_origin = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(near_origin.valid(), true);
+    REQUIRE_EQ(
+        near_origin.body, std::string(",,f.d.\\20.8=2.\\10.3=2.0=10.0"));
+}
+
+void testPreciseAutomaticKeepsUnsplitRampVolumes() {
+    using namespace mgstc::engine;
+
+    const auto unsplit = sampleAutomaticRampVolumes(15, 0, 10, true);
+    REQUIRE_EQ(unsplit.size(), 10U);
+    std::vector<std::uint8_t> letters;
+    letters.reserve(unsplit.size() + 2);
+    for (std::size_t i = 0; i < unsplit.size(); ++i) {
+        if (i == 5) {
+            letters.push_back(0x12);
+            letters.push_back(20);
+        }
+        letters.push_back(static_cast<std::uint8_t>(unsplit[i] & 0x0F));
+    }
+    const auto with_command =
+        sampleSequenceEnvelopeVolumes(letters, unsplit.size());
+    REQUIRE_EQ(with_command, unsplit);
+
+    auto layer = defaultCompositeTimbre().layers.front();
+    layer.volume = 15;
+    layer.envelope_timeline = {.length_counts = 16};
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 0,
+         .count = 10,
+         .automatic = true,
+         .precise = true},
+    };
+    layer.pitch_envelope.events = {
+        {.kind = EnvelopeEventKind::Pitch, .value = 20, .count = 5},
+    };
+    const auto conventional = formatMgsCompositeEnvelope(
+        [&layer]() {
+            auto copy = layer;
+            copy.volume_envelope.events.back().precise = false;
+            return copy;
+        }(),
+        0);
+    REQUIRE_EQ(conventional.valid(), true);
+    REQUIRE_EQ(conventional.body, std::string(",,f.8=5.\\20.0=5.0"));
+
+    const auto precise = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(precise.valid(), true);
+    REQUIRE_EQ(precise.body.find('=') == std::string::npos, true);
+    REQUIRE_EQ(precise.body.find("\\20") != std::string::npos, true);
+    REQUIRE_EQ(precise.body == conventional.body, false);
+    REQUIRE_EQ(layer.volume_envelope.events.size(), 2U);
+    REQUIRE_EQ(layer.volume_envelope.events.back().precise, true);
+}
+
+void testCompositeAutomaticVolumeRejectsMgscCount240() {
+    using namespace mgstc::engine;
+
+    auto layer = defaultCompositeTimbre().layers.front();
+    layer.volume = 15;
+    layer.envelope_timeline = {.length_counts = 250};
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume,
+         .value = 0,
+         .count = 240,
+         .automatic = true},
+    };
+    const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(formatted.valid(), false);
+    REQUIRE_EQ(
+        formatted.hasIssue(MgsEnvelopeIssue::InvalidAutomaticVolumeDuration),
+        true);
+
+    const auto parsed = parseMgsComposite(
+        "1 v15 @e0\n@e0 = { ,,f.0=240 }\n");
+    REQUIRE_EQ(parsed.valid(), false);
 }
 
 void testCompositeSoloPitchAndChannelValidation() {
@@ -4318,6 +5346,15 @@ void testCompositeTimbreLibraryRoundTripAndRevision() {
         static_cast<std::uint8_t>(22);
     composite.layers[1].relative_semitones = -12;
     composite.layers[1].detune = -37;
+    composite.layers[1].volume_envelope.events = {
+        {
+            .kind = EnvelopeEventKind::Volume,
+            .value = 8,
+            .count = 10,
+            .automatic = true,
+            .precise = true,
+        },
+    };
     composite.layers[1].pitch_envelope.events = {
         {
             .kind = EnvelopeEventKind::Pitch,
@@ -4532,10 +5569,25 @@ int main(int argc, char** argv) {
         {"FourCountHoldsCompat", testFourCountHoldsCompat},
         {"PatchAndRegisterWriteAreZeroTime", testPatchAndRegisterWriteAreZeroTime},
         {"RampUsesIntegerRemainderDistribution", testRampUsesIntegerRemainderDistribution},
+        {"AutomaticVolumeOpcode", testAutomaticVolumeOpcode},
+        {"FToZeroOver100MatchesObservedDriverTicks", testFToZeroOver100MatchesObservedDriverTicks},
+        {"Count255RampUsesEightBitAccumulatorWrap", testCount255RampUsesEightBitAccumulatorWrap},
+        {"ZeroCountRampConsumesItsExecutionTick", testZeroCountRampConsumesItsExecutionTick},
+        {"ObservedDuration50And5RampTicks", testObservedDuration50And5RampTicks},
+        {"RampStepWidthsFollowEightBitRemainderPattern", testRampStepWidthsFollowEightBitRemainderPattern},
         {"FrequencyDeltasAreSignedAndCumulativeEvents", testFrequencyDeltasAreSignedAndCumulativeEvents},
         {"NoWaitLoopHitsInstructionBudget", testNoWaitLoopHitsInstructionBudget},
         {"CompositeSequenceLanesLoopIndependently", testCompositeSequenceLanesLoopIndependently},
+        {"CompositeAutomaticVolumeRoundTripsThroughMgsc", testCompositeAutomaticVolumeRoundTripsThroughMgsc},
+        {"PreciseAutomaticKeepsUnsplitRampVolumes", testPreciseAutomaticKeepsUnsplitRampVolumes},
+        {"CompositeAutomaticVolumeRejectsMgscCount240", testCompositeAutomaticVolumeRejectsMgscCount240},
         {"RateEnvelopeNativePhases", testRateEnvelopeNativePhases},
+        {"RateEnvelopeTestRateQuantizedKeyOff", testRateEnvelopeTestRateQuantizedKeyOff},
+        {"TraceRateEnvelopePreviewKeyOff", testTraceRateEnvelopePreviewKeyOff},
+        {"RateEnvelopeHandleDragUpdatesCoupledParams", testRateEnvelopeHandleDragUpdatesCoupledParams},
+        {"SeedDefaultLayerTimbreOpllViolinAndSccTriangle", testSeedDefaultLayerTimbreOpllViolinAndSccTriangle},
+        {"RateEnvelopeMgscModeNoiseRoundTrip", testRateEnvelopeMgscModeNoiseRoundTrip},
+        {"CompositeRateEnvelopeFormat18RoundTrip", testCompositeRateEnvelopeFormat18RoundTrip},
         {"OpllKeyOffDoesNotStartSoftwareRelease", testOpllKeyOffDoesNotStartSoftwareRelease},
         {"VolumeCombination", testVolumeCombination},
         {"ChipVolumeLaneAmplitude", testChipVolumeLaneAmplitude},
@@ -4561,12 +5613,14 @@ int main(int argc, char** argv) {
         {"SccPresetGenerationIncludesDocumentedHarmonics", testSccPresetGenerationIncludesDocumentedHarmonics},
         {"SccAverageUsesCircularThreeSampleWindow", testSccAverageUsesCircularThreeSampleWindow},
         {"SccMergeFindsCircularPhaseAndPreservesLevel", testSccMergeFindsCircularPhaseAndPreservesLevel},
+        {"SccRandomPresetRecipesAreDeterministicAndCoverOptions", testSccRandomPresetRecipesAreDeterministicAndCoverOptions},
         {"SccWaveformUtilityTransforms", testSccWaveformUtilityTransforms},
         {"RuntimeUsesMgsTrackOrder", testRuntimeUsesMgsTrackOrder},
         {"PsgToneNoiseAndFrequencyMapping", testPsgToneNoiseAndFrequencyMapping},
         {"SccWaveUsesSharedChannelFourFiveRam", testSccWaveUsesSharedChannelFourFiveRam},
         {"OpllOriginalPatchThenYThenVolume", testOpllOriginalPatchThenYThenVolume},
         {"SccFrequencyDeltaAndIgnoredY", testSccFrequencyDeltaAndIgnoredY},
+        {"OpllFrequencyDeltaKeepsMgsdrvOctaveWindow", testOpllFrequencyDeltaKeepsMgsdrvOctaveWindow},
         {"RegisterWriteBufferPreservesDuplicatesAndStopsAtCapacity", testRegisterWriteBufferPreservesDuplicatesAndStopsAtCapacity},
         {"PsgHardwareEnvelopeSharedState", testPsgHardwareEnvelopeSharedState},
         {"PsgHardwareShapeRestartSuppression", testPsgHardwareShapeRestartSuppression},
@@ -4600,7 +5654,10 @@ int main(int argc, char** argv) {
         {"OpllThoroughCompactProgressAndWorkerDeterminism", testOpllThoroughCompactProgressAndWorkerDeterminism},
         {"OpllControlledCancellationDiscardsCandidates", testOpllControlledCancellationDiscardsCandidates},
         {"DefaultCompositeTimbreHasThreeAudibleSources", testDefaultCompositeTimbreHasThreeAudibleSources},
+        {"MgsCompositeSourceRoundTrip", testMgsCompositeSourceRoundTrip},
         {"CompositeLayerRemovalReusesFreedChannel", testCompositeLayerRemovalReusesFreedChannel},
+        {"CompositeLayerDuplicateUsesLowestFreeSameSourceChannel",
+         testCompositeLayerDuplicateUsesLowestFreeSameSourceChannel},
         {"EnvelopeTimelineInspectorRangeNormalization", testEnvelopeTimelineInspectorRangeNormalization},
         {"OpllRegisterAutoRiseExpandsToYInMgsc", testOpllRegisterAutoRiseExpandsToYInMgsc},
         {"LeadingBaseAtRestoresOriginalToneForYAndTlFbAuto",
@@ -4616,6 +5673,7 @@ int main(int argc, char** argv) {
         {"OpllOriginalRegisterImageIncludesRegisterAuto",
          testOpllOriginalRegisterImageIncludesRegisterAuto},
         {"CompositeEnvelopeFormatsOneSharedMgscLoop", testCompositeEnvelopeFormatsOneSharedMgscLoop},
+        {"CompositeEnvelopeMgscOutputRules", testCompositeEnvelopeMgscOutputRules},
         {"CompositeSoloPitchAndChannelValidation", testCompositeSoloPitchAndChannelValidation},
         {"CompositeSavedTimbreRevisionAndNumberAssignment", testCompositeSavedTimbreRevisionAndNumberAssignment},
         {"CompositeTimbreDependencyUpdatePreservesAssignment", testCompositeTimbreDependencyUpdatePreservesAssignment},
