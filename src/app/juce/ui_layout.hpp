@@ -57,6 +57,8 @@ constexpr int setupPitchSweepW = 80; // p 0–255
 constexpr int setupSustainComboW = 72; // so / sf
 constexpr int setupSourceLabelW = 64; // PSG / SCC / OPLL (heading)
 constexpr int setupChannelComboW = 72; // Ch.n
+constexpr int setupDuplicateLayerW = 52; // 複製
+constexpr int setupRemoveLayerW = 72; // Ch.削除
 constexpr int setupNumberModeW = 72; // 自動 / 手動
 constexpr int setupSliderTextW = 40;
 constexpr int editMarkerLaneH = 16; // @ / y: no vertical value extent
@@ -64,15 +66,16 @@ constexpr int registerAutoLaneH = 44;
 constexpr int compositeMixLaneH = 104;
 constexpr int compositeEditLaneH = 520;
 constexpr int registerAutoLanePairExtra = 44 * 2;
-constexpr int compositeSetupColumnW = 420;
+constexpr int compositeSetupColumnW = 500;
 constexpr int compositeAddPsgW = 70;
 constexpr int compositeAddSccW = 70;
 constexpr int compositeAddOpllW = 76;
-constexpr int compositeRemoveLayerW = 92;
 constexpr int compositeTempoLabelW = 44;
 constexpr int compositeTempoFieldW = 56;
 constexpr int compositeOpenSccW = 88;
 constexpr int compositeOpenOpllW = 92;
+constexpr int compositeMgscOpenW = 88;
+constexpr int compositeMgscSaveW = 92;
 constexpr int compositeStopW = 80;
 constexpr int compositeDockApplyW = 48;
 constexpr int compositeDockFieldW = 48;
@@ -95,6 +98,14 @@ constexpr int compositeOpllYParamH = 680;
 constexpr int compositeLfoDialogW = 500;
 constexpr int compositeLfoDialogH = 680;
 constexpr int compositeLfoWaveH = 140;
+constexpr int rateEnvelopeDialogW = 560;
+constexpr int rateEnvelopeDialogH = 540; // overwritten in recomputeDerived
+constexpr int rateEnvelopeGraphH = 180;
+constexpr int rateEnvelopeBarW = 56;
+constexpr int rateEnvelopeBarTrackH = 256; // 1px ≥ 1 count (0–255)
+constexpr int rateEnvelopeBarTextH = 24;
+constexpr int rateEnvelopeHandleR = 7;
+constexpr int setupRateEditW = 96;
 constexpr int settingsDialogW = 500;
 constexpr int settingsDialogH = 720;
 constexpr int libraryManagerW = 1100;
@@ -150,6 +161,8 @@ inline int setupPitchSweepW = Base::setupPitchSweepW;
 inline int setupSustainComboW = Base::setupSustainComboW;
 inline int setupSourceLabelW = Base::setupSourceLabelW;
 inline int setupChannelComboW = Base::setupChannelComboW;
+inline int setupDuplicateLayerW = Base::setupDuplicateLayerW;
+inline int setupRemoveLayerW = Base::setupRemoveLayerW;
 inline int setupNumberModeW = Base::setupNumberModeW;
 inline int setupSliderTextW = Base::setupSliderTextW;
 inline int editMarkerLaneH = Base::editMarkerLaneH;
@@ -165,11 +178,12 @@ inline int compositeLaneLabelW = Base::compositeSetupColumnW;
 inline int compositeAddPsgW = Base::compositeAddPsgW;
 inline int compositeAddSccW = Base::compositeAddSccW;
 inline int compositeAddOpllW = Base::compositeAddOpllW;
-inline int compositeRemoveLayerW = Base::compositeRemoveLayerW;
 inline int compositeTempoLabelW = Base::compositeTempoLabelW;
 inline int compositeTempoFieldW = Base::compositeTempoFieldW;
 inline int compositeOpenSccW = Base::compositeOpenSccW;
 inline int compositeOpenOpllW = Base::compositeOpenOpllW;
+inline int compositeMgscOpenW = Base::compositeMgscOpenW;
+inline int compositeMgscSaveW = Base::compositeMgscSaveW;
 inline int compositeStopW = Base::compositeStopW;
 inline int compositeDockApplyW = Base::compositeDockApplyW;
 inline int compositeDockFieldW = Base::compositeDockFieldW;
@@ -195,6 +209,16 @@ inline int compositeOpllYParamH = Base::compositeOpllYParamH;
 inline int compositeLfoDialogW = Base::compositeLfoDialogW;
 inline int compositeLfoDialogH = Base::compositeLfoDialogH;
 inline int compositeLfoWaveH = Base::compositeLfoWaveH;
+inline int rateEnvelopeDialogW = Base::rateEnvelopeDialogW;
+inline int rateEnvelopeDialogH = Base::rateEnvelopeDialogH;
+inline int rateEnvelopeGraphH = Base::rateEnvelopeGraphH;
+inline int rateEnvelopeBarW = Base::rateEnvelopeBarW;
+inline int rateEnvelopeBarTrackH = Base::rateEnvelopeBarTrackH;
+inline int rateEnvelopeBarTextH = Base::rateEnvelopeBarTextH;
+inline int rateEnvelopeHandleR = Base::rateEnvelopeHandleR;
+inline int rateEnvelopeBarColumnH = 0;
+inline int rateEnvelopeDialogPsgExtraH = 0;
+inline int setupRateEditW = Base::setupRateEditW;
 inline int compositeLayerLibraryH = 0;
 inline int settingsDialogW = Base::settingsDialogW;
 inline int settingsDialogH = Base::settingsDialogH;
@@ -207,12 +231,12 @@ constexpr juce::uint32 pageFill = 0xFF20262E;
 constexpr juce::uint32 pageFillBottom = 0xFF161B22;
 
 inline void recomputeDerived() {
-    // Setup column matches layoutLibraryBrowserChrome: panelPad inset,
-    // fieldH rows, sm between rows (title + 6 control rows).
+    // Setup column: panelPad inset, fieldH rows, sm between rows
+    // (title + 7 control rows including @e/@r).
     compositeSetupContentH =
         panelPad * 2
-        + fieldH * 7
-        + sm * 6;
+        + fieldH * 8
+        + sm * 7;
     compositeChannelLaneH =
         compositeSetupContentH + editLaneFramePadV * 2;
     compositeHeaderControlsW =
@@ -223,13 +247,30 @@ inline void recomputeDerived() {
         + controlGap
         + compositeAddSccW
         + controlGap
-        + compositeAddPsgW
-        + sm
-        + compositeRemoveLayerW;
+        + compositeAddPsgW;
     compositeLaneLabelW = compositeSetupColumnW;
     compositeEditLaneOpllExtraH = registerAutoLaneH * 2;
     compositeLayerLibraryH =
         panelPad * 2 + libraryTitleH + sm + fieldH * 2 + sm + fieldH;
+    rateEnvelopeBarColumnH =
+        fieldH / 2 + rateEnvelopeBarTrackH + rateEnvelopeBarTextH;
+    rateEnvelopeDialogPsgExtraH =
+        fieldH
+        + controlGap
+        + fieldH
+        + sm;
+    rateEnvelopeDialogH =
+        panelPad * 2
+        + titleH
+        + xs
+        + rateEnvelopeGraphH
+        + sm
+        + rateEnvelopeBarColumnH
+        + sm
+        + descriptionH * 2
+        + sm
+        + sm
+        + textButtonH;
     // Volume is the scaled 100% token `editVolumeLaneH` (265px). Pitch keeps
     // the 0.231 remainder (share 3/4 of that pre-growth value area).
     // `compositeEditLaneH` still holds the scaled 0.231 fallback here.
@@ -305,6 +346,8 @@ inline void applyScale(float factor) {
     setupSustainComboW = s(Base::setupSustainComboW);
     setupSourceLabelW = s(Base::setupSourceLabelW);
     setupChannelComboW = s(Base::setupChannelComboW);
+    setupDuplicateLayerW = s(Base::setupDuplicateLayerW);
+    setupRemoveLayerW = s(Base::setupRemoveLayerW);
     setupNumberModeW = s(Base::setupNumberModeW);
     setupSliderTextW = s(Base::setupSliderTextW);
     editMarkerLaneH = s(Base::editMarkerLaneH);
@@ -317,7 +360,6 @@ inline void applyScale(float factor) {
     compositeAddPsgW = s(Base::compositeAddPsgW);
     compositeAddSccW = s(Base::compositeAddSccW);
     compositeAddOpllW = s(Base::compositeAddOpllW);
-    compositeRemoveLayerW = s(Base::compositeRemoveLayerW);
     compositeTempoLabelW = s(Base::compositeTempoLabelW);
     compositeTempoFieldW = s(Base::compositeTempoFieldW);
     compositeOpenSccW = s(Base::compositeOpenSccW);
@@ -342,6 +384,13 @@ inline void applyScale(float factor) {
     compositeLfoDialogW = s(Base::compositeLfoDialogW);
     compositeLfoDialogH = s(Base::compositeLfoDialogH);
     compositeLfoWaveH = s(Base::compositeLfoWaveH);
+    rateEnvelopeDialogW = s(Base::rateEnvelopeDialogW);
+    rateEnvelopeGraphH = s(Base::rateEnvelopeGraphH);
+    rateEnvelopeBarW = s(Base::rateEnvelopeBarW);
+    rateEnvelopeBarTrackH = juce::jmax(256, s(Base::rateEnvelopeBarTrackH));
+    rateEnvelopeBarTextH = s(Base::rateEnvelopeBarTextH);
+    rateEnvelopeHandleR = juce::jmax(6, s(Base::rateEnvelopeHandleR));
+    setupRateEditW = s(Base::setupRateEditW);
     settingsDialogW = s(Base::settingsDialogW);
     settingsDialogH = s(Base::settingsDialogH);
     libraryManagerW = s(Base::libraryManagerW);
@@ -349,7 +398,12 @@ inline void applyScale(float factor) {
     recomputeDerived();
 }
 
-// Preferred width for a SwitchLookAndFeel toggle: track + pad + label + trailing xs.
+[[nodiscard]] inline int rateEnvelopeEditorHeight(bool psg) {
+    return rateEnvelopeDialogH
+        + (psg ? rateEnvelopeDialogPsgExtraH : 0);
+}
+
+// Preferred width for a SwitchLookAndFeel pill: label + circular end pads.
 [[nodiscard]] inline int switchControlWidth(
     const juce::String& label,
     int control_height = -1) {
@@ -361,7 +415,10 @@ inline void applyScale(float factor) {
             static_cast<float>(control_height)));
     const int text_w =
         juce::GlyphArrangement::getStringWidthInt(font, label);
-    return switchTrackW + switchLabelPad + text_w + xs;
+    // Side pads ≈ half-height (circular ends) + xs breathing room.
+    return juce::jmax(
+        control_height,
+        text_w + control_height + xs);
 }
 
 } // namespace UiLayout

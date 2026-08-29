@@ -72,12 +72,21 @@ struct EnvelopeEvent {
     // true = after `[` (re-run on each `]` return). Ignored when the event's
     // count is not the layer's loop_start_count.
     bool after_loop_start{};
+    // Volume-only authoring flag. When set, the sequence compiler emits a
+    // 2n cc ramp command using the interval from the preceding volume spec.
+    bool automatic{};
+    // Volume-only. When set with automatic, mid-span zero-time commands keep
+    // the unsplit remainder-ramp tick volumes (MGSC uses 1-count / `:` holds
+    // instead of restarting `=`). Ignored when automatic is false.
+    bool precise{};
 
     friend bool operator==(const EnvelopeEvent&, const EnvelopeEvent&)
         = default;
 };
 
 struct RateEnvelope {
+    std::uint8_t tone_mode{};
+    std::uint8_t noise{};
     std::uint8_t attack_level{};
     std::uint8_t attack_rate{};
     std::uint8_t decay_rate{};
@@ -88,6 +97,42 @@ struct RateEnvelope {
     friend bool operator==(const RateEnvelope&, const RateEnvelope&)
         = default;
 };
+
+[[nodiscard]] inline bool rateEnvelopeIsUnset(
+    const RateEnvelope& rate) noexcept {
+    return rate.tone_mode == 0
+        && rate.noise == 0
+        && rate.attack_level == 0
+        && rate.attack_rate == 0
+        && rate.decay_rate == 0
+        && rate.sustain_level == 0
+        && rate.sustain_rate == 0
+        && rate.release_rate == 0;
+}
+
+inline void seedDefaultRateEnvelope(
+    RateEnvelope& rate,
+    TimbreSource source) noexcept {
+    if (!rateEnvelopeIsUnset(rate)) {
+        return;
+    }
+    rate.attack_level = 0;
+    rate.attack_rate = 64;
+    rate.decay_rate = 32;
+    rate.sustain_level = 128;
+    rate.sustain_rate = 8;
+    rate.release_rate = 16;
+    rate.tone_mode =
+        source == TimbreSource::Psg ? std::uint8_t{1} : std::uint8_t{0};
+    rate.noise = 0;
+}
+
+[[nodiscard]] inline RateEnvelope clampRateEnvelope(
+    RateEnvelope rate) noexcept {
+    rate.tone_mode = std::min<std::uint8_t>(rate.tone_mode, 3);
+    rate.noise = std::min<std::uint8_t>(rate.noise, 31);
+    return rate;
+}
 
 struct EnvelopeTimeline {
     static constexpr std::uint32_t kDefaultLengthCounts = 120;
@@ -258,7 +303,7 @@ struct CompositeLayer {
 };
 
 struct CompositeTimbre {
-    static constexpr std::uint32_t kFormatVersion = 15;
+    static constexpr std::uint32_t kFormatVersion = 18;
     static constexpr std::uint32_t kMinimumReadableFormatVersion = 5;
 
     std::uint32_t format_version{kFormatVersion};
@@ -314,6 +359,14 @@ struct TimbreUse {
 
 [[nodiscard]] CompositeTimbre defaultCompositeTimbre();
 
+// Snapshot id for the Triangle waveform assigned when adding an SCC channel.
+// Not a library entry; the dedicated SCC editor stays closed until a saved
+// timbre is chosen.
+inline constexpr std::uint64_t kSccTrianglePresetLibraryId =
+    0x4D47534300010001ULL;
+
+void seedDefaultLayerTimbre(CompositeLayer& layer) noexcept;
+
 [[nodiscard]] bool layerIsAudible(
     const CompositeTimbre& timbre,
     std::size_t layer_index) noexcept;
@@ -332,6 +385,13 @@ struct TimbreUse {
 bool removeCompositeLayer(
     CompositeTimbre& timbre,
     std::size_t layer_index) noexcept;
+
+// Copies a layer onto the lowest free channel of the same source.
+// Cross-source copies (e.g. SCC → OPLL) are not performed. Returns the
+// new layer index, or nullopt if the source has no free channel.
+[[nodiscard]] std::optional<std::size_t> duplicateCompositeLayer(
+    CompositeTimbre& timbre,
+    std::size_t layer_index);
 
 void setEnvelopeTimelineRange(
     EnvelopeTimeline& timeline,

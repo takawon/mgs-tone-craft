@@ -2,6 +2,8 @@
 
 #include "ui_paint.hpp"
 
+#include "ui_fonts.hpp"
+
 // Fit a top-level editor window entirely inside the target monitor work
 // area (taskbar excluded). Size/position are never written to settings INI.
 //
@@ -127,6 +129,7 @@ void layoutEditorTopRightChrome(
     int host_width,
     juce::DrawableButton& settings,
     juce::Slider& master_volume,
+    juce::Label* master_volume_label,
     juce::DrawableButton* immediate_audition) {
     using namespace UiLayout;
     const int top = pageMargin;
@@ -135,11 +138,20 @@ void layoutEditorTopRightChrome(
     right -= iconButton + controlGap;
     const int vol_top = juce::jmax(
         0, top - (masterVolumeSize - iconButton) / 2);
+    const int vol_x = right - masterVolumeSize;
     master_volume.setBounds(
-        right - masterVolumeSize,
+        vol_x,
         vol_top,
         masterVolumeSize,
         masterVolumeSize);
+    if (master_volume_label != nullptr) {
+        const int label_h = juce::roundToInt(UiFonts::body().getHeight());
+        master_volume_label->setBounds(
+            vol_x,
+            vol_top + masterVolumeSize,
+            masterVolumeSize,
+            label_h);
+    }
     right -= masterVolumeSize + controlGap;
     if (immediate_audition != nullptr) {
         immediate_audition->setBounds(

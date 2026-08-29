@@ -128,6 +128,8 @@ public:
         unsignedInteger(value.target_library_id, 8);
         enumeration(value.timbre_pick);
         boolean(value.after_loop_start);
+        boolean(value.automatic);
+        boolean(value.precise);
     }
 
     void timeline(const EnvelopeTimeline& value) {
@@ -146,6 +148,8 @@ public:
         unsignedInteger(value.rate.sustain_level, 1);
         unsignedInteger(value.rate.sustain_rate, 1);
         unsignedInteger(value.rate.release_rate, 1);
+        unsignedInteger(value.rate.tone_mode, 1);
+        unsignedInteger(value.rate.noise, 1);
         unsignedInteger(value.events.size(), 4);
         for (const auto& event_value : value.events) {
             event(event_value);
@@ -348,6 +352,23 @@ public:
         } else {
             value.after_loop_start = false;
         }
+        if (format_version_ >= 16) {
+            if (!boolean(value.automatic)) {
+                return false;
+            }
+        } else {
+            value.automatic = false;
+        }
+        if (format_version_ >= 17) {
+            if (!boolean(value.precise)) {
+                return false;
+            }
+        } else {
+            value.precise = false;
+        }
+        if (!value.automatic) {
+            value.precise = false;
+        }
         return true;
     }
 
@@ -390,8 +411,20 @@ public:
             || !integer(value.rate.decay_rate, 1)
             || !integer(value.rate.sustain_level, 1)
             || !integer(value.rate.sustain_rate, 1)
-            || !integer(value.rate.release_rate, 1)
-            || (format_version_ == 2
+            || !integer(value.rate.release_rate, 1)) {
+            return false;
+        }
+        if (format_version_ >= 18) {
+            if (!integer(value.rate.tone_mode, 1)
+                || !integer(value.rate.noise, 1)) {
+                return false;
+            }
+            value.rate = clampRateEnvelope(value.rate);
+        } else {
+            value.rate.tone_mode = 0;
+            value.rate.noise = 0;
+        }
+        if ((format_version_ == 2
                 && (legacy_timeline == nullptr
                     || !timeline(*legacy_timeline)))
             || !integer(count, 4)
@@ -879,6 +912,28 @@ std::string CompositeTimbreLibrary::serialize() const {
             << "\r\n";
     }
     return output.str();
+}
+
+std::string CompositeTimbreLibrary::serializeTimbreFile(
+    const CompositeTimbre& timbre,
+    std::int64_t now_unix_seconds) {
+    CompositeTimbreLibrary library;
+    library.add(timbre, now_unix_seconds);
+    return library.serialize();
+}
+
+std::optional<CompositeTimbre>
+CompositeTimbreLibrary::deserializeTimbreFile(
+    std::string_view text,
+    std::string* error) {
+    auto library = deserialize(text, error);
+    if (!library || library->entries().empty()) {
+        if (library && library->entries().empty()) {
+            setError(error, "empty composite timbre file");
+        }
+        return std::nullopt;
+    }
+    return library->entries().front().timbre;
 }
 
 std::optional<CompositeTimbreLibrary>

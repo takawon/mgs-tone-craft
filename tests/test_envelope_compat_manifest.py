@@ -37,6 +37,25 @@ def _volume_ticks(state: EnvelopeState, ticks: int):
     ]
 
 
+def _final_volume_runs(state: EnvelopeState, ticks: int):
+    values = []
+    for _ in range(ticks):
+        events = state.tick()
+        volumes = [
+            event.args[0] for event in events if event.kind == "volume"
+        ]
+        values.append(volumes[-1])
+
+    runs = []
+    start = 0
+    for index in range(1, len(values) + 1):
+        if index < len(values) and values[index] == values[start]:
+            continue
+        runs.append([start, index - 1, values[start]])
+        start = index
+    return runs
+
+
 class EnvelopeCompatManifestTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -56,6 +75,11 @@ class EnvelopeCompatManifestTests(unittest.TestCase):
                 elif "expect_volume_ticks" in case:
                     actual = _volume_ticks(state, case["ticks"])
                     self.assertEqual(actual, case["expect_volume_ticks"])
+                elif "expect_final_volume_runs" in case:
+                    actual = _final_volume_runs(state, case["ticks"])
+                    self.assertEqual(
+                        actual, case["expect_final_volume_runs"]
+                    )
                 else:
                     self.fail(f"case {case['id']} has no expectations")
 

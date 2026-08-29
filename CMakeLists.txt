@@ -132,6 +132,7 @@ add_library(mgstc_engine STATIC
     src/engine/mamidi_memo_sound_output.cpp
     src/engine/mamidi_register_map.cpp
     src/engine/mamidi_rpc_client.cpp
+    src/engine/mgs_composite_io.cpp
     src/engine/mgs_envelope_io.cpp
     src/engine/mgs_timbre_io.cpp
     src/engine/note_pitch.cpp
@@ -270,6 +271,10 @@ if(WIN32)
                 src/app/juce/ui_hang_watchdog.hpp
                 src/app/juce/ui_layout.cpp
                 src/app/juce/ui_paint.cpp
+                src/app/juce/rate_envelope_trace.cpp
+                src/app/juce/rate_envelope_trace.hpp
+                src/app/juce/composite_timeline.cpp
+                src/app/juce/composite_timeline.hpp
                 src/app/juce/main.cpp
         )
         target_link_libraries(

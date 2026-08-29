@@ -14,7 +14,6 @@ enum class SequenceError : std::uint8_t {
     EventBufferOverflow,
     InstructionBudgetExceeded,
     TruncatedCommand,
-    InvalidRampCount,
     PositionOutOfRange,
     UnknownOpcode,
 };
@@ -28,6 +27,8 @@ public:
         bool emit_volume_events = true);
 
     void resetForKeyOn() noexcept;
+
+    void resetForKeyOn(std::uint8_t initial_volume) noexcept;
 
     [[nodiscard]] SequenceError processTick(
         EventBuffer& output,
@@ -66,5 +67,17 @@ private:
     std::uint8_t volume_{};
     Tick tick_{};
 };
+
+[[nodiscard]] std::vector<std::uint8_t> sampleSequenceEnvelopeVolumes(
+    std::span<const std::uint8_t> bytecode,
+    std::size_t ticks,
+    std::uint8_t initial_volume = 0);
+
+// Tick volumes of origin letter (optional) plus MGSDRV `2n cc` for `duration`.
+[[nodiscard]] std::vector<std::uint8_t> sampleAutomaticRampVolumes(
+    std::uint8_t origin,
+    std::uint8_t target,
+    std::uint32_t duration,
+    bool include_origin_letter);
 
 }  // namespace mgstc::engine

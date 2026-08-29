@@ -21,7 +21,7 @@ public:
         // Focus rings / hover accent / progress / SCC confirmed waveform.
         const auto accent_green = juce::Colour(kUiHoverAccent);
         // Toggle-on button fill: darker so #F2F4F5 text stays readable.
-        const auto selected_green = juce::Colour(0xFF1F8A5C);
+        const auto selected_green = juce::Colour(kUiToggleOnFill);
         setDefaultSansSerifTypefaceName(UiFonts::windowsMessageFaceName());
         setColour(juce::ResizableWindow::backgroundColourId, background);
         setColour(juce::TextEditor::backgroundColourId, panel);
