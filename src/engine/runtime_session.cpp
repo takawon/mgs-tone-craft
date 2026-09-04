@@ -571,18 +571,24 @@ TickResult RuntimeSession::processTick() {
                         };
                     }
                 } else if (track >= 3 && track < 8) {
-                    const auto map_error = mapper_.writeSccKey(
-                        track,
-                        false,
-                        tick_,
-                        writes_);
-                    if (map_error != MapError::None) {
-                        return {
-                            tick_,
+                    // SCC has no hardware envelope.  An @r release is
+                    // software volume automation, so keep the SCC key gate
+                    // on while the RateEnvelopeRuntime ramps the volume
+                    // down.  ForceMuteTrack above remains the hard-stop path.
+                    if (!runtime.rateEnvelope()) {
+                        const auto map_error = mapper_.writeSccKey(
                             track,
-                            SequenceError::None,
-                            map_error,
-                        };
+                            false,
+                            tick_,
+                            writes_);
+                        if (map_error != MapError::None) {
+                            return {
+                                tick_,
+                                track,
+                                SequenceError::None,
+                                map_error,
+                            };
+                        }
                     }
                 } else if (track >= 8) {
                     const auto map_error = mapper_.writeOpllPitch(

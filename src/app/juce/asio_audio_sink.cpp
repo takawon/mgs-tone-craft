@@ -22,7 +22,9 @@
 namespace mgstc::audio {
 namespace {
 
-constexpr int kDefaultSourceChunkFrames = 256;
+// Keep the resampling refill small so a command does not wait for a large
+// source block. At the native engine rate the converter is bypassed below.
+constexpr int kDefaultSourceChunkFrames = 64;
 
 [[nodiscard]] double chooseSampleRate(
     juce::AudioIODevice& device,
@@ -83,6 +85,8 @@ struct AsioAudioSink::Impl final : juce::AudioIODeviceCallback {
     std::atomic<bool> render_failed{};
     std::atomic<bool> format_changed{};
     std::atomic<std::uint32_t> master_volume_percent{100};
+    std::vector<float> direct_interleaved;
+    bool direct_render{};
     mutable std::mutex text_mutex;
     std::string driver_name;
     std::vector<std::string> driver_names;
@@ -148,15 +152,35 @@ struct AsioAudioSink::Impl final : juce::AudioIODeviceCallback {
                 && output_channel_data[1] != nullptr
             ? output_channel_data[1]
             : nullptr;
-        const auto converted = converter.process(
-            output_channel_data[0],
-            right,
-            frames,
-            {
-                .context = this,
-                .render = &Impl::renderSource,
-            });
-        if (!converted) {
+        bool rendered = false;
+        if (direct_render
+            && frames <= direct_interleaved.size() / 2U) {
+            auto* host = engine.load(std::memory_order_acquire);
+            rendered = host != nullptr
+                && host->render(std::span<float>(
+                    direct_interleaved.data(),
+                    frames * 2U)).ok();
+            if (rendered) {
+                for (std::size_t frame = 0; frame < frames; ++frame) {
+                    output_channel_data[0][frame]
+                        = direct_interleaved[frame * 2U];
+                    if (right != nullptr) {
+                        right[frame]
+                            = direct_interleaved[frame * 2U + 1U];
+                    }
+                }
+            }
+        } else {
+            rendered = converter.process(
+                output_channel_data[0],
+                right,
+                frames,
+                {
+                    .context = this,
+                    .render = &Impl::renderSource,
+                });
+        }
+        if (!rendered) {
             if (!render_failed.exchange(true, std::memory_order_relaxed)) {
                 push(AudioSinkStatusType::DeviceError, -1);
             }
@@ -318,6 +342,16 @@ bool AsioAudioSink::open(
         return false;
     }
 
+    const auto current_buffer_frames =
+        impl_->device->getCurrentBufferSizeSamples();
+    const auto direct_buffer_frames = std::max(
+        buffer_frames,
+        current_buffer_frames > 0 ? current_buffer_frames : 0);
+    impl_->direct_interleaved.assign(
+        static_cast<std::size_t>(direct_buffer_frames) * 2U,
+        0.0F);
+    impl_->direct_render = std::abs(
+        actual_rate - StereoSampleRateConverter::kSourceSampleRate) <= 0.5;
     impl_->prepared_sample_rate = actual_rate;
     {
         const std::scoped_lock lock(impl_->text_mutex);
@@ -335,6 +369,8 @@ void AsioAudioSink::close() noexcept {
         impl_->device.reset();
     }
     impl_->prepared_sample_rate = 0.0;
+    impl_->direct_render = false;
+    impl_->direct_interleaved.clear();
     impl_->format_changed.store(false, std::memory_order_release);
     if (impl_->type != nullptr) {
         impl_->setText("ASIO is closed");

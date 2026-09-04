@@ -1146,6 +1146,34 @@ void testRuntimeSccKeyMaskPreservesOtherChannels() {
     REQUIRE_EQ(session.writes()[0].reason, WriteReason::KeyOff);
 }
 
+void testRuntimeSccRateEnvelopeKeepsGateDuringRelease() {
+    RuntimeSession session(16, 32);
+    REQUIRE_EQ(
+        session.setRateEnvelope(
+            3,
+            {
+                .attack_level = 255,
+                .attack_rate = 0,
+                .decay_rate = 0,
+                .sustain_level = 255,
+                .sustain_rate = 0,
+                .release_rate = 64,
+            }),
+        true);
+    REQUIRE_EQ(session.queueNoteOn(3, 60), true);
+    REQUIRE_EQ(session.processTick().ok(), true);
+    REQUIRE_EQ(session.processTick().ok(), true);
+
+    REQUIRE_EQ(session.queueKeyOff(3), true);
+    REQUIRE_EQ(session.processTick().ok(), true);
+    REQUIRE_EQ(session.writes().size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(session.writes()[0].chip, ChipId::Scc);
+    REQUIRE_EQ(session.writes()[0].port, static_cast<std::uint8_t>(2));
+    REQUIRE_EQ(session.writes()[0].address, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(session.writes()[0].reason, WriteReason::Volume);
+    REQUIRE_EQ(session.writes()[0].value > 0, true);
+}
+
 void testRuntimePsgSequenceKeyOffStaysSilent() {
     RuntimeSession session(16, 32);
     REQUIRE_EQ(
@@ -2356,6 +2384,67 @@ void testOpllFrequencyDeltaKeepsMgsdrvOctaveWindow() {
     }
 }
 
+void testPsgAndSccFrequencyDeltaWraps16Bit() {
+    RegisterMapper psg;
+    RegisterWriteBuffer psg_out(8);
+    REQUIRE_EQ(
+        psg.mapMeaningEvent(
+            0, {0, MeaningEventKind::RegisterWrite, 0, 0x11}, 0, psg_out),
+        MapError::None);
+    REQUIRE_EQ(
+        psg.mapMeaningEvent(
+            0, {0, MeaningEventKind::RegisterWrite, 1, 0x00}, 0, psg_out),
+        MapError::None);
+    psg_out.clear();
+    REQUIRE_EQ(
+        psg.mapMeaningEvent(
+            0, {0, MeaningEventKind::FrequencyDelta, 127, 0}, 0, psg_out),
+        MapError::None);
+    REQUIRE_EQ(psg_out.writes()[0].value, static_cast<std::uint8_t>(0x92));
+    REQUIRE_EQ(psg_out.writes()[1].value, static_cast<std::uint8_t>(0xFF));
+
+    RegisterMapper scc;
+    RegisterWriteBuffer scc_out(8);
+    scc.setSccPeriod(0, 0x0011);
+    REQUIRE_EQ(
+        scc.mapMeaningEvent(
+            3, {0, MeaningEventKind::FrequencyDelta, 127, 0}, 0, scc_out),
+        MapError::None);
+    REQUIRE_EQ(scc_out.writes()[0].value, static_cast<std::uint8_t>(0x92));
+    REQUIRE_EQ(scc_out.writes()[1].value, static_cast<std::uint8_t>(0xFF));
+}
+
+void testOpllFrequencyDeltaPackedOverflowsBlock() {
+    RegisterMapper mapper;
+    RegisterWriteBuffer output(64);
+    REQUIRE_EQ(
+        mapper.writeOpllPitch(8, {0x0AC, 5}, true, 0, output, false),
+        MapError::None);
+    constexpr std::array<std::uint8_t, 6> expected_high{
+        0x1B, 0x1C, 0x1E, 0x1F, 0x11, 0x12};
+    constexpr std::array<std::uint8_t, 6> expected_low{
+        0x2B, 0xFD, 0xCF, 0x4E, 0x20, 0xF2};
+    for (std::size_t index = 0; index < 6; ++index) {
+        output.clear();
+        REQUIRE_EQ(
+            mapper.mapMeaningEvent(
+                8, {0, MeaningEventKind::FrequencyDelta, 127, 0}, 0, output),
+            MapError::None);
+        int high = -1;
+        int low = -1;
+        for (const auto& write : output.writes()) {
+            if (write.address == 0x20) {
+                high = write.value;
+            }
+            if (write.address == 0x10) {
+                low = write.value;
+            }
+        }
+        REQUIRE_EQ(high, static_cast<int>(expected_high[index]));
+        REQUIRE_EQ(low, static_cast<int>(expected_low[index]));
+    }
+}
+
 void testRegisterWriteBufferPreservesDuplicatesAndStopsAtCapacity() {
     RegisterMapper mapper;
     RegisterWriteBuffer output(2);
@@ -2811,6 +2900,9 @@ void testOpllEnvelopeTraceUsesEmu2413EgAndKeyOff() {
     const auto trace = traceOpllEnvelope(defaultOpllPatch(), 60);
     REQUIRE_EQ(trace.valid, true);
     REQUIRE_EQ(trace.midi_note, static_cast<std::uint8_t>(60));
+    REQUIRE_EQ(
+        OpllEnvelopeTrace::kKeyOffSeconds * 2.0F,
+        OpllEnvelopeTrace::kDurationSeconds);
     const auto key_off_point = static_cast<std::size_t>(
         OpllEnvelopeTrace::kPointCount
         * OpllEnvelopeTrace::kKeyOffSeconds
@@ -5597,6 +5689,7 @@ int main(int argc, char** argv) {
         {"RuntimePsgNoteOnOrderMatchesObservedBoundary", testRuntimePsgNoteOnOrderMatchesObservedBoundary},
         {"RuntimeBoundaryWritesMatchVgmFixture", testRuntimeBoundaryWritesMatchVgmFixture},
         {"RuntimeSccKeyMaskPreservesOtherChannels", testRuntimeSccKeyMaskPreservesOtherChannels},
+        {"RuntimeSccRateEnvelopeKeepsGateDuringRelease", testRuntimeSccRateEnvelopeKeepsGateDuringRelease},
         {"RuntimePsgSequenceKeyOffStaysSilent", testRuntimePsgSequenceKeyOffStaysSilent},
         {"AuditionGateSuppressesEnvelopeUntilNoteOn", testAuditionGateSuppressesEnvelopeUntilNoteOn},
         {"RuntimeOpllKeyOnAndOffRegisters", testRuntimeOpllKeyOnAndOffRegisters},
@@ -5621,6 +5714,8 @@ int main(int argc, char** argv) {
         {"OpllOriginalPatchThenYThenVolume", testOpllOriginalPatchThenYThenVolume},
         {"SccFrequencyDeltaAndIgnoredY", testSccFrequencyDeltaAndIgnoredY},
         {"OpllFrequencyDeltaKeepsMgsdrvOctaveWindow", testOpllFrequencyDeltaKeepsMgsdrvOctaveWindow},
+        {"PsgAndSccFrequencyDeltaWraps16Bit", testPsgAndSccFrequencyDeltaWraps16Bit},
+        {"OpllFrequencyDeltaPackedOverflowsBlock", testOpllFrequencyDeltaPackedOverflowsBlock},
         {"RegisterWriteBufferPreservesDuplicatesAndStopsAtCapacity", testRegisterWriteBufferPreservesDuplicatesAndStopsAtCapacity},
         {"PsgHardwareEnvelopeSharedState", testPsgHardwareEnvelopeSharedState},
         {"PsgHardwareShapeRestartSuppression", testPsgHardwareShapeRestartSuppression},

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <fstream>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -407,46 +409,91 @@ enum class CompositeEnvelopeLane : std::uint8_t {
             count -= chunk;
         }
     };
+    const auto append_zero_time_at = [&](std::uint32_t count) {
+        if (lane != CompositeEnvelopeLane::Volume) {
+            return;
+        }
+        for (const auto& timbre : layer.timbre_automation) {
+            if (timbre.count != count
+                || timbre.kind
+                    != mgstc::engine::EnvelopeEventKind::Timbre) {
+                continue;
+            }
+            mgstc::engine::EnvelopeEvent resolved{
+                .kind = mgstc::engine::EnvelopeEventKind::Timbre,
+                .value = timbre.value,
+                .target_library_id = timbre.target_library_id,
+                .timbre_pick = timbre.timbre_pick,
+            };
+            const auto number =
+                mgstc::engine::envelopeEventTimbreNumber(
+                    resolved, &numbers);
+            bytecode.insert(
+                bytecode.end(),
+                {0x10, number.value_or(0)});
+        }
+        for (const auto& pitch : layer.pitch_envelope.events) {
+            if (pitch.count != count
+                || pitch.kind
+                    != mgstc::engine::EnvelopeEventKind::Pitch) {
+                continue;
+            }
+            bytecode.insert(
+                bytecode.end(),
+                {0x12, static_cast<std::uint8_t>(
+                    juce::jlimit(-127, 127, pitch.value))});
+        }
+    };
+    const auto catch_up_zero_time = [&](std::uint32_t until_exclusive) {
+        if (lane != CompositeEnvelopeLane::Volume) {
+            return;
+        }
+        std::uint32_t remaining = cursor;
+        while (true) {
+            std::optional<std::uint32_t> next;
+            const auto consider = [&](std::uint32_t count) {
+                if (count < remaining || count >= until_exclusive) {
+                    return;
+                }
+                if (!next || count < *next) {
+                    next = count;
+                }
+            };
+            for (const auto& pitch : layer.pitch_envelope.events) {
+                if (pitch.kind == mgstc::engine::EnvelopeEventKind::Pitch) {
+                    consider(pitch.count);
+                }
+            }
+            for (const auto& timbre : layer.timbre_automation) {
+                if (timbre.kind == mgstc::engine::EnvelopeEventKind::Timbre
+                    || timbre.kind
+                        == mgstc::engine::EnvelopeEventKind::RegisterWrite) {
+                    consider(timbre.count);
+                }
+            }
+            if (!next) {
+                break;
+            }
+            if (*next > cursor) {
+                append_wait(*next - cursor);
+                cursor = *next;
+            }
+            append_zero_time_at(*next);
+            remaining = *next + 1;
+        }
+    };
     for (const auto& event : events) {
+        catch_up_zero_time(event.count);
         if (event.count > cursor) {
             append_wait(event.count - cursor);
             cursor = event.count;
         }
-        const auto append_zero_time_at = [&](std::uint32_t count) {
-            if (lane != CompositeEnvelopeLane::Volume) {
-                return;
-            }
-            for (const auto& timbre : layer.timbre_automation) {
-                if (timbre.count != count
-                    || timbre.kind
-                        != mgstc::engine::EnvelopeEventKind::Timbre) {
-                    continue;
-                }
-                mgstc::engine::EnvelopeEvent resolved{
-                    .kind = mgstc::engine::EnvelopeEventKind::Timbre,
-                    .value = timbre.value,
-                    .target_library_id = timbre.target_library_id,
-                    .timbre_pick = timbre.timbre_pick,
-                };
-                const auto number =
-                    mgstc::engine::envelopeEventTimbreNumber(
-                        resolved, &numbers);
-                bytecode.insert(
-                    bytecode.end(),
-                    {0x10, number.value_or(0)});
-            }
-            for (const auto& pitch : layer.pitch_envelope.events) {
-                if (pitch.count != count
-                    || pitch.kind
-                        != mgstc::engine::EnvelopeEventKind::Pitch) {
-                    continue;
-                }
-                bytecode.insert(
-                    bytecode.end(),
-                    {0x12, static_cast<std::uint8_t>(
-                        juce::jlimit(-127, 127, pitch.value))});
-            }
-        };
+        // Same-count `\` / `@` sit immediately before this volume
+        // (`e:7.\-127.d:4`). Do not inject on `[` / `]` or other kinds
+        // (that would duplicate opcodes).
+        if (event.kind == mgstc::engine::EnvelopeEventKind::Volume) {
+            append_zero_time_at(event.count);
+        }
         switch (event.kind) {
         case mgstc::engine::EnvelopeEventKind::Volume:
             {
@@ -477,7 +524,6 @@ enum class CompositeEnvelopeLane : std::uint8_t {
                     cursor = juce::jmax(cursor, event.count + 1);
                 }
                 previous_volume_count = event.count;
-                append_zero_time_at(cursor);
             }
             break;
         case mgstc::engine::EnvelopeEventKind::Pitch:
@@ -520,6 +566,7 @@ enum class CompositeEnvelopeLane : std::uint8_t {
             break;
         }
     }
+    catch_up_zero_time(std::numeric_limits<std::uint32_t>::max());
     if (cursor < timeline->length_counts) {
         append_wait(timeline->length_counts - cursor);
     }

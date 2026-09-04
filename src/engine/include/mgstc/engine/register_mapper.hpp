@@ -161,6 +161,7 @@ private:
     std::array<std::uint16_t, 5> scc_period_{};
     std::uint8_t scc_key_mask_{};
     std::array<std::uint8_t, 0x39> opll_mirror_{};
+    std::array<std::uint16_t, 9> opll_packed_{};
     std::array<std::array<std::uint8_t, 32>, 256> scc_patches_{};
     std::array<bool, 256> scc_patch_defined_{};
     std::array<std::array<std::uint8_t, 8>, 256> opll_patches_{};

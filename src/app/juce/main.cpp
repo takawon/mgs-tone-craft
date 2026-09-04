@@ -14402,7 +14402,9 @@ public:
                 &performance_keyboard_,
             },
             400);
-        setSize(UiLayout::editorWindowW, UiLayout::editorWindowH);
+        setSize(
+            UiLayout::editorWindowW,
+            UiLayout::editorWindowH + UiScale::sx(112));
         {
             juce::Component::SafePointer<OpllEditorComponent> safe(this);
             UiScale::addGlobalListener([safe] {
@@ -14726,7 +14728,7 @@ public:
             preset_row.removeFromLeft(UiScale::sx(150)));
         area.removeFromTop(md);
 
-        auto operators = area.removeFromTop(UiScale::sx(470));
+        auto operators = area.removeFromTop(UiScale::sx(582));
         patch_panel_.setBounds(operators);
 
         area.removeFromTop(md);

@@ -11,7 +11,7 @@ namespace mgstc::engine {
 struct OpllEnvelopeTrace {
     static constexpr std::size_t kPointCount = 512;
     static constexpr float kDurationSeconds = 4.0F;
-    static constexpr float kKeyOffSeconds = 1.0F;
+    static constexpr float kKeyOffSeconds = 2.0F;
 
     std::array<float, kPointCount> modulator{};
     std::array<float, kPointCount> carrier{};
