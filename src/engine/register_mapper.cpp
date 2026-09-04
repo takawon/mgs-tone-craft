@@ -13,25 +13,40 @@ namespace {
     return static_cast<std::uint8_t>(std::clamp(value, 0, 15));
 }
 
-// MGSDRV 3.20 OPLL `\`: add to F-Number, then keep it in the working
-// octave window used by the driver (YM2413 VGM of `f.e=3.\45.\-111`
-// on o5 c). 9-bit add without Block change lands in the wrong octave
-// for large deltas.
-constexpr int kOpllFnumOctaveLow = 0xAC;
-constexpr int kOpllFnumOctaveStep = 0xAD;
-constexpr int kOpllFnumOctaveHigh = 0x160;
+// MGSDRV 3.20 OPLL `\`: 16-bit packed F-num/block (reg 10h + 20h bits 0–3),
+// then at most one window snap: F-num≥0x159 → +0x153, else low<0xAC → −0x153.
+constexpr int kOpllPackedLow = 0xAC;
+constexpr int kOpllPackedHighNibble = 0x59;
+constexpr std::uint16_t kOpllPackedOctaveUp = 0x0153;
+constexpr std::uint16_t kOpllPackedOctaveDown = 0xFEAD;
 
-void applyOpllFrequencyDelta(int& f_number, int& block, int delta) noexcept {
-    f_number += delta;
-    while (f_number < kOpllFnumOctaveLow && block > 0) {
-        f_number += kOpllFnumOctaveStep;
-        --block;
+[[nodiscard]] std::uint16_t addPeriodDelta(
+    std::uint16_t current,
+    std::int32_t mml_delta) noexcept {
+    return static_cast<std::uint16_t>(static_cast<int>(current) - mml_delta);
+}
+
+void applyOpllPackedFrequencyDelta(
+    std::uint16_t& packed,
+    std::int32_t delta) noexcept {
+    packed = static_cast<std::uint16_t>(static_cast<int>(packed) + delta);
+    const auto high = static_cast<std::uint8_t>(packed >> 8);
+    const auto low = static_cast<std::uint8_t>(packed & 0xFF);
+    if ((high & 1) != 0) {
+        if (low >= kOpllPackedHighNibble) {
+            packed = static_cast<std::uint16_t>(packed + kOpllPackedOctaveUp);
+        }
+    } else if (low < kOpllPackedLow) {
+        packed = static_cast<std::uint16_t>(packed + kOpllPackedOctaveDown);
     }
-    while (f_number >= kOpllFnumOctaveHigh && block < 7) {
-        f_number -= kOpllFnumOctaveStep;
-        ++block;
-    }
-    f_number = std::clamp(f_number, 0, 0x01FF);
+}
+
+[[nodiscard]] std::uint16_t packOpllPitch(OpllPitch pitch) noexcept {
+    return static_cast<std::uint16_t>(
+        ((static_cast<unsigned>(pitch.block) << 1)
+            | ((pitch.f_number >> 8) & 1U))
+            << 8
+        | (pitch.f_number & 0xFF));
 }
 
 }  // namespace
@@ -48,6 +63,7 @@ void RegisterMapper::reset() noexcept {
     scc_period_.fill(0);
     scc_key_mask_ = 0;
     opll_mirror_.fill(0);
+    opll_packed_.fill(0);
     for (std::size_t address = 0x30; address <= 0x38; ++address) {
         opll_mirror_[address] = 0x0F;
     }
@@ -175,12 +191,12 @@ MapError RegisterMapper::mapPsg(
     case MeaningEventKind::FrequencyDelta: {
         const auto low_address = static_cast<std::uint8_t>(channel * 2);
         const auto high_address = static_cast<std::uint8_t>(low_address + 1);
-        const auto current = static_cast<int>(
+        const auto current = static_cast<std::uint16_t>(
             psg_mirror_[low_address]
-            | ((psg_mirror_[high_address] & 0x0F) << 8));
-        const auto period = std::clamp(current - event.arg0, 0, 0x0FFF);
+            | (static_cast<unsigned>(psg_mirror_[high_address]) << 8));
+        const auto period = addPeriodDelta(current, event.arg0);
         const auto low = static_cast<std::uint8_t>(period & 0xFF);
-        const auto high = static_cast<std::uint8_t>((period >> 8) & 0x0F);
+        const auto high = static_cast<std::uint8_t>(period >> 8);
         auto error = emit(
             output,
             tick,
@@ -293,10 +309,8 @@ MapError RegisterMapper::mapScc(
     case MeaningEventKind::ToneNoiseMode:
         return MapError::None;
     case MeaningEventKind::FrequencyDelta: {
-        const auto period = std::clamp(
-            static_cast<int>(scc_period_[channel]) - event.arg0,
-            0,
-            0x0FFF);
+        const auto current = scc_period_[channel];
+        const auto period = addPeriodDelta(current, event.arg0);
         const auto low_address = static_cast<std::uint8_t>(channel * 2);
         const auto high_address = static_cast<std::uint8_t>(low_address + 1);
         auto error = emit(
@@ -317,11 +331,11 @@ MapError RegisterMapper::mapScc(
             ChipId::Scc,
             1,
             high_address,
-            static_cast<std::uint8_t>((period >> 8) & 0x0F),
+            static_cast<std::uint8_t>(period >> 8),
             track,
             WriteReason::Frequency);
         if (error == MapError::None) {
-            scc_period_[channel] = static_cast<std::uint16_t>(period);
+            scc_period_[channel] = period;
         }
         return error;
     }
@@ -402,17 +416,13 @@ MapError RegisterMapper::mapOpll(
     case MeaningEventKind::FrequencyDelta: {
         const auto low_address = static_cast<std::uint8_t>(0x10 + channel);
         const auto high_address = static_cast<std::uint8_t>(0x20 + channel);
-        auto f_number = static_cast<int>(
-            opll_mirror_[low_address]
-            | ((opll_mirror_[high_address] & 0x01) << 8));
-        auto block = static_cast<int>(
-            (opll_mirror_[high_address] >> 1) & 7);
-        applyOpllFrequencyDelta(f_number, block, event.arg0);
-        const auto low = static_cast<std::uint8_t>(f_number & 0xFF);
+        auto packed = opll_packed_[channel];
+        applyOpllPackedFrequencyDelta(packed, event.arg0);
+        opll_packed_[channel] = packed;
+        const auto low = static_cast<std::uint8_t>(packed & 0xFF);
         const auto high = static_cast<std::uint8_t>(
             (opll_mirror_[high_address] & 0x30)
-            | static_cast<std::uint8_t>(block << 1)
-            | ((f_number >> 8) & 0x01));
+            | static_cast<std::uint8_t>(packed >> 8));
         // MGSDRV writes the key/block register before the F-number low byte.
         auto error = emit(
             output,
@@ -766,6 +776,7 @@ MapError RegisterMapper::writeOpllPitch(
         return error;
     }
     opll_mirror_[high_address] = high;
+    opll_packed_[channel] = packOpllPitch(pitch);
     if (!key_on) {
         return MapError::None;
     }

@@ -16,6 +16,10 @@
 /ENGINE_DESIGN.md
 /HANDOFF.md
 /RELEASE_CHECKLIST.md
+/AGENTS.md
+
+# Codex の実行ログ。公開・配布・コミットの対象外
+/debug-*.log
 
 # UIドラフトは動作検証専用のため、ディレクトリ全体を非公開
 /draft-ui/
