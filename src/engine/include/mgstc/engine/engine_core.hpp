@@ -46,6 +46,11 @@ struct OpllScopeFrame {
     std::array<float, kSampleCount> samples{};
     std::array<float, kSampleCount> mixed_samples{};
     std::uint64_t sequence{};
+    // RealtimeEngineHost annotates the chip frame for analysis views.  The
+    // last note remains valid after key-off so release tails keep their guide.
+    std::uint8_t guide_note{60};
+    std::uint8_t guide_track{};
+    bool note_active{};
 };
 
 class EngineCore {

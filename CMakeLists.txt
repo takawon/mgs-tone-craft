@@ -267,6 +267,8 @@ if(WIN32)
                 assets/MGSTC_icon.rc
                 src/app/juce/asio_audio_sink.cpp
                 src/app/juce/asio_audio_sink.hpp
+                src/app/juce/spectrogram_window.cpp
+                src/app/juce/spectrogram_window.hpp
                 src/app/juce/ui_hang_watchdog.cpp
                 src/app/juce/ui_hang_watchdog.hpp
                 src/app/juce/ui_layout.cpp
@@ -283,6 +285,7 @@ if(WIN32)
                 mgstc_binary_data
                 mgstc_windows_audio
                 juce::juce_audio_utils
+                juce::juce_dsp
                 juce::juce_gui_extra
                 gdiplus
                 windowscodecs
@@ -344,6 +347,48 @@ if(MGSTC_BUILD_TESTS)
     endif()
 
     add_test(NAME mgstc_engine_tests COMMAND mgstc_engine_tests)
+
+    add_executable(mgstc_opll_envelope_edit_tests tests/cpp/opll_envelope_edit_tests.cpp)
+    target_link_libraries(mgstc_opll_envelope_edit_tests PRIVATE mgstc_engine)
+    target_compile_features(mgstc_opll_envelope_edit_tests PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(mgstc_opll_envelope_edit_tests PRIVATE /W4 /permissive- /EHsc)
+    else()
+        target_compile_options(mgstc_opll_envelope_edit_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME mgstc_opll_envelope_edit_tests COMMAND mgstc_opll_envelope_edit_tests)
+
+    add_executable(
+        mgstc_spectrogram_emphasis_tests
+        tests/cpp/spectrogram_emphasis_tests.cpp
+    )
+    target_compile_features(
+        mgstc_spectrogram_emphasis_tests PRIVATE cxx_std_20
+    )
+    if(MSVC)
+        target_compile_options(
+            mgstc_spectrogram_emphasis_tests PRIVATE /W4 /permissive- /EHsc
+        )
+    else()
+        target_compile_options(
+            mgstc_spectrogram_emphasis_tests PRIVATE -Wall -Wextra -Wpedantic
+        )
+    endif()
+    add_test(
+        NAME mgstc_spectrogram_emphasis_tests
+        COMMAND mgstc_spectrogram_emphasis_tests
+    )
+
+    if(WIN32 AND TARGET juce::juce_gui_basics)
+        add_executable(mgstc_opll_envelope_graph_tests tests/cpp/opll_envelope_graph_tests.cpp)
+        target_link_libraries(mgstc_opll_envelope_graph_tests PRIVATE mgstc_engine juce::juce_gui_basics)
+        target_compile_features(mgstc_opll_envelope_graph_tests PRIVATE cxx_std_20)
+        target_compile_definitions(mgstc_opll_envelope_graph_tests PRIVATE JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
+        if(MSVC)
+            target_compile_options(mgstc_opll_envelope_graph_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+        endif()
+        add_test(NAME mgstc_opll_envelope_graph_tests COMMAND mgstc_opll_envelope_graph_tests)
+    endif()
 
     add_executable(
         mgstc_stereo_sample_rate_converter_tests

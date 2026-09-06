@@ -110,6 +110,8 @@ constexpr int settingsDialogW = 500;
 constexpr int settingsDialogH = 720;
 constexpr int libraryManagerW = 1100;
 constexpr int libraryManagerH = 700;
+constexpr int spectrogramLabelW = 60;
+constexpr int spectrogramSliderW = 96;
 constexpr int editLaneFramePadV = 8; // sm: gap between channel frames
 constexpr int editLaneInnerPadV = 8; // sm: plot inset inside a frame
 } // namespace Base
@@ -224,6 +226,8 @@ inline int settingsDialogW = Base::settingsDialogW;
 inline int settingsDialogH = Base::settingsDialogH;
 inline int libraryManagerW = Base::libraryManagerW;
 inline int libraryManagerH = Base::libraryManagerH;
+inline int spectrogramLabelW = Base::spectrogramLabelW;
+inline int spectrogramSliderW = Base::spectrogramSliderW;
 
 constexpr juce::uint32 panelFill = 0xFF29323C;
 constexpr juce::uint32 panelStroke = 0xFF435160;
@@ -395,6 +399,8 @@ inline void applyScale(float factor) {
     settingsDialogH = s(Base::settingsDialogH);
     libraryManagerW = s(Base::libraryManagerW);
     libraryManagerH = s(Base::libraryManagerH);
+    spectrogramLabelW = s(Base::spectrogramLabelW);
+    spectrogramSliderW = s(Base::spectrogramSliderW);
     recomputeDerived();
 }
 

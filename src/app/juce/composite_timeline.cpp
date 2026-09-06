@@ -3804,21 +3804,36 @@ public:
         repaint();
     }
 
-    void appendScopeFrame(
+    [[nodiscard]] bool appendScopeFrame(
         const mgstc::engine::OpllScopeFrame& frame,
         std::uint8_t midi_note) {
+        constexpr float kVisibleAmplitude = 1.0e-5F;
+        const bool was_visible = scope_visible_sample_count_ != 0;
         audition_note_ = midi_note;
         for (std::size_t index = 0;
              index < mgstc::engine::OpllScopeFrame::kSampleCount;
              ++index) {
-            scope_history_[0][scope_write_position_] = frame.psg_samples[index];
-            scope_history_[1][scope_write_position_] = frame.scc_samples[index];
-            scope_history_[2][scope_write_position_] = frame.samples[index];
-            scope_history_[3][scope_write_position_] = frame.mixed_samples[index];
+            const std::array<float, 4> samples{
+                frame.psg_samples[index],
+                frame.scc_samples[index],
+                frame.samples[index],
+                frame.mixed_samples[index],
+            };
+            for (std::size_t channel = 0; channel < samples.size(); ++channel) {
+                auto& cached = scope_history_[channel][scope_write_position_];
+                if (std::abs(cached) >= kVisibleAmplitude) {
+                    --scope_visible_sample_count_;
+                }
+                cached = samples[channel];
+                if (std::abs(cached) >= kVisibleAmplitude) {
+                    ++scope_visible_sample_count_;
+                }
+            }
             scope_write_position_ =
                 (scope_write_position_ + 1) % kScopeHistorySize;
             scope_size_ = juce::jmin(kScopeHistorySize, scope_size_ + 1);
         }
+        return was_visible || scope_visible_sample_count_ != 0;
     }
 
     void resized() override {
@@ -6466,7 +6481,10 @@ private:
     void updateEnvelopeMmlPreview() {
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
-            envelope_mml_preview_.clear();
+            if (last_envelope_mml_preview_.isNotEmpty()) {
+                last_envelope_mml_preview_.clear();
+                envelope_mml_preview_.clear();
+            }
             envelope_mml_preview_.setVisible(false);
             return;
         }
@@ -6502,11 +6520,16 @@ private:
         const auto track = juce::String::fromUTF8(
             mgstc::engine::formatMgsCompositeTrackSetup(layer, &numbers)
                 .c_str());
+        const auto preview_text = definition + "\n" + track;
+        if (preview_text == last_envelope_mml_preview_) {
+            return;
+        }
+        last_envelope_mml_preview_ = preview_text;
         // #region agent log
         const auto preview_t1 = juce::Time::getMillisecondCounterHiRes();
         // #endregion
         UiFonts::setMgscPreviewText(
-            envelope_mml_preview_, definition + "\n" + track);
+            envelope_mml_preview_, preview_text);
         // #region agent log
         const auto preview_t2 = juce::Time::getMillisecondCounterHiRes();
         {
@@ -8502,6 +8525,7 @@ private:
     juce::TextButton clear_loop_;
     CountCommandStackView command_stack_;
     juce::TextEditor envelope_mml_preview_;
+    juce::String last_envelope_mml_preview_;
     juce::ScrollBar horizontal_scroll_;
     juce::ScrollBar vertical_scroll_;
     EditCallback edit_callback_;
@@ -8547,6 +8571,7 @@ private:
         scope_history_{};
     int scope_write_position_{};
     int scope_size_{};
+    std::size_t scope_visible_sample_count_{};
     std::uint8_t audition_note_{kPreviewNote};
 
     void drawHoverValuePopup(juce::Graphics& graphics) const {
@@ -8675,10 +8700,10 @@ void CompositeTimeline::refreshUiScaleFonts() {
     impl_->refreshUiScaleFonts();
 }
 
-void CompositeTimeline::appendScopeFrame(
+bool CompositeTimeline::appendScopeFrame(
     const engine::OpllScopeFrame& frame,
     std::uint8_t midi_note) {
-    impl_->appendScopeFrame(frame, midi_note);
+    return impl_->appendScopeFrame(frame, midi_note);
 }
 
 }  // namespace mgstc::app
