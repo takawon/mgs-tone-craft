@@ -42,3 +42,6 @@ __pycache__/
 /tools/disassemble_mgsdrv.py
 /tools/fat12_disk.py
 /tests/test_mgs_vgm_boundary.py
+
+# MGSDRV互換確認用のローカルfixture（GitHub・Releaseへ含めない）
+/tests/fixtures/

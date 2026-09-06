@@ -56,6 +56,9 @@ def _final_volume_runs(state: EnvelopeState, ticks: int):
     return runs
 
 
+@unittest.skipUnless(
+    MANIFEST.is_file(), "private compatibility fixture is unavailable"
+)
 class EnvelopeCompatManifestTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

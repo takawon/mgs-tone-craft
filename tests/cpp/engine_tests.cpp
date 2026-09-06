@@ -1101,6 +1101,7 @@ void testRuntimePsgNoteOnOrderMatchesObservedBoundary() {
         }));
 }
 
+#if MGSTC_HAS_PRIVATE_MGSDRV_FIXTURE
 void testRuntimeBoundaryWritesMatchVgmFixture() {
     const auto fixture = std::filesystem::path(MGSTC_SOURCE_DIR)
         / "tests"
@@ -1128,6 +1129,7 @@ void testRuntimeBoundaryWritesMatchVgmFixture() {
     }
     REQUIRE_EQ(actual, golden);
 }
+#endif
 
 void testRuntimeSccKeyMaskPreservesOtherChannels() {
     RuntimeSession session(16, 32);
@@ -5722,7 +5724,9 @@ int main(int argc, char** argv) {
         {"MgsdrvNoteTables", testMgsdrvNoteTables},
         {"SccAdapterPlaysLabeledC4Near261Hz", testSccAdapterPlaysLabeledC4Near261Hz},
         {"RuntimePsgNoteOnOrderMatchesObservedBoundary", testRuntimePsgNoteOnOrderMatchesObservedBoundary},
+#if MGSTC_HAS_PRIVATE_MGSDRV_FIXTURE
         {"RuntimeBoundaryWritesMatchVgmFixture", testRuntimeBoundaryWritesMatchVgmFixture},
+#endif
         {"RuntimeSccKeyMaskPreservesOtherChannels", testRuntimeSccKeyMaskPreservesOtherChannels},
         {"RuntimeSccRateEnvelopeKeepsGateDuringRelease", testRuntimeSccRateEnvelopeKeepsGateDuringRelease},
         {"RuntimePsgSequenceKeyOffStaysSilent", testRuntimePsgSequenceKeyOffStaysSilent},
