@@ -334,6 +334,19 @@ if(MGSTC_BUILD_TESTS)
         mgstc_engine_tests
         PRIVATE MGSTC_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
+    set(
+        MGSTC_PRIVATE_MGSDRV_FIXTURE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/mgsdrv_selftest/TEST_BOUNDARY.VGM"
+    )
+    if(EXISTS "${MGSTC_PRIVATE_MGSDRV_FIXTURE}")
+        target_compile_definitions(
+            mgstc_engine_tests PRIVATE MGSTC_HAS_PRIVATE_MGSDRV_FIXTURE=1
+        )
+    else()
+        target_compile_definitions(
+            mgstc_engine_tests PRIVATE MGSTC_HAS_PRIVATE_MGSDRV_FIXTURE=0
+        )
+    endif()
     target_compile_features(mgstc_engine_tests PRIVATE cxx_std_20)
 
     if(MSVC)
