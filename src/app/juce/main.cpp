@@ -10183,7 +10183,9 @@ private:
 
 class SccPresetMenuItem final : public juce::PopupMenu::CustomComponent {
 public:
-    SccPresetMenuItem(juce::String name, SccWaveform waveform)
+    SccPresetMenuItem(
+        juce::String name,
+        std::optional<SccWaveform> waveform = std::nullopt)
         : juce::PopupMenu::CustomComponent(true),
           name_(std::move(name)), waveform_(waveform) {}
 
@@ -10210,14 +10212,24 @@ public:
         graphics.drawHorizontalLine(
             juce::roundToInt(graph.getCentreY()),
             graph.getX(), graph.getRight());
+        if (!waveform_) {
+            graphics.setColour(juce::Colour(0xFF53E3A6));
+            graphics.setFont(UiFonts::heading());
+            graphics.drawText(
+                juce::String::fromUTF8("？"),
+                graph.toNearestInt(),
+                juce::Justification::centred,
+                false);
+            return;
+        }
         juce::Path path;
-        for (std::size_t index = 0; index < waveform_.size(); ++index) {
+        for (std::size_t index = 0; index < waveform_->size(); ++index) {
             const float x = juce::jmap(
                 static_cast<float>(index), 0.0F,
-                static_cast<float>(waveform_.size() - 1),
+                static_cast<float>(waveform_->size() - 1),
                 graph.getX(), graph.getRight());
             const float y = juce::jmap(
-                static_cast<float>(waveform_[index]),
+                static_cast<float>((*waveform_)[index]),
                 -128.0F, 127.0F,
                 graph.getBottom(), graph.getY());
             if (index == 0) {
@@ -10232,7 +10244,7 @@ public:
 
 private:
     juce::String name_;
-    SccWaveform waveform_{};
+    std::optional<SccWaveform> waveform_;
 };
 
 class SccEditorComponent final
@@ -11696,8 +11708,11 @@ private:
                 std::move(item), nullptr,
                 juce::String(names[index]));
         }
-        menu->addItem(
+        menu->addCustomItem(
             7,
+            std::make_unique<SccPresetMenuItem>(
+                juce::String::fromUTF8("Random")),
+            nullptr,
             juce::String::fromUTF8("Random"));
         preset_.setSelectedId(selected, juce::dontSendNotification);
     }
