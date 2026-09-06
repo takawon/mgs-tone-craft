@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <fstream>
 #include <limits>
 #include <optional>
 #include <vector>
@@ -349,44 +348,6 @@ enum class CompositeEnvelopeLane : std::uint8_t {
             }
         }
         events.swap(scheduled);
-        // #region agent log
-        if (lane == CompositeEnvelopeLane::Volume) {
-            static std::atomic<int> remaining{40};
-            if (remaining.fetch_sub(1) > 0) {
-                std::ostringstream data;
-                data << "{\"scheduled\":[";
-                bool first = true;
-                for (const auto& event : events) {
-                    if (event.kind != mgstc::engine::EnvelopeEventKind::Volume) {
-                        continue;
-                    }
-                    if (!first) {
-                        data << ',';
-                    }
-                    first = false;
-                    data << "{\"c\":" << event.count << ",\"v\":" << event.value
-                         << ",\"a\":" << (event.automatic ? "true" : "false")
-                         << ",\"d\":" << event.automatic_duration << "}";
-                }
-                data << "]}";
-                std::ofstream out;
-                out.open(
-                    L"debug-6045ae.log",
-                    std::ios::app);
-                if (out) {
-                    const auto ms = std::chrono::duration_cast<
-                        std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-                    out << "{\"sessionId\":\"6045ae\",\"runId\":\"post-fix\","
-                           "\"hypothesisId\":\"H4\",\"location\":"
-                           "\"main.cpp:compileVolumeLane\",\"message\":"
-                           "\"volume lane schedule\",\"data\":"
-                        << data.str() << ",\"timestamp\":" << ms << "}\n";
-                }
-            }
-        }
-        // #endregion
     }
 
     std::vector<std::uint8_t> bytecode;

@@ -7,7 +7,8 @@ param(
         "settings-view",
         "settings-midi",
         "settings-output",
-        "library")]
+        "library",
+        "spectrogram")]
     [string]$Target = "editor",
     [string]$OutputPath = ""
 )
@@ -26,6 +27,7 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
         "settings-midi" { "settings-midi" }
         "settings-output" { "settings-output" }
         "library" { "library-manager" }
+        "spectrogram" { "spectrogram-playing" }
         default { "$Editor-editor" }
     }
     $OutputPath = Join-Path `
