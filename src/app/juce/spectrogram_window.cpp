@@ -2013,6 +2013,10 @@ void SpectrogramWindow::setAnalysisMode(SpectrogramAnalysisMode mode) {
     }
 }
 
+juce::Component* SpectrogramWindow::snapshotContent() const noexcept {
+    return content_;
+}
+
 void SpectrogramWindow::setInternalPin(bool pinned) {
     internal_pin_ = pinned;
     if (!internal_pin_ || !isVisible()) {

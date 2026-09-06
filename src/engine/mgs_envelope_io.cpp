@@ -4,12 +4,9 @@
 #include "mgstc/engine/opll_register_auto.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <chrono>
-#include <filesystem>
-#include <fstream>
 #include <optional>
 #include <sstream>
 #include <string_view>
@@ -392,39 +389,6 @@ void collapseTrailingHold(std::vector<std::string>& tokens) {
     return result;
 }
 
-// #region agent log
-void agentDbg(
-    const char* hypothesisId,
-    const char* location,
-    const char* message,
-    const std::string& dataObject) {
-    try {
-        static std::atomic<int> remaining{400};
-        if (remaining.fetch_sub(1) <= 0) {
-            return;
-        }
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        std::ostringstream line;
-        line << "{\"sessionId\":\"6045ae\",\"runId\":\"post-fix\",\"hypothesisId\":\""
-             << hypothesisId << "\",\"location\":\"" << location
-             << "\",\"message\":\"" << message << "\",\"data\":" << dataObject
-             << ",\"timestamp\":" << ms << "}\n";
-        const auto payload = line.str();
-        auto append = [&payload](const std::filesystem::path& path) {
-            std::ofstream out(path, std::ios::app | std::ios::binary);
-            if (out) {
-                out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
-            }
-        };
-        append(std::filesystem::path(u8"debug-6045ae.log"));
-        append(std::filesystem::path(
-            u8"debug-6045ae.log"));
-    } catch (...) {
-    }
-}
-// #endregion
-
 }  // namespace
 
 bool MgsEnvelopeFormatResult::hasIssue(
@@ -580,55 +544,6 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
             static_cast<std::int32_t>(layer.volume), false, false};
     }
 
-    // #region agent log
-    {
-        bool any_automatic = false;
-        for (const auto& event : layer.volume_envelope.events) {
-            if (event.automatic) {
-                any_automatic = true;
-                break;
-            }
-        }
-        if (any_automatic) {
-            std::ostringstream data;
-            data << "{\"vols\":[";
-            bool first = true;
-            for (const auto& event : layer.volume_envelope.events) {
-                if (event.kind != EnvelopeEventKind::Volume) {
-                    continue;
-                }
-                if (!first) {
-                    data << ',';
-                }
-                first = false;
-                data << "{\"c\":" << event.count << ",\"v\":" << event.value
-                     << ",\"a\":" << (event.automatic ? "true" : "false")
-                     << "}";
-            }
-            data << "],\"pitch\":[";
-            first = true;
-            for (const auto& event : layer.pitch_envelope.events) {
-                if (event.kind != EnvelopeEventKind::Pitch) {
-                    continue;
-                }
-                if (!first) {
-                    data << ',';
-                }
-                first = false;
-                data << "{\"c\":" << event.count << ",\"v\":" << event.value
-                     << "}";
-            }
-            data << "],\"timbre\":" << layer.timbre_automation.size()
-                 << ",\"len\":" << timeline.length_counts << "}";
-            agentDbg(
-                "H1",
-                "mgs_envelope_io.cpp:events",
-                "envelope events before format",
-                data.str());
-        }
-    }
-    // #endregion
-
     std::vector<std::string> tokens;
     std::int32_t current_volume = layer.volume;
     std::uint32_t previous_volume_count = 0;
@@ -750,7 +665,6 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
                             tokens,
                             std::string(1, volumeCharacter(origin_value)));
                     }
-                    const bool emit_junction = !first_segment;
                     first_segment = false;
                     std::string token(1, volumeCharacter(segment_volume));
                     if (duration == 1) {
@@ -759,32 +673,6 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
                         token += '=' + std::to_string(duration);
                         appendToken(tokens, std::move(token));
                     }
-                    // #region agent log
-                    {
-                        std::ostringstream data;
-                        data << "{\"from\":" << from << ",\"to\":" << to
-                             << ",\"duration\":" << duration
-                             << ",\"segVol\":" << segment_volume
-                             << ",\"junctionVol\":" << junction_volume
-                             << ",\"emitOriginNow\":"
-                             << (emit_origin_now ? "true" : "false")
-                             << ",\"emitJunctionOrigin\":"
-                             << (emit_junction ? "true" : "false")
-                             << ",\"afterCmd\":"
-                             << (to != *target_count ? "true" : "false")
-                             << ",\"token\":\""
-                             << volumeCharacter(segment_volume);
-                        if (duration != 1) {
-                            data << "=" << duration;
-                        }
-                        data << "\"}";
-                        agentDbg(
-                            "H3",
-                            "mgs_envelope_io.cpp:segment",
-                            "ramp segment emitted",
-                            data.str());
-                    }
-                    // #endregion
                     junction_volume = segment_volume;
                     if (to != *target_count) {
                         append_zero_time(to);
@@ -816,27 +704,6 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
                && !states[next].boundary()) {
             ++next;
         }
-        // #region agent log
-        if (states[cursor].volume
-            && (states[cursor].volume->automatic
-                || (next < states.size()
-                    && states[next].volume
-                    && states[next].volume->automatic))) {
-            std::ostringstream data;
-            data << "{\"cursor\":" << cursor
-                 << ",\"next\":" << next
-                 << ",\"hold\":" << (next - cursor)
-                 << ",\"currentVol\":" << current_volume
-                 << ",\"cursorAuto\":"
-                 << (states[cursor].volume->automatic ? "true" : "false")
-                 << "}";
-            agentDbg(
-                "H5",
-                "mgs_envelope_io.cpp:append_hold",
-                "hold consumed span that may include later automatic",
-                data.str());
-        }
-        // #endregion
         appendHold(tokens, current_volume, next - cursor);
         cursor = next;
     }
@@ -866,35 +733,6 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
     collapseTrailingHold(tokens);
     result.body = ",," + joinTokens(tokens);
     result.compiled_bytes = compiledEnvelopeBytes(tokens);
-    // #region agent log
-    {
-        bool any_automatic = false;
-        for (const auto& event : layer.volume_envelope.events) {
-            if (event.automatic) {
-                any_automatic = true;
-                break;
-            }
-        }
-        if (any_automatic) {
-            std::string escaped = result.body;
-            for (auto& ch : escaped) {
-                if (ch == '"') {
-                    ch = '\'';
-                }
-            }
-            std::ostringstream data;
-            data << "{\"body\":\"" << escaped
-                 << "\",\"len\":" << timeline.length_counts
-                 << ",\"def\":" << static_cast<int>(definition_number)
-                 << "}";
-            agentDbg(
-                "H1",
-                "mgs_envelope_io.cpp:result",
-                "formatted @e body",
-                data.str());
-        }
-    }
-    // #endregion
     if (result.compiled_bytes > compiled_byte_limit) {
         result.issues.push_back(MgsEnvelopeIssue::DefinitionLengthExceeded);
         return result;

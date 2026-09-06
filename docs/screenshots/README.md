@@ -14,6 +14,7 @@ README トップ説明用。バイナリ／README 更新のたびに現行 UI �
 | `settings-midi.png` | アプリ設定・MIDI タブ |
 | `settings-output.png` | アプリ設定・Output タブ |
 | `library-manager.png` | 音色ライブラリ管理 |
+| `spectrogram-playing.png` | OPLL単音試聴中のスペクトログラム |
 
 README では各群の直下に `※画面は開発中のものです` を入れる。
 
@@ -27,4 +28,5 @@ README では各群の直下に `※画面は開発中のものです` を入れ
 .\tools\capture-ui.cmd -Editor main -Target settings-midi -OutputPath docs\screenshots\settings-midi.png
 .\tools\capture-ui.cmd -Editor main -Target settings-output -OutputPath docs\screenshots\settings-output.png
 .\tools\capture-ui.cmd -Editor scc -Target library -OutputPath docs\screenshots\library-manager.png
+.\tools\capture-ui.cmd -Editor opll -Target spectrogram -OutputPath docs\screenshots\spectrogram-playing.png
 ```

@@ -36,6 +36,7 @@ public:
 
     void showWindow();
     void setAnalysisMode(SpectrogramAnalysisMode mode);
+    [[nodiscard]] juce::Component* snapshotContent() const noexcept;
     void closeButtonPressed() override;
 
 private:

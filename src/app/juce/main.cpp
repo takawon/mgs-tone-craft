@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <sstream>
 #include <limits>
@@ -100,30 +99,6 @@ namespace {
 using mgstc::app::CompositeTimeline;
 using mgstc::app::EnvelopeTimbreCatalogItem;
 using mgstc::app::LayerBaseTimbreAssign;
-
-// #region agent log
-void dbg7ae407(
-    const char* hypothesisId,
-    const char* location,
-    const char* message,
-    const std::string& dataObject) {
-    try {
-        std::ofstream out(
-            "debug-7ae407.log",
-            std::ios::app | std::ios::binary);
-        if (!out) {
-            return;
-        }
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        out << "{\"sessionId\":\"7ae407\",\"runId\":\"pre-fix\",\"hypothesisId\":\""
-            << hypothesisId << "\",\"location\":\"" << location
-            << "\",\"message\":\"" << message << "\",\"data\":" << dataObject
-            << ",\"timestamp\":" << ms << "}\n";
-    } catch (...) {
-    }
-}
-// #endregion
 
 static_assert(
     sizeof(mgstc::engine::RealtimeEngineHost) < 128 * 1024,
@@ -2143,14 +2118,17 @@ enum class PcAudioBackend : std::uint8_t {
 
 class SharedAudioService final : public SharedAudioHost, private juce::Timer {
 public:
-    SharedAudioService() {
+    explicit SharedAudioService(bool offline_snapshot_capture = false)
+        : offline_snapshot_capture_(offline_snapshot_capture) {
         master_volume_percent_ = loadMasterVolumePercent();
         wasapi_audio_.setMasterVolumePercent(
             static_cast<std::uint32_t>(master_volume_percent_));
         asio_audio_.setMasterVolumePercent(
             static_cast<std::uint32_t>(master_volume_percent_));
         loadAndApplySoundOutputSettings();
-        loadAndStartPcAudioSettings();
+        if (!offline_snapshot_capture_) {
+            loadAndStartPcAudioSettings();
+        }
         publishHangHints();
         opll_keyoff_force_silence_seconds_ =
             loadOpllKeyOffForceSilenceSeconds();
@@ -2178,7 +2156,8 @@ public:
     }
 
     [[nodiscard]] bool running() const noexcept override {
-        return active_audio_ != nullptr && active_audio_->running();
+        return offline_snapshot_capture_
+            || (active_audio_ != nullptr && active_audio_->running());
     }
 
     [[nodiscard]] int masterVolumePercent() const noexcept {
@@ -2976,6 +2955,7 @@ private:
     std::string asio_driver_name_;
     std::string pc_audio_note_;
     bool suppress_pc_audio_fallback_{};
+    bool offline_snapshot_capture_{};
     // Message thread owns these; only the two atomics cross to the worker.
     std::thread device_worker_;
     bool device_recovery_busy_{};
@@ -9704,21 +9684,6 @@ private:
         std::uint8_t base_note,
         bool stop_after_one_second,
         bool already_configured = false) {
-        // #region agent log
-        const auto note_t0 = juce::Time::getMillisecondCounterHiRes();
-        dbg7ae407(
-            "H5",
-            "main.cpp:startCompositeNote",
-            "enter",
-            std::string("{\"note\":") + std::to_string(base_note)
-                + ",\"one_sec\":"
-                + (stop_after_one_second ? "true" : "false")
-                + ",\"stale\":"
-                + (composite_program_stale_ ? "true" : "false")
-                + ",\"voices\":"
-                + std::to_string(voice_allocator_.activeVoiceCount())
-                + "}");
-        // #endregion
         if (stop_after_one_second || !performance_keyboard_.polyphonic()) {
             stopAudition();
         }
@@ -9727,17 +9692,6 @@ private:
                 && voice_allocator_.activeVoiceCount() == 0
                 && composite_program_stale_
                 && !configureEngine())) {
-            // #region agent log
-            dbg7ae407(
-                "H5",
-                "main.cpp:startCompositeNote",
-                "abort",
-                std::string("{\"note\":") + std::to_string(base_note)
-                    + ",\"ms\":"
-                    + std::to_string(
-                        juce::Time::getMillisecondCounterHiRes() - note_t0)
-                    + "}");
-            // #endregion
             return;
         }
         const double now =
@@ -9790,17 +9744,6 @@ private:
         }
         last_audition_note_ = base_note;
         saveLastAuditionNoteSetting(last_audition_note_);
-        // #region agent log
-        dbg7ae407(
-            "H5",
-            "main.cpp:startCompositeNote",
-            "exit",
-            std::string("{\"note\":") + std::to_string(base_note)
-                + ",\"ms\":"
-                + std::to_string(
-                    juce::Time::getMillisecondCounterHiRes() - note_t0)
-                + "}");
-        // #endregion
     }
 
     void restoreLibraryManagerTimbre() {
@@ -9945,13 +9888,6 @@ private:
                 scope_frame, last_audition_note_) || repaint_scope;
         }
         if (repaint_scope) {
-            // #region agent log
-            dbg7ae407(
-                "H4",
-                "main.cpp:timerCallback",
-                "scope repaint",
-                std::string("{\"playing\":true}"));
-            // #endregion
             timeline_.repaint();
         }
         if (timeline_preview_pending_
@@ -17227,11 +17163,19 @@ public:
         UiScale::loadGlobalFromIni();
         juce::LookAndFeel::setDefaultLookAndFeel(&look_and_feel_);
         hang_watchdog_.start();
-        audio_service_ = std::make_unique<SharedAudioService>();
-        midi_service_ = std::make_unique<SharedMidiInputService>();
         const juce::ArgumentList arguments(
             getApplicationName(),
             command_line);
+        const auto snapshot_target = arguments
+            .getValueForOption("--capture-target")
+            .trim()
+            .toLowerCase();
+        offline_spectrogram_capture_ =
+            arguments.getValueForOption("--capture-ui").isNotEmpty()
+            && snapshot_target == "spectrogram";
+        audio_service_ = std::make_unique<SharedAudioService>(
+            offline_spectrogram_capture_);
+        midi_service_ = std::make_unique<SharedMidiInputService>();
         auto requested_editor =
             arguments.getValueForOption("--editor");
         if (requested_editor.isEmpty()) {
@@ -17284,10 +17228,22 @@ public:
                 capture_target = "editor";
             }
             snapshot_target_ = capture_target;
-            if (snapshot_target_ == "editor") {
+            if (snapshot_target_ == "spectrogram") {
+                showSpectrogram();
+                // Enable the analyzer before starting the one-second audition,
+                // otherwise a fast initial note can complete before the
+                // capture queue begins receiving PCM frames.
+                snapshot_window_->prepareVisualInspection();
+            } else if (snapshot_target_ == "editor") {
                 snapshot_window_->prepareVisualInspection();
             }
-            startTimer(500);
+            if (offline_spectrogram_capture_) {
+                snapshot_due_ms_ =
+                    juce::Time::getMillisecondCounterHiRes() + 900.0;
+                startTimer(10);
+            } else {
+                startTimer(snapshot_target_ == "spectrogram" ? 900 : 500);
+            }
         }
     }
 
@@ -17842,6 +17798,18 @@ private:
     }
 
     void timerCallback() override {
+        if (offline_spectrogram_capture_) {
+            // `--capture-ui --capture-target spectrogram` is a headless
+            // documentation path: no device callback runs, so it advances
+            // the same engine rendering path in bounded chunks until the
+            // analyzer has received the one-second audition.
+            std::array<float, 1'600> offline_pcm{};
+            static_cast<void>(audio_service_->engine().render(offline_pcm));
+            if (juce::Time::getMillisecondCounterHiRes() < snapshot_due_ms_) {
+                return;
+            }
+            offline_spectrogram_capture_ = false;
+        }
         stopTimer();
         if (routing_test_mode_) {
             setApplicationReturnValue(static_cast<int>(
@@ -17869,6 +17837,13 @@ private:
                 : SnapshotResult::MissingContent;
         } else if (snapshot_target_ == "library") {
             result = captureLibraryManagerSnapshot(snapshot_file_);
+        } else if (snapshot_target_ == "spectrogram") {
+            auto* const content = spectrogram_window_ != nullptr
+                ? spectrogram_window_->snapshotContent()
+                : nullptr;
+            result = content != nullptr
+                ? writeComponentPngSnapshot(*content, snapshot_file_)
+                : SnapshotResult::MissingContent;
         } else if (snapshot_window_ != nullptr) {
             result = snapshot_window_->writeContentSnapshot(
                 snapshot_file_);
@@ -17919,6 +17894,8 @@ private:
     juce::String active_editor_{"main"};
     std::uint8_t composite_spectrogram_source_mask_{};
     juce::String snapshot_target_{"editor"};
+    bool offline_spectrogram_capture_{};
+    double snapshot_due_ms_{};
     bool routing_test_mode_{};
     bool routing_test_passed_{};
     bool close_confirmation_pending_{};

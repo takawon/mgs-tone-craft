@@ -4,9 +4,7 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
-#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
@@ -59,30 +57,6 @@ using mgstc::app::LayerBaseTimbreAssign;
 using mgstc::app::envelopeTimbreCatalogLabel;
 
 namespace {
-
-// #region agent log
-void dbg7ae407(
-    const char* hypothesisId,
-    const char* location,
-    const char* message,
-    const std::string& dataObject) {
-    try {
-        std::ofstream out(
-            "debug-7ae407.log",
-            std::ios::app | std::ios::binary);
-        if (!out) {
-            return;
-        }
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        out << "{\"sessionId\":\"7ae407\",\"runId\":\"pre-fix\",\"hypothesisId\":\""
-            << hypothesisId << "\",\"location\":\"" << location
-            << "\",\"message\":\"" << message << "\",\"data\":" << dataObject
-            << ",\"timestamp\":" << ms << "}\n";
-    } catch (...) {
-    }
-}
-// #endregion
 
 class EnvelopeNumericEntryContent final : public juce::Component {
 public:
@@ -4047,17 +4021,6 @@ public:
     }
 
     void paint(juce::Graphics& graphics) override {
-        // #region agent log
-        thread_local int paint_depth = 0;
-        const int depth = ++paint_depth;
-        const auto paint_t0 = juce::Time::getMillisecondCounterHiRes();
-        dbg7ae407(
-            "H1",
-            "composite_timeline.cpp:CompositeTimeline::paint",
-            "enter",
-            std::string("{\"depth\":") + std::to_string(depth)
-                + ",\"drawing\":" + (drawing_ ? "true" : "false") + "}");
-        // #endregion
         graphics.fillAll(juce::Colour(0xFF182028));
         auto area = getLocalBounds().reduced(UiLayout::panelPad);
         auto header = area.removeFromTop(UiLayout::textButtonH);
@@ -4223,26 +4186,8 @@ public:
             }
         }
         juce::ignoreUnused(numbers);
-        // #region agent log
-        const auto layout_t0 = juce::Time::getMillisecondCounterHiRes();
-        // #endregion
         layoutLayerSetups();
         layoutEditToolsDock();
-        // #region agent log
-        const auto paint_t1 = juce::Time::getMillisecondCounterHiRes();
-        dbg7ae407(
-            "H1",
-            "composite_timeline.cpp:CompositeTimeline::paint",
-            "exit",
-            std::string("{\"depth\":") + std::to_string(depth)
-                + ",\"graph_ms\":"
-                + std::to_string(layout_t0 - paint_t0)
-                + ",\"layout_ms\":"
-                + std::to_string(paint_t1 - layout_t0)
-                + ",\"total_ms\":"
-                + std::to_string(paint_t1 - paint_t0) + "}");
-        --paint_depth;
-        // #endregion
     }
 
 private:
@@ -6488,9 +6433,6 @@ private:
             envelope_mml_preview_.setVisible(false);
             return;
         }
-        // #region agent log
-        const auto preview_t0 = juce::Time::getMillisecondCounterHiRes();
-        // #endregion
         const auto& layer =
             timbre_.layers[static_cast<std::size_t>(selected_layer_)];
         const auto numbers = mgstc::engine::resolveTimbreNumbers(timbre_);
@@ -6525,52 +6467,8 @@ private:
             return;
         }
         last_envelope_mml_preview_ = preview_text;
-        // #region agent log
-        const auto preview_t1 = juce::Time::getMillisecondCounterHiRes();
-        // #endregion
         UiFonts::setMgscPreviewText(
             envelope_mml_preview_, preview_text);
-        // #region agent log
-        const auto preview_t2 = juce::Time::getMillisecondCounterHiRes();
-        {
-
-            juce::String vols;
-            for (const auto& event : layer.volume_envelope.events) {
-                if (event.kind != mgstc::engine::EnvelopeEventKind::Volume) {
-                    continue;
-                }
-                if (vols.isNotEmpty()) {
-                    vols += ",";
-                }
-                vols += juce::String(static_cast<int>(event.count)) + ":"
-                    + juce::String(event.value) + (event.automatic ? "a" : "h");
-            }
-            auto def = definition.replace("\\", "/").replace("\"", "'");
-            const auto payload =
-                juce::String("{\"sessionId\":\"6045ae\",\"runId\":\"post-fix-gui\",")
-                + "\"hypothesisId\":\"H3\",\"location\":\"main.cpp:preview\","
-                + "\"message\":\"envelope mml preview\","
-                + "\"data\":{\"def\":\"" + def
-                + "\",\"vols\":\"" + vols + "\"},\"timestamp\":"
-                + juce::String(juce::Time::currentTimeMillis()) + "}\n";
-            juce::File(juce::CharPointer_UTF8(
-                "debug-6045ae.log"))
-                .appendText(payload, false, false);
-        }
-        const auto preview_t3 = juce::Time::getMillisecondCounterHiRes();
-        dbg7ae407(
-            "H2",
-            "main.cpp:updateEnvelopeMmlPreview",
-            "preview cost",
-            std::string("{\"format_ms\":")
-                + std::to_string(preview_t1 - preview_t0)
-                + ",\"setText_ms\":"
-                + std::to_string(preview_t2 - preview_t1)
-                + ",\"dbgfile_ms\":"
-                + std::to_string(preview_t3 - preview_t2)
-                + ",\"total_ms\":"
-                + std::to_string(preview_t3 - preview_t0) + "}");
-        // #endregion
     }
 
     [[nodiscard]] bool isEditSubLaneHovered(Parameter parameter) const noexcept {
