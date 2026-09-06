@@ -59,6 +59,35 @@ constexpr std::uint8_t kAnalyzeOpll = 1U << 2U;
 constexpr std::uint8_t kAnalyzeAll =
     kAnalyzePsg | kAnalyzeScc | kAnalyzeOpll;
 
+[[nodiscard]] double noteFrequencyForChip(
+    std::uint8_t midi_note,
+    bool opll) noexcept {
+    constexpr double kMasterClock = 3'579'545.0;
+    engine::NotePitch pitch{};
+    if (!engine::notePitch(midi_note, pitch)) {
+        return 0.0;
+    }
+    if (opll) {
+        return static_cast<double>(pitch.opll.f_number) * kMasterClock
+            / (72.0
+               * static_cast<double>(1U << (19 - pitch.opll.block)));
+    }
+    return kMasterClock
+        / ((static_cast<double>(pitch.psg_scc_period) + 1.0) * 32.0);
+}
+
+[[nodiscard]] double noteFrequencyForTrack(
+    std::uint8_t midi_note,
+    std::uint8_t track) noexcept {
+    return noteFrequencyForChip(midi_note, track >= 8);
+}
+
+[[nodiscard]] double noteFrequencyForSource(
+    std::uint8_t midi_note,
+    std::size_t source) noexcept {
+    return noteFrequencyForChip(midi_note, source == 2);
+}
+
 const auto kPsgColour = juce::Colour(0xFFB990FF);
 const auto kSccColour = juce::Colour(0xFF53E3A6);
 const auto kOpllColour = juce::Colour(0xFFFFA75E);
@@ -67,6 +96,9 @@ struct SpectrogramColumn {
     std::array<std::uint8_t, kLogBinCount> psg{};
     std::array<std::uint8_t, kLogBinCount> scc{};
     std::array<std::uint8_t, kLogBinCount> opll{};
+    spectrogram::HarmonicPeakList psg_harmonics{};
+    spectrogram::HarmonicPeakList scc_harmonics{};
+    spectrogram::HarmonicPeakList opll_harmonics{};
     std::uint64_t sequence{};
     std::uint8_t guide_note{60};
     std::uint8_t guide_track{};
@@ -333,21 +365,39 @@ private:
 
     void publishColumn() noexcept {
         SpectrogramColumn column{};
+        const double psg_scc_fundamental = note_active_
+            ? noteFrequencyForSource(guide_note_, 0)
+            : 0.0;
+        const double opll_fundamental = note_active_
+            ? noteFrequencyForSource(guide_note_, 2)
+            : 0.0;
         // Keep the time axis moving during silence, but leave each inactive
         // source black and skip its FFT.  The cheap sample activity check also
         // preserves release tails until the whole FFT window is below the
         // display floor.
         if ((active_source_mask_ & kAnalyzePsg) != 0
             && active_sample_counts_[0] != 0) {
-            analyze(psg_ring_, column.psg);
+            analyze(
+                psg_ring_,
+                column.psg,
+                column.psg_harmonics,
+                psg_scc_fundamental);
         }
         if ((active_source_mask_ & kAnalyzeScc) != 0
             && active_sample_counts_[1] != 0) {
-            analyze(scc_ring_, column.scc);
+            analyze(
+                scc_ring_,
+                column.scc,
+                column.scc_harmonics,
+                psg_scc_fundamental);
         }
         if ((active_source_mask_ & kAnalyzeOpll) != 0
             && active_sample_counts_[2] != 0) {
-            analyze(opll_ring_, column.opll);
+            analyze(
+                opll_ring_,
+                column.opll,
+                column.opll_harmonics,
+                opll_fundamental);
         }
         column.sequence = ++column_sequence_;
         column.guide_note = guide_note_;
@@ -358,7 +408,9 @@ private:
 
     void analyze(
         const std::array<float, kFftSize>& ring,
-        std::array<std::uint8_t, kLogBinCount>& output) noexcept {
+        std::array<std::uint8_t, kLogBinCount>& output,
+        spectrogram::HarmonicPeakList& harmonic_peaks,
+        double fundamental_frequency) noexcept {
         const auto tail_size = kFftSize - ring_write_;
         std::copy_n(
             ring.begin() + static_cast<std::ptrdiff_t>(ring_write_),
@@ -373,6 +425,21 @@ private:
 
         const auto* spectrum = reinterpret_cast<
             const juce::dsp::Complex<float>*>(fft_data_.data());
+        for (std::size_t fft_bin = 0;
+             fft_bin < power_spectrum_.size();
+             ++fft_bin) {
+            const auto real = spectrum[fft_bin].real();
+            const auto imaginary = spectrum[fft_bin].imag();
+            power_spectrum_[fft_bin] = real * real + imaginary * imaginary;
+        }
+        harmonic_peaks = spectrogram::findHarmonicPeaks(
+            power_spectrum_,
+            fundamental_frequency,
+            kSampleRate,
+            kFftSize,
+            power_thresholds_.front(),
+            kMinimumDb);
+
         std::array<std::uint8_t, kLogBinCount> range_levels{};
         for (std::size_t range_index = 0;
              range_index < unique_log_range_count_;
@@ -382,11 +449,9 @@ private:
             for (std::size_t fft_bin = range.first;
                  fft_bin <= range.last;
                  ++fft_bin) {
-                const auto real = spectrum[fft_bin].real();
-                const auto imaginary = spectrum[fft_bin].imag();
                 maximum_power = std::max(
                     maximum_power,
-                    real * real + imaginary * imaginary);
+                    power_spectrum_[fft_bin]);
             }
             range_levels[range_index] = static_cast<std::uint8_t>(
                 std::upper_bound(
@@ -410,6 +475,7 @@ private:
     std::array<float, kFftSize> opll_ring_{};
     std::array<std::array<bool, kFftSize>, 3> active_samples_{};
     std::array<float, kFftSize * 2> fft_data_{};
+    std::array<float, kFftSize / 2 + 1> power_spectrum_{};
     std::array<std::size_t, kLogBinCount + 1> log_bin_edges_{};
     std::array<LogBandRange, kLogBinCount> unique_log_ranges_{};
     std::array<std::size_t, kLogBinCount> log_bin_range_indices_{};
@@ -437,23 +503,6 @@ private:
     bool has_frame_sequence_{};
     bool note_active_{};
 };
-
-[[nodiscard]] double noteFrequency(
-    std::uint8_t midi_note,
-    std::uint8_t track) noexcept {
-    constexpr double kMasterClock = 3'579'545.0;
-    engine::NotePitch pitch{};
-    if (!engine::notePitch(midi_note, pitch)) {
-        return 0.0;
-    }
-    if (track >= 8) {
-        return static_cast<double>(pitch.opll.f_number) * kMasterClock
-            / (72.0
-               * static_cast<double>(1U << (19 - pitch.opll.block)));
-    }
-    return kMasterClock
-        / ((static_cast<double>(pitch.psg_scc_period) + 1.0) * 32.0);
-}
 
 [[nodiscard]] juce::String nearestNoteName(double frequency) {
     if (!(frequency > 0.0)) {
@@ -564,10 +613,32 @@ void configurePinButton(juce::DrawableButton& button) {
 
 class SpectrogramDisplay final : public juce::Component {
 private:
+    static constexpr std::size_t kMaximumPixelHarmonics =
+        spectrogram::kMaximumHarmonicPeaks * 4;
+
     struct SourceIntensity {
         std::uint8_t psg{};
         std::uint8_t scc{};
         std::uint8_t opll{};
+    };
+
+    struct PixelHarmonicPeakList {
+        std::array<spectrogram::HarmonicPeak, kMaximumPixelHarmonics> peaks{};
+        std::uint8_t count{};
+    };
+
+    struct PixelHarmonics {
+        PixelHarmonicPeakList psg{};
+        PixelHarmonicPeakList scc{};
+        PixelHarmonicPeakList opll{};
+    };
+
+    static constexpr std::uint8_t kNoHarmonic = 0xFF;
+
+    struct HarmonicInfluence {
+        std::uint8_t psg{kNoHarmonic};
+        std::uint8_t scc{kNoHarmonic};
+        std::uint8_t opll{kNoHarmonic};
     };
 
     struct GuideState {
@@ -583,7 +654,6 @@ private:
 public:
     SpectrogramDisplay()
         : history_(kHistoryCapacity) {
-        rebuildEmphasisLut();
         setMouseCursor(juce::MouseCursor::CrosshairCursor);
         setOpaque(true);
     }
@@ -623,14 +693,17 @@ public:
                 source_intensities_.end(),
                 SourceIntensity{});
             std::fill(
-                local_averages_.begin(),
-                local_averages_.end(),
-                SourceIntensity{});
-            local_averages_valid_ = true;
-            std::fill(
                 pixel_cycles_.begin(),
                 pixel_cycles_.end(),
                 std::numeric_limits<std::uint64_t>::max());
+            std::fill(
+                pixel_harmonics_.begin(),
+                pixel_harmonics_.end(),
+                PixelHarmonics{});
+            std::fill(
+                harmonic_influences_.begin(),
+                harmonic_influences_.end(),
+                HarmonicInfluence{});
             dirty_first_x_ = std::numeric_limits<int>::max();
             dirty_last_x_ = -1;
             requestFullRepaint();
@@ -656,10 +729,6 @@ public:
             return;
         }
         emphasis_percent_ = next;
-        rebuildEmphasisLut();
-        if (emphasis_percent_ > 0.0 && !local_averages_valid_) {
-            rebuildLocalAverages();
-        }
         recomposeImage();
     }
 
@@ -681,8 +750,7 @@ public:
         }
         frequency_zoom_ = next;
         clampFrequencyOffset();
-        rebuildFrequencyBinCache();
-        clearHistory();
+        rebuildImage();
     }
 
     void setFrequencyOffset(double octaves) {
@@ -781,7 +849,7 @@ public:
 
     void resized() override {
         clampFrequencyOffset();
-        clearHistory();
+        rebuildImage();
     }
 
     void mouseEnter(const juce::MouseEvent& event) override {
@@ -886,7 +954,7 @@ private:
         GuideState state,
         std::array<juce::Rectangle<int>, 32>& regions,
         std::size_t& count) const {
-        const double fundamental = noteFrequency(state.note, state.track);
+        const double fundamental = noteFrequencyForTrack(state.note, state.track);
         for (int harmonic = 1; harmonic <= 16; ++harmonic) {
             const int y = yForFrequency(fundamental * harmonic);
             if (y == std::numeric_limits<int>::min()
@@ -983,29 +1051,24 @@ private:
     }
 
     [[nodiscard]] juce::Colour colourFor(
-        const SourceIntensity& intensity,
-        const SourceIntensity& local_average) const noexcept {
+        const SourceIntensity& intensity) const noexcept {
         float red = 0.0F;
         float green = 0.0F;
         float blue = 0.0F;
-        const auto add = [&](
-            std::uint8_t level,
-            std::uint8_t average,
-            juce::Colour colour) {
-            const float amount = static_cast<float>(
-                emphasis_lut_[emphasisLutIndex(level, average)]) / 255.0F;
+        const auto add = [&](std::uint8_t level, juce::Colour colour) {
+            const float amount = static_cast<float>(level) / 255.0F;
             red += colour.getFloatRed() * amount;
             green += colour.getFloatGreen() * amount;
             blue += colour.getFloatBlue() * amount;
         };
         if (show_psg_) {
-            add(intensity.psg, local_average.psg, kPsgColour);
+            add(intensity.psg, kPsgColour);
         }
         if (show_scc_) {
-            add(intensity.scc, local_average.scc, kSccColour);
+            add(intensity.scc, kSccColour);
         }
         if (show_opll_) {
-            add(intensity.opll, local_average.opll, kOpllColour);
+            add(intensity.opll, kOpllColour);
         }
         return juce::Colour::fromFloatRGBA(
             std::clamp(red, 0.0F, 1.0F),
@@ -1014,11 +1077,161 @@ private:
             1.0F);
     }
 
-    [[nodiscard]] static constexpr std::size_t emphasisLutIndex(
-        std::uint8_t level,
-        std::uint8_t local_average) noexcept {
-        return static_cast<std::size_t>(level) * 256U
-            + static_cast<std::size_t>(local_average);
+    [[nodiscard]] double imageYForFrequency(double frequency) const noexcept {
+        const double octave = std::log2(
+            frequency / static_cast<double>(kMinimumFrequency));
+        return static_cast<double>(image_.getHeight() - 1)
+            - (octave - frequency_offset_) * pixelsPerOctave();
+    }
+
+    [[nodiscard]] double harmonicLobeRadiusPixels(
+        double frequency) const noexcept {
+        constexpr double kFftBinWidth = kSampleRate
+            / static_cast<double>(kFftSize);
+        constexpr double kHannMainLobeHalfWidthBins = 2.0;
+        const double centre_y = imageYForFrequency(frequency);
+        const double lower = std::max(
+            static_cast<double>(kMinimumFrequency),
+            frequency - kHannMainLobeHalfWidthBins * kFftBinWidth);
+        const double upper = std::min(
+            static_cast<double>(kMaximumFrequency),
+            frequency + kHannMainLobeHalfWidthBins * kFftBinWidth);
+        return std::clamp(
+            std::max(
+                std::abs(imageYForFrequency(lower) - centre_y),
+                std::abs(imageYForFrequency(upper) - centre_y)),
+            1.5,
+            12.0);
+    }
+
+    [[nodiscard]] std::uint8_t emphasizedSourceLevel(
+        std::uint8_t original,
+        const PixelHarmonicPeakList& harmonics,
+        std::uint8_t harmonic_index,
+        int image_y) const noexcept {
+        if (emphasis_percent_ <= 0.0
+            || harmonic_index == kNoHarmonic
+            || harmonic_index >= harmonics.count) {
+            return original;
+        }
+        const auto& peak = harmonics.peaks[harmonic_index];
+        const double radius = harmonicLobeRadiusPixels(peak.frequency);
+        const double distance = std::abs(
+            static_cast<double>(image_y)
+            - imageYForFrequency(peak.frequency));
+        return spectrogram::composeHarmonicRidgeLevel(
+            original,
+            peak.level,
+            distance,
+            radius,
+            emphasis_percent_ / 100.0);
+    }
+
+    [[nodiscard]] SourceIntensity emphasizedIntensity(
+        const SourceIntensity& original,
+        const PixelHarmonics& harmonics,
+        const HarmonicInfluence& influence,
+        int image_y) const noexcept {
+        return {
+            emphasizedSourceLevel(
+                original.psg, harmonics.psg, influence.psg, image_y),
+            emphasizedSourceLevel(
+                original.scc, harmonics.scc, influence.scc, image_y),
+            emphasizedSourceLevel(
+                original.opll, harmonics.opll, influence.opll, image_y),
+        };
+    }
+
+    static void mergeHarmonics(
+        PixelHarmonicPeakList& destination,
+        const spectrogram::HarmonicPeakList& source) noexcept {
+        constexpr float kSamePeakToleranceHz = static_cast<float>(
+            kSampleRate / static_cast<double>(kFftSize));
+        for (std::size_t source_index = 0;
+             source_index < source.count;
+             ++source_index) {
+            const auto candidate = source.peaks[source_index];
+            bool merged = false;
+            for (std::size_t index = 0; index < destination.count; ++index) {
+                auto& existing = destination.peaks[index];
+                if (std::abs(existing.frequency - candidate.frequency)
+                    <= kSamePeakToleranceHz) {
+                    if (candidate.level > existing.level) {
+                        existing = candidate;
+                    }
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged && destination.count < destination.peaks.size()) {
+                destination.peaks[destination.count++] = candidate;
+            }
+        }
+    }
+
+    void rebuildHarmonicInfluencesForSource(
+        const PixelHarmonicPeakList& harmonics,
+        std::size_t column_offset,
+        std::size_t height,
+        std::uint8_t HarmonicInfluence::* member) noexcept {
+        for (std::size_t y = 0; y < height; ++y) {
+            harmonic_influences_[column_offset + y].*member = kNoHarmonic;
+        }
+        for (std::size_t peak_index = 0;
+             peak_index < harmonics.count;
+             ++peak_index) {
+            const auto& peak = harmonics.peaks[peak_index];
+            const double centre_y = imageYForFrequency(peak.frequency);
+            const double radius = harmonicLobeRadiusPixels(peak.frequency);
+            const int first_y = std::max(
+                0, static_cast<int>(std::floor(centre_y - radius)));
+            const int last_y = std::min(
+                static_cast<int>(height) - 1,
+                static_cast<int>(std::ceil(centre_y + radius)));
+            for (int y = first_y; y <= last_y; ++y) {
+                const double candidate_distance = std::abs(
+                    static_cast<double>(y) - centre_y) / radius;
+                if (candidate_distance > 1.0) {
+                    continue;
+                }
+                auto& nearest = harmonic_influences_[
+                    column_offset + static_cast<std::size_t>(y)].*member;
+                if (nearest == kNoHarmonic) {
+                    nearest = static_cast<std::uint8_t>(peak_index);
+                    continue;
+                }
+                const auto& current = harmonics.peaks[nearest];
+                const double current_distance = std::abs(
+                    static_cast<double>(y)
+                    - imageYForFrequency(current.frequency))
+                    / harmonicLobeRadiusPixels(current.frequency);
+                if (candidate_distance < current_distance) {
+                    nearest = static_cast<std::uint8_t>(peak_index);
+                }
+            }
+        }
+    }
+
+    void rebuildHarmonicInfluencesForColumn(
+        std::size_t x,
+        std::size_t height) noexcept {
+        const auto column_offset = x * height;
+        const auto& harmonics = pixel_harmonics_[x];
+        rebuildHarmonicInfluencesForSource(
+            harmonics.psg,
+            column_offset,
+            height,
+            &HarmonicInfluence::psg);
+        rebuildHarmonicInfluencesForSource(
+            harmonics.scc,
+            column_offset,
+            height,
+            &HarmonicInfluence::scc);
+        rebuildHarmonicInfluencesForSource(
+            harmonics.opll,
+            column_offset,
+            height,
+            &HarmonicInfluence::opll);
     }
 
     [[nodiscard]] static bool columnIsSilent(
@@ -1032,98 +1245,6 @@ private:
             && std::none_of(
                    column.opll.begin(), column.opll.end(),
                    [](std::uint8_t level) { return level != 0; });
-    }
-
-    void rebuildEmphasisLut() noexcept {
-        const double strength = emphasis_percent_ / 100.0;
-        for (int level = 0; level <= 255; ++level) {
-            for (int average = 0; average <= 255; ++average) {
-                emphasis_lut_[emphasisLutIndex(
-                    static_cast<std::uint8_t>(level),
-                    static_cast<std::uint8_t>(average))]
-                    = spectrogram::emphasizeLevel(
-                        static_cast<std::uint8_t>(level),
-                        static_cast<std::uint8_t>(average),
-                        strength);
-            }
-        }
-    }
-
-    [[nodiscard]] int emphasisRadius() const noexcept {
-        return juce::jlimit(
-            2,
-            12,
-            juce::roundToInt(pixelsPerOctave() / 24.0));
-    }
-
-    void updateLocalAveragesForColumn(
-        std::size_t column_offset,
-        std::size_t height) {
-        if (height == 0
-            || column_offset + height > source_intensities_.size()
-            || column_offset + height > local_averages_.size()) {
-            return;
-        }
-        if (emphasis_prefix_.size() != height + 1) {
-            emphasis_prefix_.assign(height + 1, {});
-        }
-        emphasis_prefix_[0] = {};
-        for (std::size_t y = 0; y < height; ++y) {
-            const auto& intensity = source_intensities_[column_offset + y];
-            const auto& previous = emphasis_prefix_[y];
-            emphasis_prefix_[y + 1] = {
-                previous[0] + intensity.psg,
-                previous[1] + intensity.scc,
-                previous[2] + intensity.opll,
-            };
-        }
-
-        const auto radius = static_cast<std::size_t>(emphasisRadius());
-        for (std::size_t y = 0; y < height; ++y) {
-            const auto first = y > radius ? y - radius : 0U;
-            const auto last = std::min(height - 1, y + radius);
-            const auto neighbour_count = last - first;
-            const auto& intensity = source_intensities_[column_offset + y];
-            auto& average = local_averages_[column_offset + y];
-            if (neighbour_count == 0) {
-                average = intensity;
-                continue;
-            }
-            const auto roundedAverage = [neighbour_count](
-                                            std::uint32_t sum,
-                                            std::uint8_t centre) {
-                const auto neighbour_sum = sum - centre;
-                return static_cast<std::uint8_t>(
-                    (neighbour_sum + neighbour_count / 2U)
-                    / neighbour_count);
-            };
-            const auto psg_sum = emphasis_prefix_[last + 1][0]
-                - emphasis_prefix_[first][0];
-            const auto scc_sum = emphasis_prefix_[last + 1][1]
-                - emphasis_prefix_[first][1];
-            const auto opll_sum = emphasis_prefix_[last + 1][2]
-                - emphasis_prefix_[first][2];
-            average = {
-                roundedAverage(psg_sum, intensity.psg),
-                roundedAverage(scc_sum, intensity.scc),
-                roundedAverage(opll_sum, intensity.opll),
-            };
-        }
-    }
-
-    void rebuildLocalAverages() {
-        if (!image_.isValid()
-            || local_averages_.size() != source_intensities_.size()) {
-            local_averages_valid_ = false;
-            return;
-        }
-        const auto height = static_cast<std::size_t>(image_.getHeight());
-        for (int x = 0; x < image_.getWidth(); ++x) {
-            updateLocalAveragesForColumn(
-                static_cast<std::size_t>(x) * height,
-                height);
-        }
-        local_averages_valid_ = true;
     }
 
     void rebuildFrequencyBinCache() {
@@ -1142,12 +1263,11 @@ private:
             || source_intensities_.size()
                 != static_cast<std::size_t>(
                     image_.getWidth() * image_.getHeight())
-            || local_averages_.size() != source_intensities_.size()) {
+            || pixel_harmonics_.size()
+                != static_cast<std::size_t>(image_.getWidth())
+            || harmonic_influences_.size() != source_intensities_.size()) {
             rebuildImage();
             return;
-        }
-        if (emphasis_percent_ > 0.0 && !local_averages_valid_) {
-            rebuildLocalAverages();
         }
         const auto height = static_cast<std::size_t>(image_.getHeight());
         juce::Image::BitmapData bitmap(
@@ -1159,10 +1279,13 @@ private:
                     x,
                     y,
                     colourFor(
-                        source_intensities_[
-                            column_offset + static_cast<std::size_t>(y)],
-                        local_averages_[
-                            column_offset + static_cast<std::size_t>(y)]));
+                        emphasizedIntensity(
+                            source_intensities_[
+                                column_offset + static_cast<std::size_t>(y)],
+                            pixel_harmonics_[static_cast<std::size_t>(x)],
+                            harmonic_influences_[
+                                column_offset + static_cast<std::size_t>(y)],
+                            y)));
             }
         }
         dirty_first_x_ = std::numeric_limits<int>::max();
@@ -1195,6 +1318,8 @@ private:
             const bool blend = pixel_cycles_[static_cast<std::size_t>(x)]
                 == cycle;
             const auto column_offset = static_cast<std::size_t>(x) * height;
+            auto& cached_harmonics =
+                pixel_harmonics_[static_cast<std::size_t>(x)];
             if (silent) {
                 if (!blend) {
                     std::fill_n(
@@ -1202,11 +1327,12 @@ private:
                             + static_cast<std::ptrdiff_t>(column_offset),
                         height,
                         SourceIntensity{});
+                    cached_harmonics = {};
                     std::fill_n(
-                        local_averages_.begin()
+                        harmonic_influences_.begin()
                             + static_cast<std::ptrdiff_t>(column_offset),
                         height,
-                        SourceIntensity{});
+                        HarmonicInfluence{});
                     for (int y = 0; y < image_.getHeight(); ++y) {
                         bitmap.setPixelColour(x, y, juce::Colours::black);
                     }
@@ -1216,6 +1342,14 @@ private:
                 dirty_last_x_ = std::max(dirty_last_x_, x);
                 continue;
             }
+            if (!blend) {
+                cached_harmonics = {};
+            }
+            mergeHarmonics(cached_harmonics.psg, column.psg_harmonics);
+            mergeHarmonics(cached_harmonics.scc, column.scc_harmonics);
+            mergeHarmonics(cached_harmonics.opll, column.opll_harmonics);
+            rebuildHarmonicInfluencesForColumn(
+                static_cast<std::size_t>(x), height);
             for (int y = 0; y < image_.getHeight(); ++y) {
                 const auto bin = frequency_bins_[static_cast<std::size_t>(y)];
                 SourceIntensity next{};
@@ -1236,11 +1370,6 @@ private:
                     cached = next;
                 }
             }
-            if (emphasis_percent_ > 0.0) {
-                updateLocalAveragesForColumn(column_offset, height);
-            } else {
-                local_averages_valid_ = false;
-            }
             for (int y = 0; y < image_.getHeight(); ++y) {
                 const auto pixel_offset = column_offset
                     + static_cast<std::size_t>(y);
@@ -1248,8 +1377,11 @@ private:
                     x,
                     y,
                     colourFor(
-                        source_intensities_[pixel_offset],
-                        local_averages_[pixel_offset]));
+                        emphasizedIntensity(
+                            source_intensities_[pixel_offset],
+                            cached_harmonics,
+                            harmonic_influences_[pixel_offset],
+                            y)));
             }
             pixel_cycles_[static_cast<std::size_t>(x)] = cycle;
             dirty_first_x_ = std::min(dirty_first_x_, x);
@@ -1262,11 +1394,10 @@ private:
         if (plot.getWidth() <= 0 || plot.getHeight() <= 0) {
             image_ = {};
             source_intensities_.clear();
-            local_averages_.clear();
-            emphasis_prefix_.clear();
-            local_averages_valid_ = true;
             frequency_bins_.clear();
             pixel_cycles_.clear();
+            pixel_harmonics_.clear();
+            harmonic_influences_.clear();
             dirty_first_x_ = std::numeric_limits<int>::max();
             dirty_last_x_ = -1;
             requestFullRepaint();
@@ -1280,15 +1411,16 @@ private:
         source_intensities_.assign(
             static_cast<std::size_t>(plot.getWidth() * plot.getHeight()),
             SourceIntensity{});
-        local_averages_.assign(source_intensities_.size(), SourceIntensity{});
-        emphasis_prefix_.assign(
-            static_cast<std::size_t>(plot.getHeight()) + 1U,
-            {});
-        local_averages_valid_ = true;
         rebuildFrequencyBinCache();
         pixel_cycles_.assign(
             static_cast<std::size_t>(plot.getWidth()),
             std::numeric_limits<std::uint64_t>::max());
+        pixel_harmonics_.assign(
+            static_cast<std::size_t>(plot.getWidth()),
+            PixelHarmonics{});
+        harmonic_influences_.assign(
+            source_intensities_.size(),
+            HarmonicInfluence{});
         dirty_first_x_ = std::numeric_limits<int>::max();
         dirty_last_x_ = -1;
         const auto wanted = static_cast<std::size_t>(std::ceil(
@@ -1351,7 +1483,7 @@ private:
         juce::Rectangle<int> plot) const {
         const double fundamental = cursor_inside_
             ? frequencyAtPlotY(cursor_position_.y)
-            : noteFrequency(guide_note_, guide_track_);
+            : noteFrequencyForTrack(guide_note_, guide_track_);
         const float alpha = cursor_inside_ ? 0.72F
             : note_active_ ? 0.48F : 0.23F;
         graphics.setFont(static_cast<float>(UiScale::sx(10)));
@@ -1446,11 +1578,10 @@ private:
     std::size_t history_count_{};
     juce::Image image_;
     std::vector<SourceIntensity> source_intensities_;
-    std::vector<SourceIntensity> local_averages_;
-    std::vector<std::array<std::uint32_t, 3>> emphasis_prefix_;
     std::vector<std::size_t> frequency_bins_;
     std::vector<std::uint64_t> pixel_cycles_;
-    std::array<std::uint8_t, 256U * 256U> emphasis_lut_{};
+    std::vector<PixelHarmonics> pixel_harmonics_;
+    std::vector<HarmonicInfluence> harmonic_influences_;
     std::function<void(double)> frequency_scroll_;
     juce::Point<int> cursor_position_{};
     std::uint64_t latest_sequence_{};
@@ -1459,7 +1590,6 @@ private:
     double frequency_zoom_{1.0};
     double frequency_offset_{};
     double emphasis_percent_{};
-    bool local_averages_valid_{true};
     int painted_write_x_{-1};
     GuideState painted_guide_state_{};
     bool painted_guide_valid_{true};
@@ -1691,7 +1821,6 @@ public:
 
     void resized() override {
         UiScale::forceGlobalForNonEditorUi();
-        analyzer_.discardPendingColumns();
         auto area = getLocalBounds().reduced(UiLayout::sm);
         auto controls = area.removeFromTop(UiLayout::fieldH);
         psg_.setBounds(controls.removeFromLeft(UiScale::sx(66)));
@@ -1787,8 +1916,6 @@ private:
     }
 
     void resetFrequencyView(double offset) {
-        analyzer_.discardPendingColumns();
-        display_.clearHistory();
         display_.setFrequencyOffset(offset);
     }
 
