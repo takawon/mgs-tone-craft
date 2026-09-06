@@ -111,7 +111,7 @@ public:
         const engine::CompositeTimbre& timbre,
         bool reset_scroll_extent = false);
     void refreshUiScaleFonts();
-    void appendScopeFrame(
+    [[nodiscard]] bool appendScopeFrame(
         const engine::OpllScopeFrame& frame,
         std::uint8_t midi_note);
 

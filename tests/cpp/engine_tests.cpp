@@ -2830,6 +2830,41 @@ void testRealtimeHostPublishesOpllScopeToUiQueue() {
     REQUIRE_EQ(host.pollOpllScope(scope), false);
 }
 
+void testRealtimeHostSpectrogramCaptureIsOptInAndKeepsLastNote() {
+    RealtimeEngineHost host;
+    std::vector<float> output(OpllScopeFrame::kSampleCount * 2);
+    REQUIRE_EQ(host.render(output).ok(), true);
+
+    OpllScopeFrame scope{};
+    REQUIRE_EQ(host.pollSpectrogramScope(scope), false);
+
+    host.setSpectrogramCaptureEnabled(true);
+    REQUIRE_EQ(host.submit(EngineCommand::noteOn(0, 64)), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollSpectrogramScope(scope), true);
+    REQUIRE_EQ(scope.guide_note, static_cast<std::uint8_t>(64));
+    REQUIRE_EQ(scope.guide_track, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(scope.note_active, true);
+
+    REQUIRE_EQ(host.submit(EngineCommand::noteOff(0)), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollSpectrogramScope(scope), true);
+    REQUIRE_EQ(scope.guide_note, static_cast<std::uint8_t>(64));
+    REQUIRE_EQ(scope.guide_track, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(scope.note_active, false);
+
+    REQUIRE_EQ(host.submit(EngineCommand::noteOn(8, 60)), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollSpectrogramScope(scope), true);
+    REQUIRE_EQ(scope.guide_note, static_cast<std::uint8_t>(60));
+    REQUIRE_EQ(scope.guide_track, static_cast<std::uint8_t>(8));
+    REQUIRE_EQ(scope.note_active, true);
+
+    host.setSpectrogramCaptureEnabled(false);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollSpectrogramScope(scope), false);
+}
+
 void testInvalidAuditionKeepsProgramEditable() {
     RealtimeEngineHost host;
     auto edit = host.beginProgramEdit();
@@ -5731,6 +5766,7 @@ int main(int argc, char** argv) {
         {"ProgramPoolLimitsEditingAndReusesReleasedSlot", testProgramPoolLimitsEditingAndReusesReleasedSlot},
         {"ProgramSnapshotActivatesAndRetriggersWithoutAudioAllocation", testProgramSnapshotActivatesAndRetriggersWithoutAudioAllocation},
         {"RealtimeHostPublishesOpllScopeToUiQueue", testRealtimeHostPublishesOpllScopeToUiQueue},
+        {"RealtimeHostSpectrogramCaptureIsOptInAndKeepsLastNote", testRealtimeHostSpectrogramCaptureIsOptInAndKeepsLastNote},
         {"InvalidAuditionKeepsProgramEditable", testInvalidAuditionKeepsProgramEditable},
         {"OpllPatchSemanticRoundTrip", testOpllPatchSemanticRoundTrip},
         {"Ym2413RomPatchesComeFromEmu2413Table", testYm2413RomPatchesComeFromEmu2413Table},

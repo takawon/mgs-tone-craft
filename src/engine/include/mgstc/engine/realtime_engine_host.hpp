@@ -45,6 +45,7 @@ public:
     static constexpr std::size_t kCommandCapacity = 256;
     static constexpr std::size_t kNoticeCapacity = 128;
     static constexpr std::size_t kOpllScopeCapacity = 8;
+    static constexpr std::size_t kSpectrogramScopeCapacity = 8;
     static constexpr std::size_t kProgramSlotCount = 3;
 
     RealtimeEngineHost();
@@ -78,6 +79,13 @@ public:
     [[nodiscard]] bool pollOpllScope(
         OpllScopeFrame& frame) noexcept;
 
+    // UI controls capture; the analysis thread is the queue's sole consumer.
+    // The audio thread performs one bounded lock-free copy per completed
+    // 800-sample frame while enabled.
+    void setSpectrogramCaptureEnabled(bool enabled) noexcept;
+    [[nodiscard]] bool pollSpectrogramScope(
+        OpllScopeFrame& frame) noexcept;
+
     // Audio thread only. Commands are drained before the first sample.
     [[nodiscard]] RenderResult render(
         std::span<float> interleaved_stereo) noexcept;
@@ -108,17 +116,36 @@ private:
     void notify(const EngineNotice& notice) noexcept;
     void applyOutputRouting() noexcept;
     void applyOutputRouting(EngineCore& engine) noexcept;
+    void noteStarted(std::uint8_t track, std::uint8_t note) noexcept;
+    void noteStopped(std::uint8_t track) noexcept;
+    void allNotesStopped() noexcept;
+    void annotateGuideNote(OpllScopeFrame& frame) const noexcept;
+
+    struct ActiveGuideNote {
+        std::uint64_t order{};
+        std::uint8_t note{60};
+        bool active{};
+    };
 
     SpscQueue<EngineCommand, kCommandCapacity> commands_{};
     SpscQueue<EngineNotice, kNoticeCapacity> notices_{};
     std::unique_ptr<SpscQueue<OpllScopeFrame, kOpllScopeCapacity>>
         opll_scope_frames_;
+    std::unique_ptr<
+        SpscQueue<OpllScopeFrame, kSpectrogramScopeCapacity>>
+        spectrogram_scope_frames_;
     std::unique_ptr<ProgramSlot[]> programs_;
     std::unique_ptr<MAmidiMemoSoundOutput> mamidi_;
     MAmidiOutputSettings mamidi_settings_{};
     SoundOutputKind output_kind_{SoundOutputKind::Emulator};
     std::uint8_t active_program_{};
     MixerGains current_gains_{};
+    std::array<ActiveGuideNote, RuntimeSession::kTrackCount>
+        active_guide_notes_{};
+    std::atomic<bool> spectrogram_capture_enabled_{false};
+    std::uint64_t guide_note_order_{};
+    std::uint8_t last_guide_note_{60};
+    std::uint8_t last_guide_track_{};
     bool clipping_{};
 };
 

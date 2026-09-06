@@ -63,6 +63,7 @@
 #include "switch_look_and_feel.hpp"
 #include "mgstc_look_and_feel.hpp"
 #include "about_panel.hpp"
+#include "spectrogram_window.hpp"
 #include "mgstc/audio/wasapi_audio_sink.hpp"
 #include "mgstc/engine/engine_command.hpp"
 #include "mgstc/engine/chip_rack.hpp"
@@ -153,6 +154,8 @@ using EditorActivateCallback =
     std::function<void(const juce::String&)>;
 using TagManagementCallback =
     std::function<void(juce::Component*)>;
+using SpectrogramOpenCallback = std::function<void()>;
+using SpectrogramSourceMaskCallback = std::function<void(std::uint8_t)>;
 
 // Close-button / client clicks leave ModifierKeys with a button down until
 // WM_*BUTTONUP. Caption (HTCAPTION) clicks are different: JUCE never forwards
@@ -6950,8 +6953,13 @@ public:
         SharedAudioService& audio_service,
         SharedMidiInputService& midi_service,
         EditorOpenCallback open_editor,
+        SpectrogramOpenCallback open_spectrogram,
+        SpectrogramSourceMaskCallback spectrogram_source_mask_changed,
         TagManagementCallback manage_tags)
         : open_editor_(std::move(open_editor)),
+          open_spectrogram_(std::move(open_spectrogram)),
+          spectrogram_source_mask_changed_(
+              std::move(spectrogram_source_mask_changed)),
           manage_tags_(std::move(manage_tags)),
           audio_service_(audio_service),
           engine_(audio_service.engine()),
@@ -6995,6 +7003,33 @@ public:
             open_editor_("opll", std::nullopt);
         };
         addAndMakeVisible(open_opll_);
+        spectrogram_.setButtonText(
+            juce::String::fromUTF8("スペアナ"));
+        spectrogram_.setTooltip(juce::String::fromUTF8(
+            "共通スペクトログラムウィンドウを開きます"));
+        spectrogram_.onClick = [this] {
+            if (open_spectrogram_) {
+                open_spectrogram_();
+            }
+        };
+        addAndMakeVisible(spectrogram_);
+        configureImmediateAuditionButton(
+            immediate_audition_,
+            loadCompositeImmediateAuditionSetting(),
+            [this] {
+                if (!immediate_audition_.getToggleState()) {
+                    timeline_preview_pending_ = false;
+                }
+                saveCompositeImmediateAuditionSetting(
+                    immediate_audition_.getToggleState());
+                updateStatus(
+                    immediate_audition_.getToggleState()
+                        ? juce::String::fromUTF8(
+                              "総合音色の即時発音をONにしました")
+                        : juce::String::fromUTF8(
+                              "総合音色の即時発音をOFFにしました"));
+            });
+        addAndMakeVisible(immediate_audition_);
         description_.setText(
             juce::String::fromUTF8(
                 "PSG・SCC・OPLLの音色とソフトウェアエンベロープを"
@@ -7409,7 +7444,9 @@ public:
                     return;
                 }
                 recordHistory();
-                if (request_preview && !satellite_session_) {
+                if (request_preview
+                    && !satellite_session_
+                    && immediate_audition_.getToggleState()) {
                     timeline_preview_pending_ = true;
                     timeline_preview_due_ms_ =
                         juce::Time::getMillisecondCounterHiRes() + 50.0;
@@ -7807,10 +7844,9 @@ public:
             getWidth(),
             settings_,
             master_volume_,
-            &master_volume_label_);
-        int chrome_right =
-            getWidth() - pageMargin - iconButton - controlGap - masterVolumeSize
-            - controlGap;
+            &master_volume_label_,
+            &immediate_audition_);
+        int chrome_right = immediate_audition_.getX() - controlGap;
         open_opll_.setBounds(
             chrome_right - compositeOpenOpllW,
             pageMargin,
@@ -7822,9 +7858,15 @@ public:
             pageMargin,
             compositeOpenSccW,
             textButtonH);
+        chrome_right -= compositeOpenSccW + controlGap;
+        spectrogram_.setBounds(
+            chrome_right - UiScale::sx(88),
+            pageMargin,
+            UiScale::sx(88),
+            textButtonH);
         const int title_w = juce::jmax(
             120,
-            chrome_right - compositeOpenSccW - area.getX() - sm);
+            chrome_right - UiScale::sx(88) - area.getX() - sm);
         title_.setBounds(area.getX(), area.getY(), title_w, titleH);
         description_.setBounds(
             area.getX(),
@@ -8625,7 +8667,7 @@ private:
         resetHistoryToCurrent();
         updateStatus(
             juce::String::fromUTF8("総合音色を読み込みました"));
-        startAudition();
+        auditionAfterEdit();
     }
 
     void saveCompositeTimbre(bool save_as) {
@@ -8990,7 +9032,7 @@ private:
         syncControlsFromModel();
         timeline_.setTimbre(timbre_);
         recordHistory();
-        startAudition();
+        auditionAfterEdit();
     }
 
     void assignLayerOpllRom(std::size_t index, std::uint8_t rom) {
@@ -9007,7 +9049,7 @@ private:
         syncControlsFromModel();
         timeline_.setTimbre(timbre_);
         recordHistory();
-        startAudition();
+        auditionAfterEdit();
     }
 
     void refreshTimbreSelectors() {
@@ -9101,7 +9143,7 @@ private:
         number_mode_[index].setEnabled(true);
         syncNumberControlsFromModel(index);
         refreshModelViews();
-        startAudition();
+        auditionAfterEdit();
     }
 
     void syncNumberControlsFromModel(std::size_t index) {
@@ -9347,6 +9389,7 @@ private:
 
     void refreshModelViews() {
         timeline_.setTimbre(timbre_);
+        publishSpectrogramSourceMask();
         const auto validation =
             mgstc::engine::validateCompositeTimbre(timbre_);
         const auto numbers =
@@ -9405,6 +9448,27 @@ private:
             return static_cast<std::uint8_t>(8 + layer.channel);
         }
         return 0;
+    }
+
+    void publishSpectrogramSourceMask() const {
+        if (!spectrogram_source_mask_changed_) {
+            return;
+        }
+        std::uint8_t mask = 0;
+        for (const auto& layer : timbre_.layers) {
+            switch (layer.source) {
+            case mgstc::engine::TimbreSource::Psg:
+                mask |= 1U << 0U;
+                break;
+            case mgstc::engine::TimbreSource::Scc:
+                mask |= 1U << 1U;
+                break;
+            case mgstc::engine::TimbreSource::Opll:
+                mask |= 1U << 2U;
+                break;
+            }
+        }
+        spectrogram_source_mask_changed_(mask);
     }
 
     [[nodiscard]] std::array<std::uint8_t, 3>
@@ -9630,6 +9694,12 @@ private:
         startCompositeNote(last_audition_note_, true);
     }
 
+    void auditionAfterEdit() {
+        if (immediate_audition_.getToggleState()) {
+            startAudition();
+        }
+    }
+
     void startCompositeNote(
         std::uint8_t base_note,
         bool stop_after_one_second,
@@ -9809,6 +9879,31 @@ private:
             .getChildFile("settings-v1.ini");
     }
 
+    [[nodiscard]] bool loadCompositeImmediateAuditionSetting() const {
+        const auto file = settingsFile();
+        if (!file.existsAsFile()) {
+            return true;
+        }
+        return GetPrivateProfileIntW(
+                   L"Application",
+                   L"CompositeImmediateAudition",
+                   1,
+                   file.getFullPathName().toWideCharPointer())
+            != 0;
+    }
+
+    void saveCompositeImmediateAuditionSetting(bool enabled) {
+        const auto file = settingsFile();
+        if (file.getParentDirectory().createDirectory().failed()) {
+            return;
+        }
+        WritePrivateProfileStringW(
+            L"Application",
+            L"CompositeImmediateAudition",
+            enabled ? L"1" : L"0",
+            file.getFullPathName().toWideCharPointer());
+    }
+
     [[nodiscard]] std::uint8_t
     loadLastAuditionNoteSetting() const {
         return LastAuditionNoteStore::instance().get();
@@ -9834,6 +9929,9 @@ private:
         }
         if (++settings_poll_ticks_ >= 30) {
             settings_poll_ticks_ = 0;
+            immediate_audition_.setToggleState(
+                loadCompositeImmediateAuditionSetting(),
+                juce::dontSendNotification);
             const auto note = loadLastAuditionNoteSetting();
             if (!performance_keyboard_.hasActiveNote()
                 && note != last_audition_note_) {
@@ -9841,13 +9939,12 @@ private:
             }
         }
         mgstc::engine::OpllScopeFrame scope_frame{};
-        bool got_scope = false;
+        bool repaint_scope = false;
         while (engine_.pollOpllScope(scope_frame)) {
-            timeline_.appendScopeFrame(
-                scope_frame, last_audition_note_);
-            got_scope = true;
+            repaint_scope = timeline_.appendScopeFrame(
+                scope_frame, last_audition_note_) || repaint_scope;
         }
-        if (got_scope) {
+        if (repaint_scope) {
             // #region agent log
             dbg7ae407(
                 "H4",
@@ -9875,6 +9972,8 @@ private:
     }
 
     EditorOpenCallback open_editor_;
+    SpectrogramOpenCallback open_spectrogram_;
+    SpectrogramSourceMaskCallback spectrogram_source_mask_changed_;
     TagManagementCallback manage_tags_;
     SharedAudioService& audio_service_;
     mgstc::engine::RealtimeEngineHost& engine_;
@@ -9933,6 +10032,10 @@ private:
     juce::Rectangle<int> layer_library_bounds_;
     juce::TextButton open_scc_;
     juce::TextButton open_opll_;
+    juce::TextButton spectrogram_;
+    juce::DrawableButton immediate_audition_{
+        "immediate audition",
+        juce::DrawableButton::ImageOnButtonBackground};
     juce::DrawableButton settings_{
         "settings", juce::DrawableButton::ImageOnButtonBackground};
     juce::Slider master_volume_;
@@ -10140,10 +10243,12 @@ public:
         SharedAudioService& audio_service,
         SharedMidiInputService& midi_service,
         EditorOpenCallback open_editor,
+        SpectrogramOpenCallback open_spectrogram,
         OpllCandidateCallback open_opll_candidates,
         TagManagementCallback manage_tags,
         bool envelope_context = false)
         : open_editor_(std::move(open_editor)),
+          open_spectrogram_(std::move(open_spectrogram)),
           open_opll_candidates_(std::move(open_opll_candidates)),
           manage_tags_(std::move(manage_tags)),
           audio_service_(audio_service),
@@ -10238,10 +10343,20 @@ public:
             [this] { importAudacitySelection(); });
         configureButton(
             open_opll_,
-            juce::String::fromUTF8("OPLLを開く"),
+            juce::String::fromUTF8("OPLL音色"),
             juce::String::fromUTF8(
                 "OPLL音色エディタを別ウィンドウで開きます"),
             [this] { open_editor_("opll", std::nullopt); });
+        configureButton(
+            spectrogram_,
+            juce::String::fromUTF8("スペアナ"),
+            juce::String::fromUTF8(
+                "共通スペクトログラムウィンドウを開きます"),
+            [this] {
+                if (open_spectrogram_) {
+                    open_spectrogram_();
+                }
+            });
         configureIconButton(
             convert_to_opll_, EditorIcon::Convert,
             juce::String::fromUTF8(
@@ -10898,6 +11013,8 @@ public:
             100);
         assignExplicitFocusOrders(
             {
+                &spectrogram_,
+                &open_opll_,
                 &immediate_audition_,
                 &master_volume_,
                 &settings_,
@@ -10909,7 +11026,6 @@ public:
                 &redo_,
                 &import_wave_,
                 &import_audacity_,
-                &open_opll_,
                 &convert_to_opll_,
                 &preset_,
                 &random_reroll_,
@@ -11262,6 +11378,18 @@ public:
             master_volume_,
             &master_volume_label_,
             &immediate_audition_);
+        int chrome_right = immediate_audition_.getX() - controlGap;
+        open_opll_.setBounds(
+            chrome_right - compositeOpenOpllW,
+            pageMargin,
+            compositeOpenOpllW,
+            textButtonH);
+        chrome_right -= compositeOpenOpllW + controlGap;
+        spectrogram_.setBounds(
+            chrome_right - UiScale::sx(88),
+            pageMargin,
+            UiScale::sx(88),
+            textButtonH);
         area.removeFromTop(md);
 
         auto keyboard_area = area.removeFromBottom(keyboardH);
@@ -11296,8 +11424,6 @@ public:
         import_wave_.setBounds(file_row.removeFromLeft(UiScale::sx(66)));
         file_row.removeFromLeft(sm);
         import_audacity_.setBounds(file_row.removeFromLeft(UiScale::sx(184)));
-        file_row.removeFromLeft(sm);
-        open_opll_.setBounds(file_row.removeFromLeft(UiScale::sx(120)));
         file_row.removeFromLeft(sm);
         convert_to_opll_.setBounds(file_row.removeFromLeft(iconButton));
         area.removeFromTop(sm);
@@ -13520,6 +13646,7 @@ private:
     }
 
     EditorOpenCallback open_editor_;
+    SpectrogramOpenCallback open_spectrogram_;
     OpllCandidateCallback open_opll_candidates_;
     TagManagementCallback manage_tags_;
     SharedAudioService& audio_service_;
@@ -13544,6 +13671,7 @@ private:
     juce::TextButton import_wave_;
     juce::TextButton import_audacity_;
     juce::TextButton open_opll_;
+    juce::TextButton spectrogram_;
     juce::DrawableButton convert_to_opll_{
         "convert-to-opll",
         juce::DrawableButton::ImageOnButtonBackground};
@@ -13976,9 +14104,11 @@ public:
         SharedAudioService& audio_service,
         SharedMidiInputService& midi_service,
         EditorOpenCallback open_editor,
+        SpectrogramOpenCallback open_spectrogram,
         TagManagementCallback manage_tags,
         bool envelope_context = false)
         : open_editor_(std::move(open_editor)),
+          open_spectrogram_(std::move(open_spectrogram)),
           manage_tags_(std::move(manage_tags)),
           audio_service_(audio_service),
           engine_(audio_service.engine()),
@@ -14101,6 +14231,11 @@ public:
         patch_panel_.onChange = [this](bool commit) {
             controlsChanged(commit);
         };
+        patch_panel_.onEnvelopeCommit = [this] {
+            if (syncing_) return;
+            recordHistory();
+            updateStatus(juce::String::fromUTF8("OPLL音色を更新しました"));
+        };
 
         constexpr std::array<const char*, 15> names{
             "@0  Violin",
@@ -14151,7 +14286,7 @@ public:
 
         updateAuditionNoteLabels();
         open_scc_.setButtonText(
-            juce::String::fromUTF8("SCCを開く"));
+            juce::String::fromUTF8("SCC音色"));
         open_scc_.setTooltip(
             juce::String::fromUTF8(
                 "SCC音色エディタを別ウィンドウで開きます"));
@@ -14159,6 +14294,16 @@ public:
             open_editor_("scc", std::nullopt);
         };
         addAndMakeVisible(open_scc_);
+        configureButton(
+            spectrogram_,
+            juce::String::fromUTF8("スペアナ"),
+            juce::String::fromUTF8(
+                "共通スペクトログラムウィンドウを開きます"),
+            [this] {
+                if (open_spectrogram_) {
+                    open_spectrogram_();
+                }
+            });
         configureIconButton(
             convert_to_scc_, EditorIcon::Convert,
             juce::String::fromUTF8(
@@ -14372,6 +14517,8 @@ public:
             100);
         assignExplicitFocusOrders(
             {
+                &spectrogram_,
+                &open_scc_,
                 &immediate_audition_,
                 &master_volume_,
                 &settings_,
@@ -14385,7 +14532,6 @@ public:
                 &import_audacity_,
                 &wave_previous_,
                 &wave_next_,
-                &open_scc_,
                 &convert_to_scc_,
                 &rom_preset_,
                 &rom_load_,
@@ -14683,6 +14829,18 @@ public:
             master_volume_,
             &master_volume_label_,
             &immediate_audition_);
+        int chrome_right = immediate_audition_.getX() - controlGap;
+        open_scc_.setBounds(
+            chrome_right - compositeOpenSccW,
+            pageMargin,
+            compositeOpenSccW,
+            textButtonH);
+        chrome_right -= compositeOpenSccW + controlGap;
+        spectrogram_.setBounds(
+            chrome_right - UiScale::sx(88),
+            pageMargin,
+            UiScale::sx(88),
+            textButtonH);
         area.removeFromTop(sm);
 
         auto keyboard_area = area.removeFromBottom(keyboardH);
@@ -14712,9 +14870,6 @@ public:
             toolbar.removeFromLeft(UiScale::sx(112)));
         wave_next_.setBounds(
             toolbar.removeFromLeft(iconButton));
-        toolbar.removeFromLeft(sm);
-        open_scc_.setBounds(
-            toolbar.removeFromLeft(UiScale::sx(120)));
         toolbar.removeFromLeft(sm);
         convert_to_scc_.setBounds(
             toolbar.removeFromLeft(iconButton));
@@ -16426,6 +16581,7 @@ private:
     }
 
     EditorOpenCallback open_editor_;
+    SpectrogramOpenCallback open_spectrogram_;
     TagManagementCallback manage_tags_;
     SharedAudioService& audio_service_;
     mgstc::engine::RealtimeEngineHost& engine_;
@@ -16466,6 +16622,7 @@ private:
         "immediate audition",
         juce::DrawableButton::ImageOnButtonBackground};
     juce::TextButton open_scc_;
+    juce::TextButton spectrogram_;
     juce::DrawableButton convert_to_scc_{
         "convert-to-scc",
         juce::DrawableButton::ImageOnButtonBackground};
@@ -16538,6 +16695,8 @@ public:
         SharedAudioService& audio_service,
         SharedMidiInputService& midi_service,
         EditorOpenCallback open_editor,
+        SpectrogramOpenCallback open_spectrogram,
+        SpectrogramSourceMaskCallback spectrogram_source_mask_changed,
         OpllCandidateCallback open_opll_candidates,
         TagManagementCallback manage_tags,
         EditorCloseCallback close_editor,
@@ -16558,6 +16717,7 @@ public:
             setContentOwned(
                 new OpllEditorComponent(
                     audio_service, midi_service, open_editor,
+                    open_spectrogram,
                     manage_tags,
                     editor.equalsIgnoreCase("opll-envelope")), true);
         } else if (editor.equalsIgnoreCase("scc")
@@ -16565,6 +16725,7 @@ public:
             setContentOwned(
                 new SccEditorComponent(
                     audio_service, midi_service, open_editor,
+                    open_spectrogram,
                     open_opll_candidates,
                     manage_tags,
                     editor.equalsIgnoreCase("scc-envelope")), true);
@@ -16572,6 +16733,8 @@ public:
             setContentOwned(
                 new CompositeEditorComponent(
                     audio_service, midi_service, open_editor,
+                    open_spectrogram,
+                    std::move(spectrogram_source_mask_changed),
                     manage_tags), true);
         }
         setResizable(true, false);
@@ -17068,13 +17231,19 @@ public:
             auto* const opll = showEditor("opll");
             closeEditor("scc");
             auto* const reopened_scc = showEditor("scc");
+            showSpectrogram();
+            auto* const first_spectrogram = spectrogram_window_.get();
+            showSpectrogram();
             routing_test_passed_ = main != nullptr
                 && first_scc != nullptr
                 && opll != nullptr
                 && first_scc == reopened_scc
                 && main->isVisible()
                 && reopened_scc->isVisible()
-                && opll->isVisible();
+                && opll->isVisible()
+                && first_spectrogram != nullptr
+                && first_spectrogram == spectrogram_window_.get()
+                && first_spectrogram->isVisible();
             startTimer(250);
             return;
         }
@@ -17111,6 +17280,7 @@ public:
         stopTimer();
         hang_watchdog_.stop();
         snapshot_window_ = nullptr;
+        spectrogram_window_.reset();
         opll_envelope_window_.reset();
         scc_envelope_window_.reset();
         opll_window_.reset();
@@ -17143,6 +17313,18 @@ private:
             return "scc";
         }
         return "main";
+    }
+
+    [[nodiscard]] mgstc::app::SpectrogramAnalysisMode
+    spectrogramAnalysisModeForEditor(const juce::String& editor) const noexcept {
+        if (editor == "scc" || editor == "scc-envelope") {
+            return mgstc::app::SpectrogramAnalysisMode::SccOnly;
+        }
+        if (editor == "opll" || editor == "opll-envelope") {
+            return mgstc::app::SpectrogramAnalysisMode::OpllOnly;
+        }
+        return static_cast<mgstc::app::SpectrogramAnalysisMode>(
+            composite_spectrogram_source_mask_);
     }
 
     [[nodiscard]] std::unique_ptr<MainWindow>& windowSlot(
@@ -17195,6 +17377,16 @@ private:
                         opened->requestLibraryEntry(*library_id);
                     }
                 },
+                [this] { showSpectrogram(); },
+                [this](std::uint8_t mask) {
+                    composite_spectrogram_source_mask_ =
+                        static_cast<std::uint8_t>(mask & 0x07U);
+                    if (active_editor_ == "main"
+                        && spectrogram_window_ != nullptr) {
+                        spectrogram_window_->setAnalysisMode(
+                            spectrogramAnalysisModeForEditor("main"));
+                    }
+                },
                 [this](
                     std::vector<
                         mgstc::engine::OpllPatchParameters> candidates) {
@@ -17234,6 +17426,18 @@ private:
             window->grabKeyboardFocus();
         }
         return window.get();
+    }
+
+    void showSpectrogram() {
+        if (spectrogram_window_ == nullptr) {
+            UiScale::forceGlobalForNonEditorUi();
+            spectrogram_window_ =
+                std::make_unique<mgstc::app::SpectrogramWindow>(
+                    audio_service_->engine());
+        }
+        spectrogram_window_->setAnalysisMode(
+            spectrogramAnalysisModeForEditor(active_editor_));
+        spectrogram_window_->showWindow();
     }
 
     [[nodiscard]] MainWindow* showEditor(
@@ -17610,6 +17814,10 @@ private:
                 audio_service_->clearScopeFrames();
             }
             active_editor_ = editor;
+            if (spectrogram_window_ != nullptr) {
+                spectrogram_window_->setAnalysisMode(
+                    spectrogramAnalysisModeForEditor(active_editor_));
+            }
             if (auto& window = windowSlot(editor); window != nullptr) {
                 window->syncProcessUiScale();
                 window->refreshExternalState();
@@ -17687,12 +17895,14 @@ private:
     std::unique_ptr<MainWindow> opll_window_;
     std::unique_ptr<MainWindow> scc_envelope_window_;
     std::unique_ptr<MainWindow> opll_envelope_window_;
+    std::unique_ptr<mgstc::app::SpectrogramWindow> spectrogram_window_;
     MainWindow* snapshot_window_{};
     std::unique_ptr<SharedAudioService> audio_service_;
     std::unique_ptr<SharedMidiInputService> midi_service_;
     mgstc::app::UiHangWatchdog hang_watchdog_;
     juce::String primary_editor_{"main"};
     juce::String active_editor_{"main"};
+    std::uint8_t composite_spectrogram_source_mask_{};
     juce::String snapshot_target_{"editor"};
     bool routing_test_mode_{};
     bool routing_test_passed_{};

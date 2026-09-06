@@ -12,6 +12,7 @@
 #include "mgstc/engine/opll_envelope_trace.hpp"
 #include "mgstc/engine/opll_patch.hpp"
 #include "midi_note_name.hpp"
+#include "opll_envelope_graph.hpp"
 #include "switch_look_and_feel.hpp"
 #include "ui_fonts.hpp"
 #include "ui_layout.hpp"
@@ -21,474 +22,6 @@
 // Compact FM original-tone editor for manual `y` authoring on the composite
 // timeline. Highlights fields that differ from the pre-step baseline
 // (base + prior @ + prior y).
-
-struct OpllEnvelopeValues {
-    std::uint8_t attack_rate{};
-    std::uint8_t decay_rate{};
-    std::uint8_t sustain_level{};
-    std::uint8_t release_rate{};
-};
-
-enum class OpllEnvelopeHandle {
-    Attack,
-    DecaySustain,
-    SustainRelease,
-    Release,
-};
-
-class OpllEnvelopeGraph final
-    : public juce::Component,
-      public juce::SettableTooltipClient {
-public:
-    OpllEnvelopeGraph(
-        juce::Colour waveform_colour,
-        bool modulator)
-        : waveform_colour_(waveform_colour),
-          modulator_(modulator) {}
-
-    void setTrace(
-        const std::array<
-            float,
-            mgstc::engine::OpllEnvelopeTrace::kPointCount>& levels,
-        bool valid) {
-        levels_ = levels;
-        valid_ = valid;
-        repaint();
-    }
-
-    std::function<void(const OpllEnvelopeValues&, bool)> onEdit;
-    std::function<OpllEnvelopeValues()> getValues;
-    std::function<bool()> getSustainedTone;
-
-    void paint(juce::Graphics& graphics) override {
-        const auto graph =
-            getLocalBounds().toFloat().reduced(0.5F);
-        graphics.setColour(juce::Colour(0xFF111920));
-        graphics.fillRoundedRectangle(graph, 5.0F);
-        graphics.setColour(juce::Colour(0xFF435160));
-        graphics.drawRoundedRectangle(graph, 5.0F, 1.0F);
-
-        graphics.setColour(juce::Colour(0xFF34434E));
-        graphics.drawHorizontalLine(
-            juce::roundToInt(graph.getCentreY()),
-            graph.getX() + 1.0F,
-            graph.getRight() - 1.0F);
-
-        const float key_off_x = graph.getX()
-            + graph.getWidth()
-                * mgstc::engine::OpllEnvelopeTrace::
-                      kKeyOffSeconds
-                / mgstc::engine::OpllEnvelopeTrace::
-                      kDurationSeconds;
-        const float dash_pattern[]{4.0F, 3.0F};
-        graphics.setColour(juce::Colour(0xFFD66B6B));
-        graphics.drawDashedLine(
-            {key_off_x,
-             graph.getY() + 1.0F,
-             key_off_x,
-             graph.getBottom() - 1.0F},
-            dash_pattern,
-            2,
-            1.0F);
-
-        if (valid_) {
-            juce::Path envelope;
-            for (std::size_t index = 0;
-                 index < levels_.size();
-                 ++index) {
-                const float x = juce::jmap(
-                    static_cast<float>(index),
-                    0.0F,
-                    static_cast<float>(levels_.size() - 1),
-                    graph.getX() + 2.0F,
-                    graph.getRight() - 2.0F);
-                const float level = juce::jlimit(
-                    0.0F, 1.0F, levels_[index]);
-                const float y = juce::jmap(
-                    level,
-                    0.0F,
-                    1.0F,
-                    graph.getBottom() - 3.0F,
-                    graph.getY() + 3.0F);
-                if (index == 0) {
-                    envelope.startNewSubPath(x, y);
-                } else {
-                    envelope.lineTo(x, y);
-                }
-            }
-            juce::Path envelope_fill = envelope;
-            envelope_fill.lineTo(
-                graph.getRight() - 2.0F, graph.getBottom() - 3.0F);
-            envelope_fill.lineTo(
-                graph.getX() + 2.0F, graph.getBottom() - 3.0F);
-            envelope_fill.closeSubPath();
-            graphics.setColour(waveform_colour_.withAlpha(0.24F));
-            graphics.fillPath(envelope_fill);
-            graphics.setColour(waveform_colour_.withAlpha(0.98F));
-            graphics.strokePath(
-                envelope,
-                juce::PathStrokeType(
-                    1.7F,
-                    juce::PathStrokeType::curved,
-                    juce::PathStrokeType::rounded));
-        }
-
-        const auto guide = adsrGuide(
-            graph, values(), sustainedTone());
-        juce::Path adsr;
-        adsr.startNewSubPath(graph.getX() + 2.0F, graph.getBottom() - 3.0F);
-        adsr.lineTo(guide.attack);
-        adsr.lineTo(guide.decay_sustain);
-        adsr.lineTo(guide.sustain_release);
-        adsr.lineTo(guide.release);
-        graphics.setColour(juce::Colour(0xFFFFF1A8));
-        graphics.strokePath(
-            adsr,
-            juce::PathStrokeType(
-                2.0F,
-                juce::PathStrokeType::curved,
-                juce::PathStrokeType::rounded));
-        const auto drawHandle = [&graphics](juce::Point<float> handle) {
-            graphics.setColour(juce::Colour(0xFF141A20));
-            graphics.fillEllipse(handle.x - 10.0F, handle.y - 10.0F,
-                                 20.0F, 20.0F);
-            graphics.setColour(juce::Colour(0xFFFF514D));
-            graphics.fillEllipse(handle.x - 7.0F, handle.y - 7.0F,
-                                 14.0F, 14.0F);
-            graphics.setColour(juce::Colour(0xFFFFC1BB));
-            graphics.drawEllipse(handle.x - 7.0F, handle.y - 7.0F,
-                                 14.0F, 14.0F, 1.0F);
-        };
-        drawHandle(guide.attack);
-        drawHandle(guide.decay_sustain);
-        drawHandle(guide.key_off_handle);
-        if (guide.release_editable) {
-            drawHandle(guide.release);
-        }
-
-        graphics.setFont(UiFonts::dense());
-        graphics.setColour(juce::Colour(0xFF9BA8B2));
-        graphics.drawText(
-            "0s",
-            getLocalBounds().reduced(UiScale::sx(5)).removeFromBottom(
-                UiScale::sx(15)),
-            juce::Justification::bottomLeft);
-        graphics.drawText(
-            "4s",
-            getLocalBounds().reduced(UiScale::sx(5)).removeFromBottom(
-                UiScale::sx(15)),
-            juce::Justification::bottomRight);
-        graphics.setColour(juce::Colour(0xFFD98A8A));
-        graphics.drawText(
-            "KO 2s",
-            juce::Rectangle<int>(
-                juce::roundToInt(key_off_x) + UiScale::sx(4),
-                getHeight() - UiScale::sx(21),
-                UiScale::sx(42),
-                UiScale::sx(16)),
-            juce::Justification::centredLeft);
-
-    }
-
-    void mouseDown(const juce::MouseEvent& event) override {
-        const auto graph = getLocalBounds().toFloat().reduced(0.5F);
-        drag_start_position_ = event.position;
-        drag_start_values_ = values();
-        drag_values_ = drag_start_values_;
-        drag_start_sustained_tone_ = sustainedTone();
-        drag_handle_ = handleAt(
-            event.position,
-            adsrGuide(
-                graph,
-                drag_start_values_,
-                drag_start_sustained_tone_));
-        drag_changed_ = false;
-        if (drag_handle_) {
-            updateFromMouse(event.position);
-            repaint();
-        }
-    }
-
-    void mouseDrag(const juce::MouseEvent& event) override {
-        updateFromMouse(event.position);
-    }
-
-    void mouseUp(const juce::MouseEvent& event) override {
-        updateFromMouse(event.position);
-        if (drag_handle_ && drag_changed_ && onEdit) {
-            onEdit(drag_values_, true);
-        }
-        drag_handle_.reset();
-        drag_changed_ = false;
-        repaint();
-    }
-
-    void mouseMove(const juce::MouseEvent& event) override {
-        const auto graph = getLocalBounds().toFloat().reduced(0.5F);
-        const auto handle = handleAt(
-            event.position, adsrGuide(graph, values(), sustainedTone()));
-        if (handle) {
-            setMouseCursor(juce::MouseCursor::DraggingHandCursor);
-        } else {
-            setMouseCursor(juce::MouseCursor::NormalCursor);
-        }
-    }
-
-    void mouseExit(const juce::MouseEvent&) override {
-        if (!drag_handle_) {
-            setMouseCursor(juce::MouseCursor::NormalCursor);
-        }
-    }
-
-    void mouseWheelMove(
-        const juce::MouseEvent&,
-        const juce::MouseWheelDetails&) override {}
-
-private:
-    struct AdsrGuide {
-        juce::Point<float> attack;
-        juce::Point<float> decay_sustain;
-        juce::Point<float> sustain_release;
-        juce::Point<float> key_off_handle;
-        juce::Point<float> release;
-        bool release_editable{};
-    };
-
-    [[nodiscard]] OpllEnvelopeValues values() const {
-        return getValues ? getValues() : OpllEnvelopeValues{};
-    }
-
-    [[nodiscard]] bool sustainedTone() const {
-        return getSustainedTone ? getSustainedTone() : true;
-    }
-
-    [[nodiscard]] static float levelY(
-        const juce::Rectangle<float>& graph,
-        std::uint8_t sustain_level) {
-        return juce::jmap(
-            static_cast<float>(sustain_level), 0.0F, 15.0F,
-            graph.getY() + 3.0F, graph.getBottom() - 3.0F);
-    }
-
-    [[nodiscard]] static float inverseRateX(
-        float left,
-        float width,
-        std::uint8_t rate) {
-        return left + width * (1.0F - static_cast<float>(rate) / 15.0F);
-    }
-
-    [[nodiscard]] static float rateFromInverseX(
-        float position,
-        float left,
-        float width) {
-        const float fraction = juce::jlimit(
-            0.0F, 1.0F, (position - left) / juce::jmax(1.0F, width));
-        return (1.0F - fraction) * 15.0F;
-    }
-
-    [[nodiscard]] AdsrGuide adsrGuide(
-        const juce::Rectangle<float>& graph,
-        const OpllEnvelopeValues& values,
-        bool sustained_tone) const {
-        const float section = graph.getWidth() / 4.0F;
-        const float top = graph.getY() + 3.0F;
-        const float bottom = graph.getBottom() - 3.0F;
-        const float key_off_x = graph.getX() + graph.getWidth() * 0.5F;
-        const float attack_x = inverseRateX(
-            graph.getX() + 4.0F, section - 8.0F, values.attack_rate);
-        const float decay_x = values.decay_rate == 0
-            ? attack_x
-            : inverseRateX(
-                  graph.getX() + section + 4.0F,
-                  section - 8.0F,
-                  values.decay_rate);
-        const float sustain_y = levelY(graph, values.sustain_level);
-        constexpr std::uint8_t kNonSustainedReleaseRate = 7;
-        const auto release_rate = sustained_tone
-            ? values.release_rate
-            : kNonSustainedReleaseRate;
-        const float release_x = inverseRateX(
-            graph.getX() + section * 3.0F + 4.0F, section - 8.0F,
-            release_rate);
-        float key_off_y = sustain_y;
-        if (!sustained_tone) {
-            // EG=0 continues the post-DR decay with RR until key-off. The
-            // emu2413 trace remains the authoritative curve; this is only a
-            // readable parameter guide over the trace.
-            const float rr_progress = juce::jmap(
-                static_cast<float>(values.release_rate),
-                0.0F,
-                15.0F,
-                0.08F,
-                0.94F);
-            const float time_to_key_off = juce::jlimit(
-                0.0F,
-                1.0F,
-                (key_off_x - decay_x)
-                    / juce::jmax(1.0F, graph.getWidth() * 0.5F));
-            key_off_y = juce::jmap(
-                juce::jlimit(
-                    0.0F,
-                    1.0F,
-                    rr_progress * time_to_key_off * 1.25F),
-                0.0F,
-                1.0F,
-                sustain_y,
-                bottom);
-        }
-        const float rr_handle_y = modulator_ && sustained_tone
-            ? juce::jmap(
-                  static_cast<float>(values.release_rate),
-                  0.0F,
-                  15.0F,
-                  sustain_y,
-                  bottom)
-            : key_off_y;
-        const auto release = modulator_
-            ? juce::Point<float>(key_off_x, key_off_y)
-            : juce::Point<float>(release_x, bottom);
-        return {{attack_x, top},
-                {decay_x, sustain_y},
-                {key_off_x, key_off_y},
-                {key_off_x, rr_handle_y},
-                release,
-                sustained_tone && !modulator_};
-    }
-
-    [[nodiscard]] static std::optional<OpllEnvelopeHandle> handleAt(
-        juce::Point<float> position,
-        const AdsrGuide& guide) {
-        constexpr float hit_radius = 18.0F;
-        const auto hit = [position](juce::Point<float> point) {
-            return position.getDistanceFrom(point) <= hit_radius;
-        };
-        if (hit(guide.attack)) {
-            return OpllEnvelopeHandle::Attack;
-        }
-        if (hit(guide.decay_sustain)) {
-            return OpllEnvelopeHandle::DecaySustain;
-        }
-        if (hit(guide.key_off_handle)) {
-            return OpllEnvelopeHandle::SustainRelease;
-        }
-        if (guide.release_editable && hit(guide.release)) {
-            return OpllEnvelopeHandle::Release;
-        }
-        return std::nullopt;
-    }
-
-    void updateFromMouse(juce::Point<float> position) {
-        if (!drag_handle_) {
-            return;
-        }
-        auto next = values();
-        const auto graph = getLocalBounds().toFloat().reduced(0.5F);
-        if (drag_handle_) {
-            const float section = graph.getWidth() / 4.0F;
-            const auto start_guide = adsrGuide(
-                graph,
-                drag_start_values_,
-                drag_start_sustained_tone_);
-            const float delta_x =
-                position.x - drag_start_position_.x;
-            switch (*drag_handle_) {
-            case OpllEnvelopeHandle::Attack:
-                next.attack_rate = static_cast<std::uint8_t>(juce::roundToInt(
-                    rateFromInverseX(start_guide.attack.x + delta_x,
-                                     graph.getX() + 4.0F,
-                                     section - 8.0F)));
-                next.decay_rate = drag_start_values_.decay_rate == 0
-                    ? 0
-                    : static_cast<std::uint8_t>(juce::roundToInt(
-                          rateFromInverseX(
-                              start_guide.decay_sustain.x + delta_x,
-                              graph.getX() + section + 4.0F,
-                              section - 8.0F)));
-                break;
-            case OpllEnvelopeHandle::DecaySustain:
-                next.decay_rate = static_cast<std::uint8_t>(juce::roundToInt(
-                    rateFromInverseX(position.x, graph.getX() + section + 4.0F,
-                                     section - 8.0F)));
-                next.sustain_level = static_cast<std::uint8_t>(juce::roundToInt(
-                    juce::jmap(position.y, graph.getY() + 3.0F,
-                               graph.getBottom() - 3.0F, 0.0F, 15.0F)));
-                break;
-            case OpllEnvelopeHandle::SustainRelease: {
-                if (drag_start_sustained_tone_ && !modulator_) {
-                    next.sustain_level = static_cast<std::uint8_t>(
-                        juce::roundToInt(
-                            juce::jmap(
-                                position.y,
-                                graph.getY() + 3.0F,
-                                graph.getBottom() - 3.0F,
-                                0.0F,
-                                15.0F)));
-                }
-                // EG=0 has no sustain phase: its key-off handle edits RR
-                // only, while SL remains assigned to the second handle. Its
-                // vertical position is the RR cue: up decreases RR and down
-                // increases RR. Only a sustained CAR uses horizontal RR.
-                const bool rr_is_vertical = !drag_start_sustained_tone_
-                    || modulator_;
-                const float rr_delta = rr_is_vertical
-                    ? position.y - drag_start_position_.y
-                    : position.x - drag_start_position_.x;
-                const float rr_direction = rr_is_vertical ? 1.0F : -1.0F;
-                next.release_rate = static_cast<std::uint8_t>(juce::roundToInt(
-                    juce::jlimit(
-                        0.0F,
-                        15.0F,
-                        static_cast<float>(drag_start_values_.release_rate)
-                            + rr_direction * rr_delta * 15.0F
-                                / juce::jmax(
-                                    1.0F,
-                                    rr_is_vertical
-                                        ? graph.getHeight()
-                                        : graph.getWidth()))));
-                break;
-            }
-            case OpllEnvelopeHandle::Release:
-                next.release_rate = static_cast<std::uint8_t>(juce::roundToInt(
-                    rateFromInverseX(position.x,
-                                     graph.getX() + section * 3.0F + 4.0F,
-                                     section - 8.0F)));
-                break;
-            }
-        } else {
-            return;
-        }
-        next.attack_rate = juce::jlimit<std::uint8_t>(0, 15, next.attack_rate);
-        next.decay_rate = juce::jlimit<std::uint8_t>(0, 15, next.decay_rate);
-        next.sustain_level = juce::jlimit<std::uint8_t>(0, 15, next.sustain_level);
-        next.release_rate = juce::jlimit<std::uint8_t>(0, 15, next.release_rate);
-        if (drag_changed_
-            && next.attack_rate == drag_values_.attack_rate
-            && next.decay_rate == drag_values_.decay_rate
-            && next.sustain_level == drag_values_.sustain_level
-            && next.release_rate == drag_values_.release_rate) {
-            return;
-        }
-        drag_values_ = next;
-        drag_changed_ = true;
-        if (onEdit) {
-            onEdit(drag_values_, false);
-        }
-    }
-
-    std::array<
-        float,
-        mgstc::engine::OpllEnvelopeTrace::kPointCount>
-        levels_{};
-    juce::Colour waveform_colour_;
-    bool modulator_{};
-    juce::Point<float> drag_start_position_;
-    OpllEnvelopeValues drag_start_values_{};
-    bool drag_start_sustained_tone_{};
-    std::optional<OpllEnvelopeHandle> drag_handle_;
-    OpllEnvelopeValues drag_values_{};
-    bool drag_changed_{};
-    bool valid_{};
-};
 
 class OpllOperatorPanel final : public juce::Component {
 public:
@@ -517,6 +50,7 @@ public:
                 juce::Colour(0xFFC9D1D9));
             flags_[index].onClick = [this, index] {
                 if (index == 2) {
+                    envelope_graph_.cancelDrag();
                     envelope_graph_.repaint();
                 }
                 notifyChanged(true);
@@ -541,13 +75,15 @@ public:
         addAndMakeVisible(envelope_title_);
         envelope_graph_.setTooltip(
             juce::String::fromUTF8(
-                "淡いADSRライン上の赤い●をドラッグして編集します。"
-                "Attack点はAR、Decay/Sustain点はDRとSL、"
-                "EG=1のキーオフ点はSLとRR、EG=0のキーオフ点はRR、"
-                "Release終端点はEG=1のRRに対応します。"
-                "EG=0とMODのRRは上で減少、下で増加します。"
-                "AR・DR・RRは右ほど遅く、SLは下ほど減衰量が"
-                "大きくなります。赤い線は2秒地点のキーオフです"));
+                "赤い●だけをドラッグして編集します。1点目は横でARのみ、"
+                "2点目は横でDR・縦でSL、右のRR点は縦でRRのみを変更します。"
+                "ARとDRは左で増加、SLとRRは下で増加。Shiftで微調整、Escで取消。"
+                "淡い補助線は模式表示で、実際の時間とレベルは半透明の実効EGで確認します。"
+                "SL目標は破線。ドラッグ中の輪郭丸は操作終了時の戻り先です。"
+                "キーオフは中央2秒固定、チャンネルSUSはOFFです。"));
+        envelope_graph_.onCommit = [this] {
+            if (onEnvelopeCommit) onEnvelopeCommit();
+        };
         envelope_graph_.onEdit =
             [this](
                 const OpllEnvelopeValues& values,
@@ -827,6 +363,7 @@ public:
     }
 
     std::function<void(bool commit)> onChange;
+    std::function<void()> onEnvelopeCommit;
     std::function<void(bool)> onEnvelopeEdit;
 
 private:
@@ -978,6 +515,12 @@ public:
         carrier_.onEnvelopeEdit = [this](bool commit) {
             notifyChanged(commit);
         };
+        modulator_.onEnvelopeCommit = [this] {
+            if (onEnvelopeCommit) onEnvelopeCommit();
+        };
+        carrier_.onEnvelopeCommit = [this] {
+            if (onEnvelopeCommit) onEnvelopeCommit();
+        };
     }
 
     void setParameters(const mgstc::engine::OpllPatchParameters& patch) {
@@ -1064,6 +607,7 @@ public:
     }
 
     std::function<void(bool commit)> onChange;
+    std::function<void()> onEnvelopeCommit;
 
 private:
     void notifyChanged(bool commit) {

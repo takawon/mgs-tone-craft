@@ -11,6 +11,9 @@ RealtimeEngineHost::RealtimeEngineHost()
     : opll_scope_frames_(
           std::make_unique<
               SpscQueue<OpllScopeFrame, kOpllScopeCapacity>>()),
+      spectrogram_scope_frames_(
+          std::make_unique<SpscQueue<
+              OpllScopeFrame, kSpectrogramScopeCapacity>>()),
       programs_(std::make_unique<ProgramSlot[]>(kProgramSlotCount)),
       mamidi_(std::make_unique<MAmidiMemoSoundOutput>()) {
     programs_[0].state.store(
@@ -228,6 +231,58 @@ bool RealtimeEngineHost::pollOpllScope(
     return opll_scope_frames_->tryPop(frame);
 }
 
+void RealtimeEngineHost::setSpectrogramCaptureEnabled(
+    bool enabled) noexcept {
+    spectrogram_capture_enabled_.store(enabled, std::memory_order_release);
+}
+
+bool RealtimeEngineHost::pollSpectrogramScope(
+    OpllScopeFrame& frame) noexcept {
+    return spectrogram_scope_frames_->tryPop(frame);
+}
+
+void RealtimeEngineHost::noteStarted(
+    std::uint8_t track,
+    std::uint8_t note) noexcept {
+    if (track >= active_guide_notes_.size()) {
+        return;
+    }
+    auto& active = active_guide_notes_[track];
+    active.active = true;
+    active.note = note;
+    active.order = ++guide_note_order_;
+    last_guide_note_ = note;
+    last_guide_track_ = track;
+}
+
+void RealtimeEngineHost::noteStopped(std::uint8_t track) noexcept {
+    if (track < active_guide_notes_.size()) {
+        active_guide_notes_[track].active = false;
+    }
+}
+
+void RealtimeEngineHost::allNotesStopped() noexcept {
+    for (auto& note : active_guide_notes_) {
+        note.active = false;
+    }
+}
+
+void RealtimeEngineHost::annotateGuideNote(
+    OpllScopeFrame& frame) const noexcept {
+    const ActiveGuideNote* newest = nullptr;
+    std::uint8_t newest_track = last_guide_track_;
+    for (std::size_t index = 0; index < active_guide_notes_.size(); ++index) {
+        const auto& note = active_guide_notes_[index];
+        if (note.active && (newest == nullptr || note.order > newest->order)) {
+            newest = &note;
+            newest_track = static_cast<std::uint8_t>(index);
+        }
+    }
+    frame.guide_note = newest != nullptr ? newest->note : last_guide_note_;
+    frame.guide_track = newest_track;
+    frame.note_active = newest != nullptr;
+}
+
 void RealtimeEngineHost::notify(const EngineNotice& notice) noexcept {
     static_cast<void>(notices_.tryPush(notice));
 }
@@ -278,6 +333,7 @@ void RealtimeEngineHost::loadProgram(
     incoming.engine.session().gateUntilNoteOn();
     const auto previous = active_program_;
     active_program_ = command.program_slot;
+    allNotesStopped();
     incoming.state.store(ProgramSlotState::Active, std::memory_order_release);
     programs_[previous].state.store(
         ProgramSlotState::Free,
@@ -288,6 +344,8 @@ void RealtimeEngineHost::loadProgram(
             command.track,
             command.midi_note)) {
         reject(command.type);
+    } else if (command.retrigger) {
+        noteStarted(command.track, command.midi_note);
     }
     notify({
         .type = EngineNoticeType::ProgramActivated,
@@ -308,23 +366,30 @@ void RealtimeEngineHost::applyPendingCommands() noexcept {
                     command.track,
                     command.midi_note)) {
                 reject(command.type);
+            } else {
+                noteStarted(command.track, command.midi_note);
             }
             break;
         case EngineCommandType::NoteOff:
             if (!programs_[active_program_].engine.session().queueKeyOff(
                     command.track)) {
                 reject(command.type);
+            } else {
+                noteStopped(command.track);
             }
             break;
         case EngineCommandType::SilenceTrack:
             if (!programs_[active_program_].engine.session().forceMuteTrack(
                     command.track)) {
                 reject(command.type);
+            } else {
+                noteStopped(command.track);
             }
             break;
         case EngineCommandType::Stop:
         case EngineCommandType::HardReset:
             programs_[active_program_].engine.hardReset();
+            allNotesStopped();
             break;
         case EngineCommandType::SetMixerGains:
             if (!programs_[active_program_].engine.setGains(
@@ -345,7 +410,11 @@ RenderResult RealtimeEngineHost::render(
         programs_[active_program_].engine.render(interleaved_stereo);
     OpllScopeFrame scope{};
     if (programs_[active_program_].engine.takeOpllScopeFrame(scope)) {
+        annotateGuideNote(scope);
         static_cast<void>(opll_scope_frames_->tryPush(scope));
+        if (spectrogram_capture_enabled_.load(std::memory_order_acquire)) {
+            static_cast<void>(spectrogram_scope_frames_->tryPush(scope));
+        }
     }
     if (!result.ok()) {
         notify({
