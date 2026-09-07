@@ -78,6 +78,10 @@ public:
     [[nodiscard]] bool pollNotice(EngineNotice& notice) noexcept;
     [[nodiscard]] bool pollOpllScope(
         OpllScopeFrame& frame) noexcept;
+    // UI thread only. Drain at most one full queue and return only the newest
+    // frame so a live producer cannot keep the message thread in a poll loop.
+    [[nodiscard]] bool pollLatestOpllScope(
+        OpllScopeFrame& frame) noexcept;
 
     // UI controls capture; the analysis thread is the queue's sole consumer.
     // The audio thread performs one bounded lock-free copy per completed

@@ -5552,7 +5552,10 @@ public:
     ~PerformanceKeyboard() override {
         stopTimer();
         midi_service_.removeDrainListener(this);
-        LastAuditionNoteStore::instance().flushIfDirty();
+        {
+            MGSTC_UI_ACTIVITY("settings: flush last audition note");
+            LastAuditionNoteStore::instance().flushIfDirty();
+        }
         keyboard_state_.removeListener(this);
     }
 
@@ -6370,6 +6373,7 @@ private:
         if (preview_update_) {
             return;
         }
+        MGSTC_UI_ACTIVITY("keyboard: note on callbacks");
         const HeldNote incoming{channel, note};
         std::erase_if(
             held_notes_,
@@ -6398,6 +6402,7 @@ private:
         if (preview_update_) {
             return;
         }
+        MGSTC_UI_ACTIVITY("keyboard: note off callbacks");
         const bool was_active = polyphonic_
             || (
             !held_notes_.empty()
@@ -6602,7 +6607,10 @@ private:
     }
 
     void timerCallback() override {
-        LastAuditionNoteStore::instance().flushIfDirty();
+        {
+            MGSTC_UI_ACTIVITY("settings: flush last audition note");
+            LastAuditionNoteStore::instance().flushIfDirty();
+        }
         serviceActiveWindowInput(true);
     }
 
@@ -13751,6 +13759,7 @@ private:
 class OpllScopeComponent final : public juce::Component {
 public:
     static constexpr std::size_t kHistorySampleCount = 4096;
+    static constexpr std::size_t kMaxSynchronizationCandidates = 64;
 
     void setSynchronized(bool synchronized) {
         synchronized_ = synchronized;
@@ -13778,7 +13787,9 @@ public:
             history_size_ = std::min(
                 history_size_ + 1, history_.size());
         }
-        rebuildSynchronizedDisplay();
+        if (synchronized_) {
+            rebuildSynchronizedDisplay();
+        }
         repaint();
     }
 
@@ -13998,8 +14009,7 @@ private:
             candidates.push_back(maximum_start);
         }
 
-        const bool compare_previous =
-            synchronized_available_;
+        const bool compare_previous = synchronized_available_;
         double best_start = candidates.back();
         double best_score =
             -std::numeric_limits<double>::infinity();
@@ -14007,12 +14017,19 @@ private:
             float,
             mgstc::engine::OpllScopeFrame::kSampleCount>
             candidate{};
-        for (const double start : candidates) {
+        const std::size_t evaluation_count = std::min(
+            candidates.size(), kMaxSynchronizationCandidates);
+        for (std::size_t evaluation = 0;
+             compare_previous && evaluation < evaluation_count;
+             ++evaluation) {
+            const std::size_t candidate_index = evaluation_count > 1
+                ? evaluation * (candidates.size() - 1)
+                    / (evaluation_count - 1)
+                : candidates.size() - 1;
+            const double start = candidates[candidate_index];
             sampleWindow(start, sample_span, candidate);
-            const double similarity = compare_previous
-                ? correlation(
-                      candidate, synchronized_display_)
-                : 0.0;
+            const double similarity = correlation(
+                candidate, synchronized_display_);
             const double recency = maximum_start > 0.0
                 ? start / maximum_start
                 : 0.0;
@@ -16512,10 +16529,10 @@ private:
             }
         }
         mgstc::engine::OpllScopeFrame frame{};
-        if (componentWindowIsActive(*this)) {
-            while (engine_.pollOpllScope(frame)) {
-                scope_.appendFrame(frame, last_audition_note_);
-            }
+        if (componentWindowIsActive(*this)
+            && engine_.pollLatestOpllScope(frame)) {
+            MGSTC_UI_ACTIVITY("opll: scope latest-frame display");
+            scope_.appendFrame(frame, last_audition_note_);
         }
         if (audition_stop_time_ms_
             && juce::Time::getMillisecondCounterHiRes()
