@@ -226,3 +226,8 @@ Alphaのため、内部の設計書・詳細仕様書は公開していません
 - [msxplay-js](https://github.com/digital-sound-antiques/msxplay-js) / [libkss-js](https://github.com/digital-sound-antiques/libkss-js)（Digital Sound Antiques）— 試聴バランス等の参考
 - [Wavetable Synthesizer algorithm](https://www.mathworks.com/help/audio/ref/wavetablesynthesizer-system-object.html)（MathWorks）
 - [A Data-Driven Approach to Wavetable-Synthesis](https://www.creative-technologies.de/a-data-driven-approach-to-wavetable-synthesis/)（Creative Technologies）
+- [JUCE `dsp::FFT` Class Reference](https://docs.juce.com/master/classjuce_1_1dsp_1_1FFT.html)（JUCE）— 実数FFT処理のAPI参照
+- [JUCE `dsp::WindowingFunction` Class Reference](https://docs.juce.com/master/classjuce_1_1dsp_1_1WindowingFunction.html)（JUCE）— Hann窓処理のAPI参照
+- [NumPy Discrete Fourier Transform (DFT)](https://numpy.org/doc/2.2/reference/routines.fft.html)（NumPy）— FFT／DFTの定義
+- [SciPy `detrend`](https://docs.scipy.org/doc/scipy-1.14.0/reference/generated/scipy.signal.detrend.html)（SciPy）— DC／定常成分除去の参考
+- [SciPy `correlation_lags`](https://docs.scipy.org/doc/scipy-1.11.1/reference/generated/scipy.signal.correlation_lags.html)（SciPy）— 時系列遅延の参考
