@@ -14,6 +14,7 @@ enum class MeaningEventKind : std::uint8_t {
     Patch,
     RegisterWrite,
     FrequencyDelta,
+    TrackMicroDetune,
     Noise,
     ToneNoiseMode,
     RateVolume,

@@ -231,6 +231,20 @@ bool RealtimeEngineHost::pollOpllScope(
     return opll_scope_frames_->tryPop(frame);
 }
 
+bool RealtimeEngineHost::pollLatestOpllScope(
+    OpllScopeFrame& frame) noexcept {
+    bool found = false;
+    OpllScopeFrame next{};
+    for (std::size_t count = 0;
+         count < kOpllScopeCapacity
+         && opll_scope_frames_->tryPop(next);
+         ++count) {
+        frame = next;
+        found = true;
+    }
+    return found;
+}
+
 void RealtimeEngineHost::setSpectrogramCaptureEnabled(
     bool enabled) noexcept {
     spectrogram_capture_enabled_.store(enabled, std::memory_order_release);

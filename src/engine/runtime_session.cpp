@@ -5,6 +5,47 @@
 #include "mgstc/engine/volume.hpp"
 
 namespace mgstc::engine {
+namespace {
+
+[[nodiscard]] std::int32_t psgSccTrackMicroDetuneOffset(
+    std::int32_t value) noexcept {
+    const auto wide = static_cast<std::int64_t>(value);
+    if (wide >= 0) {
+        return static_cast<std::int32_t>((wide + 4) / 8);
+    }
+    return static_cast<std::int32_t>(-((-wide + 4) / 8));
+}
+
+[[nodiscard]] std::int32_t opllTrackMicroDetuneOffset(
+    std::uint8_t midi_note,
+    std::int32_t value) noexcept {
+    if (value <= 0) {
+        return 0;
+    }
+    NotePitch current{};
+    NotePitch next{};
+    if (!notePitch(midi_note, current)) {
+        return 0;
+    }
+    int next_f_number{};
+    if ((midi_note % 12) == 11) {
+        if (!notePitch(static_cast<std::uint8_t>(midi_note - 11), next)) {
+            return 0;
+        }
+        next_f_number = static_cast<int>(next.opll.f_number) * 2;
+    } else {
+        if (!notePitch(static_cast<std::uint8_t>(midi_note + 1), next)) {
+            return 0;
+        }
+        next_f_number = next.opll.f_number;
+    }
+    const auto difference =
+        next_f_number - static_cast<int>(current.opll.f_number);
+    return static_cast<std::int32_t>(
+        static_cast<std::int64_t>(difference) * value / 255);
+}
+
+}  // namespace
 
 RuntimeSession::RuntimeSession(
     std::size_t max_meaning_events,
@@ -698,7 +739,23 @@ MapError RuntimeSession::applyTrackDetunes(std::uint8_t track) {
     if (error != MapError::None) {
         return error;
     }
-    return apply_delta(track_micro_detune_[track]);
+    const auto micro_offset = track < 8
+        ? psgSccTrackMicroDetuneOffset(track_micro_detune_[track])
+        : opllTrackMicroDetuneOffset(
+            current_notes_[track], track_micro_detune_[track]);
+    if (micro_offset != 0) {
+        error = mapper_.mapMeaningEvent(
+            track,
+            MeaningEvent{
+                tick_,
+                MeaningEventKind::TrackMicroDetune,
+                micro_offset,
+                0,
+            },
+            tick_,
+            writes_);
+    }
+    return error;
 }
 
 MapError RuntimeSession::applyTrackPatch(std::uint8_t track) {

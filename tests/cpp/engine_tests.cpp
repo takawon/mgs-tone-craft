@@ -2832,6 +2832,25 @@ void testRealtimeHostPublishesOpllScopeToUiQueue() {
     REQUIRE_EQ(host.pollOpllScope(scope), false);
 }
 
+void testRealtimeHostPollLatestOpllScopeIsBoundedAndCoalesces() {
+    RealtimeEngineHost host;
+    std::vector<float> output(OpllScopeFrame::kSampleCount * 2);
+    for (std::size_t index = 0;
+         index < RealtimeEngineHost::kOpllScopeCapacity + 2;
+         ++index) {
+        REQUIRE_EQ(host.render(output).ok(), true);
+    }
+
+    OpllScopeFrame scope{};
+    REQUIRE_EQ(host.pollLatestOpllScope(scope), true);
+    REQUIRE_EQ(
+        scope.sequence,
+        static_cast<std::uint64_t>(
+            RealtimeEngineHost::kOpllScopeCapacity));
+    REQUIRE_EQ(host.pollOpllScope(scope), false);
+    REQUIRE_EQ(host.pollLatestOpllScope(scope), false);
+}
+
 void testRealtimeHostSpectrogramCaptureIsOptInAndKeepsLastNote() {
     RealtimeEngineHost host;
     std::vector<float> output(OpllScopeFrame::kSampleCount * 2);
@@ -5770,6 +5789,8 @@ int main(int argc, char** argv) {
         {"ProgramPoolLimitsEditingAndReusesReleasedSlot", testProgramPoolLimitsEditingAndReusesReleasedSlot},
         {"ProgramSnapshotActivatesAndRetriggersWithoutAudioAllocation", testProgramSnapshotActivatesAndRetriggersWithoutAudioAllocation},
         {"RealtimeHostPublishesOpllScopeToUiQueue", testRealtimeHostPublishesOpllScopeToUiQueue},
+        {"RealtimeHostPollLatestOpllScopeIsBoundedAndCoalesces",
+         testRealtimeHostPollLatestOpllScopeIsBoundedAndCoalesces},
         {"RealtimeHostSpectrogramCaptureIsOptInAndKeepsLastNote", testRealtimeHostSpectrogramCaptureIsOptInAndKeepsLastNote},
         {"InvalidAuditionKeepsProgramEditable", testInvalidAuditionKeepsProgramEditable},
         {"OpllPatchSemanticRoundTrip", testOpllPatchSemanticRoundTrip},

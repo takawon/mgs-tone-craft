@@ -26,6 +26,13 @@ constexpr std::uint16_t kOpllPackedOctaveDown = 0xFEAD;
     return static_cast<std::uint16_t>(static_cast<int>(current) - mml_delta);
 }
 
+[[nodiscard]] std::uint16_t addTrackMicroDetune(
+    std::uint16_t current,
+    std::int32_t period_offset) noexcept {
+    return static_cast<std::uint16_t>(
+        (static_cast<int>(current) + period_offset) & 0x1FFF);
+}
+
 void applyOpllPackedFrequencyDelta(
     std::uint16_t& packed,
     std::int32_t delta) noexcept {
@@ -188,13 +195,16 @@ MapError RegisterMapper::mapPsg(
         }
         return error;
     }
-    case MeaningEventKind::FrequencyDelta: {
+    case MeaningEventKind::FrequencyDelta:
+    case MeaningEventKind::TrackMicroDetune: {
         const auto low_address = static_cast<std::uint8_t>(channel * 2);
         const auto high_address = static_cast<std::uint8_t>(low_address + 1);
         const auto current = static_cast<std::uint16_t>(
             psg_mirror_[low_address]
             | (static_cast<unsigned>(psg_mirror_[high_address]) << 8));
-        const auto period = addPeriodDelta(current, event.arg0);
+        const auto period = event.kind == MeaningEventKind::TrackMicroDetune
+            ? addTrackMicroDetune(current, event.arg0)
+            : addPeriodDelta(current, event.arg0);
         const auto low = static_cast<std::uint8_t>(period & 0xFF);
         const auto high = static_cast<std::uint8_t>(period >> 8);
         auto error = emit(
@@ -308,9 +318,12 @@ MapError RegisterMapper::mapScc(
     case MeaningEventKind::Noise:
     case MeaningEventKind::ToneNoiseMode:
         return MapError::None;
-    case MeaningEventKind::FrequencyDelta: {
+    case MeaningEventKind::FrequencyDelta:
+    case MeaningEventKind::TrackMicroDetune: {
         const auto current = scc_period_[channel];
-        const auto period = addPeriodDelta(current, event.arg0);
+        const auto period = event.kind == MeaningEventKind::TrackMicroDetune
+            ? addTrackMicroDetune(current, event.arg0)
+            : addPeriodDelta(current, event.arg0);
         const auto low_address = static_cast<std::uint8_t>(channel * 2);
         const auto high_address = static_cast<std::uint8_t>(low_address + 1);
         auto error = emit(
@@ -413,7 +426,8 @@ MapError RegisterMapper::mapOpll(
         }
         return error;
     }
-    case MeaningEventKind::FrequencyDelta: {
+    case MeaningEventKind::FrequencyDelta:
+    case MeaningEventKind::TrackMicroDetune: {
         const auto low_address = static_cast<std::uint8_t>(0x10 + channel);
         const auto high_address = static_cast<std::uint8_t>(0x20 + channel);
         auto packed = opll_packed_[channel];
