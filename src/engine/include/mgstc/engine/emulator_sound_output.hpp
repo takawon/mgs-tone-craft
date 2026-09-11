@@ -24,7 +24,7 @@ public:
     [[nodiscard]] SoundOutputKind kind() const override;
 
     [[nodiscard]] bool valid() const noexcept;
-    [[nodiscard]] ChipSamples renderSample() noexcept;
+    [[nodiscard]] ChipSamples renderSample(bool capture_channels = false) noexcept;
 
 private:
     ChipRack chips_{};

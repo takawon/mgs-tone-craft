@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <span>
 
@@ -22,7 +23,7 @@ public:
     [[nodiscard]] bool write(
         std::uint8_t address,
         std::uint8_t value) noexcept;
-    [[nodiscard]] float renderSample() noexcept;
+    [[nodiscard]] float renderSample(std::span<float> channels = {}) noexcept;
 
 private:
     struct Impl;
@@ -44,7 +45,7 @@ public:
         std::uint8_t port,
         std::uint8_t address,
         std::uint8_t value) noexcept;
-    [[nodiscard]] float renderSample() noexcept;
+    [[nodiscard]] float renderSample(std::span<float> channels = {}) noexcept;
 
 private:
     struct Impl;
@@ -65,7 +66,7 @@ public:
     [[nodiscard]] bool write(
         std::uint8_t address,
         std::uint8_t value) noexcept;
-    [[nodiscard]] float renderSample() noexcept;
+    [[nodiscard]] float renderSample(std::span<float> channels = {}) noexcept;
 
 private:
     struct Impl;
@@ -76,6 +77,8 @@ struct ChipSamples {
     float psg{};
     float scc{};
     float opll{};
+    // PSG 0..2, SCC 3..7, OPLL melody 8..16, BD/HH/SD/TOM/CYM 17..21.
+    std::array<float, 22> channels{};
 };
 
 class ChipRack {
@@ -85,7 +88,7 @@ public:
     [[nodiscard]] bool apply(const RegisterWrite& write) noexcept;
     [[nodiscard]] bool apply(
         std::span<const RegisterWrite> writes) noexcept;
-    [[nodiscard]] ChipSamples renderSample() noexcept;
+    [[nodiscard]] ChipSamples renderSample(bool capture_channels = false) noexcept;
 
 private:
     Ym2149Adapter psg_;

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-only
 
 #include <array>
 #include <algorithm>
@@ -58,6 +58,7 @@
 #include "composite_timeline.hpp"
 #include "juce_utf8.hpp"
 #include "library_browser_chrome.hpp"
+#include "tone_import_tab.hpp"
 #include "composite_envelope_compile.hpp"
 #include "switch_look_and_feel.hpp"
 #include "mgstc_look_and_feel.hpp"
@@ -129,6 +130,7 @@ using EditorActivateCallback =
     std::function<void(const juce::String&)>;
 using TagManagementCallback =
     std::function<void(juce::Component*)>;
+using LibrariesChangedCallback = std::function<void()>;
 using SpectrogramOpenCallback = std::function<void()>;
 using SpectrogramSourceMaskCallback = std::function<void(std::uint8_t)>;
 
@@ -142,6 +144,9 @@ using SpectrogramSourceMaskCallback = std::function<void(std::uint8_t)>;
 // DefWindowProc immediately (activate + raise). TopLevelWindowManager also keys
 // "active" off keyboard focus, so caption-only clicks never reach
 // activeWindowStatusChanged / toFront — raise Z-order in an HWND subclass.
+// The same subclass rewrites WM_WINDOWPOSCHANGING so a pinned spectrogram
+// stays above this editor before paint (the old 15 Hz toFront flashed).
+// Deadline so a button flag that never clears (capture lost to another app)
 // Deadline so a button flag that never clears (capture lost to another app)
 // cannot swallow the callback forever: close/quit confirmation sets a pending
 // flag first, and a never-shown dialog looks exactly like a frozen app.
@@ -2121,6 +2126,7 @@ public:
     explicit SharedAudioService(bool offline_snapshot_capture = false)
         : offline_snapshot_capture_(offline_snapshot_capture) {
         master_volume_percent_ = loadMasterVolumePercent();
+        engine_.setSpectrumOutputGain(static_cast<float>(master_volume_percent_) / 100.0F);
         wasapi_audio_.setMasterVolumePercent(
             static_cast<std::uint32_t>(master_volume_percent_));
         asio_audio_.setMasterVolumePercent(
@@ -2237,6 +2243,7 @@ public:
             return;
         }
         master_volume_percent_ = next;
+        engine_.setSpectrumOutputGain(static_cast<float>(next) / 100.0F);
         if (!device_recovery_busy_) {
             // The device worker owns wasapi_audio_ while recovering; the volume
             // is re-applied when the recovery is collected.
@@ -4564,9 +4571,7 @@ private:
             return;
         }
         refreshTable(false);
-        if (libraries_changed_) {
-            libraries_changed_();
-        }
+        notifyLibrariesChanged();
     }
 
     void restoreDetailNameField() {
@@ -4649,6 +4654,7 @@ private:
             return;
         }
         refreshTable(false);
+        notifyLibrariesChanged();
     }
 
     void commitDetailMemo() {
@@ -4700,6 +4706,13 @@ private:
             return;
         }
         refreshTable(false);
+        notifyLibrariesChanged();
+    }
+
+    void notifyLibrariesChanged() {
+        if (libraries_changed_) {
+            libraries_changed_();
+        }
     }
 
     void notifyPerformanceTargetChanged(
@@ -4781,6 +4794,7 @@ private:
                               : juce::Colour(0xFF9AA8B5));
         }
         table_.repaintRow(row_number);
+        notifyLibrariesChanged();
     }
 
     void duplicateSelected() {
@@ -4829,9 +4843,7 @@ private:
                 juce::String::fromUTF8("複製結果を保存できませんでした"));
         }
         refreshTable(true);
-        if (libraries_changed_) {
-            libraries_changed_();
-        }
+        notifyLibrariesChanged();
     }
 
     void deleteSelected() {
@@ -4899,9 +4911,7 @@ private:
                             "削除結果を保存できませんでした"));
                 }
                 safe->refreshTable(true);
-                if (safe->libraries_changed_) {
-                    safe->libraries_changed_();
-                }
+                safe->notifyLibrariesChanged();
             });
     }
 
@@ -4987,9 +4997,7 @@ private:
                             "タグ付与結果を保存できませんでした"));
                 }
                 safe->refreshTable(true);
-                if (safe->libraries_changed_) {
-                    safe->libraries_changed_();
-                }
+                safe->notifyLibrariesChanged();
             });
     }
 
@@ -5006,13 +5014,12 @@ private:
         if (open_editor_) {
             open_editor_(selected.front().kind, selected.front().id);
         }
-        closeParentDialog();
     }
 
     void closeParentDialog() {
-        if (auto* dialog =
-                findParentComponentOfClass<juce::DialogWindow>()) {
-            dialog->exitModalState(0);
+        if (auto* window =
+                findParentComponentOfClass<juce::DocumentWindow>()) {
+            window->closeButtonPressed();
         }
     }
 
@@ -5586,6 +5593,22 @@ public:
 
     [[nodiscard]] bool polyphonic() const noexcept {
         return polyphonic_;
+    }
+
+    void setPolyphonic(bool polyphonic) {
+        if (polyphonic_ == polyphonic) {
+            return;
+        }
+        allNotesOff();
+        polyphonic_ = polyphonic;
+        mode_.setButtonText(polyphonic_ ? "Poly" : "Mono");
+        if (mode_changed_) {
+            mode_changed_(polyphonic_);
+        }
+    }
+
+    void setModeQueryCallback(std::function<bool()> query) {
+        mode_query_ = std::move(query);
     }
 
     void showSettingsDialog() {
@@ -6583,6 +6606,9 @@ private:
     }
 
     void serviceActiveWindowInput(bool poll_pc_keys) {
+        if (mode_query_) {
+            setPolyphonic(mode_query_());
+        }
         if (midi_service_revision_ != midi_service_.revision()) {
             syncMidiControls();
         }
@@ -6633,6 +6659,7 @@ private:
     NoteCallback note_on_;
     NoteCallback note_off_;
     ModeCallback mode_changed_;
+    std::function<bool()> mode_query_;
     SuppressCallback suppress_pc_input_;
     bool input_active_override_{};
     int pc_octave_{4};
@@ -6659,6 +6686,13 @@ public:
     using NoteOffCallback = std::function<void(
         LibraryManagerKind, std::uint8_t)>;
     using AllNotesOffCallback = std::function<void()>;
+    using ImportPreviewCallback = std::function<void(
+        const mgstc::engine::ImportedToneCandidate&)>;
+    using ImportEditCallback = std::function<void(
+        const mgstc::engine::ImportedToneCandidate&)>;
+    using ImportNoteOnCallback = std::function<void(
+        const mgstc::engine::ImportedToneCandidate&, std::uint8_t)>;
+    using PolyphonicQuery = std::function<bool(LibraryManagerKind)>;
 
     LibraryManagerContent(
         LibraryManagerKind initial_kind,
@@ -6672,7 +6706,11 @@ public:
         RefreshEditorsCallback refresh_editors,
         NoteOnCallback note_on,
         NoteOffCallback note_off,
-        AllNotesOffCallback all_notes_off)
+        AllNotesOffCallback all_notes_off,
+        ImportPreviewCallback import_preview = {},
+        ImportEditCallback import_edit = {},
+        ImportNoteOnCallback import_note_on = {},
+        PolyphonicQuery editor_polyphonic = {})
         : timbres_(std::move(timbres)),
           composites_(std::move(composites)),
           apply_tag_(std::move(apply_tag)),
@@ -6682,6 +6720,10 @@ public:
           note_on_(std::move(note_on)),
           note_off_(std::move(note_off)),
           all_notes_off_(std::move(all_notes_off)),
+          import_preview_(std::move(import_preview)),
+          import_edit_(std::move(import_edit)),
+          import_note_on_(std::move(import_note_on)),
+          editor_polyphonic_(std::move(editor_polyphonic)),
           performance_keyboard_(midi_service, audio_service) {
         setWantsKeyboardFocus(true);
         tabs_.setTabBarDepth(UiLayout::fieldH);
@@ -6722,12 +6764,39 @@ public:
             tag_tab_.get(),
             false);
 
+        import_tab_ = std::make_unique<ToneImportTab>(
+            import_preview_,
+            import_edit_,
+            [this] { return reloadLibraries(); },
+            [this] { return persistTimbreLibrary(timbres_); },
+            [this] {
+                return persistCompositeTimbreLibrary(composites_);
+            },
+            [this] { return &timbres_; },
+            [this] { return &composites_; },
+            [this] {
+                if (list_tab_ != nullptr) {
+                    list_tab_->reloadFromParent();
+                }
+                refreshTagManagementFromLibraries();
+                if (refresh_editors_) {
+                    refresh_editors_();
+                }
+            });
+        tabs_.addTab(
+            juce::String::fromUTF8("インポート"),
+            juce::Colour(UiLayout::panelFill),
+            import_tab_.get(),
+            false);
+
         performance_keyboard_.setHeadlessMode(true);
         performance_keyboard_.setCallbacks(
             [this](std::uint8_t note) { handlePerformanceNoteOn(note); },
             [this](std::uint8_t note) {
                 handlePerformanceNoteOff(note);
             });
+        performance_keyboard_.setModeQueryCallback(
+            [this] { return currentEditorPolyphonic(); });
         performance_keyboard_.setSuppressPcInputCallback(
             [this] { return textEntryHasFocusWithin(*this); });
         addChildComponent(performance_keyboard_);
@@ -6792,8 +6861,36 @@ public:
         return false;
     }
 
+    void prepareToHide() {
+        performance_keyboard_.allNotesOff();
+        if (all_notes_off_) {
+            all_notes_off_();
+        }
+    }
+
+    void reloadFromExternalChange() {
+        if (!reloadLibraries()) {
+            return;
+        }
+        if (list_tab_ != nullptr) {
+            list_tab_->reloadFromParent();
+        }
+        refreshTagManagementFromLibraries();
+    }
+
 private:
     void handlePerformanceNoteOn(std::uint8_t note) {
+        if (tabs_.getCurrentTabIndex() == 2
+            && import_tab_ != nullptr
+            && import_note_on_) {
+            const auto* candidate = import_tab_->selectedCandidate();
+            if (candidate == nullptr) {
+                return;
+            }
+            active_performance_kind_ = kindFromImported(*candidate);
+            import_note_on_(*candidate, note);
+            return;
+        }
         if (list_tab_ == nullptr || !note_on_) {
             return;
         }
@@ -6865,6 +6962,38 @@ private:
         refreshTagManagementFromLibraries();
     }
 
+    [[nodiscard]] bool currentEditorPolyphonic() const {
+        if (!editor_polyphonic_) {
+            return true;
+        }
+        if (tabs_.getCurrentTabIndex() == 2
+            && import_tab_ != nullptr) {
+            const auto* candidate = import_tab_->selectedCandidate();
+            if (candidate != nullptr) {
+                return editor_polyphonic_(kindFromImported(*candidate));
+            }
+        }
+        if (list_tab_ != nullptr) {
+            if (const auto target = list_tab_->performanceTarget()) {
+                return editor_polyphonic_(target->kind);
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] static LibraryManagerKind kindFromImported(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        switch (candidate.default_register_as) {
+        case mgstc::engine::ImportRegisterAs::Scc:
+            return LibraryManagerKind::Scc;
+        case mgstc::engine::ImportRegisterAs::Composite:
+            return LibraryManagerKind::Composite;
+        case mgstc::engine::ImportRegisterAs::Opll:
+            break;
+        }
+        return LibraryManagerKind::Opll;
+    }
+
     mgstc::engine::TimbreLibrary timbres_;
     mgstc::engine::CompositeTimbreLibrary composites_;
     ApplyTagCallback apply_tag_;
@@ -6874,64 +7003,71 @@ private:
     NoteOnCallback note_on_;
     NoteOffCallback note_off_;
     AllNotesOffCallback all_notes_off_;
+    ImportPreviewCallback import_preview_;
+    ImportEditCallback import_edit_;
+    ImportNoteOnCallback import_note_on_;
+    PolyphonicQuery editor_polyphonic_;
     PerformanceKeyboard performance_keyboard_;
     std::optional<LibraryManagerKind> active_performance_kind_;
     juce::TabbedComponent tabs_{
         juce::TabbedButtonBar::TabsAtTop};
     std::unique_ptr<LibraryManagerListTab> list_tab_;
     std::unique_ptr<TagManagementContent> tag_tab_;
+    std::unique_ptr<ToneImportTab> import_tab_;
 };
 
-void showLibraryManagerDialog(
-    juce::Component* anchor,
-    LibraryManagerKind initial_kind,
-    mgstc::engine::TimbreLibrary timbres,
-    mgstc::engine::CompositeTimbreLibrary composites,
-    SharedMidiInputService& midi_service,
-    SharedAudioService& audio_service,
-    LibraryManagerContent::ApplyTagCallback apply_tag,
-    LibraryManagerContent::PreviewCallback preview,
-    LibraryManagerContent::OpenEditorCallback open_editor,
-    LibraryManagerContent::RefreshEditorsCallback refresh_editors,
-    LibraryManagerContent::NoteOnCallback note_on,
-    LibraryManagerContent::NoteOffCallback note_off,
-    LibraryManagerContent::AllNotesOffCallback all_notes_off) {
-    UiScale::forceGlobalForNonEditorUi();
-    auto* dialog = new ModalDialogWindow(
-        juce::String::fromUTF8("ライブラリ管理"),
-        juce::Colour(0xFF1B222C));
-    auto* content = new LibraryManagerContent(
-        initial_kind,
-        std::move(timbres),
-        std::move(composites),
-        midi_service,
-        audio_service,
-        std::move(apply_tag),
-        std::move(preview),
-        std::move(open_editor),
-        std::move(refresh_editors),
-        std::move(note_on),
-        std::move(note_off),
-        std::move(all_notes_off));
-    dialog->setUsingNativeTitleBar(true);
-    dialog->setContentOwned(content, true);
-    dialog->setResizable(true, true);
-    dialog->setResizeLimits(
-        UiScale::sx(900),
-        UiScale::sx(560),
-        UiScale::sx(1600),
-        UiScale::sx(960));
-    if (anchor != nullptr) {
-        dialog->centreAroundComponent(
-            anchor, content->getWidth(), content->getHeight() + 32);
-    } else {
-        dialog->centreWithSize(
-            content->getWidth(), content->getHeight() + 32);
+class LibraryManagerWindow final : public juce::DocumentWindow {
+public:
+    LibraryManagerWindow(std::unique_ptr<LibraryManagerContent> content)
+        : DocumentWindow(
+            juce::String::fromUTF8("ライブラリ管理"),
+            juce::Colour(0xFF1B222C),
+            DocumentWindow::closeButton | DocumentWindow::minimiseButton) {
+        setUsingNativeTitleBar(true);
+        setResizable(true, true);
+        setResizeLimits(
+            UiScale::sx(900),
+            UiScale::sx(560),
+            UiScale::sx(1600),
+            UiScale::sx(960));
+        content_ = content.get();
+        setContentOwned(content.release(), true);
     }
-    dialog->enterModalState(true, nullptr, true);
-    content->grabKeyboardFocus();
-}
 
+    void closeButtonPressed() override {
+        if (content_ != nullptr) {
+            content_->prepareToHide();
+        }
+        setVisible(false);
+    }
+
+    void reloadFromExternalChange() {
+        if (content_ != nullptr) {
+            content_->reloadFromExternalChange();
+        }
+    }
+
+    void activeWindowStatusChanged() override {
+        juce::DocumentWindow::activeWindowStatusChanged();
+        if (!isActiveWindow()) {
+            return;
+        }
+        UiScale::forceGlobalForNonEditorUi();
+        if (auto* content = getContentComponent()) {
+            content->sendLookAndFeelChange();
+            content->resized();
+            content->repaint();
+        }
+    }
+
+    void resized() override {
+        UiScale::forceGlobalForNonEditorUi();
+        juce::DocumentWindow::resized();
+    }
+
+private:
+    LibraryManagerContent* content_{};
+};
 
 class CompositeEditorComponent final
     : public juce::Component,
@@ -6943,12 +7079,14 @@ public:
         EditorOpenCallback open_editor,
         SpectrogramOpenCallback open_spectrogram,
         SpectrogramSourceMaskCallback spectrogram_source_mask_changed,
-        TagManagementCallback manage_tags)
+        TagManagementCallback manage_tags,
+        LibrariesChangedCallback libraries_changed = {})
         : open_editor_(std::move(open_editor)),
           open_spectrogram_(std::move(open_spectrogram)),
           spectrogram_source_mask_changed_(
               std::move(spectrogram_source_mask_changed)),
           manage_tags_(std::move(manage_tags)),
+          libraries_changed_(std::move(libraries_changed)),
           audio_service_(audio_service),
           engine_(audio_service.engine()),
           tooltip_window_(this, 450),
@@ -7637,7 +7775,14 @@ public:
         const bool composite_reloaded = loadCompositeLibrary();
         const bool timbre_reloaded = loadTimbreLibrary();
         if (!composite_reloaded && !timbre_reloaded) {
+            refreshCompositeSelector();
+            refreshTimbreSelectors();
             return;
+        }
+        if (selected_composite_id_
+            && composite_library_.find(*selected_composite_id_)
+                == nullptr) {
+            selected_composite_id_.reset();
         }
         std::size_t updated_references{};
         for (const auto& entry : timbre_library_.entries()) {
@@ -7730,6 +7875,74 @@ public:
     void libraryManagerAllNotesOff() {
         stopAudition();
         restoreLibraryManagerTimbre();
+    }
+
+    [[nodiscard]] bool polyphonic() const noexcept {
+        return performance_keyboard_.polyphonic();
+    }
+
+    void auditionImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        auto timbre = mgstc::engine::makeImportedComposite(
+            candidate, mgstc::engine::ImportRegisterAs::Composite);
+        if (!timbre) {
+            return;
+        }
+        last_audition_note_ = loadLastAuditionNoteSetting();
+        auditionCompositeModel(*timbre);
+    }
+
+    void loadImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        auto timbre = mgstc::engine::makeImportedComposite(
+            candidate, mgstc::engine::ImportRegisterAs::Composite);
+        if (!timbre) {
+            return;
+        }
+        if (hasUnsavedChanges()) {
+            juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+            auto pending = std::make_shared<mgstc::engine::CompositeTimbre>(
+                std::move(*timbre));
+            showDiscardConfirmation(
+                this,
+                juce::String::fromUTF8("インポート音色の編集"),
+                [safe, pending] {
+                    if (safe != nullptr) {
+                        safe->performLoadImportedComposite(*pending);
+                    }
+                });
+            return;
+        }
+        performLoadImportedComposite(std::move(*timbre));
+    }
+
+    void libraryManagerImportedNoteOn(
+        const mgstc::engine::ImportedToneCandidate& candidate,
+        std::uint8_t note) {
+        auto timbre = mgstc::engine::makeImportedComposite(
+            candidate, mgstc::engine::ImportRegisterAs::Composite);
+        if (!timbre) {
+            return;
+        }
+        if (!library_manager_imported_
+            || !library_manager_saved_timbre_
+            || timbre_ != *timbre) {
+            stopAudition();
+            if (!library_manager_saved_timbre_) {
+                library_manager_saved_timbre_ = timbre_;
+            }
+            timbre_ = std::move(*timbre);
+            composite_program_stale_ = true;
+            library_manager_imported_ = true;
+            library_manager_performance_id_.reset();
+            if (!configureEngine()) {
+                restoreLibraryManagerTimbre();
+                return;
+            }
+            startCompositeNote(note, false, true);
+            return;
+        }
+        startCompositeNote(note, false);
     }
 
     void applyTagRewrite(
@@ -8531,6 +8744,27 @@ private:
                 "新しい総合音色を作成しました"));
     }
 
+    void performLoadImportedComposite(
+        mgstc::engine::CompositeTimbre timbre) {
+        stopAudition();
+        restoreLibraryManagerTimbre();
+        selected_composite_id_.reset();
+        composite_select_.setSelectedId(
+            0, juce::dontSendNotification);
+        timbre_ = std::move(timbre);
+        composite_program_stale_ = true;
+        syncControlsFromModel();
+        timeline_.setTimbre(timbre_, true);
+        editor_baseline_ = mgstc::engine::defaultCompositeTimbre();
+        editor_baseline_.layers.clear();
+        editor_baseline_id_.reset();
+        resetHistoryToCurrent();
+        static_cast<void>(configureEngine());
+        updateStatus(
+            juce::String::fromUTF8(
+                "インポートした総合音色を編集中（未保存）"));
+    }
+
     void selectCompositePreview() {
         if (syncing_) {
             return;
@@ -8713,6 +8947,7 @@ private:
                     "総合音色ライブラリを書き込めませんでした"));
             return;
         }
+        notifyLibraryContentsChanged();
         refreshCompositeSelector();
         setEditorBaseline();
         updateStatus(
@@ -8754,6 +8989,7 @@ private:
                 juce::String::fromUTF8("複製を保存できませんでした"));
             return;
         }
+        notifyLibraryContentsChanged();
         timbre_ = std::move(copy);
         refreshCompositeSelector();
         syncControlsFromModel();
@@ -8800,6 +9036,7 @@ private:
                     "名前の変更を保存できませんでした"));
             return;
         }
+        notifyLibraryContentsChanged();
         timbre_.name = requested;
         refreshCompositeSelector();
         syncControlsFromModel();
@@ -8845,9 +9082,16 @@ private:
                             "削除結果を保存できませんでした"));
                     return;
                 }
+                safe->notifyLibraryContentsChanged();
                 safe->performNewCompositeTimbre();
                 safe->refreshCompositeSelector();
             });
+    }
+
+    void notifyLibraryContentsChanged() {
+        if (libraries_changed_) {
+            libraries_changed_();
+        }
     }
 
     void setEditorBaseline() {
@@ -9563,6 +9807,10 @@ private:
                         break;
                     }
                 }
+                if (snap == nullptr) {
+                    snap = mgstc::engine::findEmbeddedTimbreSnapshot(
+                        timbre_, assignment.library_id);
+                }
             }
             if (snap == nullptr) {
                 continue;
@@ -9583,6 +9831,12 @@ private:
         }
         const auto counts = audibleLayerCounts();
         const auto voice_capacity = compositeVoiceCapacity(counts);
+        auto spectrum_map = mgstc::engine::identitySpectrumChannelMap();
+        for (std::uint8_t voice = 0; voice < voice_capacity; ++voice)
+            for (std::size_t index = 0; index < timbre_.layers.size(); ++index)
+                if (mgstc::engine::layerIsAudible(timbre_, index))
+                    spectrum_map[trackForVoice(index, voice, counts)] = trackFor(timbre_.layers[index]);
+        edit.engine->setSpectrumChannelMap(spectrum_map);
         voice_allocator_.setChannelCount(voice_capacity);
         voice_allocator_.setPolyphonic(performance_keyboard_.polyphonic());
         static_cast<void>(
@@ -9757,11 +10011,13 @@ private:
     void restoreLibraryManagerTimbre() {
         if (!library_manager_saved_timbre_) {
             library_manager_performance_id_.reset();
+            library_manager_imported_ = false;
             return;
         }
         timbre_ = std::move(*library_manager_saved_timbre_);
         library_manager_saved_timbre_.reset();
         library_manager_performance_id_.reset();
+        library_manager_imported_ = false;
         static_cast<void>(configureEngine());
     }
 
@@ -9919,6 +10175,7 @@ private:
     SpectrogramOpenCallback open_spectrogram_;
     SpectrogramSourceMaskCallback spectrogram_source_mask_changed_;
     TagManagementCallback manage_tags_;
+    LibrariesChangedCallback libraries_changed_;
     SharedAudioService& audio_service_;
     mgstc::engine::RealtimeEngineHost& engine_;
     juce::TooltipWindow tooltip_window_;
@@ -10011,6 +10268,7 @@ private:
     std::optional<std::uint64_t> library_manager_performance_id_;
     std::optional<mgstc::engine::CompositeTimbre>
         library_manager_saved_timbre_;
+    bool library_manager_imported_{};
     bool composite_ab_next_b_{true};
     std::vector<std::string> composite_filter_tags_;
     mgstc::engine::CompositeTimbre editor_baseline_;
@@ -10202,11 +10460,13 @@ public:
         SpectrogramOpenCallback open_spectrogram,
         OpllCandidateCallback open_opll_candidates,
         TagManagementCallback manage_tags,
-        bool envelope_context = false)
+        bool envelope_context = false,
+        LibrariesChangedCallback libraries_changed = {})
         : open_editor_(std::move(open_editor)),
           open_spectrogram_(std::move(open_spectrogram)),
           open_opll_candidates_(std::move(open_opll_candidates)),
           manage_tags_(std::move(manage_tags)),
+          libraries_changed_(std::move(libraries_changed)),
           audio_service_(audio_service),
           engine_(audio_service.engine()),
           tooltip_window_(this, 450),
@@ -11064,6 +11324,11 @@ public:
     void refreshExternalState() {
         synchronizeMasterVolumeSlider(
             master_volume_, master_volume_revision_, audio_service_);
+        loadLibrary();
+        if (selected_library_id_ && library_.find(*selected_library_id_) == nullptr) {
+            selected_library_id_.reset();
+        }
+        updateTagButtons();
         // pending取込が試聴を始めた直後に configureEngine(false) すると
         // hardResetで音が消えるため、取込成功時は再構成しない。
         if (consumePendingSccConversion() || !engine_ready_) {
@@ -11220,6 +11485,85 @@ public:
         silenceAllVoices();
         library_manager_performance_id_.reset();
         library_manager_preview_wave_.reset();
+    }
+
+    [[nodiscard]] bool polyphonic() const noexcept {
+        return performance_keyboard_.polyphonic();
+    }
+
+    void auditionImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        const auto* wave =
+            std::get_if<mgstc::engine::SccWaveform>(&candidate.data);
+        if (wave == nullptr) {
+            return;
+        }
+        last_audition_note_ = loadLastAuditionNoteSetting();
+        static_cast<void>(auditionOneSecond(wave));
+    }
+
+    void loadImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        const auto* wave =
+            std::get_if<mgstc::engine::SccWaveform>(&candidate.data);
+        if (wave == nullptr) {
+            return;
+        }
+        auto pending = *wave;
+        const auto name = candidate.name;
+        const bool favorite = candidate.favorite;
+        if (hasUnsavedChanges()) {
+            juce::Component::SafePointer<SccEditorComponent> safe(this);
+            showDiscardConfirmation(
+                this,
+                juce::String::fromUTF8("インポート音色の編集"),
+                [safe, pending, name, favorite] {
+                    if (safe != nullptr) {
+                        safe->performLoadImportedScc(
+                            pending, name, favorite);
+                    }
+                });
+            return;
+        }
+        performLoadImportedScc(pending, name, favorite);
+    }
+
+    void libraryManagerImportedNoteOn(
+        const mgstc::engine::ImportedToneCandidate& candidate,
+        std::uint8_t note) {
+        const auto* wave =
+            std::get_if<mgstc::engine::SccWaveform>(&candidate.data);
+        if (wave == nullptr) {
+            return;
+        }
+        audition_stop_time_ms_.reset();
+        performance_keyboard_.clearPreviewNote();
+        last_audition_note_ = note;
+        saveLastAuditionNoteSetting(last_audition_note_);
+        if (!engine_ready_) {
+            return;
+        }
+        if (!library_manager_preview_wave_
+            || *library_manager_preview_wave_ != *wave
+            || voice_allocator_.activeVoiceCount() == 0) {
+            if (!configureEngine(false, wave)) {
+                return;
+            }
+            library_manager_performance_id_.reset();
+            library_manager_preview_wave_ = *wave;
+        }
+        const auto assignment = voice_allocator_.noteOn(note);
+        const auto track = static_cast<std::uint8_t>(
+            kSccTrack + assignment.channel);
+        if (assignment.stolen_note) {
+            static_cast<void>(engine_.submit(
+                mgstc::engine::EngineCommand::noteOff(track)));
+        }
+        if (!engine_.submit(
+                mgstc::engine::EngineCommand::noteOn(
+                    track, note))) {
+            static_cast<void>(voice_allocator_.noteOff(note));
+        }
     }
 
     [[nodiscard]] bool hasUnsavedChanges() const {
@@ -12642,6 +12986,21 @@ private:
             juce::String::fromUTF8("新しいSCC音色を編集中"));
     }
 
+    void performLoadImportedScc(
+        const SccWaveform& wave,
+        const std::string& name,
+        bool favorite) {
+        performNewLibraryEntry();
+        commitWave(wave);
+        name_.setText(
+            juce::String::fromUTF8(name.c_str()),
+            juce::dontSendNotification);
+        favorite_.setToggleState(favorite, juce::dontSendNotification);
+        updateStatus(
+            juce::String::fromUTF8(
+                "インポートしたSCC音色を編集中（未保存）"));
+    }
+
     void loadSelectedLibraryEntry() {
         if (!selected_library_id_) {
             showError(
@@ -12851,6 +13210,7 @@ private:
                     "ライブラリファイルを更新できませんでした"));
             return;
         }
+        notifyLibraryContentsChanged();
         setEditorBaseline();
         updateStatus(
             save_as
@@ -12861,6 +13221,12 @@ private:
                            ? juce::String{}
                            : juce::String::fromUTF8(
                                  "（総合音色の参照も更新）")));
+    }
+
+    void notifyLibraryContentsChanged() {
+        if (libraries_changed_) {
+            libraries_changed_();
+        }
     }
 
     void setEditorBaseline() {
@@ -12911,6 +13277,7 @@ private:
                     "名前の変更を保存できませんでした"));
             return;
         }
+        notifyLibraryContentsChanged();
         refreshLibraryList();
         selectLibraryEntryFromList();
         setEditorBaseline();
@@ -12982,6 +13349,7 @@ private:
                 safe->favorite_.setToggleState(
                     false, juce::dontSendNotification);
                 safe->refreshLibraryList();
+                safe->notifyLibraryContentsChanged();
                 safe->setEditorBaseline();
                 safe->updateStatus(
                     juce::String::fromUTF8(
@@ -13042,6 +13410,7 @@ private:
                     "音色は追加されましたが、ローカルファイルを更新できませんでした"));
             return;
         }
+        notifyLibraryContentsChanged();
         updateStatus(
             juce::String(static_cast<int>(imported_ids->size()))
             + juce::String::fromUTF8(
@@ -13608,6 +13977,7 @@ private:
     SpectrogramOpenCallback open_spectrogram_;
     OpllCandidateCallback open_opll_candidates_;
     TagManagementCallback manage_tags_;
+    LibrariesChangedCallback libraries_changed_;
     SharedAudioService& audio_service_;
     mgstc::engine::RealtimeEngineHost& engine_;
     juce::TooltipWindow tooltip_window_;
@@ -14074,10 +14444,12 @@ public:
         EditorOpenCallback open_editor,
         SpectrogramOpenCallback open_spectrogram,
         TagManagementCallback manage_tags,
-        bool envelope_context = false)
+        bool envelope_context = false,
+        LibrariesChangedCallback libraries_changed = {})
         : open_editor_(std::move(open_editor)),
           open_spectrogram_(std::move(open_spectrogram)),
           manage_tags_(std::move(manage_tags)),
+          libraries_changed_(std::move(libraries_changed)),
           audio_service_(audio_service),
           engine_(audio_service.engine()),
           tooltip_window_(this, 450),
@@ -14576,6 +14948,11 @@ public:
     void refreshExternalState() {
         synchronizeMasterVolumeSlider(
             master_volume_, master_volume_revision_, audio_service_);
+        loadLibrary();
+        if (selected_library_id_ && library_.find(*selected_library_id_) == nullptr) {
+            selected_library_id_.reset();
+        }
+        updateTagButtons();
         // pending取込が試聴を始めた直後に configureEngine(false) すると
         // hardResetで音が消えるため、取込成功時は再構成しない。
         if (consumePendingOpllConversion() || !engine_ready_) {
@@ -14723,6 +15100,88 @@ public:
         silenceAllVoices();
         library_manager_performance_id_.reset();
         library_manager_preview_patch_.reset();
+    }
+
+    [[nodiscard]] bool polyphonic() const noexcept {
+        return performance_keyboard_.polyphonic();
+    }
+
+    void auditionImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        const auto* patch =
+            std::get_if<mgstc::engine::OpllPatchParameters>(&candidate.data);
+        if (patch == nullptr) {
+            return;
+        }
+        last_audition_note_ = loadLastAuditionNoteSetting();
+        static_cast<void>(auditionOneSecond(patch));
+    }
+
+    void loadImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        const auto* patch =
+            std::get_if<mgstc::engine::OpllPatchParameters>(&candidate.data);
+        if (patch == nullptr) {
+            return;
+        }
+        auto pending = *patch;
+        const auto name = candidate.name;
+        const bool favorite = candidate.favorite;
+        if (hasUnsavedChanges()) {
+            juce::Component::SafePointer<OpllEditorComponent> safe(this);
+            showDiscardConfirmation(
+                this,
+                juce::String::fromUTF8("インポート音色の編集"),
+                [safe, pending, name, favorite] {
+                    if (safe != nullptr) {
+                        safe->performLoadImportedOpll(
+                            pending, name, favorite);
+                    }
+                });
+            return;
+        }
+        performLoadImportedOpll(pending, name, favorite);
+    }
+
+    void libraryManagerImportedNoteOn(
+        const mgstc::engine::ImportedToneCandidate& candidate,
+        std::uint8_t note) {
+        const auto* patch =
+            std::get_if<mgstc::engine::OpllPatchParameters>(&candidate.data);
+        if (patch == nullptr) {
+            return;
+        }
+        audition_stop_time_ms_.reset();
+        performance_keyboard_.clearPreviewNote();
+        last_audition_note_ = note;
+        saveLastAuditionNoteSetting(last_audition_note_);
+        updateAuditionNoteLabels();
+        pending_envelope_trace_refresh_ = true;
+        if (!engine_ready_) {
+            return;
+        }
+        if (!library_manager_preview_patch_
+            || *library_manager_preview_patch_ != *patch
+            || voice_allocator_.activeVoiceCount() == 0) {
+            if (!configureEngine(false, patch)) {
+                return;
+            }
+            library_manager_performance_id_.reset();
+            library_manager_preview_patch_ = *patch;
+        }
+        const auto assignment = voice_allocator_.noteOn(note);
+        const auto track = static_cast<std::uint8_t>(
+            kOpllTrack + assignment.channel);
+        audio_service_.cancelOpllKeyOffForceSilence(track);
+        if (assignment.stolen_note) {
+            static_cast<void>(engine_.submit(
+                mgstc::engine::EngineCommand::noteOff(track)));
+        }
+        if (!engine_.submit(
+                mgstc::engine::EngineCommand::noteOn(
+                    track, note))) {
+            static_cast<void>(voice_allocator_.noteOff(note));
+        }
     }
 
     [[nodiscard]] bool hasUnsavedChanges() const {
@@ -15768,6 +16227,21 @@ private:
                 "新しいOPLL音色を編集中"));
     }
 
+    void performLoadImportedOpll(
+        const mgstc::engine::OpllPatchParameters& patch,
+        const std::string& name,
+        bool favorite) {
+        performNewLibraryEntry();
+        commitPatch(patch);
+        name_.setText(
+            juce::String::fromUTF8(name.c_str()),
+            juce::dontSendNotification);
+        favorite_.setToggleState(favorite, juce::dontSendNotification);
+        updateStatus(
+            juce::String::fromUTF8(
+                "インポートしたOPLL音色を編集中（未保存）"));
+    }
+
     void loadSelectedLibraryEntry() {
         if (!selected_library_id_) {
             showError(
@@ -15965,6 +16439,7 @@ private:
         }
         refreshLibraryList();
         selectLibraryEntryFromList();
+        notifyLibraryContentsChanged();
         setEditorBaseline();
         updateStatus(
             save_as
@@ -15976,6 +16451,12 @@ private:
                            ? juce::String{}
                            : juce::String::fromUTF8(
                                  "（総合音色の参照も更新）")));
+    }
+
+    void notifyLibraryContentsChanged() {
+        if (libraries_changed_) {
+            libraries_changed_();
+        }
     }
 
     void setEditorBaseline() {
@@ -16026,6 +16507,7 @@ private:
                     "名前の変更を保存できませんでした"));
             return;
         }
+        notifyLibraryContentsChanged();
         refreshLibraryList();
         selectLibraryEntryFromList();
         setEditorBaseline();
@@ -16103,6 +16585,7 @@ private:
                 safe->favorite_.setToggleState(
                     false, juce::dontSendNotification);
                 safe->refreshLibraryList();
+                safe->notifyLibraryContentsChanged();
                 safe->setEditorBaseline();
                 safe->updateStatus(
                     juce::String::fromUTF8(
@@ -16157,6 +16640,7 @@ private:
                     "取込結果を保存できませんでした"));
             return;
         }
+        notifyLibraryContentsChanged();
         selected_library_id_ = first_opll;
         refreshLibraryList();
         if (first_opll && selected_library_id_) {
@@ -16551,6 +17035,7 @@ private:
     EditorOpenCallback open_editor_;
     SpectrogramOpenCallback open_spectrogram_;
     TagManagementCallback manage_tags_;
+    LibrariesChangedCallback libraries_changed_;
     SharedAudioService& audio_service_;
     mgstc::engine::RealtimeEngineHost& engine_;
     juce::TooltipWindow tooltip_window_;
@@ -16667,6 +17152,7 @@ public:
         SpectrogramSourceMaskCallback spectrogram_source_mask_changed,
         OpllCandidateCallback open_opll_candidates,
         TagManagementCallback manage_tags,
+        LibrariesChangedCallback libraries_changed,
         EditorCloseCallback close_editor,
         EditorActivateCallback activate_editor)
         : DocumentWindow(
@@ -16687,7 +17173,8 @@ public:
                     audio_service, midi_service, open_editor,
                     open_spectrogram,
                     manage_tags,
-                    editor.equalsIgnoreCase("opll-envelope")), true);
+                    editor.equalsIgnoreCase("opll-envelope"),
+                    libraries_changed), true);
         } else if (editor.equalsIgnoreCase("scc")
                    || editor.equalsIgnoreCase("scc-envelope")) {
             setContentOwned(
@@ -16696,20 +17183,21 @@ public:
                     open_spectrogram,
                     open_opll_candidates,
                     manage_tags,
-                    editor.equalsIgnoreCase("scc-envelope")), true);
+                    editor.equalsIgnoreCase("scc-envelope"),
+                    libraries_changed), true);
         } else {
             setContentOwned(
                 new CompositeEditorComponent(
                     audio_service, midi_service, open_editor,
                     open_spectrogram,
                     std::move(spectrogram_source_mask_changed),
-                    manage_tags), true);
+                    manage_tags,
+                    std::move(libraries_changed)), true);
         }
         setResizable(true, false);
         centreWithSize(getWidth(), getHeight());
         clampWindowToDisplayWorkArea(*this);
         setWantsKeyboardFocus(true);
-        setVisible(true);
         installCaptionZOrderHook();
     }
 
@@ -16763,6 +17251,23 @@ public:
                 initial_tab, output_file);
         }
         return SnapshotResult::MissingContent;
+    }
+
+    [[nodiscard]] bool polyphonic() const {
+        if (auto* composite =
+                dynamic_cast<CompositeEditorComponent*>(
+                    getContentComponent())) {
+            return composite->polyphonic();
+        }
+        if (auto* scc = dynamic_cast<SccEditorComponent*>(
+                getContentComponent())) {
+            return scc->polyphonic();
+        }
+        if (auto* opll = dynamic_cast<OpllEditorComponent*>(
+                getContentComponent())) {
+            return opll->polyphonic();
+        }
+        return true;
     }
 
     void refreshExternalState() {
@@ -16827,6 +17332,82 @@ public:
                        dynamic_cast<OpllEditorComponent*>(
                            getContentComponent())) {
             opll->auditionLibraryPreview(id);
+        }
+    }
+
+    void auditionImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        if (candidate.default_register_as
+            == mgstc::engine::ImportRegisterAs::Composite) {
+            if (auto* composite =
+                    dynamic_cast<CompositeEditorComponent*>(
+                        getContentComponent())) {
+                composite->auditionImportedCandidate(candidate);
+            }
+            return;
+        }
+        if (candidate.default_register_as
+            == mgstc::engine::ImportRegisterAs::Scc) {
+            if (auto* scc = dynamic_cast<SccEditorComponent*>(
+                    getContentComponent())) {
+                scc->auditionImportedCandidate(candidate);
+            }
+            return;
+        }
+        if (auto* opll = dynamic_cast<OpllEditorComponent*>(
+                getContentComponent())) {
+            opll->auditionImportedCandidate(candidate);
+        }
+    }
+
+    void loadImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        if (candidate.default_register_as
+            == mgstc::engine::ImportRegisterAs::Composite) {
+            if (auto* composite =
+                    dynamic_cast<CompositeEditorComponent*>(
+                        getContentComponent())) {
+                composite->loadImportedCandidate(candidate);
+            }
+            return;
+        }
+        if (candidate.default_register_as
+            == mgstc::engine::ImportRegisterAs::Scc) {
+            if (auto* scc = dynamic_cast<SccEditorComponent*>(
+                    getContentComponent())) {
+                scc->loadImportedCandidate(candidate);
+            }
+            return;
+        }
+        if (auto* opll = dynamic_cast<OpllEditorComponent*>(
+                getContentComponent())) {
+            opll->loadImportedCandidate(candidate);
+        }
+    }
+
+    void libraryManagerImportedNoteOn(
+        const mgstc::engine::ImportedToneCandidate& candidate,
+        std::uint8_t note) {
+        if (candidate.default_register_as
+            == mgstc::engine::ImportRegisterAs::Composite) {
+            if (auto* composite =
+                    dynamic_cast<CompositeEditorComponent*>(
+                        getContentComponent())) {
+                composite->libraryManagerImportedNoteOn(candidate, note);
+            }
+            return;
+        }
+        if (candidate.default_register_as
+            == mgstc::engine::ImportRegisterAs::Scc) {
+            if (auto* scc = dynamic_cast<SccEditorComponent*>(
+                    getContentComponent())) {
+                scc->libraryManagerImportedNoteOn(candidate, note);
+            }
+            return;
+        }
+        if (auto* opll = dynamic_cast<OpllEditorComponent*>(
+                getContentComponent())) {
+            opll->libraryManagerImportedNoteOn(candidate, note);
         }
     }
 
@@ -17120,6 +17701,18 @@ private:
         } else if (msg == WM_EXITSIZEMOVE) {
             mgstc::app::exitUiHangNativeModal();
         }
+        if (msg == WM_WINDOWPOSCHANGING) {
+            mgstc::app::SpectrogramWindow::constrainSiblingZOrder(
+                reinterpret_cast<void*>(lParam),
+                hwnd);
+        } else if (msg == WM_WINDOWPOSCHANGED) {
+            if (const auto* position =
+                    reinterpret_cast<const WINDOWPOS*>(lParam);
+                position != nullptr
+                && (position->flags & SWP_NOZORDER) == 0) {
+                mgstc::app::SpectrogramWindow::raisePinnedAfterSibling(hwnd);
+            }
+        }
         if (msg == WM_NCLBUTTONDOWN && wParam == HTCAPTION) {
             // Mirror the Z-order side-effect of DefWindowProc(HTCAPTION)
             // without entering its modal drag loop (JUCE defers that until
@@ -17189,7 +17782,7 @@ public:
             .toLowerCase();
         offline_spectrogram_capture_ =
             arguments.getValueForOption("--capture-ui").isNotEmpty()
-            && snapshot_target == "spectrogram";
+            && (snapshot_target == "spectrogram" || snapshot_target == "spectrum");
         audio_service_ = std::make_unique<SharedAudioService>(
             offline_spectrogram_capture_);
         midi_service_ = std::make_unique<SharedMidiInputService>();
@@ -17245,8 +17838,9 @@ public:
                 capture_target = "editor";
             }
             snapshot_target_ = capture_target;
-            if (snapshot_target_ == "spectrogram") {
+            if (snapshot_target_ == "spectrogram" || snapshot_target_ == "spectrum") {
                 showSpectrogram();
+                spectrogram_window_->setSpectrumMode(snapshot_target_ == "spectrum");
                 // Enable the analyzer before starting the one-second audition,
                 // otherwise a fast initial note can complete before the
                 // capture queue begins receiving PCM frames.
@@ -17259,7 +17853,7 @@ public:
                     juce::Time::getMillisecondCounterHiRes() + 900.0;
                 startTimer(10);
             } else {
-                startTimer(snapshot_target_ == "spectrogram" ? 900 : 500);
+                startTimer((snapshot_target_ == "spectrogram" || snapshot_target_ == "spectrum") ? 900 : 500);
             }
         }
     }
@@ -17269,6 +17863,7 @@ public:
         hang_watchdog_.stop();
         snapshot_window_ = nullptr;
         spectrogram_window_.reset();
+        library_manager_window_.reset();
         opll_envelope_window_.reset();
         scc_envelope_window_.reset();
         opll_window_.reset();
@@ -17334,7 +17929,8 @@ private:
 
     [[nodiscard]] MainWindow* ensureEditor(
         const juce::String& requested_editor,
-        bool bring_to_front) {
+        bool bring_to_front,
+        bool show = true) {
         const auto editor = canonicalEditor(requested_editor);
         auto& window = windowSlot(editor);
         const bool created = window == nullptr;
@@ -17386,12 +17982,19 @@ private:
                 [this](juce::Component* anchor) {
                     showLibraryManager(anchor);
                 },
+                [this] { notifyLibraryContentsChanged(); },
                 [this](const juce::String& closed) {
                     closeEditor(closed);
                 },
                 [this](const juce::String& active) {
                     activateEditor(active);
                 });
+        }
+        if (!show) {
+            if (created) {
+                window->setVisible(false);
+            }
+            return window.get();
         }
         // Create or re-show: size from this window's effective scale (global
         // unless it already has its own Ctrl± session override).
@@ -17434,6 +18037,13 @@ private:
     }
 
     void showLibraryManager(juce::Component* anchor) {
+        if (library_manager_window_ != nullptr) {
+            UiScale::forceGlobalForNonEditorUi();
+            library_manager_window_->reloadFromExternalChange();
+            library_manager_window_->setVisible(true);
+            library_manager_window_->toFront(true);
+            return;
+        }
         // Bounded IPC wait (see ScopedLibraryIpcLock); a second MGSTC
         // instance holding the shared library must not stall forever.
         MGSTC_UI_ACTIVITY(
@@ -17458,8 +18068,8 @@ private:
             dynamic_cast<OpllEditorComponent*>(anchor) != nullptr) {
             initial_kind = LibraryManagerKind::Opll;
         }
-        showLibraryManagerDialog(
-            anchor,
+        UiScale::forceGlobalForNonEditorUi();
+        auto content = std::make_unique<LibraryManagerContent>(
             initial_kind,
             std::move(*timbres),
             std::move(*composites),
@@ -17475,7 +18085,7 @@ private:
             [this](LibraryManagerKind kind, std::uint64_t id) {
                 openLibraryEntryForEdit(kind, id);
             },
-            [this] { refreshAllEditorLibraries(); },
+            [this] { notifyLibraryContentsChanged(); },
             [this](
                 LibraryManagerKind kind,
                 std::uint64_t id,
@@ -17485,7 +18095,93 @@ private:
             [this](LibraryManagerKind kind, std::uint8_t note) {
                 libraryManagerNoteOff(kind, note);
             },
-            [this] { libraryManagerAllNotesOff(); });
+            [this] { libraryManagerAllNotesOff(); },
+            [this](const mgstc::engine::ImportedToneCandidate& candidate) {
+                previewImportedCandidate(candidate);
+            },
+            [this](const mgstc::engine::ImportedToneCandidate& candidate) {
+                editImportedCandidate(candidate);
+            },
+            [this](
+                const mgstc::engine::ImportedToneCandidate& candidate,
+                std::uint8_t note) {
+                libraryManagerImportedNoteOn(candidate, note);
+            },
+            [this](LibraryManagerKind kind) {
+                const juce::String editor =
+                    kind == LibraryManagerKind::Composite
+                        ? "main"
+                    : kind == LibraryManagerKind::Scc ? "scc" : "opll";
+                auto& window = windowSlot(editor);
+                if (window != nullptr) {
+                    return window->polyphonic();
+                }
+                return true;
+            });
+        library_manager_window_ =
+            std::make_unique<LibraryManagerWindow>(std::move(content));
+        if (anchor != nullptr) {
+            library_manager_window_->centreAroundComponent(
+                anchor,
+                library_manager_window_->getWidth(),
+                library_manager_window_->getHeight());
+        } else {
+            library_manager_window_->centreWithSize(
+                library_manager_window_->getWidth(),
+                library_manager_window_->getHeight());
+        }
+        clampWindowToDisplayWorkArea(*library_manager_window_);
+        library_manager_window_->setVisible(true);
+        library_manager_window_->toFront(true);
+        if (auto* hosted = library_manager_window_->getContentComponent()) {
+            hosted->grabKeyboardFocus();
+        }
+    }
+
+    void previewImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        const juce::String editor =
+            candidate.default_register_as
+                    == mgstc::engine::ImportRegisterAs::Composite
+                ? "main"
+            : candidate.default_register_as
+                    == mgstc::engine::ImportRegisterAs::Scc
+                ? "scc"
+                : "opll";
+        if (auto* window = ensureEditor(editor, false, false)) {
+            window->auditionImportedCandidate(candidate);
+        }
+    }
+
+    void editImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        const juce::String editor =
+            candidate.default_register_as
+                    == mgstc::engine::ImportRegisterAs::Composite
+                ? "main"
+            : candidate.default_register_as
+                    == mgstc::engine::ImportRegisterAs::Scc
+                ? "scc"
+                : "opll";
+        if (auto* window = showEditor(editor)) {
+            window->loadImportedCandidate(candidate);
+        }
+    }
+
+    void libraryManagerImportedNoteOn(
+        const mgstc::engine::ImportedToneCandidate& candidate,
+        std::uint8_t note) {
+        const juce::String editor =
+            candidate.default_register_as
+                    == mgstc::engine::ImportRegisterAs::Composite
+                ? "main"
+            : candidate.default_register_as
+                    == mgstc::engine::ImportRegisterAs::Scc
+                ? "scc"
+                : "opll";
+        if (auto* window = ensureEditor(editor, false, false)) {
+            window->libraryManagerImportedNoteOn(candidate, note);
+        }
     }
 
     void previewLibraryEntry(
@@ -17495,7 +18191,7 @@ private:
             kind == LibraryManagerKind::Composite
                 ? "main"
             : kind == LibraryManagerKind::Scc ? "scc" : "opll";
-        if (auto* window = ensureEditor(editor, false)) {
+        if (auto* window = ensureEditor(editor, false, false)) {
             window->auditionLibraryPreview(kind, id);
         }
     }
@@ -17508,7 +18204,7 @@ private:
             kind == LibraryManagerKind::Composite
                 ? "main"
             : kind == LibraryManagerKind::Scc ? "scc" : "opll";
-        if (auto* window = ensureEditor(editor, false)) {
+        if (auto* window = ensureEditor(editor, false, false)) {
             window->libraryManagerNoteOn(kind, id, note);
         }
     }
@@ -17564,6 +18260,19 @@ private:
                 window->refreshExternalState();
             }
         }
+    }
+
+    void notifyLibraryContentsChanged() {
+        if (notifying_library_change_) {
+            return;
+        }
+        notifying_library_change_ = true;
+        refreshAllEditorLibraries();
+        if (library_manager_window_ != nullptr
+            && library_manager_window_->isVisible()) {
+            library_manager_window_->reloadFromExternalChange();
+        }
+        notifying_library_change_ = false;
     }
 
     void applyGlobalTagRewrite(
@@ -17854,7 +18563,7 @@ private:
                 : SnapshotResult::MissingContent;
         } else if (snapshot_target_ == "library") {
             result = captureLibraryManagerSnapshot(snapshot_file_);
-        } else if (snapshot_target_ == "spectrogram") {
+        } else if (snapshot_target_ == "spectrogram" || snapshot_target_ == "spectrum") {
             auto* const content = spectrogram_window_ != nullptr
                 ? spectrogram_window_->snapshotContent()
                 : nullptr;
@@ -17903,6 +18612,8 @@ private:
     std::unique_ptr<MainWindow> scc_envelope_window_;
     std::unique_ptr<MainWindow> opll_envelope_window_;
     std::unique_ptr<mgstc::app::SpectrogramWindow> spectrogram_window_;
+    std::unique_ptr<LibraryManagerWindow> library_manager_window_;
+    bool notifying_library_change_{};
     MainWindow* snapshot_window_{};
     std::unique_ptr<SharedAudioService> audio_service_;
     std::unique_ptr<SharedMidiInputService> midi_service_;

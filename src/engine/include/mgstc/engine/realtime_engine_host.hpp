@@ -90,6 +90,20 @@ public:
     [[nodiscard]] bool pollSpectrogramScope(
         OpllScopeFrame& frame) noexcept;
 
+    // UI controls. The low context bits identify sources; the high bits change
+    // whenever capture resumes or the editor changes. Display mode is independent.
+    void setSpectrumCaptureEnabled(bool enabled) noexcept;
+    void setSpectrumSourceMask(std::uint8_t mask) noexcept;
+    void setSpectrumOutputGain(float gain) noexcept;
+    void setSpectrumChannelsEnabled(bool enabled) noexcept {
+        spectrum_channels_enabled_.store(enabled, std::memory_order_release);
+    }
+    [[nodiscard]] bool pollSpectrumCapture(SpectrumCaptureBlock& block) noexcept;
+    [[nodiscard]] std::uint64_t spectrumDroppedBlocks() const noexcept;
+    [[nodiscard]] std::uint64_t spectrumContext() const noexcept {
+        return spectrum_context_.load(std::memory_order_acquire);
+    }
+
     // Audio thread only. Commands are drained before the first sample.
     [[nodiscard]] RenderResult render(
         std::span<float> interleaved_stereo) noexcept;
@@ -123,6 +137,7 @@ private:
     void noteStarted(std::uint8_t track, std::uint8_t note) noexcept;
     void noteStopped(std::uint8_t track) noexcept;
     void allNotesStopped() noexcept;
+    SpectrumGuideNote currentGuideNote() const noexcept;
     void annotateGuideNote(OpllScopeFrame& frame) const noexcept;
 
     struct ActiveGuideNote {
@@ -150,6 +165,13 @@ private:
     std::uint64_t guide_note_order_{};
     std::uint8_t last_guide_note_{60};
     std::uint8_t last_guide_track_{};
+    std::unique_ptr<SpectrumCapture> spectrum_capture_;
+    std::atomic<bool> spectrum_enabled_{false};
+    std::atomic<bool> spectrum_channels_enabled_{true};
+    std::atomic<std::uint64_t> spectrum_context_{15};
+    std::atomic<float> spectrum_output_gain_{1.0F};
+    std::uint64_t spectrum_sample_clock_{};
+    std::uint64_t spectrum_pcm_epoch_{};
     bool clipping_{};
 };
 

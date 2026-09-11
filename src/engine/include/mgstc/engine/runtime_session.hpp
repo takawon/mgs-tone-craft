@@ -151,6 +151,7 @@ private:
     std::array<PendingKey, kTrackCount> pending_keys_{};
     std::array<bool, kTrackCount> audition_track_running_{};
     std::array<bool, kTrackCount> force_mute_pending_{};
+    std::array<bool, kTrackCount> sequence_faulted_{};
     std::array<bool, 3> psg_sequence_muted_{};
     std::array<std::uint8_t, kTrackCount> current_notes_{};
     std::array<std::uint8_t, 3> psg_tone_noise_modes_{};

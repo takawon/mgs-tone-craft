@@ -44,4 +44,23 @@ struct ParsedMgsComposite {
     const CompositeLayer& layer,
     unsigned number);
 
+struct MgsSourceDefinition {
+    char kind{};
+    unsigned number{};
+    std::string body;
+};
+
+[[nodiscard]] std::vector<MgsSourceDefinition> extractMgsSourceDefinitions(
+    std::string_view source,
+    char kind);
+
+[[nodiscard]] bool parseMgsSequenceBody(
+    std::string_view body,
+    CompositeLayer& layer,
+    std::vector<std::string>& issues);
+
+[[nodiscard]] bool parseMgsRateBody(
+    std::string_view body,
+    RateEnvelope& rate);
+
 }  // namespace mgstc::engine

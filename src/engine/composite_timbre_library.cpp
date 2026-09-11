@@ -240,6 +240,10 @@ public:
             unsignedInteger(layer.pitch_sweep.value, 1);
             boolean(layer.opll_sustain);
         }
+        unsignedInteger(value.embedded_timbres.size(), 4);
+        for (const auto& reference_value : value.embedded_timbres) {
+            reference(reference_value);
+        }
     }
 
     void registerAuto(const OpllRegisterAutoLane& value) {
@@ -691,6 +695,21 @@ public:
                 value.layers[index].envelope_number =
                     static_cast<std::uint8_t>(std::min<std::size_t>(index, 31));
             }
+        }
+        if (format_version_ >= 19) {
+            std::uint32_t embedded_count{};
+            if (!integer(embedded_count, 4)
+                || embedded_count > kMaximumCollectionSize) {
+                return false;
+            }
+            value.embedded_timbres.resize(embedded_count);
+            for (auto& reference_value : value.embedded_timbres) {
+                if (!reference(reference_value)) {
+                    return false;
+                }
+            }
+        } else {
+            value.embedded_timbres.clear();
         }
         value.format_version = CompositeTimbre::kFormatVersion;
         return position_ == data_.size();

@@ -304,6 +304,7 @@ void RuntimeSession::gateUntilNoteOn() noexcept {
     audition_gated_ = true;
     audition_track_running_.fill(false);
     force_mute_pending_.fill(false);
+    sequence_faulted_.fill(false);
 }
 
 void RuntimeSession::resetForKeyOn() noexcept {
@@ -324,6 +325,7 @@ void RuntimeSession::resetForKeyOn() noexcept {
     pending_keys_.fill(PendingKey::None);
     audition_track_running_.fill(false);
     force_mute_pending_.fill(false);
+    sequence_faulted_.fill(false);
     psg_sequence_muted_.fill(false);
     psg_period_pending_ = false;
 }
@@ -352,6 +354,9 @@ TickResult RuntimeSession::processTick() {
 
     for (std::uint8_t track = 0; track < kTrackCount; ++track) {
         auto& runtime = tracks_[track];
+        if (sequence_faulted_[track]) {
+            continue;
+        }
         if (force_mute_pending_[track]) {
             force_mute_pending_[track] = false;
             key_off_hang_remaining_[track] = 0;
@@ -665,6 +670,12 @@ TickResult RuntimeSession::processTick() {
 
         meaning_events_.clear();
         const auto sequence_error = runtime.processTick(meaning_events_);
+        if (sequence_error == SequenceError::InstructionBudgetExceeded) {
+            sequence_faulted_[track] = true;
+            runtime.keyOff(track < 8);
+            audition_track_running_[track] = false;
+            continue;
+        }
         if (sequence_error != SequenceError::None) {
             return {tick_, track, sequence_error, MapError::None};
         }

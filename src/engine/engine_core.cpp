@@ -23,12 +23,12 @@ bool EngineCore::writeActiveRegisters(
     return true;
 }
 
-ChipSamples EngineCore::renderScopeSample() noexcept {
+ChipSamples EngineCore::renderScopeSample(bool capture_channels) noexcept {
     if (output_backend_ == nullptr) {
-        return emulator_.renderSample();
+        return emulator_.renderSample(capture_channels);
     }
     if (waveform_monitor_) {
-        return emulator_.renderSample();
+        return emulator_.renderSample(capture_channels);
     }
     return silentSample();
 }
@@ -58,6 +58,8 @@ void EngineCore::hardReset() noexcept {
     }
     clock_.reset();
     mix_dc_blocker_.reset();
+    analysis_mix_dc_blocker_.reset();
+    analysis_context_ = 0;
     psg_scope_work_.fill(0.0F);
     scc_scope_work_.fill(0.0F);
     opll_scope_work_.fill(0.0F);
@@ -79,7 +81,7 @@ bool EngineCore::takeOpllScopeFrame(
 }
 
 RenderResult EngineCore::render(
-    std::span<float> interleaved_stereo) noexcept {
+    std::span<float> interleaved_stereo, SpectrumCapture* capture) noexcept {
     RenderResult result{};
     if ((interleaved_stereo.size() % 2) != 0) {
         std::fill(interleaved_stereo.begin(), interleaved_stereo.end(), 0.0F);
@@ -115,7 +117,7 @@ RenderResult EngineCore::render(
             static_cast<void>(clock_.beginTick());
         }
 
-        const auto scope_chips = renderScopeSample();
+        const auto scope_chips = renderScopeSample(capture != nullptr && capture->channelsEnabled());
         const auto scope_raw = gains_.master * (
             scope_chips.psg * gains_.psg
             + scope_chips.scc * gains_.scc
@@ -124,6 +126,22 @@ RenderResult EngineCore::render(
         // stage with MML lpf=0: RCF off, DC filter still active).
         const auto scope_filtered = mix_dc_blocker_.process(scope_raw);
         const auto scope_mixed = std::clamp(scope_filtered, -1.0F, 1.0F);
+        if (capture != nullptr) {
+            if (analysis_context_ != capture->context()) {
+                analysis_mix_dc_blocker_.reset();
+                analysis_context_ = capture->context();
+            }
+            const auto mask = capture->sourceMask();
+            const auto selected_raw = gains_.master * (
+                ((mask & 1) ? scope_chips.psg * gains_.psg : 0.0F)
+                + ((mask & 2) ? scope_chips.scc * gains_.scc : 0.0F)
+                + ((mask & 4) ? scope_chips.opll * gains_.opll : 0.0F));
+            const auto selected = std::clamp(analysis_mix_dc_blocker_.process(selected_raw), -1.0F, 1.0F);
+            // Full context taps the audible bus exactly. A restricted editor
+            // uses the same mixer stages on its selected source PCM.
+            capture->append(scope_chips, mask == 7 ? scope_mixed : selected,
+                            gains_.master, gains_.psg, gains_.scc, gains_.opll);
+        }
         const auto scope_index = opll_scope_position_++;
         psg_scope_work_[scope_index] = scope_chips.psg;
         scc_scope_work_[scope_index] = scope_chips.scc;

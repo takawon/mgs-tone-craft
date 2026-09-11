@@ -303,7 +303,7 @@ struct CompositeLayer {
 };
 
 struct CompositeTimbre {
-    static constexpr std::uint32_t kFormatVersion = 18;
+    static constexpr std::uint32_t kFormatVersion = 19;
     static constexpr std::uint32_t kMinimumReadableFormatVersion = 5;
 
     std::uint32_t format_version{kFormatVersion};
@@ -314,6 +314,10 @@ struct CompositeTimbre {
     // MGSC #tempo for this composite (audition + library save). Not app-global.
     int playback_tempo{kMgscDefaultTempo};
     std::vector<CompositeLayer> layers;
+    // Extra SCC / OPLL snapshots referenced by `@` events that are not the
+    // layer base timbre. Import embeds linked `@s` / `@v` here so audition
+    // and MGSC output work without a live library entry.
+    std::vector<SavedTimbreReference> embedded_timbres;
 
     friend bool operator==(const CompositeTimbre&, const CompositeTimbre&)
         = default;
@@ -404,6 +408,10 @@ void setEnvelopeTimelineRange(
 
 [[nodiscard]] SavedTimbreReference makeSavedTimbreReference(
     const TimbreLibraryEntry& entry);
+
+[[nodiscard]] const SavedTimbreReference* findEmbeddedTimbreSnapshot(
+    const CompositeTimbre& timbre,
+    std::uint64_t library_id) noexcept;
 
 [[nodiscard]] TimbreNumberResolution resolveTimbreNumbers(
     const CompositeTimbre& timbre,

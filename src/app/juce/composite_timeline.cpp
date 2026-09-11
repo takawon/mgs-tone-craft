@@ -970,8 +970,15 @@ public:
         graphics.setColour(juce::Colour(0xFF435160));
         graphics.drawRoundedRectangle(bounds, 5.0F, 1.0F);
 
-        const auto graph = bounds.reduced(6.0F, 6.0F);
+        auto graph = bounds.reduced(
+            static_cast<float>(UiLayout::xs),
+            static_cast<float>(UiLayout::xs));
+        auto scale_area = graph;
+        scale_area.setWidth(static_cast<float>(UiLayout::fieldH));
+        graph.removeFromLeft(static_cast<float>(UiLayout::fieldH));
         constexpr int kSeconds = 4;
+        constexpr int kDisplayExtent =
+            mgstc::engine::kSoftwareLfoPreviewExtent;
         const int interrupt_hz = juce::roundToInt(
             mgstc::engine::kMgscInterruptHz);
         const int tick_count = interrupt_hz * kSeconds;
@@ -1002,32 +1009,87 @@ public:
             graphics.setColour(juce::Colour(0xFF586675));
         }
 
-        const int extent = juce::jmax(
-            1,
-            mgstc::engine::softwareLfoDisplayExtent(
-                settings_, apply_extra_roughness_));
+        graphics.setColour(juce::Colour(0xFF8896A3));
+        const float scale_text_h =
+            UiFonts::dense().getHeight() + static_cast<float>(UiLayout::xs);
+        graphics.drawText(
+            "+" + juce::String(kDisplayExtent),
+            scale_area.withHeight(scale_text_h).toNearestInt(),
+            juce::Justification::centredRight,
+            false);
+        graphics.drawText(
+            "0",
+            scale_area.withSizeKeepingCentre(
+                scale_area.getWidth(), scale_text_h).toNearestInt(),
+            juce::Justification::centredRight,
+            false);
+        graphics.drawText(
+            "-" + juce::String(kDisplayExtent),
+            scale_area.withTop(
+                scale_area.getBottom() - scale_text_h).toNearestInt(),
+            juce::Justification::centredRight,
+            false);
+
+        const auto map_y = [&](std::int32_t offset) {
+            const auto shown = std::clamp(
+                offset,
+                static_cast<std::int32_t>(-kDisplayExtent),
+                static_cast<std::int32_t>(kDisplayExtent));
+            return juce::jmap(
+                static_cast<float>(shown),
+                static_cast<float>(-kDisplayExtent),
+                static_cast<float>(kDisplayExtent),
+                graph.getBottom(),
+                graph.getY());
+        };
         juce::Path path;
+        std::int32_t minimum_offset = 0;
+        std::int32_t maximum_offset = 0;
+        float previous_y = graph.getCentreY();
         for (int tick = 0; tick <= tick_count; ++tick) {
             const float x = graph.getX()
                 + graph.getWidth()
                     * static_cast<float>(tick)
                     / static_cast<float>(tick_count);
-            const float offset = static_cast<float>(
-                mgstc::engine::softwareLfoOffsetAtTick(
-                    settings_,
-                    static_cast<std::uint32_t>(tick),
-                    apply_extra_roughness_));
-            const float y = graph.getCentreY()
-                - (offset / static_cast<float>(extent))
-                    * graph.getHeight() * 0.45F;
+            const auto offset = mgstc::engine::softwareLfoOffsetAtTick(
+                settings_,
+                static_cast<std::uint32_t>(tick),
+                apply_extra_roughness_);
+            minimum_offset = std::min(minimum_offset, offset);
+            maximum_offset = std::max(maximum_offset, offset);
+            const float y = map_y(offset);
             if (tick == 0) {
                 path.startNewSubPath(x, y);
             } else {
+                // The register value is held between 60 Hz interrupts, then
+                // changes immediately at the update tick.
+                path.lineTo(x, previous_y);
                 path.lineTo(x, y);
             }
+            previous_y = y;
         }
+        graphics.saveState();
+        graphics.reduceClipRegion(graph.toNearestInt());
         graphics.setColour(juce::Colour(kUiHoverAccent));
         graphics.strokePath(path, juce::PathStrokeType(1.5F));
+        graphics.restoreState();
+
+        graphics.setColour(juce::Colour(kUiHoverAccent));
+        if (maximum_offset > kDisplayExtent) {
+            graphics.drawText(
+                juce::String::fromUTF8("最大 ") + juce::String(maximum_offset),
+                graph.withHeight(scale_text_h).toNearestInt(),
+                juce::Justification::centredRight,
+                false);
+        }
+        if (minimum_offset < -kDisplayExtent) {
+            graphics.drawText(
+                juce::String::fromUTF8("最小 ") + juce::String(minimum_offset),
+                graph.withTop(
+                    graph.getBottom() - scale_text_h).toNearestInt(),
+                juce::Justification::centredRight,
+                false);
+        }
     }
 
 private:
@@ -1074,7 +1136,8 @@ public:
             0.0,
             255.0,
             juce::String::fromUTF8(
-                "n1。キーオンから三角波開始までの約1/60秒カウント（0～255）"));
+                "n1。最初の音程更新までに加える約1/60秒の待ち"
+                "（0～255。実際の開始位置には速度n3も含む）"));
         configureParam(
             depth_,
             depth_label_,
@@ -1082,7 +1145,8 @@ public:
             0.0,
             127.0,
             juce::String::fromUTF8(
-                "n2。三角波の振幅（0～127）。音程オフセット単位"));
+                "n2。三角波が折り返すまでの更新回数（0～127）。"
+                "振幅は粗さとの積で決まる"));
         configureParam(
             speed_,
             speed_label_,
@@ -1090,7 +1154,8 @@ public:
             0.0,
             255.0,
             juce::String::fromUTF8(
-                "n3。割り込みごとの位相進み（0～255）"));
+                "n3。音程を1ステップ更新する間隔（0～255）。"
+                "値が大きいほど遅く、255は256カウント"));
         configureParam(
             roughness_,
             roughness_label_,
@@ -1113,9 +1178,8 @@ public:
 
         hint_.setText(
             juce::String::fromUTF8(
-                "波形は MGSDRV 3.20 互換の三角波（約60Hz）。"
-                "縦線は1秒。MIDI／PCキーでも当該チャンネルの音色で演奏できます"
-                "（鍵盤は表示しません）。"),
+                "MGSDRV 3.20互換の約60Hz階段波。縦軸は音程オフセット"
+                "±127固定、縦線は1秒。MIDI／PCキーでも演奏できます。"),
             juce::dontSendNotification);
         hint_.setFont(UiFonts::body());
         hint_.setColour(
@@ -7170,6 +7234,7 @@ private:
                 juce::roundToInt(std::ceil(visible.getEnd())));
             juce::Path lfo_path;
             bool started = false;
+            float previous_y = 0.0F;
             for (int count = start; count <= end; ++count) {
                 const int value = cumulativePitchAt(layer, count)
                     + static_cast<int>(
@@ -7183,8 +7248,10 @@ private:
                     lfo_path.startNewSubPath(lx, ly);
                     started = true;
                 } else {
+                    lfo_path.lineTo(lx, previous_y);
                     lfo_path.lineTo(lx, ly);
                 }
+                previous_y = ly;
             }
             if (started) {
                 graphics.setColour(

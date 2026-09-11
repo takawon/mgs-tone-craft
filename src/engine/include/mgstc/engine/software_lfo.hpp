@@ -43,6 +43,21 @@ struct SoftwareLfoSettings {
     return stored == 0U ? 256U : stored;
 }
 
+// First 60 Hz tick (0-based from key-on) that applies a step. Offset stays 0
+// until this tick. Matches the 8-bit (stored delay + stored speed) countdown.
+[[nodiscard]] constexpr unsigned softwareLfoFirstUpdateTick(
+    std::uint8_t delay,
+    std::uint8_t speed) noexcept {
+    const unsigned initial =
+        (softwareLfoStoredParam(delay) + softwareLfoStoredParam(speed))
+        & 0xFFU;
+    return (initial == 0U ? 256U : initial) - 1U;
+}
+
+// Dialog preview Y range in pitch-offset units. Not Hz. Settings that exceed
+// this are clipped in the graph and labelled with the real min/max.
+constexpr int kSoftwareLfoPreviewExtent = 127;
+
 [[nodiscard]] inline SoftwareLfoSettings clampSoftwareLfo(
     SoftwareLfoSettings settings,
     bool allow_extra_roughness) noexcept {

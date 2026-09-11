@@ -110,6 +110,10 @@ constexpr int settingsDialogW = 500;
 constexpr int settingsDialogH = 720;
 constexpr int libraryManagerW = 1100;
 constexpr int libraryManagerH = 700;
+constexpr int spectrumScrollW = 18;
+constexpr int spectrumModeW = 180;
+constexpr int spectrumActionW = 128;
+constexpr int spectrumHistoryW = 140;
 constexpr int spectrogramLabelW = 60;
 constexpr int spectrogramSliderW = 96;
 constexpr int editLaneFramePadV = 8; // sm: gap between channel frames
@@ -226,6 +230,10 @@ inline int settingsDialogW = Base::settingsDialogW;
 inline int settingsDialogH = Base::settingsDialogH;
 inline int libraryManagerW = Base::libraryManagerW;
 inline int libraryManagerH = Base::libraryManagerH;
+inline int spectrumScrollW = Base::spectrumScrollW;
+inline int spectrumModeW = Base::spectrumModeW;
+inline int spectrumActionW = Base::spectrumActionW;
+inline int spectrumHistoryW = Base::spectrumHistoryW;
 inline int spectrogramLabelW = Base::spectrogramLabelW;
 inline int spectrogramSliderW = Base::spectrogramSliderW;
 
@@ -399,6 +407,10 @@ inline void applyScale(float factor) {
     settingsDialogH = s(Base::settingsDialogH);
     libraryManagerW = s(Base::libraryManagerW);
     libraryManagerH = s(Base::libraryManagerH);
+    spectrumScrollW = s(Base::spectrumScrollW);
+    spectrumModeW = s(Base::spectrumModeW);
+    spectrumActionW = s(Base::spectrumActionW);
+    spectrumHistoryW = s(Base::spectrumHistoryW);
     spectrogramLabelW = s(Base::spectrogramLabelW);
     spectrogramSliderW = s(Base::spectrogramSliderW);
     recomputeDerived();

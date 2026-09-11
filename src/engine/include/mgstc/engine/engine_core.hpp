@@ -6,6 +6,7 @@
 #include <span>
 
 #include "mgstc/engine/dc_blocker.hpp"
+#include "mgstc/engine/spectrum_capture.hpp"
 #include "mgstc/engine/emulator_sound_output.hpp"
 #include "mgstc/engine/runtime_session.hpp"
 #include "mgstc/engine/sound_output_backend.hpp"
@@ -111,17 +112,22 @@ public:
     // Interleaved stereo: L, R, L, R... Audible mix is silent while a
     // remote backend is selected; scope can still track the simulator.
     [[nodiscard]] RenderResult render(
-        std::span<float> interleaved_stereo) noexcept;
+        std::span<float> interleaved_stereo, SpectrumCapture* capture = nullptr) noexcept;
+
+    // Set only while editing an inactive program; physical voices map to UI channels.
+    void setSpectrumChannelMap(const SpectrumChannelMap& map) noexcept { spectrum_channel_map_ = map; }
+    [[nodiscard]] const SpectrumChannelMap& spectrumChannelMap() const noexcept { return spectrum_channel_map_; }
 
 private:
     [[nodiscard]] static bool validGain(float value) noexcept;
     [[nodiscard]] bool writeActiveRegisters(
         std::span<const RegisterWrite> writes) noexcept;
-    [[nodiscard]] ChipSamples renderScopeSample() noexcept;
+    [[nodiscard]] ChipSamples renderScopeSample(bool capture_channels) noexcept;
     [[nodiscard]] static ChipSamples silentSample() noexcept {
         return {};
     }
 
+    SpectrumChannelMap spectrum_channel_map_{identitySpectrumChannelMap()};
     RuntimeSession session_{};
     EmulatorSoundOutput emulator_{};
     SoundOutputBackend* output_backend_{nullptr};
@@ -129,6 +135,8 @@ private:
     TickClock clock_{};
     MixerGains gains_{};
     DcBlocker mix_dc_blocker_{48'000.0F, 3.4F};
+    DcBlocker analysis_mix_dc_blocker_{48'000.0F, 3.4F};
+    std::uint64_t analysis_context_{};
     std::array<float, OpllScopeFrame::kSampleCount> psg_scope_work_{};
     std::array<float, OpllScopeFrame::kSampleCount> scc_scope_work_{};
     std::array<float, OpllScopeFrame::kSampleCount> opll_scope_work_{};
