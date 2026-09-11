@@ -2,11 +2,13 @@
 
 #include "spectrogram_window.hpp"
 #include "spectrogram_emphasis.hpp"
+#include "spectrum_display.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -34,6 +36,10 @@
 
 namespace mgstc::app {
 namespace {
+
+SpectrogramWindow* g_spectrogram_window = nullptr;
+bool g_in_pin_zorder = false;
+HHOOK g_pin_zorder_ret_hook = nullptr;
 
 constexpr double kSampleRate = 48'000.0;
 constexpr int kFftOrder = 11;
@@ -92,19 +98,7 @@ const auto kPsgColour = juce::Colour(0xFFB990FF);
 const auto kSccColour = juce::Colour(0xFF53E3A6);
 const auto kOpllColour = juce::Colour(0xFFFFA75E);
 
-struct SpectrogramColumn {
-    std::array<std::uint8_t, kLogBinCount> psg{};
-    std::array<std::uint8_t, kLogBinCount> scc{};
-    std::array<std::uint8_t, kLogBinCount> opll{};
-    spectrogram::HarmonicPeakList psg_harmonics{};
-    spectrogram::HarmonicPeakList scc_harmonics{};
-    spectrogram::HarmonicPeakList opll_harmonics{};
-    std::uint64_t sequence{};
-    std::uint8_t guide_note{60};
-    std::uint8_t guide_track{};
-    bool note_active{};
-};
-
+using SpectrogramColumn = spectrum::Column;
 static_assert(std::is_trivially_copyable_v<SpectrogramColumn>);
 
 [[nodiscard]] constexpr std::uint8_t sourceMaskForMode(
@@ -122,387 +116,7 @@ static_assert(
 static_assert(
     sourceMaskForMode(SpectrogramAnalysisMode::AllSources) == kAnalyzeAll);
 
-class SpectrumAnalyzerThread final : private juce::Thread {
-public:
-    explicit SpectrumAnalyzerThread(engine::RealtimeEngineHost& engine)
-        : Thread("MGSTC spectrum analyzer"),
-          engine_(engine),
-          window_(
-              kFftSize,
-              juce::dsp::WindowingFunction<float>::hann,
-              true) {
-        for (std::size_t index = 0; index < log_bin_edges_.size(); ++index) {
-            const double ratio = static_cast<double>(index)
-                / static_cast<double>(kLogBinCount);
-            const double frequency = static_cast<double>(kMinimumFrequency)
-                * std::pow(
-                    static_cast<double>(kMaximumFrequency)
-                        / static_cast<double>(kMinimumFrequency),
-                    ratio);
-            log_bin_edges_[index] = std::clamp<std::size_t>(
-                static_cast<std::size_t>(std::floor(
-                    frequency * static_cast<double>(kFftSize) / kSampleRate)),
-                1,
-                kFftSize / 2);
-        }
-        for (std::size_t log_bin = 0; log_bin < kLogBinCount; ++log_bin) {
-            const LogBandRange range{
-                log_bin_edges_[log_bin],
-                std::min(
-                    std::max(
-                        log_bin_edges_[log_bin] + 1,
-                        log_bin_edges_[log_bin + 1]),
-                    kFftSize / 2),
-            };
-            std::size_t range_index = 0;
-            for (; range_index < unique_log_range_count_; ++range_index) {
-                if (unique_log_ranges_[range_index] == range) {
-                    break;
-                }
-            }
-            if (range_index == unique_log_range_count_) {
-                unique_log_ranges_[unique_log_range_count_++] = range;
-            }
-            log_bin_range_indices_[log_bin] = range_index;
-        }
-        for (std::size_t level = 1;
-             level <= power_thresholds_.size();
-             ++level) {
-            const double normalized_level =
-                (static_cast<double>(level) - 0.5) / 255.0;
-            const double decibels = static_cast<double>(kMinimumDb)
-                + normalized_level * -static_cast<double>(kMinimumDb);
-            const double magnitude = static_cast<double>(kFftSize)
-                * std::pow(10.0, decibels / 20.0);
-            power_thresholds_[level - 1] = static_cast<float>(
-                magnitude * magnitude);
-        }
-    }
-
-    ~SpectrumAnalyzerThread() override {
-        engine_.setSpectrogramCaptureEnabled(false);
-        signalThreadShouldExit();
-        notify();
-        static_cast<void>(stopThread(1500));
-    }
-
-    void setCaptureEnabled(bool enabled) noexcept {
-        const bool previous = capture_enabled_.exchange(
-            enabled,
-            std::memory_order_acq_rel);
-        if (previous == enabled) {
-            return;
-        }
-        if (!enabled) {
-            engine_.setSpectrogramCaptureEnabled(false);
-        }
-        reset_requested_.store(true, std::memory_order_release);
-        if (enabled && !isThreadRunning()) {
-            startThread();
-        }
-        if (enabled) {
-            engine_.setSpectrogramCaptureEnabled(true);
-        }
-        notify();
-    }
-
-    [[nodiscard]] bool pollColumn(SpectrogramColumn& column) noexcept {
-        return columns_.tryPop(column);
-    }
-
-    void discardPendingColumns() noexcept {
-        reset_requested_.store(true, std::memory_order_release);
-        SpectrogramColumn column{};
-        while (columns_.tryPop(column)) {
-        }
-        notify();
-    }
-
-    void setSourceMask(std::uint8_t source_mask) noexcept {
-        source_mask &= kAnalyzeAll;
-        const auto previous = requested_source_mask_.exchange(
-            source_mask,
-            std::memory_order_acq_rel);
-        if (previous == source_mask) {
-            return;
-        }
-        source_mask_reset_requested_.store(true, std::memory_order_release);
-        notify();
-    }
-
-private:
-    struct LogBandRange {
-        std::size_t first{};
-        std::size_t last{};
-
-        [[nodiscard]] bool operator==(
-            const LogBandRange&) const noexcept = default;
-    };
-
-    void run() override {
-        const juce::ScopedNoDenormals no_denormals;
-        while (!threadShouldExit()) {
-            const bool full_reset = reset_requested_.exchange(
-                false,
-                std::memory_order_acq_rel);
-            const bool source_mask_reset =
-                source_mask_reset_requested_.exchange(
-                    false,
-                    std::memory_order_acq_rel);
-            if (source_mask_reset) {
-                active_source_mask_ = requested_source_mask_.load(
-                    std::memory_order_acquire);
-            }
-            if (full_reset) {
-                resetAnalysisState();
-            } else if (source_mask_reset) {
-                // Do not join PCM from different editor analysis contexts.
-                // Keep column_sequence_ continuous so existing history stays.
-                resetPcmState(true);
-            }
-            if (full_reset || source_mask_reset) {
-                engine::OpllScopeFrame stale{};
-                while (engine_.pollSpectrogramScope(stale)) {
-                }
-            }
-            engine::OpllScopeFrame frame{};
-            if (!engine_.pollSpectrogramScope(frame)) {
-                wait(kAnalyzerIdleWaitMs);
-                continue;
-            }
-            // Program replacement restarts EngineCore's sequence, while a
-            // forward gap means queued audio was lost.  In either case, do
-            // not join unrelated PCM in one FFT window.  Keep the published
-            // column sequence continuous so one-second preview history and
-            // the UI time axis are preserved.
-            if (has_frame_sequence_
-                && frame.sequence != last_frame_sequence_ + 1) {
-                resetPcmState(true);
-            }
-            last_frame_sequence_ = frame.sequence;
-            has_frame_sequence_ = true;
-            appendFrame(frame);
-        }
-    }
-
-    void resetAnalysisState() noexcept {
-        resetPcmState(false);
-        column_sequence_ = 0;
-        last_frame_sequence_ = 0;
-        has_frame_sequence_ = false;
-    }
-
-    void resetPcmState(bool prime_with_silence) noexcept {
-        psg_ring_.fill(0.0F);
-        scc_ring_.fill(0.0F);
-        opll_ring_.fill(0.0F);
-        for (auto& active : active_samples_) {
-            active.fill(false);
-        }
-        psg_dc_blocker_.reset();
-        scc_dc_blocker_.reset();
-        opll_dc_blocker_.reset();
-        ring_write_ = 0;
-        buffered_samples_ = prime_with_silence ? kFftSize : 0;
-        samples_since_fft_ = 0;
-        active_sample_counts_.fill(0);
-    }
-
-    void appendFrame(const engine::OpllScopeFrame& frame) noexcept {
-        guide_note_ = frame.guide_note;
-        guide_track_ = frame.guide_track;
-        note_active_ = frame.note_active;
-        for (std::size_t index = 0; index < frame.samples.size(); ++index) {
-            if ((active_source_mask_ & kAnalyzePsg) != 0) {
-                appendSourceSample(
-                    0,
-                    psg_dc_blocker_.process(frame.psg_samples[index]),
-                    psg_ring_);
-            }
-            if ((active_source_mask_ & kAnalyzeScc) != 0) {
-                appendSourceSample(
-                    1,
-                    scc_dc_blocker_.process(frame.scc_samples[index]),
-                    scc_ring_);
-            }
-            if ((active_source_mask_ & kAnalyzeOpll) != 0) {
-                appendSourceSample(
-                    2,
-                    opll_dc_blocker_.process(frame.samples[index]),
-                    opll_ring_);
-            }
-            ring_write_ = (ring_write_ + 1) % kFftSize;
-
-            if (buffered_samples_ < kFftSize) {
-                ++buffered_samples_;
-                if (buffered_samples_ == kFftSize) {
-                    publishColumn();
-                    samples_since_fft_ = 0;
-                }
-                continue;
-            }
-            if (++samples_since_fft_ >= kFftHop) {
-                samples_since_fft_ = 0;
-                publishColumn();
-            }
-        }
-    }
-
-    void appendSourceSample(
-        std::size_t source,
-        float sample,
-        std::array<float, kFftSize>& ring) noexcept {
-        if (active_samples_[source][ring_write_]) {
-            --active_sample_counts_[source];
-        }
-        ring[ring_write_] = sample;
-        const bool active = std::abs(sample) >= kSilenceAmplitude;
-        active_samples_[source][ring_write_] = active;
-        if (active) {
-            ++active_sample_counts_[source];
-        }
-    }
-
-    void publishColumn() noexcept {
-        SpectrogramColumn column{};
-        const double psg_scc_fundamental = note_active_
-            ? noteFrequencyForSource(guide_note_, 0)
-            : 0.0;
-        const double opll_fundamental = note_active_
-            ? noteFrequencyForSource(guide_note_, 2)
-            : 0.0;
-        // Keep the time axis moving during silence, but leave each inactive
-        // source black and skip its FFT.  The cheap sample activity check also
-        // preserves release tails until the whole FFT window is below the
-        // display floor.
-        if ((active_source_mask_ & kAnalyzePsg) != 0
-            && active_sample_counts_[0] != 0) {
-            analyze(
-                psg_ring_,
-                column.psg,
-                column.psg_harmonics,
-                psg_scc_fundamental);
-        }
-        if ((active_source_mask_ & kAnalyzeScc) != 0
-            && active_sample_counts_[1] != 0) {
-            analyze(
-                scc_ring_,
-                column.scc,
-                column.scc_harmonics,
-                psg_scc_fundamental);
-        }
-        if ((active_source_mask_ & kAnalyzeOpll) != 0
-            && active_sample_counts_[2] != 0) {
-            analyze(
-                opll_ring_,
-                column.opll,
-                column.opll_harmonics,
-                opll_fundamental);
-        }
-        column.sequence = ++column_sequence_;
-        column.guide_note = guide_note_;
-        column.guide_track = guide_track_;
-        column.note_active = note_active_;
-        static_cast<void>(columns_.tryPush(column));
-    }
-
-    void analyze(
-        const std::array<float, kFftSize>& ring,
-        std::array<std::uint8_t, kLogBinCount>& output,
-        spectrogram::HarmonicPeakList& harmonic_peaks,
-        double fundamental_frequency) noexcept {
-        const auto tail_size = kFftSize - ring_write_;
-        std::copy_n(
-            ring.begin() + static_cast<std::ptrdiff_t>(ring_write_),
-            tail_size,
-            fft_data_.begin());
-        std::copy_n(
-            ring.begin(),
-            ring_write_,
-            fft_data_.begin() + static_cast<std::ptrdiff_t>(tail_size));
-        window_.multiplyWithWindowingTable(fft_data_.data(), kFftSize);
-        fft_.performRealOnlyForwardTransform(fft_data_.data(), true);
-
-        const auto* spectrum = reinterpret_cast<
-            const juce::dsp::Complex<float>*>(fft_data_.data());
-        for (std::size_t fft_bin = 0;
-             fft_bin < power_spectrum_.size();
-             ++fft_bin) {
-            const auto real = spectrum[fft_bin].real();
-            const auto imaginary = spectrum[fft_bin].imag();
-            power_spectrum_[fft_bin] = real * real + imaginary * imaginary;
-        }
-        harmonic_peaks = spectrogram::findHarmonicPeaks(
-            power_spectrum_,
-            fundamental_frequency,
-            kSampleRate,
-            kFftSize,
-            power_thresholds_.front(),
-            kMinimumDb);
-
-        std::array<std::uint8_t, kLogBinCount> range_levels{};
-        for (std::size_t range_index = 0;
-             range_index < unique_log_range_count_;
-             ++range_index) {
-            const auto range = unique_log_ranges_[range_index];
-            float maximum_power = 0.0F;
-            for (std::size_t fft_bin = range.first;
-                 fft_bin <= range.last;
-                 ++fft_bin) {
-                maximum_power = std::max(
-                    maximum_power,
-                    power_spectrum_[fft_bin]);
-            }
-            range_levels[range_index] = static_cast<std::uint8_t>(
-                std::upper_bound(
-                    power_thresholds_.begin(),
-                    power_thresholds_.end(),
-                    maximum_power)
-                - power_thresholds_.begin());
-        }
-        for (std::size_t log_bin = 0; log_bin < kLogBinCount; ++log_bin) {
-            output[log_bin] = range_levels[
-                log_bin_range_indices_[log_bin]];
-        }
-    }
-
-    engine::RealtimeEngineHost& engine_;
-    juce::dsp::FFT fft_{kFftOrder};
-    juce::dsp::WindowingFunction<float> window_;
-    engine::SpscQueue<SpectrogramColumn, kColumnQueueCapacity> columns_{};
-    std::array<float, kFftSize> psg_ring_{};
-    std::array<float, kFftSize> scc_ring_{};
-    std::array<float, kFftSize> opll_ring_{};
-    std::array<std::array<bool, kFftSize>, 3> active_samples_{};
-    std::array<float, kFftSize * 2> fft_data_{};
-    std::array<float, kFftSize / 2 + 1> power_spectrum_{};
-    std::array<std::size_t, kLogBinCount + 1> log_bin_edges_{};
-    std::array<LogBandRange, kLogBinCount> unique_log_ranges_{};
-    std::array<std::size_t, kLogBinCount> log_bin_range_indices_{};
-    std::array<float, 255> power_thresholds_{};
-    engine::DcBlocker psg_dc_blocker_{
-        static_cast<float>(kSampleRate), kDcBlockerCutoffHz};
-    engine::DcBlocker scc_dc_blocker_{
-        static_cast<float>(kSampleRate), kDcBlockerCutoffHz};
-    engine::DcBlocker opll_dc_blocker_{
-        static_cast<float>(kSampleRate), kDcBlockerCutoffHz};
-    std::size_t ring_write_{};
-    std::size_t buffered_samples_{};
-    std::size_t samples_since_fft_{};
-    std::array<std::size_t, 3> active_sample_counts_{};
-    std::size_t unique_log_range_count_{};
-    std::uint64_t column_sequence_{};
-    std::uint64_t last_frame_sequence_{};
-    std::uint8_t guide_note_{60};
-    std::uint8_t guide_track_{};
-    std::atomic<bool> capture_enabled_{false};
-    std::atomic<bool> reset_requested_{true};
-    std::atomic<std::uint8_t> requested_source_mask_{kAnalyzeAll};
-    std::atomic<bool> source_mask_reset_requested_{false};
-    std::uint8_t active_source_mask_{kAnalyzeAll};
-    bool has_frame_sequence_{};
-    bool note_active_{};
-};
+using SpectrumAnalyzerThread = spectrum::Analyzer;
 
 [[nodiscard]] juce::String nearestNoteName(double frequency) {
     if (!(frequency > 0.0)) {
@@ -652,20 +266,23 @@ private:
     };
 
 public:
-    SpectrogramDisplay()
-        : history_(kHistoryCapacity) {
+    explicit SpectrogramDisplay(spectrum::GuideState& guide)
+        : common_guide_(guide), history_(kHistoryCapacity) {
+        setWantsKeyboardFocus(true);
         setMouseCursor(juce::MouseCursor::CrosshairCursor);
         setOpaque(true);
     }
 
     void appendColumn(const SpectrogramColumn& column) {
-        if (source_sequence_ != 0
-            && column.sequence != source_sequence_ + 1) {
-            clearHistory();
-        }
+        if (source_context_ != column.context) clearHistory();
+        const auto advance = source_sequence_ == 0 ? std::uint64_t{1}
+            : std::max<std::uint64_t>(1, static_cast<std::uint64_t>(std::llround(
+                static_cast<double>(column.sample_position - source_sample_) / kFftHop)));
         source_sequence_ = column.sequence;
+        source_sample_ = column.sample_position;
+        source_context_ = column.context;
         auto displayed = column;
-        displayed.sequence = latest_sequence_ + 1;
+        displayed.sequence = latest_sequence_ + advance;
         history_[history_write_] = displayed;
         history_write_ = (history_write_ + 1) % history_.size();
         history_count_ = std::min(history_count_ + 1, history_.size());
@@ -673,16 +290,39 @@ public:
         guide_note_ = column.guide_note;
         guide_track_ = column.guide_track;
         note_active_ = column.note_active;
-        if (image_.isValid()) {
+        if (!drawing_active_) image_dirty_ = true;
+        else if (image_.isValid()) {
+            if (advance > 1) clearMissingColumns(displayed.sequence - advance, displayed.sequence);
             drawColumn(displayed);
         }
     }
 
+    void setDrawingActive(bool active) {
+        drawing_active_ = active;
+        cursor_position_ = getMouseXYRelative();
+        cursor_inside_ = plotBounds().contains(cursor_position_);
+        if (active && image_dirty_) { image_dirty_ = false; rebuildImage(); }
+        if (active) requestFullRepaint();
+    }
+    bool keyPressed(const juce::KeyPress& key) override {
+        if (key == juce::KeyPress::escapeKey && common_guide_.fixed()) {
+            common_guide_.release(); requestFullRepaint(); return true;
+        }
+        return false;
+    }
+    void mouseDown(const juce::MouseEvent& e) override {
+        if (e.mods.isLeftButtonDown() && plotBounds().contains(e.getPosition())) {
+            common_guide_.click(frequencyAtPlotY(e.y));
+            grabKeyboardFocus(); requestFullRepaint();
+        }
+    }
     void clearHistory() {
         history_count_ = 0;
         history_write_ = 0;
         latest_sequence_ = 0;
         source_sequence_ = 0;
+        source_context_ = source_sample_ = 0;
+        if (!drawing_active_) { image_dirty_ = true; return; }
         const auto plot = plotBounds();
         if (image_.isValid()
             && image_.getWidth() == plot.getWidth()
@@ -779,10 +419,11 @@ public:
     }
 
     void flushPendingRepaint() {
+        if (!drawing_active_) return;
         const auto plot = plotBounds();
         const int write_x = writePositionImageX();
         const GuideState guide_state{guide_note_, guide_track_, note_active_};
-        const bool guide_changed = !cursor_inside_
+        const bool guide_changed = !common_guide_.fixed() && !cursor_inside_
             && (!painted_guide_valid_
                 || painted_guide_state_ != guide_state);
         if (dirty_first_x_ > dirty_last_x_
@@ -845,6 +486,14 @@ public:
         drawHarmonicGuides(graphics, plot);
         drawCursor(graphics, plot);
         drawWritePosition(graphics, plot);
+        if (common_guide_.fixed()) {
+            graphics.setFont(UiFonts::dense());
+            graphics.setColour(juce::Colours::white);
+            graphics.drawText(juce::String::fromUTF8("基準固定：")
+                + juce::String(common_guide_.fixed_frequency, 1) + " Hz",
+                plot.getX(), plot.getBottom(), plot.getWidth() / 2, UiLayout::fieldH,
+                juce::Justification::centredLeft, false);
+        }
     }
 
     void resized() override {
@@ -1259,6 +908,7 @@ private:
     }
 
     void recomposeImage() {
+        if (!drawing_active_) { image_dirty_ = true; return; }
         if (!image_.isValid()
             || source_intensities_.size()
                 != static_cast<std::size_t>(
@@ -1291,6 +941,29 @@ private:
         dirty_first_x_ = std::numeric_limits<int>::max();
         dirty_last_x_ = -1;
         requestFullRepaint();
+    }
+
+    void clearMissingColumns(std::uint64_t previous, std::uint64_t next) {
+        const auto first = static_cast<std::uint64_t>(std::ceil(previous * time_scale_));
+        const auto end = static_cast<std::uint64_t>(std::floor((next - 1) * time_scale_));
+        if (end <= first) return;
+        const auto width = static_cast<std::uint64_t>(image_.getWidth());
+        const auto height = static_cast<std::size_t>(image_.getHeight());
+        // At most one image width even after a long acquisition interruption.
+        const auto begin = std::max(first, end > width ? end - width : 0);
+        juce::Image::BitmapData bitmap(image_, juce::Image::BitmapData::readWrite);
+        for (auto absolute = begin; absolute < end; ++absolute) {
+            const auto x = static_cast<std::size_t>(absolute % width);
+            const auto offset = static_cast<std::ptrdiff_t>(x * height);
+            std::fill_n(source_intensities_.begin() + offset, height, SourceIntensity{});
+            std::fill_n(harmonic_influences_.begin() + offset, height, HarmonicInfluence{});
+            pixel_harmonics_[x] = {};
+            pixel_cycles_[x] = absolute / width;
+            for (int y = 0; y < image_.getHeight(); ++y)
+                bitmap.setPixelColour(static_cast<int>(x), y, juce::Colours::black);
+            dirty_first_x_ = std::min(dirty_first_x_, static_cast<int>(x));
+            dirty_last_x_ = std::max(dirty_last_x_, static_cast<int>(x));
+        }
     }
 
     void drawColumn(const SpectrogramColumn& column) {
@@ -1390,6 +1063,7 @@ private:
     }
 
     void rebuildImage() {
+        if (!drawing_active_) { image_dirty_ = true; return; }
         const auto plot = plotBounds();
         if (plot.getWidth() <= 0 || plot.getHeight() <= 0) {
             image_ = {};
@@ -1429,7 +1103,8 @@ private:
         const auto oldest = (history_write_ + history_.size() - count)
             % history_.size();
         for (std::size_t index = 0; index < count; ++index) {
-            drawColumn(history_[(oldest + index) % history_.size()]);
+            const auto& column = history_[(oldest + index) % history_.size()];
+            if (latest_sequence_ - column.sequence <= wanted) drawColumn(column);
         }
         dirty_first_x_ = std::numeric_limits<int>::max();
         dirty_last_x_ = -1;
@@ -1481,10 +1156,10 @@ private:
     void drawHarmonicGuides(
         juce::Graphics& graphics,
         juce::Rectangle<int> plot) const {
-        const double fundamental = cursor_inside_
+        const double fundamental = common_guide_.fixed() ? common_guide_.fixed_frequency : cursor_inside_
             ? frequencyAtPlotY(cursor_position_.y)
             : noteFrequencyForTrack(guide_note_, guide_track_);
-        const float alpha = cursor_inside_ ? 0.72F
+        const float alpha = common_guide_.fixed() || cursor_inside_ ? 0.72F
             : note_active_ ? 0.48F : 0.23F;
         graphics.setFont(static_cast<float>(UiScale::sx(10)));
         for (int harmonic = 1; harmonic <= 16; ++harmonic) {
@@ -1573,6 +1248,9 @@ private:
             static_cast<float>(plot.getBottom()));
     }
 
+    spectrum::GuideState& common_guide_;
+    bool drawing_active_{true}, image_dirty_{};
+    std::uint64_t source_context_{}, source_sample_{};
     std::vector<SpectrogramColumn> history_;
     std::size_t history_write_{};
     std::size_t history_count_{};
@@ -1643,6 +1321,86 @@ void writeIniString(const wchar_t* key, const juce::String& value) {
     return text.isEmpty() ? fallback : text.getIntValue() != 0;
 }
 
+[[nodiscard]] HWND spectrogramNativeHandle() {
+    if (g_spectrogram_window == nullptr) {
+        return nullptr;
+    }
+    auto* peer = g_spectrogram_window->getPeer();
+    if (peer == nullptr) {
+        return nullptr;
+    }
+    return static_cast<HWND>(peer->getNativeHandle());
+}
+
+[[nodiscard]] bool anotherProcessIsForeground() {
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == nullptr) {
+        return false;
+    }
+    DWORD process_id = 0;
+    GetWindowThreadProcessId(foreground, &process_id);
+    return process_id != GetCurrentProcessId();
+}
+
+[[nodiscard]] bool shouldKeepPinnedAboveSiblings() {
+    return g_spectrogram_window != nullptr
+        && g_spectrogram_window->isVisible()
+        && !g_spectrogram_window->isMinimised()
+        && !anotherProcessIsForeground()
+        && juce::ModalComponentManager::getInstance()
+                ->getNumModalComponents()
+            == 0;
+}
+
+void raiseSpectrogramWithoutActivating(HWND spectrogram) {
+    if (spectrogram == nullptr || g_in_pin_zorder) {
+        return;
+    }
+    if (GetWindow(spectrogram, GW_HWNDPREV) == nullptr) {
+        return;
+    }
+    g_in_pin_zorder = true;
+    constexpr UINT kFlags =
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    // TOPMOST then NOTOPMOST places this window above the foreground
+    // sibling without leaving WS_EX_TOPMOST (other apps can still cover it).
+    SetWindowPos(spectrogram, HWND_TOPMOST, 0, 0, 0, 0, kFlags);
+    SetWindowPos(spectrogram, HWND_NOTOPMOST, 0, 0, 0, 0, kFlags);
+    g_in_pin_zorder = false;
+}
+
+LRESULT CALLBACK pinZOrderCallWndRetProc(
+    int code,
+    WPARAM w_param,
+    LPARAM l_param) {
+    if (code == HC_ACTION && l_param != 0) {
+        const auto* info = reinterpret_cast<const CWPRETSTRUCT*>(l_param);
+        if (info->message == WM_WINDOWPOSCHANGED) {
+            SpectrogramWindow::raisePinnedAfterSibling(info->hwnd);
+        }
+    }
+    return CallNextHookEx(g_pin_zorder_ret_hook, code, w_param, l_param);
+}
+
+void installPinZOrderRetHook() {
+    if (g_pin_zorder_ret_hook != nullptr) {
+        return;
+    }
+    g_pin_zorder_ret_hook = SetWindowsHookExW(
+        WH_CALLWNDPROCRET,
+        &pinZOrderCallWndRetProc,
+        nullptr,
+        GetCurrentThreadId());
+}
+
+void removePinZOrderRetHook() {
+    if (g_pin_zorder_ret_hook == nullptr) {
+        return;
+    }
+    UnhookWindowsHookEx(g_pin_zorder_ret_hook);
+    g_pin_zorder_ret_hook = nullptr;
+}
+
 }  // namespace
 
 class SpectrogramWindow::Content final
@@ -1654,6 +1412,9 @@ public:
         engine::RealtimeEngineHost& engine,
         std::function<void(bool)> internal_pin_changed)
         : analyzer_(engine),
+          display_(common_guide_),
+          spectrum_display_(spectrum_model_, common_guide_, {kPsgColour, kSccColour, kOpllColour}),
+          incoming_frame_(std::make_unique<spectrum::Frame>()),
           internal_pin_changed_(std::move(internal_pin_changed)),
           frequency_scroll_(true) {
         psg_.setButtonText("PSG");
@@ -1698,7 +1459,6 @@ public:
         configureZoomSlider(time_zoom_, 0.25, 4.0, 1.0);
         configureZoomSlider(frequency_zoom_, 0.5, 4.0, 1.0);
         time_zoom_.onValueChange = [this] {
-            analyzer_.discardPendingColumns();
             display_.setTimeScale(time_zoom_.getValue());
         };
         frequency_zoom_.onValueChange = [this] {
@@ -1725,6 +1485,58 @@ public:
                 juce::dontSendNotification);
         });
         addAndMakeVisible(display_);
+        addChildComponent(spectrum_display_);
+        mode_gram_.setButtonText(juce::String::fromUTF8("スペクトログラム"));
+        mode_spectrum_.setButtonText(juce::String::fromUTF8("スペアナ"));
+        for (auto* b : {&mode_gram_, &mode_spectrum_}) {
+            b->setClickingTogglesState(true); b->setRadioGroupId(264);
+            addAndMakeVisible(*b);
+        }
+        mode_gram_.setToggleState(true, juce::dontSendNotification);
+        mode_gram_.onClick = [this] { setSpectrumMode(false); };
+        mode_spectrum_.onClick = [this] { setSpectrumMode(true); };
+        configureZoomSlider(history_seconds_, 0, 5, 1);
+        history_seconds_.setRange(0, 5, 0.1);
+        history_seconds_.setDoubleClickReturnValue(true, 1.0);
+        history_seconds_.setTextValueSuffix(" s");
+        history_seconds_.onValueChange = [this] {
+            spectrum_display_.history_seconds = history_seconds_.getValue(); spectrum_display_.refresh();
+        };
+        history_label_.setText(juce::String::fromUTF8("履歴時間"), juce::dontSendNotification);
+        history_label_.setJustificationType(juce::Justification::centredRight);
+        position_label_.setText(juce::String::fromUTF8("履歴位置"), juce::dontSendNotification);
+        position_label_.setJustificationType(juce::Justification::centredRight);
+        configureZoomSlider(history_position_, 0, 5, 0);
+        history_position_.setRange(0, 5, 0.001);
+        history_position_.setTextValueSuffix(" s");
+        history_position_.onValueChange = [this] {
+            spectrum_model_.selected_seconds = history_position_.getValue();
+            spectrum_display_.refresh(); updateSpectrumControls();
+        };
+        channels_button_.setButtonText(juce::String::fromUTF8("チャンネル"));
+        channels_button_.onClick = [this] { showChannelMenu(); };
+        hold_button_.setButtonText(juce::String::fromUTF8("比較用に保持"));
+        hold_button_.onClick = [this] {
+            spectrum_model_.hold(); spectrum_display_.refresh(); updateSpectrumControls();
+        };
+        reference_button_.setButtonText(juce::String::fromUTF8("比較表示"));
+        reference_button_.setClickingTogglesState(true);
+        reference_button_.onClick = [this] {
+            spectrum_model_.reference_visible = reference_button_.getToggleState();
+            spectrum_display_.refresh();
+        };
+        clear_button_.setButtonText(juce::String::fromUTF8("比較クリア"));
+        clear_button_.onClick = [this] {
+            spectrum_model_.reference.reset(); spectrum_display_.refresh(); updateSpectrumControls();
+        };
+        pause_button_.onClick = [this] {
+            spectrum_model_.setPaused(!spectrum_model_.paused);
+            updateSpectrumControls(); resized(); spectrum_display_.refresh();
+        };
+        for (auto* c : std::array<juce::Component*, 9>{&history_label_, &history_seconds_,
+                &position_label_, &history_position_, &channels_button_, &hold_button_,
+                &reference_button_, &clear_button_, &pause_button_}) addChildComponent(*c);
+        setSpectrumMode(false);
         setSize(UiScale::sx(960), UiScale::sx(560));
     }
 
@@ -1754,12 +1566,22 @@ public:
             false,
             UiScale::sx(54),
             UiScale::sx(22));
+        for (auto* slider : {&history_seconds_, &history_position_})
+            slider->setTextBoxStyle(juce::Slider::TextBoxRight, false, UiScale::sx(64), UiScale::sx(22));
         sendLookAndFeelChange();
         resized();
         repaint();
     }
 
     void setActive(bool active) {
+        if (active && !active_) {
+            spectrum_model_.clearAcquisition();
+            if (spectrum_mode_) spectrum_display_.refresh();
+            display_.clearHistory();
+            updateSpectrumControls();
+            resized();
+        }
+        active_ = active;
         analyzer_.setCaptureEnabled(active);
         if (active) {
             startTimerHz(30);
@@ -1769,7 +1591,15 @@ public:
     }
 
     void setAnalysisMode(SpectrogramAnalysisMode mode) {
-        analyzer_.setSourceMask(sourceMaskForMode(mode));
+        const auto mask = sourceMaskForMode(mode);
+        if ((analyzer_.context() & 7) != mask) {
+            spectrum_model_.clearAcquisition();
+            if (spectrum_mode_) spectrum_display_.refresh();
+            display_.clearHistory();
+            updateSpectrumControls();
+            resized();
+        }
+        analyzer_.setSourceMask(mask);
     }
 
     void loadControls() {
@@ -1792,6 +1622,15 @@ public:
         display_.setFrequencyOffset(
             readIniDouble(L"FrequencyOffset", 0.0));
         updateSourceVisibility();
+        const auto seconds_text = readIniString(L"SpectrumHistorySeconds", L"1.0").trim().toStdString();
+        double seconds = 1.0;
+        const auto parsed = std::from_chars(seconds_text.data(), seconds_text.data() + seconds_text.size(), seconds);
+        if (parsed.ec != std::errc{} || parsed.ptr != seconds_text.data() + seconds_text.size() || !std::isfinite(seconds))
+            seconds = 1.0;
+        history_seconds_.setValue(juce::jlimit(0.0, 5.0, seconds),
+                                   juce::dontSendNotification);
+        spectrum_display_.history_seconds = history_seconds_.getValue();
+        setSpectrumMode(readIniString(L"DisplayMode", L"0") == "1");
         updateScrollBar();
     }
 
@@ -1804,6 +1643,8 @@ public:
     }
 
     void saveControls() const {
+        writeIniString(L"DisplayMode", spectrum_mode_ ? "1" : "0");
+        writeIniString(L"SpectrumHistorySeconds", juce::String(history_seconds_.getValue(), 1));
         writeIniString(L"TimeZoom", juce::String(time_zoom_.getValue(), 3));
         writeIniString(
             L"FrequencyZoom",
@@ -1822,42 +1663,127 @@ public:
     void resized() override {
         UiScale::forceGlobalForNonEditorUi();
         auto area = getLocalBounds().reduced(UiLayout::sm);
-        auto controls = area.removeFromTop(UiLayout::fieldH);
-        psg_.setBounds(controls.removeFromLeft(UiScale::sx(66)));
-        controls.removeFromLeft(UiLayout::controlGap);
-        scc_.setBounds(controls.removeFromLeft(UiScale::sx(66)));
-        controls.removeFromLeft(UiLayout::controlGap);
-        opll_.setBounds(controls.removeFromLeft(UiScale::sx(72)));
-        controls.removeFromLeft(UiLayout::controlGap);
-        const auto layoutSlider = [&](juce::Label& label, juce::Slider& slider) {
-            label.setBounds(
-                controls.removeFromLeft(UiLayout::spectrogramLabelW));
-            controls.removeFromLeft(UiLayout::controlGap);
-            slider.setBounds(
-                controls.removeFromLeft(UiLayout::spectrogramSliderW));
-        };
-        layoutSlider(time_label_, time_zoom_);
-        controls.removeFromLeft(UiLayout::controlGap);
-        layoutSlider(frequency_label_, frequency_zoom_);
-        controls.removeFromLeft(UiLayout::controlGap);
-        layoutSlider(emphasis_label_, emphasis_);
-        pin_.setBounds(
-            controls.removeFromRight(UiScale::sx(28)));
+        auto modes = area.removeFromTop(UiLayout::fieldH);
+        pin_.setBounds(modes.removeFromRight(UiLayout::fieldH));
+        mode_gram_.setBounds(modes.removeFromLeft(UiLayout::spectrumModeW));
+        modes.removeFromLeft(UiLayout::controlGap);
+        mode_spectrum_.setBounds(modes.removeFromLeft(UiLayout::spectrumActionW));
         area.removeFromTop(UiLayout::controlGap);
-        display_.setBounds(area);
-        updateScrollBar();
-        if (frequency_scroll_.isVisible()) {
-            frequency_scroll_.setBounds(
-                area.removeFromRight(UiScale::sx(18)));
-            area.removeFromRight(UiScale::sx(4));
+        auto row = area.removeFromTop(UiLayout::fieldH);
+        auto place = [&](juce::Component& c, int width) {
+            if (row.getWidth() < width) {
+                area.removeFromTop(UiLayout::controlGap);
+                row = area.removeFromTop(UiLayout::fieldH);
+            }
+            c.setBounds(row.removeFromLeft(width));
+            row.removeFromLeft(UiLayout::controlGap);
+        };
+        place(psg_, UiLayout::spectrogramLabelW);
+        place(scc_, UiLayout::spectrogramLabelW);
+        place(opll_, UiLayout::spectrogramLabelW);
+        if (spectrum_mode_) {
+            place(channels_button_, UiLayout::spectrumActionW);
+            place(history_label_, UiLayout::setupRateEditW);
+            place(history_seconds_, UiLayout::spectrumHistoryW);
+            area.removeFromTop(UiLayout::controlGap);
+            row = area.removeFromTop(UiLayout::fieldH);
+            place(hold_button_, UiLayout::spectrumActionW);
+            place(reference_button_, UiLayout::spectrumActionW);
+            place(clear_button_, UiLayout::spectrumActionW);
+            place(pause_button_, UiLayout::spectrumActionW);
+            if (spectrum_model_.paused) {
+                area.removeFromTop(UiLayout::controlGap);
+                row = area.removeFromTop(UiLayout::fieldH);
+                position_label_.setBounds(row.removeFromLeft(UiLayout::setupRateEditW));
+                row.removeFromLeft(UiLayout::controlGap);
+                history_position_.setBounds(row);
+            }
+        } else {
+            place(time_label_, UiLayout::spectrogramLabelW);
+            place(time_zoom_, UiLayout::spectrogramSliderW);
+            place(frequency_label_, UiLayout::spectrogramLabelW);
+            place(frequency_zoom_, UiLayout::spectrogramSliderW);
+            place(emphasis_label_, UiLayout::spectrogramLabelW);
+            place(emphasis_, UiLayout::spectrogramSliderW);
+        }
+        area.removeFromTop(UiLayout::controlGap);
+        spectrum_display_.setBounds(area);
+        if (!spectrum_mode_) {
             display_.setBounds(area);
             updateScrollBar();
-        } else {
-            frequency_scroll_.setBounds({});
-        }
+            if (frequency_scroll_.isVisible()) {
+                frequency_scroll_.setBounds(area.removeFromRight(UiLayout::spectrumScrollW));
+                area.removeFromRight(UiLayout::xs);
+                display_.setBounds(area);
+                updateScrollBar();
+            }
+        } else frequency_scroll_.setVisible(false);
     }
 
+public:
+    bool keyPressed(const juce::KeyPress& key) override {
+        if (key == juce::KeyPress::escapeKey && common_guide_.fixed()) {
+            common_guide_.release();
+            if (spectrum_mode_) spectrum_display_.refresh();
+            else display_.repaint();
+            return true;
+        }
+        return false;
+    }
+    void setSpectrumMode(bool spectrum_mode) {
+        spectrum_mode_ = spectrum_mode;
+        analyzer_.setChannelsEnabled(spectrum_mode);
+        mode_gram_.setToggleState(!spectrum_mode, juce::dontSendNotification);
+        mode_spectrum_.setToggleState(spectrum_mode, juce::dontSendNotification);
+        display_.setDrawingActive(!spectrum_mode);
+        display_.setVisible(!spectrum_mode);
+        spectrum_display_.setVisible(spectrum_mode);
+        for (auto* c : std::array<juce::Component*, 6>{&time_label_, &time_zoom_,
+                &frequency_label_, &frequency_zoom_, &emphasis_label_, &emphasis_}) c->setVisible(!spectrum_mode);
+        for (auto* c : std::array<juce::Component*, 7>{&history_label_, &history_seconds_,
+                &channels_button_, &hold_button_, &reference_button_, &clear_button_, &pause_button_}) c->setVisible(spectrum_mode);
+        updateSpectrumControls();
+        resized();
+        if (spectrum_mode) { spectrum_display_.reevaluatePointer(); spectrum_display_.refresh(); }
+        else display_.setDrawingActive(true);
+    }
 private:
+    void updateSpectrumControls() {
+        pause_button_.setButtonText(juce::String::fromUTF8(spectrum_model_.paused ? "再開" : "表示停止"));
+        pause_button_.setEnabled(spectrum_model_.history().size() > 0);
+        hold_button_.setEnabled(spectrum_model_.front() != nullptr);
+        clear_button_.setEnabled(spectrum_model_.reference.has_value());
+        reference_button_.setEnabled(spectrum_model_.reference.has_value());
+        reference_button_.setToggleState(spectrum_model_.reference_visible, juce::dontSendNotification);
+        position_label_.setVisible(spectrum_mode_ && spectrum_model_.paused);
+        history_position_.setVisible(spectrum_mode_ && spectrum_model_.paused);
+        if (spectrum_model_.paused) {
+            const auto seconds = spectrum_model_.availableSeconds();
+            history_position_.setRange(0, std::max(0.001, seconds), 0.001);
+            history_position_.setEnabled(seconds > 0);
+            history_position_.setValue(spectrum_model_.selected_seconds, juce::dontSendNotification);
+        }
+    }
+    void showChannelMenu() {
+        juce::PopupMenu menu;
+        menu.addItem(1001, juce::String::fromUTF8("すべて表示"));
+        menu.addItem(1002, juce::String::fromUTF8("すべて非表示"));
+        menu.addSeparator();
+        for (std::size_t ch = 0; ch < spectrum::channels; ++ch)
+            if ((analyzer_.context() & (std::uint64_t{1} << engine::spectrumSource(ch))) != 0)
+                menu.addItem(static_cast<int>(ch + 1), spectrum::channelName(ch), true, spectrum_display_.channel_visible[ch]);
+        juce::Component::SafePointer<Content> safe(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&channels_button_), [safe](int id) {
+            if (!safe || id == 0) return;
+            if (id == 1001 || id == 1002) safe->spectrum_display_.channel_visible.fill(id == 1001);
+            else if (id > 0 && id <= static_cast<int>(spectrum::channels)) {
+                auto& visible = safe->spectrum_display_.channel_visible[static_cast<std::size_t>(id - 1)];
+                visible = !visible;
+            }
+            safe->spectrum_display_.refresh();
+        });
+    }
+
     static void configureZoomSlider(
         juce::Slider& slider,
         double minimum,
@@ -1899,14 +1825,20 @@ private:
     void timerCallback() override {
         UiScale::forceGlobalForNonEditorUi();
         applyPendingEmphasis();
-        SpectrogramColumn column{};
         bool changed = false;
-        while (analyzer_.pollColumn(column)) {
-            display_.appendColumn(column);
+        const bool was_paused = spectrum_model_.paused;
+        for (std::size_t count = 0; count < SpectrumAnalyzerThread::queueCapacity
+             && analyzer_.pollFrame(*incoming_frame_); ++count) {
+            if (incoming_frame_->info.context != analyzer_.context()) continue;
+            spectrum_model_.ingest(*incoming_frame_);
+            display_.appendColumn(incoming_frame_->column);
             changed = true;
         }
         if (changed) {
-            display_.flushPendingRepaint();
+            if (spectrum_mode_ && (!spectrum_model_.paused || !was_paused)) spectrum_display_.refresh();
+            else if (!spectrum_mode_) display_.flushPendingRepaint();
+            updateSpectrumControls();
+            if (was_paused != spectrum_model_.paused) resized();
         }
     }
 
@@ -1924,9 +1856,12 @@ private:
             psg_.getToggleState(),
             scc_.getToggleState(),
             opll_.getToggleState());
+        spectrum_display_.source_visible = {psg_.getToggleState(), scc_.getToggleState(), opll_.getToggleState()};
+        if (spectrum_mode_) spectrum_display_.refresh();
     }
 
     void updateScrollBar() {
+        if (spectrum_mode_) { frequency_scroll_.setVisible(false); return; }
         const double total = display_.totalOctaves();
         const double visible = std::min(total, display_.visibleOctaves());
         const bool scrollable = visible + 0.0001 < total;
@@ -1943,8 +1878,17 @@ private:
         frequency_scroll_.setSingleStepSize(0.25);
     }
 
+    spectrum::GuideState common_guide_;
+    spectrum::Model spectrum_model_;
     SpectrumAnalyzerThread analyzer_;
     SpectrogramDisplay display_;
+    spectrum::Display spectrum_display_;
+    std::unique_ptr<spectrum::Frame> incoming_frame_;
+    juce::TextButton mode_gram_, mode_spectrum_, channels_button_, hold_button_,
+        reference_button_, clear_button_, pause_button_;
+    juce::Label history_label_, position_label_;
+    juce::Slider history_seconds_, history_position_;
+    bool spectrum_mode_{}, active_{};
     std::function<void(bool)> internal_pin_changed_;
     SpectrogramToggleLookAndFeel source_toggle_look_and_feel_;
     juce::ToggleButton psg_;
@@ -1968,6 +1912,7 @@ SpectrogramWindow::SpectrogramWindow(engine::RealtimeEngineHost& engine)
           juce::String::fromUTF8("MGS Tone Craft - スペクトログラム"),
           juce::Colour(0xFF1B222C),
           DocumentWindow::allButtons) {
+    g_spectrogram_window = this;
     setUsingNativeTitleBar(true);
     content_ = new Content(engine, [this](bool pinned) {
         setInternalPin(pinned);
@@ -1988,7 +1933,10 @@ SpectrogramWindow::SpectrogramWindow(engine::RealtimeEngineHost& engine)
 }
 
 SpectrogramWindow::~SpectrogramWindow() {
-    stopTimer();
+    if (g_spectrogram_window == this) {
+        g_spectrogram_window = nullptr;
+    }
+    removePinZOrderRetHook();
     if (content_ != nullptr) {
         content_->setActive(false);
     }
@@ -2002,9 +1950,11 @@ void SpectrogramWindow::showWindow() {
     }
     setVisible(true);
     toFront(true);
-    if (internal_pin_) {
-        startTimerHz(15);
-    }
+    updatePinZOrderHook();
+}
+
+void SpectrogramWindow::setSpectrumMode(bool enabled) {
+    if (content_ != nullptr) content_->setSpectrumMode(enabled);
 }
 
 void SpectrogramWindow::setAnalysisMode(SpectrogramAnalysisMode mode) {
@@ -2019,23 +1969,59 @@ juce::Component* SpectrogramWindow::snapshotContent() const noexcept {
 
 void SpectrogramWindow::setInternalPin(bool pinned) {
     internal_pin_ = pinned;
-    if (!internal_pin_ || !isVisible()) {
-        stopTimer();
-        return;
-    }
-    startTimerHz(15);
-    toFront(false);
-}
-
-void SpectrogramWindow::timerCallback() {
-    if (!internal_pin_ || !isVisible()) {
-        stopTimer();
-        return;
-    }
-    const auto* active = juce::TopLevelWindow::getActiveTopLevelWindow();
-    if (active != nullptr && active != this) {
+    updatePinZOrderHook();
+    if (internal_pin_ && isVisible()) {
         toFront(false);
     }
+}
+
+void SpectrogramWindow::updatePinZOrderHook() {
+    if (internal_pin_ && isVisible()) {
+        installPinZOrderRetHook();
+        return;
+    }
+    removePinZOrderRetHook();
+}
+
+void SpectrogramWindow::constrainSiblingZOrder(
+    void* window_pos,
+    void* caller_native_handle) {
+    auto* position = static_cast<WINDOWPOS*>(window_pos);
+    const auto caller = static_cast<HWND>(caller_native_handle);
+    if (position == nullptr
+        || caller == nullptr
+        || g_in_pin_zorder
+        || (position->flags & SWP_NOZORDER) != 0
+        || (position->flags & SWP_HIDEWINDOW) != 0
+        || g_spectrogram_window == nullptr
+        || !g_spectrogram_window->internal_pin_
+        || !shouldKeepPinnedAboveSiblings()) {
+        return;
+    }
+    const HWND spectrogram = spectrogramNativeHandle();
+    if (spectrogram == nullptr
+        || spectrogram == caller
+        || !IsWindowVisible(spectrogram)) {
+        return;
+    }
+    raiseSpectrogramWithoutActivating(spectrogram);
+    position->hwndInsertAfter = spectrogram;
+}
+
+void SpectrogramWindow::raisePinnedAfterSibling(void* caller_native_handle) {
+    const auto caller = static_cast<HWND>(caller_native_handle);
+    if (caller == nullptr
+        || g_in_pin_zorder
+        || g_spectrogram_window == nullptr
+        || !g_spectrogram_window->internal_pin_
+        || !shouldKeepPinnedAboveSiblings()) {
+        return;
+    }
+    const HWND spectrogram = spectrogramNativeHandle();
+    if (spectrogram == nullptr || spectrogram == caller) {
+        return;
+    }
+    raiseSpectrogramWithoutActivating(spectrogram);
 }
 
 void SpectrogramWindow::applyGlobalUiScale() {
@@ -2055,12 +2041,12 @@ void SpectrogramWindow::closeButtonPressed() {
 }
 
 void SpectrogramWindow::hideWindow() {
-    stopTimer();
     if (content_ != nullptr) {
         content_->setActive(false);
     }
     saveState();
     setVisible(false);
+    updatePinZOrderHook();
 }
 
 void SpectrogramWindow::loadState() {

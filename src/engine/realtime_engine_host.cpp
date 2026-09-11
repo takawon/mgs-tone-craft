@@ -1,6 +1,8 @@
 #include "mgstc/engine/realtime_engine_host.hpp"
 
 #include <type_traits>
+#include <algorithm>
+#include <cmath>
 #include <utility>
 
 namespace mgstc::engine {
@@ -15,7 +17,8 @@ RealtimeEngineHost::RealtimeEngineHost()
           std::make_unique<SpscQueue<
               OpllScopeFrame, kSpectrogramScopeCapacity>>()),
       programs_(std::make_unique<ProgramSlot[]>(kProgramSlotCount)),
-      mamidi_(std::make_unique<MAmidiMemoSoundOutput>()) {
+      mamidi_(std::make_unique<MAmidiMemoSoundOutput>()),
+      spectrum_capture_(std::make_unique<SpectrumCapture>()) {
     programs_[0].state.store(
         ProgramSlotState::Active,
         std::memory_order_relaxed);
@@ -255,6 +258,28 @@ bool RealtimeEngineHost::pollSpectrogramScope(
     return spectrogram_scope_frames_->tryPop(frame);
 }
 
+void RealtimeEngineHost::setSpectrumCaptureEnabled(bool enabled) noexcept {
+    if (spectrum_enabled_.load(std::memory_order_acquire) == enabled) return;
+    spectrum_context_.fetch_add(8, std::memory_order_acq_rel);
+    spectrum_enabled_.store(enabled, std::memory_order_release);
+}
+void RealtimeEngineHost::setSpectrumSourceMask(std::uint8_t mask) noexcept {
+    mask &= 7;
+    const auto current = spectrum_context_.load(std::memory_order_acquire);
+    if ((current & 7) != mask)
+        spectrum_context_.store(((current & ~std::uint64_t{7}) + 8) | mask, std::memory_order_release);
+}
+void RealtimeEngineHost::setSpectrumOutputGain(float gain) noexcept {
+    spectrum_output_gain_.store(std::isfinite(gain) ? std::clamp(gain, 0.0F, 1.0F) : 1.0F,
+                               std::memory_order_release);
+}
+bool RealtimeEngineHost::pollSpectrumCapture(SpectrumCaptureBlock& block) noexcept {
+    return spectrum_capture_->poll(block);
+}
+std::uint64_t RealtimeEngineHost::spectrumDroppedBlocks() const noexcept {
+    return spectrum_capture_->dropped();
+}
+
 void RealtimeEngineHost::noteStarted(
     std::uint8_t track,
     std::uint8_t note) noexcept {
@@ -281,8 +306,7 @@ void RealtimeEngineHost::allNotesStopped() noexcept {
     }
 }
 
-void RealtimeEngineHost::annotateGuideNote(
-    OpllScopeFrame& frame) const noexcept {
+SpectrumGuideNote RealtimeEngineHost::currentGuideNote() const noexcept {
     const ActiveGuideNote* newest = nullptr;
     std::uint8_t newest_track = last_guide_track_;
     for (std::size_t index = 0; index < active_guide_notes_.size(); ++index) {
@@ -292,9 +316,14 @@ void RealtimeEngineHost::annotateGuideNote(
             newest_track = static_cast<std::uint8_t>(index);
         }
     }
-    frame.guide_note = newest != nullptr ? newest->note : last_guide_note_;
-    frame.guide_track = newest_track;
-    frame.note_active = newest != nullptr;
+    return {newest != nullptr ? newest->note : last_guide_note_, newest_track, newest != nullptr};
+}
+
+void RealtimeEngineHost::annotateGuideNote(OpllScopeFrame& frame) const noexcept {
+    const auto note = currentGuideNote();
+    frame.guide_note = note.note;
+    frame.guide_track = note.track;
+    frame.note_active = note.active;
 }
 
 void RealtimeEngineHost::notify(const EngineNotice& notice) noexcept {
@@ -344,6 +373,7 @@ void RealtimeEngineHost::loadProgram(
     static_cast<void>(incoming.engine.setGains(current_gains_));
     applyOutputRouting(incoming.engine);
     incoming.engine.hardReset();
+    ++spectrum_pcm_epoch_;
     incoming.engine.session().gateUntilNoteOn();
     const auto previous = active_program_;
     active_program_ = command.program_slot;
@@ -403,6 +433,7 @@ void RealtimeEngineHost::applyPendingCommands() noexcept {
         case EngineCommandType::Stop:
         case EngineCommandType::HardReset:
             programs_[active_program_].engine.hardReset();
+            ++spectrum_pcm_epoch_;
             allNotesStopped();
             break;
         case EngineCommandType::SetMixerGains:
@@ -420,8 +451,20 @@ void RealtimeEngineHost::applyPendingCommands() noexcept {
 RenderResult RealtimeEngineHost::render(
     std::span<float> interleaved_stereo) noexcept {
     applyPendingCommands();
-    const auto result =
-        programs_[active_program_].engine.render(interleaved_stereo);
+    auto& core = programs_[active_program_].engine;
+    SpectrumCapture* capture = nullptr;
+    if (spectrum_enabled_.load(std::memory_order_acquire)) {
+        spectrum_capture_->begin(spectrum_sample_clock_,
+            spectrum_context_.load(std::memory_order_acquire), spectrum_pcm_epoch_,
+            core.spectrumChannelMap(),
+            currentGuideNote(),
+            spectrum_output_gain_.load(std::memory_order_acquire),
+            core.outputKind() != SoundOutputKind::Emulator,
+            spectrum_channels_enabled_.load(std::memory_order_acquire));
+        capture = spectrum_capture_.get();
+    }
+    const auto result = core.render(interleaved_stereo, capture);
+    spectrum_sample_clock_ += result.frames;
     OpllScopeFrame scope{};
     if (programs_[active_program_].engine.takeOpllScopeFrame(scope)) {
         annotateGuideNote(scope);

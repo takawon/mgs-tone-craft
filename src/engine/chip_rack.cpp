@@ -93,13 +93,16 @@ bool Ym2149Adapter::write(
     return true;
 }
 
-float Ym2149Adapter::renderSample() noexcept {
+float Ym2149Adapter::renderSample(std::span<float> channels) noexcept {
     if (!valid()) {
         return 0.0F;
     }
-    return impl_->rate_conv->next([this] {
-        return static_cast<float>(PSG_calc(impl_->chip)) * kInt16Scale;
-    });
+    return impl_->rate_conv->next([this, channels] {
+        const float mixed = static_cast<float>(PSG_calc(impl_->chip)) * kInt16Scale;
+        for (std::size_t ch = 0; ch < channels.size(); ++ch)
+            channels[ch] = static_cast<float>(impl_->chip->ch_out[ch]) * kInt16Scale;
+        return mixed;
+    }, channels);
 }
 
 struct SccAdapter::Impl {
@@ -178,10 +181,12 @@ bool SccAdapter::write(
     return true;
 }
 
-float SccAdapter::renderSample() noexcept {
-    return valid()
-        ? static_cast<float>(SCC_calc(impl_->chip)) * kInt16Scale
-        : 0.0F;
+float SccAdapter::renderSample(std::span<float> channels) noexcept {
+    if (!valid()) return 0.0F;
+    const float mixed = static_cast<float>(SCC_calc(impl_->chip)) * kInt16Scale;
+    for (std::size_t ch = 0; ch < channels.size(); ++ch)
+        channels[ch] = static_cast<float>(impl_->chip->ch_out[ch]) * kInt16Scale;
+    return mixed;
 }
 
 struct Ym2413Adapter::Impl {
@@ -242,13 +247,16 @@ bool Ym2413Adapter::write(
     return true;
 }
 
-float Ym2413Adapter::renderSample() noexcept {
+float Ym2413Adapter::renderSample(std::span<float> channels) noexcept {
     if (!valid()) {
         return 0.0F;
     }
-    return impl_->rate_conv->next([this] {
-        return static_cast<float>(OPLL_calc(impl_->chip)) * kInt16Scale;
-    });
+    return impl_->rate_conv->next([this, channels] {
+        const float mixed = static_cast<float>(OPLL_calc(impl_->chip)) * kInt16Scale;
+        for (std::size_t ch = 0; ch < channels.size(); ++ch)
+            channels[ch] = static_cast<float>(impl_->chip->ch_out[ch]) * kInt16Scale;
+        return mixed;
+    }, channels);
 }
 
 bool ChipRack::valid() const noexcept {
@@ -285,12 +293,13 @@ bool ChipRack::apply(
     return true;
 }
 
-ChipSamples ChipRack::renderSample() noexcept {
-    return {
-        psg_.renderSample(),
-        scc_.renderSample(),
-        opll_.renderSample(),
-    };
+ChipSamples ChipRack::renderSample(bool capture_channels) noexcept {
+    ChipSamples result{};
+    auto channels = std::span<float>(result.channels);
+    result.psg = psg_.renderSample(capture_channels ? channels.first(3) : std::span<float>{});
+    result.scc = scc_.renderSample(capture_channels ? channels.subspan(3, 5) : std::span<float>{});
+    result.opll = opll_.renderSample(capture_channels ? channels.subspan(8, 14) : std::span<float>{});
+    return result;
 }
 
 }  // namespace mgstc::engine

@@ -123,8 +123,8 @@ bool EmulatorSoundOutput::valid() const noexcept {
     return chips_.valid();
 }
 
-ChipSamples EmulatorSoundOutput::renderSample() noexcept {
-    return chips_.renderSample();
+ChipSamples EmulatorSoundOutput::renderSample(bool capture_channels) noexcept {
+    return chips_.renderSample(capture_channels);
 }
 
 }  // namespace mgstc::engine

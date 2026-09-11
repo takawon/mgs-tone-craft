@@ -15,6 +15,7 @@
 #include <mutex>
 #include <numbers>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -56,6 +57,8 @@
 #include "mgstc/engine/volume.hpp"
 #include "mgstc/engine/voice_allocator.hpp"
 #include "mgstc/engine/wave_import.hpp"
+#include "mgstc/engine/gzip_inflate.hpp"
+#include "mgstc/engine/tone_import.hpp"
 #ifdef _WIN32
 #include "mgstc/audio/wasapi_audio_sink.hpp"
 #endif
@@ -1099,6 +1102,66 @@ void testRuntimePsgNoteOnOrderMatchesObservedBoundary() {
             {1, 0x01},
             {8, 15},
         }));
+}
+
+void testRuntimeTrackMicroDetuneMatchesObservedVgm() {
+    const auto pitch_registers = [](std::uint8_t track, std::int32_t micro) {
+        RuntimeSession session(32, 64);
+        REQUIRE_EQ(session.setTrackDetune(track, 0, micro), true);
+        REQUIRE_EQ(session.queueNoteOn(track, 60), true);
+        REQUIRE_EQ(session.processTick().ok(), true);
+
+        int low = -1;
+        int high = -1;
+        for (const auto& write : session.writes()) {
+            if (write.track != track) {
+                continue;
+            }
+            const bool frequency_write =
+                write.reason == WriteReason::Frequency;
+            const bool opll_key_pitch =
+                write.chip == ChipId::Opll
+                && write.address == 0x20
+                && write.reason == WriteReason::KeyOn;
+            if (!frequency_write && !opll_key_pitch) {
+                continue;
+            }
+            if ((write.chip == ChipId::Opll && write.address == 0x10)
+                || (write.chip != ChipId::Opll
+                    && (write.address % 2) == 0)) {
+                low = write.value;
+            } else {
+                high = write.value;
+            }
+        }
+        REQUIRE_EQ(low >= 0, true);
+        REQUIRE_EQ(high >= 0, true);
+        return low | (high << 8);
+    };
+
+    constexpr std::array<std::int32_t, 8> psg_scc_values{
+        30, -30, 110, -110, 10'000, -10'000, 1'000, -1'000};
+    constexpr std::array<int, 8> psg_scc_expected{
+        0x01AF, 0x01A7, 0x01B9, 0x019D,
+        0x068D, 0x1CC9, 0x0228, 0x012E};
+    for (const auto track : {std::uint8_t{0}, std::uint8_t{3}}) {
+        for (std::size_t i = 0; i < psg_scc_values.size(); ++i) {
+            REQUIRE_EQ(
+                pitch_registers(track, psg_scc_values[i]),
+                psg_scc_expected[i]);
+        }
+    }
+
+    constexpr std::array<std::int32_t, 8> opll_values{
+        10, 40, 70, 90, 130, 160, 200, 255};
+    constexpr std::array<int, 8> opll_expected{
+        0x16AC, 0x16AD, 0x16AE, 0x16AF,
+        0x16B1, 0x16B2, 0x16B3, 0x16B6};
+    for (std::size_t i = 0; i < opll_values.size(); ++i) {
+        REQUIRE_EQ(
+            pitch_registers(8, opll_values[i]),
+            opll_expected[i]);
+    }
 }
 
 #if MGSTC_HAS_PRIVATE_MGSDRV_FIXTURE
@@ -5234,6 +5297,7 @@ void testSoftwareLfoTriangleDelayAndRoughness() {
     settings.depth = 10;
     settings.speed = 0;
     settings.roughness = 3;
+    REQUIRE_EQ(softwareLfoFirstUpdateTick(0, 0), 1U);
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 0), static_cast<std::int32_t>(0));
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 1), static_cast<std::int32_t>(3));
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 2), static_cast<std::int32_t>(6));
@@ -5243,10 +5307,48 @@ void testSoftwareLfoTriangleDelayAndRoughness() {
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 2), static_cast<std::int32_t>(-6));
     settings.roughness = 3;
     settings.delay = 2;
+    REQUIRE_EQ(softwareLfoFirstUpdateTick(2, 0), 3U);
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 0), static_cast<std::int32_t>(0));
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 2), static_cast<std::int32_t>(0));
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 3), static_cast<std::int32_t>(3));
     settings.delay = 0;
+    settings.speed = 2;
+    REQUIRE_EQ(softwareLfoFirstUpdateTick(0, 2), 3U);
+    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 2), static_cast<std::int32_t>(0));
+    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 3), static_cast<std::int32_t>(3));
+    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 5), static_cast<std::int32_t>(3));
+    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 6), static_cast<std::int32_t>(6));
+    settings.delay = 2;
+    settings.speed = 2;
+    REQUIRE_EQ(softwareLfoFirstUpdateTick(2, 2), 5U);
+    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 4), static_cast<std::int32_t>(0));
+    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 5), static_cast<std::int32_t>(3));
+    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 7), static_cast<std::int32_t>(3));
+    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 8), static_cast<std::int32_t>(6));
+    settings.speed = 0;
+    settings.delay = 254;
+    REQUIRE_EQ(softwareLfoFirstUpdateTick(254, 0), 255U);
+    REQUIRE_EQ(
+        softwareLfoOffsetAtTick(settings, 254),
+        static_cast<std::int32_t>(0));
+    REQUIRE_EQ(
+        softwareLfoOffsetAtTick(settings, 255),
+        static_cast<std::int32_t>(3));
+    settings.delay = 255;
+    settings.speed = 255;
+    REQUIRE_EQ(softwareLfoFirstUpdateTick(255, 255), 255U);
+    REQUIRE_EQ(
+        softwareLfoOffsetAtTick(settings, 254),
+        static_cast<std::int32_t>(0));
+    REQUIRE_EQ(
+        softwareLfoOffsetAtTick(settings, 255),
+        static_cast<std::int32_t>(3));
+    settings.delay = 0;
+    settings.speed = 0;
+    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 5), static_cast<std::int32_t>(15));
+    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 6), static_cast<std::int32_t>(12));
+    settings.delay = 0;
+    settings.speed = 0;
     settings.extra_roughness = 5;
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 1, true), static_cast<std::int32_t>(5));
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 1, false), static_cast<std::int32_t>(3));
@@ -5262,6 +5364,11 @@ void testSoftwareLfoTriangleDelayAndRoughness() {
     }
     REQUIRE_EQ(min_offset < 0, true);
     REQUIRE_EQ(max_offset > 0, true);
+    settings.depth = 0;
+    settings.roughness = 3;
+    REQUIRE_EQ(
+        softwareLfoOffsetAtTick(settings, 1),
+        static_cast<std::int32_t>(-3));
     settings.enabled = false;
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 1), static_cast<std::int32_t>(0));
 }
@@ -5708,6 +5815,8 @@ void testWasapiSinkConstructsWithoutOpeningDevice() {
 }
 #endif
 
+#include "tone_import_tests.inc.cpp"
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -5743,6 +5852,7 @@ int main(int argc, char** argv) {
         {"MgsdrvNoteTables", testMgsdrvNoteTables},
         {"SccAdapterPlaysLabeledC4Near261Hz", testSccAdapterPlaysLabeledC4Near261Hz},
         {"RuntimePsgNoteOnOrderMatchesObservedBoundary", testRuntimePsgNoteOnOrderMatchesObservedBoundary},
+        {"RuntimeTrackMicroDetuneMatchesObservedVgm", testRuntimeTrackMicroDetuneMatchesObservedVgm},
 #if MGSTC_HAS_PRIVATE_MGSDRV_FIXTURE
         {"RuntimeBoundaryWritesMatchVgmFixture", testRuntimeBoundaryWritesMatchVgmFixture},
 #endif
@@ -5844,6 +5954,40 @@ int main(int argc, char** argv) {
         {"CompositeLibraryDependencyIndexAndPropagation", testCompositeLibraryDependencyIndexAndPropagation},
         {"PcKeyboardPhysicalLayoutAndOctaveSlide", testPcKeyboardPhysicalLayoutAndOctaveSlide},
         {"SequentialVoiceAllocatorPolyMonoAndStealing", testSequentialVoiceAllocatorPolyMonoAndStealing},
+        {"GzipStoredRoundTrip", testGzipStoredRoundTrip},
+        {"ToneImportRejectsEmptyAndUnknown", testToneImportRejectsEmptyAndUnknown},
+        {"ToneImportRejectsCompressedMgs", testToneImportRejectsCompressedMgs},
+        {"ToneImportRejectsCompressedMgsAfterEofMarker",
+         testToneImportRejectsCompressedMgsAfterEofMarker},
+        {"ToneImportVgmCompleteOpllAndDuplicates",
+         testToneImportVgmCompleteOpllAndDuplicates},
+        {"ToneImportVgmRejectsPartialAndLongWait",
+         testToneImportVgmRejectsPartialAndLongWait},
+        {"ToneImportVgmSccCompleteReorderAndPartial",
+         testToneImportVgmSccCompleteReorderAndPartial},
+        {"ToneImportVgzMatchesVgm", testToneImportVgzMatchesVgm},
+        {"ToneImportMmlTonesAndSelfContainedEnvelope",
+         testToneImportMmlTonesAndSelfContainedEnvelope},
+        {"ToneImportMmlStripsPsgModeNoise", testToneImportMmlStripsPsgModeNoise},
+        {"ToneImportMmlSccTrackEmbedsWaveWithoutEnvelopePatch",
+         testToneImportMmlSccTrackEmbedsWaveWithoutEnvelopePatch},
+        {"ToneImportMmlSccTrackEmbedsEveryTrackPatch",
+         testToneImportMmlSccTrackEmbedsEveryTrackPatch},
+        {"ToneImportDropsZeroTimeEnvelopeLoop",
+         testToneImportDropsZeroTimeEnvelopeLoop},
+        {"ToneImportMgsBinarySccTrackUsesSccLayer",
+         testToneImportMgsBinarySccTrackUsesSccLayer},
+        {"ToneImportMgsBinaryOpllSccAndEnvelope",
+         testToneImportMgsBinaryOpllSccAndEnvelope},
+        {"ToneImportMgsVoiceTrackDoesNotWalkIntoMusic",
+         testToneImportMgsVoiceTrackDoesNotWalkIntoMusic},
+        {"ToneImportMgsEnvelopeHoldWaitIsLiteral",
+         testToneImportMgsEnvelopeHoldWaitIsLiteral},
+        {"ToneImportMusicaVcdNamesAndSccEnvelope",
+         testToneImportMusicaVcdNamesAndSccEnvelope},
+        {"ToneImportSngWaveAndName", testToneImportSngWaveAndName},
+        {"ImportedLibraryEntryKeepsEmptyName",
+         testImportedLibraryEntryKeepsEmptyName},
 #ifdef _WIN32
         {"WasapiSinkConstructsWithoutOpeningDevice", testWasapiSinkConstructsWithoutOpeningDevice},
 #endif

@@ -300,6 +300,26 @@ SavedTimbreReference makeSavedTimbreReference(
     return reference;
 }
 
+const SavedTimbreReference* findEmbeddedTimbreSnapshot(
+    const CompositeTimbre& timbre,
+    std::uint64_t library_id) noexcept {
+    if (library_id == 0) {
+        return nullptr;
+    }
+    for (const auto& layer : timbre.layers) {
+        if (layer.base_timbre
+            && layer.base_timbre->library_id == library_id) {
+            return &*layer.base_timbre;
+        }
+    }
+    for (const auto& reference : timbre.embedded_timbres) {
+        if (reference.library_id == library_id) {
+            return &reference;
+        }
+    }
+    return nullptr;
+}
+
 TimbreNumberResolution resolveTimbreNumbers(
     const CompositeTimbre& timbre,
     std::uint8_t minimum_number,

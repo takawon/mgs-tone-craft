@@ -127,6 +127,7 @@ add_library(mgstc_engine STATIC
     src/engine/composite_timbre_library.cpp
     src/engine/emulator_sound_output.cpp
     src/engine/engine_core.cpp
+    src/engine/gzip_inflate.cpp
     src/engine/envelope_rate.cpp
     src/engine/envelope_sequence.cpp
     src/engine/mamidi_memo_sound_output.cpp
@@ -149,6 +150,11 @@ add_library(mgstc_engine STATIC
     src/engine/stereo_sample_rate_converter.cpp
     src/engine/timbre_library.cpp
     src/engine/timbre_tags.cpp
+    src/engine/tone_import.cpp
+    src/engine/tone_import_mgs.cpp
+    src/engine/tone_import_sng.cpp
+    src/engine/tone_import_vcd.cpp
+    src/engine/tone_import_vgm.cpp
     src/engine/track_runtime.cpp
     src/engine/voice_allocator.cpp
     src/engine/wave_import.cpp
@@ -393,6 +399,15 @@ if(MGSTC_BUILD_TESTS)
     )
 
     if(WIN32 AND TARGET juce::juce_gui_basics)
+        add_executable(mgstc_spectrum_tests tests/cpp/spectrum_tests.cpp src/app/juce/ui_layout.cpp)
+        target_link_libraries(mgstc_spectrum_tests PRIVATE mgstc_engine juce::juce_dsp juce::juce_gui_extra)
+        target_compile_features(mgstc_spectrum_tests PRIVATE cxx_std_20)
+        target_compile_definitions(mgstc_spectrum_tests PRIVATE JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
+        if(MSVC)
+            target_compile_options(mgstc_spectrum_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+        endif()
+        add_test(NAME mgstc_spectrum_tests COMMAND mgstc_spectrum_tests)
+
         add_executable(mgstc_opll_envelope_graph_tests tests/cpp/opll_envelope_graph_tests.cpp)
         target_link_libraries(mgstc_opll_envelope_graph_tests PRIVATE mgstc_engine juce::juce_gui_basics)
         target_compile_features(mgstc_opll_envelope_graph_tests PRIVATE cxx_std_20)

@@ -18,11 +18,7 @@
 namespace mgstc::engine {
 namespace {
 
-struct Definition {
-    char kind{};
-    unsigned number{};
-    std::string body;
-};
+using Definition = MgsSourceDefinition;
 
 struct ParsedTrack {
     CompositeLayer layer;
@@ -96,11 +92,30 @@ std::string withoutComments(std::string_view text) {
     return result;
 }
 
-std::vector<Definition> definitions(
+}  // namespace
+
+std::vector<MgsSourceDefinition> extractMgsSourceDefinitions(
     std::string_view source,
     char wanted_kind) {
-    const auto cleaned = withoutComments(source);
-    std::vector<Definition> result;
+    std::string cleaned;
+    cleaned.reserve(source.size());
+    bool comment = false;
+    for (const char character : source) {
+        if (comment) {
+            if (character == '\r' || character == '\n') {
+                comment = false;
+                cleaned.push_back(character);
+            }
+            continue;
+        }
+        if (character == ';') {
+            comment = true;
+            cleaned.push_back(' ');
+        } else {
+            cleaned.push_back(character);
+        }
+    }
+    std::vector<MgsSourceDefinition> result;
     for (std::size_t index = 0; index + 3 < cleaned.size(); ++index) {
         if (cleaned[index] != '@'
             || static_cast<char>(std::tolower(
@@ -156,6 +171,14 @@ std::vector<Definition> definitions(
         index = body_end;
     }
     return result;
+}
+
+namespace {
+
+std::vector<Definition> definitions(
+    std::string_view source,
+    char wanted_kind) {
+    return extractMgsSourceDefinitions(source, wanted_kind);
 }
 
 bool decimal(
@@ -392,6 +415,10 @@ std::optional<SavedTimbreReference> findReference(
     const TimbreLibrary* library,
     TimbreSource source,
     std::uint64_t id) {
+    if (const auto* embedded = findEmbeddedTimbreSnapshot(timbre, id);
+        embedded != nullptr && embedded->source == source) {
+        return *embedded;
+    }
     for (const auto& layer : timbre.layers) {
         if (layer.base_timbre
             && layer.base_timbre->library_id == id
@@ -917,6 +944,21 @@ std::optional<ParsedTrack> parseTrackLine(
 }
 
 }  // namespace
+
+bool parseMgsRateBody(std::string_view body, RateEnvelope& rate) {
+    Definition definition;
+    definition.body = std::string(body);
+    return parseRate(definition, rate);
+}
+
+bool parseMgsSequenceBody(
+    std::string_view body,
+    CompositeLayer& layer,
+    std::vector<std::string>& issues) {
+    Definition definition;
+    definition.body = std::string(body);
+    return parseSequence(definition, layer, issues);
+}
 
 std::string formatMgsRateDefinition(
     const CompositeLayer& layer,
