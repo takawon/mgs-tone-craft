@@ -437,18 +437,45 @@ CompositeTimbre makeSelfContainedComposite(
         if (layer.base_timbre) {
             return;
         }
+        const bool envelope_has_timbre = std::any_of(
+            envelope_layer.timbre_automation.begin(),
+            envelope_layer.timbre_automation.end(),
+            [](const EnvelopeEvent& event) {
+                return event.kind == EnvelopeEventKind::Timbre;
+            });
+        if (!envelope_has_timbre) {
+            if (layer.source == TimbreSource::Opll && usage.opll) {
+                if (usage.primary_opll) {
+                    const auto number = *usage.primary_opll;
+                    if (embedOpll(number)) {
+                        layer.base_timbre = opll_refs[number];
+                        return;
+                    }
+                    if (number <= 14) {
+                        layer.base_opll_rom =
+                            static_cast<std::uint8_t>(number);
+                        return;
+                    }
+                }
+                seedDefaultLayerTimbre(layer);
+                return;
+            }
+            if (layer.source == TimbreSource::Scc && usage.scc) {
+                if (usage.primary_scc) {
+                    const auto number = *usage.primary_scc;
+                    if (embedScc(number)) {
+                        layer.base_timbre = scc_refs[number];
+                        return;
+                    }
+                }
+                seedDefaultLayerTimbre(layer);
+                return;
+            }
+        }
         if (layer.source == TimbreSource::Opll && !opll_refs.empty()) {
             layer.base_timbre = opll_refs.begin()->second;
         } else if (layer.source == TimbreSource::Scc && !scc_refs.empty()) {
             layer.base_timbre = scc_refs.begin()->second;
-        } else if (layer.source == TimbreSource::Opll && !tones.opll.empty()) {
-            if (embedOpll(tones.opll.begin()->first)) {
-                layer.base_timbre = opll_refs.begin()->second;
-            }
-        } else if (layer.source == TimbreSource::Scc && !tones.scc.empty()) {
-            if (embedScc(tones.scc.begin()->first)) {
-                layer.base_timbre = scc_refs.begin()->second;
-            }
         } else {
             seedDefaultLayerTimbre(layer);
         }

@@ -3,6 +3,7 @@
 #include "mgstc/engine/tone_import.hpp"
 
 #include <map>
+#include <optional>
 #include <set>
 #include <utility>
 
@@ -46,6 +47,9 @@ struct EnvelopeChipUse {
     bool opll{};
     std::set<unsigned> track_scc;
     std::set<unsigned> track_opll;
+    // First music-track use: sounding @n, or nullopt for the chip default.
+    std::optional<unsigned> primary_scc;
+    std::optional<unsigned> primary_opll;
 
     [[nodiscard]] bool anyChip() const noexcept {
         return psg || scc || opll;
