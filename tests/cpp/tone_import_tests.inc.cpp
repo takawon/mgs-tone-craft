@@ -64,6 +64,42 @@ void testGzipStoredRoundTrip() {
     REQUIRE_EQ(*inflated, payload);
 }
 
+void appendMgsMusicTrack(
+    std::vector<std::uint8_t>& bytes,
+    std::size_t header,
+    int track,
+    const std::vector<std::uint8_t>& commands) {
+    const auto music_relative =
+        static_cast<std::uint16_t>(bytes.size() - header);
+    const auto offset = header + 4 + static_cast<std::size_t>(track) * 2;
+    bytes[offset] = static_cast<std::uint8_t>(music_relative);
+    bytes[offset + 1] = static_cast<std::uint8_t>(music_relative >> 8U);
+    bytes.insert(bytes.end(), commands.begin(), commands.end());
+}
+
+const mgstc::engine::CompositeTimbre* firstCompositeTimbre(
+    const mgstc::engine::ToneImportResult& result) {
+    for (const auto& candidate : result.candidates) {
+        if (const auto* timbre =
+                std::get_if<mgstc::engine::CompositeTimbre>(&candidate.data)) {
+            return timbre;
+        }
+    }
+    return nullptr;
+}
+
+int countImportedType(
+    const mgstc::engine::ToneImportResult& result,
+    mgstc::engine::ImportedToneType type) {
+    int count = 0;
+    for (const auto& candidate : result.candidates) {
+        if (candidate.type == type) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 void testToneImportRejectsEmptyAndUnknown() {
     const auto empty = mgstc::engine::importTones({});
     REQUIRE_EQ(empty.valid(), false);
@@ -183,7 +219,7 @@ void testToneImportMmlTonesAndSelfContainedEnvelope() {
             std::array<std::uint8_t, 8>{8, 7, 6, 5, 4, 3, 2, 1}),
         20,
         {});
-    std::string source = opll_a + opll_b + "@e0 = { @12.f @20.0 }\n";
+    std::string source = opll_a + opll_b + "@e0 = { @12.f @20.0 }\n9 @e0 c\n";
     std::vector<std::uint8_t> bytes(source.begin(), source.end());
     const auto result = mgstc::engine::importTones(bytes, "mus");
     REQUIRE_EQ(result.valid(), true);
@@ -255,6 +291,7 @@ void testToneImportMgsBinaryOpllSccAndEnvelope() {
     bytes.push_back(static_cast<std::uint8_t>(env.size()));
     bytes.insert(bytes.end(), env.begin(), env.end());
     bytes.push_back(0xFF);
+    appendMgsMusicTrack(bytes, header, 1, {0x49, 0x00, 0xFF});
     const auto result = mgstc::engine::importTones(bytes, "mgs");
     REQUIRE_EQ(result.valid(), true);
     REQUIRE_EQ(result.format, mgstc::engine::ToneImportFormat::Mgs);
@@ -303,15 +340,10 @@ void testToneImportMgsEnvelopeHoldWaitIsLiteral() {
     bytes.push_back(static_cast<std::uint8_t>(env.size()));
     bytes.insert(bytes.end(), env.begin(), env.end());
     bytes.push_back(0xFF);
+    appendMgsMusicTrack(bytes, header, 1, {0x49, 0x00, 0xFF});
     const auto result = mgstc::engine::importTones(bytes, "mgs");
     REQUIRE_EQ(result.valid(), true);
-    const mgstc::engine::CompositeTimbre* timbre = nullptr;
-    for (const auto& candidate : result.candidates) {
-        timbre = std::get_if<mgstc::engine::CompositeTimbre>(&candidate.data);
-        if (timbre != nullptr) {
-            break;
-        }
-    }
+    const auto* timbre = firstCompositeTimbre(result);
     REQUIRE_EQ(timbre != nullptr, true);
     REQUIRE_EQ(timbre->layers.empty(), false);
     REQUIRE_EQ(
@@ -320,7 +352,7 @@ void testToneImportMgsEnvelopeHoldWaitIsLiteral() {
 }
 
 void testToneImportMmlStripsPsgModeNoise() {
-    const std::string source = "@e0 = { n7./3.f }\n";
+    const std::string source = "@e0 = { n7./3.f }\n1 @e0 c\n";
     std::vector<std::uint8_t> bytes(source.begin(), source.end());
     const auto result = mgstc::engine::importTones(bytes, "mus");
     REQUIRE_EQ(result.valid(), true);
@@ -351,7 +383,7 @@ void testToneImportMmlSccTrackEmbedsWaveWithoutEnvelopePatch() {
     }
     const auto source =
         mgstc::engine::formatMgsSccDefinition(wave, 3, {})
-        + "@e0 = { f }\n4 @e0 c\n";
+        + "@e0 = { f }\n4 @3 @e0 c\n";
     std::vector<std::uint8_t> bytes(source.begin(), source.end());
     const auto result = mgstc::engine::importTones(bytes, "mus");
     REQUIRE_EQ(result.valid(), true);
@@ -396,7 +428,10 @@ void testToneImportMmlSccTrackEmbedsEveryTrackPatch() {
     }
     REQUIRE_EQ(timbre != nullptr, true);
     REQUIRE_EQ(timbre->layers.front().source, mgstc::engine::TimbreSource::Scc);
-    REQUIRE_EQ(timbre->embedded_timbres.size(), static_cast<std::size_t>(2));
+    REQUIRE_EQ(timbre->embedded_timbres.size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(
+        timbre->embedded_timbres.front().scc_waveform,
+        mgstc::engine::sccWaveformToBytes(wave_b));
 }
 
 void testToneImportDropsZeroTimeEnvelopeLoop() {
@@ -413,15 +448,10 @@ void testToneImportDropsZeroTimeEnvelopeLoop() {
     bytes.push_back(static_cast<std::uint8_t>(env.size()));
     bytes.insert(bytes.end(), env.begin(), env.end());
     bytes.push_back(0xFF);
+    appendMgsMusicTrack(bytes, header, 1, {0x49, 0x00, 0xFF});
     const auto result = mgstc::engine::importTones(bytes, "mgs");
     REQUIRE_EQ(result.valid(), true);
-    const mgstc::engine::CompositeTimbre* timbre = nullptr;
-    for (const auto& candidate : result.candidates) {
-        timbre = std::get_if<mgstc::engine::CompositeTimbre>(&candidate.data);
-        if (timbre != nullptr) {
-            break;
-        }
-    }
+    const auto* timbre = firstCompositeTimbre(result);
     REQUIRE_EQ(timbre != nullptr, true);
     REQUIRE_EQ(timbre->layers.empty(), false);
     REQUIRE_EQ(
@@ -454,6 +484,7 @@ void testToneImportMgsBinarySccTrackUsesSccLayer() {
         bytes.size() - header);
     bytes[header + 12] = static_cast<std::uint8_t>(music_relative);
     bytes[header + 13] = static_cast<std::uint8_t>(music_relative >> 8U);
+    bytes.push_back(0x83);
     bytes.push_back(0x49);
     bytes.push_back(0x00);
     bytes.push_back(0xFF);
@@ -518,6 +549,210 @@ void testToneImportSngWaveAndName() {
     REQUIRE_EQ(result.format, mgstc::engine::ToneImportFormat::SccMusixxSng);
     REQUIRE_EQ(result.candidates.size(), static_cast<std::size_t>(1));
     REQUIRE_EQ(result.candidates.front().name, std::string("SINEWAVE"));
+}
+
+std::vector<std::uint8_t> makeMgsEnvelopeOnlyVoice() {
+    std::vector<std::uint8_t> bytes{'M', 'G', 'S', '3', '\r', '\n', 0x1A};
+    const auto header = bytes.size();
+    bytes.resize(header + 0x28, 0);
+    bytes[header] = 0x00;
+    bytes[header + 4] = 0x28;
+    bytes[header + 5] = 0x00;
+    bytes.push_back(0x02);
+    bytes.push_back(0x00);
+    bytes.push_back(0x00);
+    bytes.push_back(0x01);
+    bytes.push_back(0x0F);
+    bytes.push_back(0xFF);
+    return bytes;
+}
+
+void requireNoImportedTones(const mgstc::engine::ToneImportResult& result) {
+    REQUIRE_EQ(result.valid(), false);
+    REQUIRE_EQ(result.candidates.empty(), true);
+    REQUIRE_EQ(result.errors.empty(), false);
+    REQUIRE_EQ(
+        result.errors.front().find("no complete tones") != std::string::npos,
+        true);
+}
+
+void testToneImportSkipsUnusedEnvelope() {
+    requireNoImportedTones(
+        mgstc::engine::importTones(makeMgsEnvelopeOnlyVoice(), "mgs"));
+
+    const std::string source = "@e0 = { f }\n";
+    const std::vector<std::uint8_t> mml(source.begin(), source.end());
+    requireNoImportedTones(mgstc::engine::importTones(mml, "mus"));
+}
+
+void testToneImportSkipsOpllRhythmChannelEnvelope() {
+    auto bytes = makeMgsEnvelopeOnlyVoice();
+    const auto marker = std::find(bytes.begin(), bytes.end(), 0x1A);
+    const auto header_off =
+        static_cast<std::size_t>(std::distance(bytes.begin(), marker) + 1);
+    appendMgsMusicTrack(
+        bytes,
+        header_off,
+        15,
+        {0x5C, 0x0E, 0x20, 0x49, 0x00, 0xFF});
+    requireNoImportedTones(mgstc::engine::importTones(bytes, "mgs"));
+
+    auto restored = makeMgsEnvelopeOnlyVoice();
+    appendMgsMusicTrack(
+        restored,
+        header_off,
+        15,
+        {0x5C, 0x0E, 0x20, 0x20, 0x10, 0x5C, 0x0E, 0x00, 0x49, 0x00, 0xFF});
+    const auto kept = mgstc::engine::importTones(restored, "mgs");
+    REQUIRE_EQ(kept.valid(), true);
+    REQUIRE_EQ(
+        countImportedType(kept, mgstc::engine::ImportedToneType::Composite),
+        1);
+    const auto* timbre = firstCompositeTimbre(kept);
+    REQUIRE_EQ(timbre != nullptr, true);
+    REQUIRE_EQ(timbre->layers.front().source, mgstc::engine::TimbreSource::Opll);
+
+    const std::string nine_voice =
+        "@e0 = { f }\n15 y14,32 @e0 c\n";
+    const std::vector<std::uint8_t> nine_bytes(
+        nine_voice.begin(), nine_voice.end());
+    const auto nine = mgstc::engine::importTones(nine_bytes, "mus");
+    REQUIRE_EQ(
+        countImportedType(nine, mgstc::engine::ImportedToneType::Composite),
+        0);
+
+    const std::string key_bits =
+        "@e0 = { f }\n15 y14,48 @e0 c\n";
+    const std::vector<std::uint8_t> key_bytes(
+        key_bits.begin(), key_bits.end());
+    const auto keyed = mgstc::engine::importTones(key_bytes, "mus");
+    REQUIRE_EQ(
+        countImportedType(keyed, mgstc::engine::ImportedToneType::Composite),
+        0);
+
+    const std::string psg_y =
+        "@e0 = { f }\n1 y14,32\n15 @e0 c\n";
+    const std::vector<std::uint8_t> psg_bytes(psg_y.begin(), psg_y.end());
+    const auto psg = mgstc::engine::importTones(psg_bytes, "mus");
+    REQUIRE_EQ(
+        countImportedType(psg, mgstc::engine::ImportedToneType::Composite),
+        1);
+
+    const std::string f_letter =
+        "@e0 = { f }\nF y14,32 @e0 c\n";
+    const std::vector<std::uint8_t> f_bytes(
+        f_letter.begin(), f_letter.end());
+    const auto f_track = mgstc::engine::importTones(f_bytes, "mus");
+    REQUIRE_EQ(
+        countImportedType(f_track, mgstc::engine::ImportedToneType::Composite),
+        0);
+
+    const std::string g_y_f_env =
+        "@e0 = { f }\nF @e0 c\nG y14,32\n";
+    const std::vector<std::uint8_t> g_y_bytes(
+        g_y_f_env.begin(), g_y_f_env.end());
+    REQUIRE_EQ(
+        countImportedType(
+            mgstc::engine::importTones(g_y_bytes, "mus"),
+            mgstc::engine::ImportedToneType::Composite),
+        0);
+
+    const std::string h_y =
+        "@e0 = { f }\n15 @e0 c\n17 y14,32\n";
+    const std::vector<std::uint8_t> h_y_bytes(h_y.begin(), h_y.end());
+    REQUIRE_EQ(
+        countImportedType(
+            mgstc::engine::importTones(h_y_bytes, "mus"),
+            mgstc::engine::ImportedToneType::Composite),
+        0);
+
+    auto other_ch = makeMgsEnvelopeOnlyVoice();
+    appendMgsMusicTrack(other_ch, header_off, 15, {0x49, 0x00, 0xFF});
+    appendMgsMusicTrack(
+        other_ch, header_off, 16, {0x5C, 0x0E, 0x20, 0xFF});
+    requireNoImportedTones(mgstc::engine::importTones(other_ch, "mgs"));
+
+    const std::string melody_y =
+        "@e0 = { f }\n9 y14,32\n15 @e0 c\n";
+    const std::vector<std::uint8_t> melody_bytes(
+        melody_y.begin(), melody_y.end());
+    const auto from_melody = mgstc::engine::importTones(melody_bytes, "mus");
+    REQUIRE_EQ(
+        countImportedType(
+            from_melody, mgstc::engine::ImportedToneType::Composite),
+        1);
+}
+
+void testToneImportRhythmHeaderAndMelodyTrack() {
+    auto rhythm_header = makeMgsEnvelopeOnlyVoice();
+    const auto marker = std::find(
+        rhythm_header.begin(), rhythm_header.end(), 0x1A);
+    const auto header_off =
+        static_cast<std::size_t>(std::distance(rhythm_header.begin(), marker) + 1);
+    rhythm_header[header_off + 1] = 0x01;
+    appendMgsMusicTrack(
+        rhythm_header, header_off, 15, {0x49, 0x00, 0xFF});
+    const auto skipped = mgstc::engine::importTones(rhythm_header, "mgs");
+    REQUIRE_EQ(
+        countImportedType(skipped, mgstc::engine::ImportedToneType::Composite),
+        0);
+
+    auto melody = makeMgsEnvelopeOnlyVoice();
+    melody[header_off + 1] = 0x01;
+    appendMgsMusicTrack(melody, header_off, 9, {0x49, 0x00, 0xFF});
+    appendMgsMusicTrack(
+        melody, header_off, 15, {0x5C, 0x0E, 0x20, 0xFF});
+    const auto kept = mgstc::engine::importTones(melody, "mgs");
+    REQUIRE_EQ(
+        countImportedType(kept, mgstc::engine::ImportedToneType::Composite),
+        1);
+
+    const std::string source =
+        "#opll_mode 1\n@e0 = { f }\n@e1 = { 8 }\n"
+        "15 y14,32 @e0 c y14,0 @e1 c\n";
+    const std::vector<std::uint8_t> mml(source.begin(), source.end());
+    const auto text = mgstc::engine::importTones(mml, "mus");
+    REQUIRE_EQ(text.valid(), true);
+    REQUIRE_EQ(
+        countImportedType(text, mgstc::engine::ImportedToneType::Composite),
+        1);
+}
+
+void testToneImportUsedEnvelopeWithoutPatchUsesDefault() {
+    const std::string opll_source = "@e0 = { f }\n9 @e0 c\n";
+    const std::vector<std::uint8_t> opll_bytes(
+        opll_source.begin(), opll_source.end());
+    const auto opll = mgstc::engine::importTones(opll_bytes, "mus");
+    const auto* opll_timbre = firstCompositeTimbre(opll);
+    REQUIRE_EQ(opll_timbre != nullptr, true);
+    REQUIRE_EQ(opll_timbre->layers.front().source, mgstc::engine::TimbreSource::Opll);
+    REQUIRE_EQ(opll_timbre->layers.front().base_opll_rom.has_value(), true);
+    REQUIRE_EQ(*opll_timbre->layers.front().base_opll_rom, 0);
+    REQUIRE_EQ(opll_timbre->embedded_timbres.empty(), true);
+
+    const std::string rom_source = "@e0 = { f }\n9 @5 @e0 c\n";
+    const std::vector<std::uint8_t> rom_bytes(
+        rom_source.begin(), rom_source.end());
+    const auto rom = mgstc::engine::importTones(rom_bytes, "mus");
+    const auto* rom_timbre = firstCompositeTimbre(rom);
+    REQUIRE_EQ(rom_timbre != nullptr, true);
+    REQUIRE_EQ(rom_timbre->layers.front().base_opll_rom.has_value(), true);
+    REQUIRE_EQ(*rom_timbre->layers.front().base_opll_rom, 5);
+
+    const std::string scc_source = "@e0 = { f }\n4 @e0 c\n";
+    const std::vector<std::uint8_t> scc_bytes(
+        scc_source.begin(), scc_source.end());
+    const auto scc = mgstc::engine::importTones(scc_bytes, "mus");
+    const auto* scc_timbre = firstCompositeTimbre(scc);
+    REQUIRE_EQ(scc_timbre != nullptr, true);
+    REQUIRE_EQ(scc_timbre->layers.front().source, mgstc::engine::TimbreSource::Scc);
+    REQUIRE_EQ(scc_timbre->layers.front().base_timbre.has_value(), true);
+    const auto triangle = mgstc::engine::generateSccPreset(
+        mgstc::engine::SccWavePreset::Triangle,
+        mgstc::engine::SccHarmonic::One);
+    REQUIRE_EQ(
+        scc_timbre->layers.front().base_timbre->scc_waveform,
+        mgstc::engine::sccWaveformToBytes(triangle));
 }
 
 void testImportedLibraryEntryKeepsEmptyName() {

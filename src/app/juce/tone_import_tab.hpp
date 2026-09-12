@@ -151,6 +151,10 @@ private:
 
     class MiniPreview final : public juce::Component {
     public:
+        MiniPreview() {
+            setInterceptsMouseClicks(false, false);
+        }
+
         void setCandidate(const mgstc::engine::ImportedToneCandidate& candidate) {
             candidate_ = candidate;
             if (const auto* patch =
@@ -373,6 +377,9 @@ private:
             type_.setFont(UiFonts::body());
             addAndMakeVisible(type_);
             UiFonts::styleBodyField(name_);
+            name_.setTextToShowWhenEmpty(
+                juce::String::fromUTF8("音色名を設定"),
+                juce::Colour(0xFF7F8993));
             name_.onTextChange = [this] {
                 candidate().name = utf8String(name_.getText());
             };
@@ -573,7 +580,7 @@ private:
             if (group.result.candidates.empty()) {
                 continue;
             }
-            group.checked.assign(group.result.candidates.size(), 1);
+            group.checked.assign(group.result.candidates.size(), 0);
             added_candidates += static_cast<int>(group.result.candidates.size());
             ++added_files;
             files_.push_back(std::move(group));
@@ -659,7 +666,19 @@ private:
         using namespace UiLayout;
         const int row_h = fieldH + sm;
         const int header_h = fieldH;
-        const int width = std::max(1, viewport_.getWidth());
+        const int viewport_w = std::max(1, viewport_.getWidth());
+        const int viewport_h = std::max(1, viewport_.getHeight());
+        int content_h = 0;
+        for (const auto& group : files_) {
+            content_h += header_h;
+            content_h += static_cast<int>(group.result.candidates.size()) * row_h;
+        }
+        content_h = std::max(row_h, content_h);
+        int width = viewport_w;
+        if (content_h > viewport_h) {
+            width = std::max(
+                1, viewport_w - viewport_.getScrollBarThickness());
+        }
         int y = 0;
         std::size_t row_index = 0;
         for (std::size_t file_index = 0; file_index < files_.size(); ++file_index) {
@@ -676,7 +695,7 @@ private:
                 ++row_index;
             }
         }
-        list_host_.setSize(width, std::max(row_h, y));
+        list_host_.setSize(width, content_h);
     }
 
     void updateStatus() {

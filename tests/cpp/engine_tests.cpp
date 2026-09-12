@@ -5986,6 +5986,13 @@ int main(int argc, char** argv) {
         {"ToneImportMusicaVcdNamesAndSccEnvelope",
          testToneImportMusicaVcdNamesAndSccEnvelope},
         {"ToneImportSngWaveAndName", testToneImportSngWaveAndName},
+        {"ToneImportSkipsUnusedEnvelope", testToneImportSkipsUnusedEnvelope},
+        {"ToneImportSkipsOpllRhythmChannelEnvelope",
+         testToneImportSkipsOpllRhythmChannelEnvelope},
+        {"ToneImportRhythmHeaderAndMelodyTrack",
+         testToneImportRhythmHeaderAndMelodyTrack},
+        {"ToneImportUsedEnvelopeWithoutPatchUsesDefault",
+         testToneImportUsedEnvelopeWithoutPatchUsesDefault},
         {"ImportedLibraryEntryKeepsEmptyName",
          testImportedLibraryEntryKeepsEmptyName},
 #ifdef _WIN32

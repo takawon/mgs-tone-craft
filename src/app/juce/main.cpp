@@ -7892,6 +7892,10 @@ public:
         auditionCompositeModel(*timbre);
     }
 
+    void stopImportedPreview() {
+        stopAudition();
+    }
+
     void loadImportedCandidate(
         const mgstc::engine::ImportedToneCandidate& candidate) {
         auto timbre = mgstc::engine::makeImportedComposite(
@@ -11295,8 +11299,7 @@ public:
                 }
             });
         }
-        engine_ready_ = audio_service.running()
-            && configureEngine(false);
+        engine_ready_ = audio_service.running();
         startTimerHz(60);
         updateStatus(
             engine_ready_
@@ -11500,6 +11503,12 @@ public:
         }
         last_audition_note_ = loadLastAuditionNoteSetting();
         static_cast<void>(auditionOneSecond(wave));
+    }
+
+    void stopImportedPreview() {
+        silenceAllVoices();
+        engine_holds_temporary_program_ = false;
+        dismissPreviewState(false);
     }
 
     void loadImportedCandidate(
@@ -12990,12 +12999,29 @@ private:
         const SccWaveform& wave,
         const std::string& name,
         bool favorite) {
-        performNewLibraryEntry();
-        commitWave(wave);
+        silenceAllVoices();
+        dismissPreviewState(false);
+        scale_previewing_ = false;
+        selected_library_id_.reset();
+        library_list_.setSelectedId(0, juce::dontSendNotification);
+        selected_tags_.clear();
+        updateTagButtons();
+        memo_.clear();
+        scc_wave_ = wave;
+        graph_.setWaveform(scc_wave_);
+        history_.clear();
+        history_.push_back(scc_wave_);
+        history_cursor_ = 0;
+        updateHistoryButtons();
+        if (engine_ready_) {
+            static_cast<void>(configureEngine(false));
+        }
         name_.setText(
             juce::String::fromUTF8(name.c_str()),
             juce::dontSendNotification);
         favorite_.setToggleState(favorite, juce::dontSendNotification);
+        updateDefinitionPreview();
+        setEditorBaseline();
         updateStatus(
             juce::String::fromUTF8(
                 "インポートしたSCC音色を編集中（未保存）"));
@@ -14899,8 +14925,7 @@ public:
                 }
             });
         }
-        engine_ready_ = audio_service.running()
-            && configureEngine(false);
+        engine_ready_ = audio_service.running();
         startTimerHz(60);
         updateStatus(
             engine_ready_
@@ -15115,6 +15140,11 @@ public:
         }
         last_audition_note_ = loadLastAuditionNoteSetting();
         static_cast<void>(auditionOneSecond(patch));
+    }
+
+    void stopImportedPreview() {
+        silenceAllVoices();
+        engine_holds_temporary_program_ = false;
     }
 
     void loadImportedCandidate(
@@ -16231,12 +16261,29 @@ private:
         const mgstc::engine::OpllPatchParameters& patch,
         const std::string& name,
         bool favorite) {
-        performNewLibraryEntry();
-        commitPatch(patch);
+        silenceAllVoices();
+        selected_library_id_.reset();
+        library_list_.setSelectedId(
+            0, juce::dontSendNotification);
+        selected_tags_.clear();
+        updateTagButtons();
+        memo_.clear();
+        patch_ = patch;
+        clearWaveCandidates();
+        history_.clear();
+        history_.push_back(patch_);
+        history_cursor_ = 0;
+        updateHistoryButtons();
+        syncControls();
+        if (engine_ready_) {
+            static_cast<void>(configureEngine(false));
+        }
         name_.setText(
             juce::String::fromUTF8(name.c_str()),
             juce::dontSendNotification);
         favorite_.setToggleState(favorite, juce::dontSendNotification);
+        updateDefinitionPreview();
+        setEditorBaseline();
         updateStatus(
             juce::String::fromUTF8(
                 "インポートしたOPLL音色を編集中（未保存）"));
@@ -17360,6 +17407,24 @@ public:
         }
     }
 
+    void silenceImportedPreview() {
+        if (auto* composite =
+                dynamic_cast<CompositeEditorComponent*>(
+                    getContentComponent())) {
+            composite->stopImportedPreview();
+            return;
+        }
+        if (auto* scc = dynamic_cast<SccEditorComponent*>(
+                getContentComponent())) {
+            scc->stopImportedPreview();
+            return;
+        }
+        if (auto* opll = dynamic_cast<OpllEditorComponent*>(
+                getContentComponent())) {
+            opll->stopImportedPreview();
+        }
+    }
+
     void loadImportedCandidate(
         const mgstc::engine::ImportedToneCandidate& candidate) {
         if (candidate.default_register_as
@@ -18163,9 +18228,11 @@ private:
                     == mgstc::engine::ImportRegisterAs::Scc
                 ? "scc"
                 : "opll";
-        if (auto* window = showEditor(editor)) {
+        if (auto* window = ensureEditor(editor, false, false)) {
+            window->silenceImportedPreview();
             window->loadImportedCandidate(candidate);
         }
+        static_cast<void>(showEditor(editor));
     }
 
     void libraryManagerImportedNoteOn(
