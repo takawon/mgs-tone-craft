@@ -60,23 +60,32 @@ struct Column {
     std::uint8_t guide_note{60}, guide_track{};
     bool note_active{};
 };
+struct HistoryFrame {
+    FrameInfo info{};
+    Trace mixed{};
+    std::uint64_t interval_samples{hop};
+};
 struct Frame {
     FrameInfo info{};
     Trace mixed{};
     std::array<Trace, channels> channel{};
     Column column{};
+    HistoryFrame finalized_history{};
     bool channels_available{true};
+    bool history_finalized{};
 };
-struct HistoryFrame { FrameInfo info{}; Trace mixed{}; };
 
 class History {
 public:
     History() : frames_(historyCapacity) {}
     void clear() noexcept { count_ = write_ = 0; }
-    void append(const Frame& f) {
-        frames_[write_] = {f.info, f.mixed};
+    void append(const HistoryFrame& f) {
+        frames_[write_] = f;
         write_ = (write_ + 1) % frames_.size();
         count_ = std::min(count_ + 1, frames_.size());
+        constexpr auto maximum_history_samples = static_cast<std::uint64_t>(5.0 * sampleRate);
+        while (count_ > 1 && latest()->info.sample - at(0).info.sample > maximum_history_samples)
+            --count_;
     }
     std::size_t size() const noexcept { return count_; }
     const HistoryFrame& at(std::size_t chronological) const noexcept {
@@ -95,8 +104,10 @@ public:
         if (lo > 0 && std::abs(static_cast<double>(at(lo - 1).info.sample) - sample)
                       < std::abs(static_cast<double>(best->info.sample) - sample))
             best = &at(lo - 1);
-        // Never stretch a nearby valid frame across an acquisition gap.
-        return std::abs(static_cast<double>(best->info.sample) - sample) <= hop / 2.0 + 1.0
+        // Averaged frames represent one complete history interval. Never
+        // stretch one across a wider acquisition gap.
+        const auto tolerance = static_cast<double>(best->interval_samples) / 2.0 + hop / 2.0 + 1.0;
+        return std::abs(static_cast<double>(best->info.sample) - sample) <= tolerance
             ? best : nullptr;
     }
 private:
@@ -109,27 +120,37 @@ public:
     Model() : latest_(std::make_unique<Frame>()), stopped_(std::make_unique<Frame>()) {}
     void ingest(const Frame& frame) {
         if (context_ != frame.info.context) {
-            live.clear(); frozen.clear(); paused = false; selected_seconds = 0;
+            clearAcquisition();
             context_ = frame.info.context;
         }
-        live.append(frame);
+        if (frame.history_finalized) live.append(frame.finalized_history);
         *latest_ = frame;
+        current_ = {frame.info, frame.mixed, hop};
+        current_valid_ = true;
     }
-    void clearAcquisition() { live.clear(); frozen.clear(); paused = false; selected_seconds = 0; }
+    void clearAcquisition() {
+        live.clear(); frozen.clear(); paused = false; selected_seconds = 0;
+        current_valid_ = stopped_current_valid_ = false;
+    }
+    void clearHistory() noexcept { live.clear(); frozen.clear(); selected_seconds = 0; }
     void setPaused(bool value) {
-        if (paused == value || (value && !live.size())) return;
+        if (paused == value || (value && !current_valid_)) return;
         paused = value;
         selected_seconds = 0;
         if (paused) {
             frozen = live; // Both vectors already have identical preallocated sizes.
             *stopped_ = *latest_;
+            stopped_current_ = current_;
+            stopped_current_valid_ = true;
         }
     }
     const History& history() const noexcept { return paused ? frozen : live; }
     const HistoryFrame* front() const noexcept {
-        const auto* last = history().latest();
-        return last ? history().nearest(static_cast<double>(last->info.sample)
-                         - (paused ? selected_seconds * sampleRate : 0.0)) : nullptr;
+        if (!paused) return current_valid_ ? &current_ : nullptr;
+        if (!stopped_current_valid_) return nullptr;
+        if (selected_seconds <= 0) return &stopped_current_;
+        return history().nearest(static_cast<double>(stopped_current_.info.sample)
+                                 - selected_seconds * sampleRate);
     }
     const Frame* channelFrame() const noexcept {
         if (!front() || (paused && front()->info.id != stopped_->info.id)) return nullptr;
@@ -138,14 +159,17 @@ public:
     }
     double availableSeconds() const noexcept {
         const auto& h = history();
-        return h.size() ? std::min(5.0, static_cast<double>(h.latest()->info.sample - h.at(0).info.sample)
-                                        / sampleRate) : 0.0;
+        const auto* current = paused ? (stopped_current_valid_ ? &stopped_current_ : nullptr)
+                                     : (current_valid_ ? &current_ : nullptr);
+        return h.size() && current
+            ? std::min(5.0, static_cast<double>(current->info.sample - h.at(0).info.sample) / sampleRate)
+            : 0.0;
     }
     double selectedAge() const noexcept {
         const auto* f = front();
-        const auto* last = history().latest();
-        return paused && f && last ? static_cast<double>(last->info.sample - f->info.sample) / sampleRate
-                                  : selected_seconds;
+        return paused && f && stopped_current_valid_
+            ? static_cast<double>(stopped_current_.info.sample - f->info.sample) / sampleRate
+            : selected_seconds;
     }
     void hold() {
         if (const auto* f = front()) {
@@ -161,6 +185,8 @@ public:
     double selected_seconds{}, reference_selection_seconds{};
 private:
     std::unique_ptr<Frame> latest_, stopped_;
+    HistoryFrame current_{}, stopped_current_{};
+    bool current_valid_{}, stopped_current_valid_{};
     std::uint64_t context_{};
 };
 struct GuideState {

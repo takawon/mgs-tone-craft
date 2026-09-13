@@ -77,11 +77,16 @@ ToneImportResult importSccMusixxSng(std::span<const std::uint8_t> bytes) {
         }
         std::array<std::uint8_t, 32> wave{};
         std::copy(wave_bytes.begin(), wave_bytes.end(), wave.begin());
+        auto label = tone_import_detail::decodeCp932Name(name_bytes);
+        if (label.empty()) {
+            label = tone_import_detail::paddedImportNumber(
+                static_cast<unsigned>(index));
+        }
         tone_import_detail::addCandidate(
             result.candidates,
             tone_import_detail::makeSccCandidate(
                 sccWaveformFromBytes(wave),
-                tone_import_detail::decodeCp932Name(name_bytes),
+                std::move(label),
                 "SNG"));
     }
     return result;

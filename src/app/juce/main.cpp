@@ -5582,7 +5582,7 @@ public:
         suppress_pc_input_ = std::move(callback);
     }
 
-    // Keep MIDI / PC keys alive while a modal (e.g. software LFO) holds focus.
+    // Keep MIDI / PC keys alive while an approved auxiliary window holds focus.
     void setInputActiveOverride(bool enabled) noexcept {
         input_active_override_ = enabled;
     }
@@ -7640,7 +7640,7 @@ public:
                 audition_layer_filter_ =
                     isolate && layer ? layer : std::nullopt;
                 performance_keyboard_.setInputActiveOverride(
-                    layer.has_value());
+                    satellite_session_ || spectrogram_input_active_);
                 composite_program_stale_ = true;
                 if (!layer) {
                     stopAudition();
@@ -7879,6 +7879,12 @@ public:
 
     [[nodiscard]] bool polyphonic() const noexcept {
         return performance_keyboard_.polyphonic();
+    }
+
+    void setSpectrogramInputActive(bool active) noexcept {
+        spectrogram_input_active_ = active;
+        performance_keyboard_.setInputActiveOverride(
+            satellite_session_ || spectrogram_input_active_);
     }
 
     void auditionImportedCandidate(
@@ -10303,6 +10309,7 @@ private:
         bool timeline_preview_pending_{};
     double timeline_preview_due_ms_{};
     bool satellite_session_{};
+    bool spectrogram_input_active_{};
     std::optional<std::size_t> audition_layer_filter_{};
 };
 
@@ -11492,6 +11499,10 @@ public:
 
     [[nodiscard]] bool polyphonic() const noexcept {
         return performance_keyboard_.polyphonic();
+    }
+
+    void setSpectrogramInputActive(bool active) noexcept {
+        performance_keyboard_.setInputActiveOverride(active);
     }
 
     void auditionImportedCandidate(
@@ -15131,6 +15142,10 @@ public:
         return performance_keyboard_.polyphonic();
     }
 
+    void setSpectrogramInputActive(bool active) noexcept {
+        performance_keyboard_.setInputActiveOverride(active);
+    }
+
     void auditionImportedCandidate(
         const mgstc::engine::ImportedToneCandidate& candidate) {
         const auto* patch =
@@ -17317,6 +17332,20 @@ public:
         return true;
     }
 
+    void setSpectrogramInputActive(bool active) noexcept {
+        if (auto* composite =
+                dynamic_cast<CompositeEditorComponent*>(
+                    getContentComponent())) {
+            composite->setSpectrogramInputActive(active);
+        } else if (auto* scc = dynamic_cast<SccEditorComponent*>(
+                       getContentComponent())) {
+            scc->setSpectrogramInputActive(active);
+        } else if (auto* opll = dynamic_cast<OpllEditorComponent*>(
+                       getContentComponent())) {
+            opll->setSpectrogramInputActive(active);
+        }
+    }
+
     void refreshExternalState() {
         MGSTC_UI_ACTIVITY("window: refresh external state (library reload)");
         if (auto* opll =
@@ -17868,6 +17897,12 @@ public:
             showSpectrogram();
             auto* const first_spectrogram = spectrogram_window_.get();
             showSpectrogram();
+            first_spectrogram->closeButtonPressed();
+            const bool spectrogram_input_released =
+                !spectrogram_performance_input_active_
+                && spectrogram_input_editor_.isEmpty()
+                && !first_spectrogram->isVisible();
+            showSpectrogram();
             routing_test_passed_ = main != nullptr
                 && first_scc != nullptr
                 && opll != nullptr
@@ -17877,7 +17912,10 @@ public:
                 && opll->isVisible()
                 && first_spectrogram != nullptr
                 && first_spectrogram == spectrogram_window_.get()
-                && first_spectrogram->isVisible();
+                && first_spectrogram->isVisible()
+                && spectrogram_performance_input_active_
+                && spectrogram_input_editor_ == active_editor_
+                && spectrogram_input_released;
             startTimer(250);
             return;
         }
@@ -18089,11 +18127,41 @@ private:
             UiScale::forceGlobalForNonEditorUi();
             spectrogram_window_ =
                 std::make_unique<mgstc::app::SpectrogramWindow>(
-                    audio_service_->engine());
+                    audio_service_->engine(),
+                    [this](bool active) {
+                        setSpectrogramPerformanceInputActive(active);
+                    });
         }
         spectrogram_window_->setAnalysisMode(
             spectrogramAnalysisModeForEditor(active_editor_));
         spectrogram_window_->showWindow();
+    }
+
+    void setSpectrogramPerformanceInputActive(bool active) {
+        spectrogram_performance_input_active_ = active;
+        updateSpectrogramPerformanceInputTarget();
+    }
+
+    void updateSpectrogramPerformanceInputTarget() {
+        const auto clear = [](const std::unique_ptr<MainWindow>& window) {
+            if (window != nullptr) {
+                window->setSpectrogramInputActive(false);
+            }
+        };
+        clear(main_window_);
+        clear(scc_window_);
+        clear(opll_window_);
+        clear(scc_envelope_window_);
+        clear(opll_envelope_window_);
+        spectrogram_input_editor_.clear();
+        if (!spectrogram_performance_input_active_) {
+            return;
+        }
+        auto& target = windowSlot(active_editor_);
+        if (target != nullptr && target->isVisible()) {
+            target->setSpectrogramInputActive(true);
+            spectrogram_input_editor_ = active_editor_;
+        }
     }
 
     [[nodiscard]] MainWindow* showEditor(
@@ -18588,6 +18656,7 @@ private:
             }
         }
         pending_activate_editor_.reset();
+        updateSpectrogramPerformanceInputTarget();
     }
 
     void timerCallback() override {
@@ -18687,12 +18756,14 @@ private:
     mgstc::app::UiHangWatchdog hang_watchdog_;
     juce::String primary_editor_{"main"};
     juce::String active_editor_{"main"};
+    juce::String spectrogram_input_editor_;
     std::uint8_t composite_spectrogram_source_mask_{};
     juce::String snapshot_target_{"editor"};
     bool offline_spectrogram_capture_{};
     double snapshot_due_ms_{};
     bool routing_test_mode_{};
     bool routing_test_passed_{};
+    bool spectrogram_performance_input_active_{};
     bool close_confirmation_pending_{};
     bool activating_editor_{};
     std::optional<juce::String> pending_activate_editor_;

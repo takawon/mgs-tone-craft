@@ -5993,6 +5993,8 @@ int main(int argc, char** argv) {
          testToneImportRhythmHeaderAndMelodyTrack},
         {"ToneImportUsedEnvelopeWithoutPatchUsesDefault",
          testToneImportUsedEnvelopeWithoutPatchUsesDefault},
+        {"ToneImportDefaultCandidateNames",
+         testToneImportDefaultCandidateNames},
         {"ImportedLibraryEntryKeepsEmptyName",
          testImportedLibraryEntryKeepsEmptyName},
 #ifdef _WIN32

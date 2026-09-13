@@ -148,7 +148,7 @@ void testToneImportVgmCompleteOpllAndDuplicates() {
     REQUIRE_EQ(result.format, mgstc::engine::ToneImportFormat::Vgm);
     REQUIRE_EQ(result.candidates.size(), static_cast<std::size_t>(1));
     REQUIRE_EQ(result.candidates.front().type, mgstc::engine::ImportedToneType::Opll);
-    REQUIRE_EQ(result.candidates.front().name.empty(), true);
+    REQUIRE_EQ(result.candidates.front().name, std::string("tone - 00"));
     const auto* patch = std::get_if<mgstc::engine::OpllPatchParameters>(
         &result.candidates.front().data);
     REQUIRE_EQ(patch != nullptr, true);
@@ -186,6 +186,7 @@ void testToneImportVgmSccCompleteReorderAndPartial() {
     REQUIRE_EQ(result.valid(), true);
     REQUIRE_EQ(result.candidates.size(), static_cast<std::size_t>(1));
     REQUIRE_EQ(result.candidates.front().type, mgstc::engine::ImportedToneType::Scc);
+    REQUIRE_EQ(result.candidates.front().name, std::string("00"));
     const auto* wave = std::get_if<mgstc::engine::SccWaveform>(
         &result.candidates.front().data);
     REQUIRE_EQ(wave != nullptr, true);
@@ -206,6 +207,7 @@ void testToneImportVgzMatchesVgm() {
     REQUIRE_EQ(result.valid(), true);
     REQUIRE_EQ(result.format, mgstc::engine::ToneImportFormat::Vgz);
     REQUIRE_EQ(result.candidates.size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(result.candidates.front().name, std::string("tone - 00"));
 }
 
 void testToneImportMmlTonesAndSelfContainedEnvelope() {
@@ -753,6 +755,88 @@ void testToneImportUsedEnvelopeWithoutPatchUsesDefault() {
     REQUIRE_EQ(
         scc_timbre->layers.front().base_timbre->scc_waveform,
         mgstc::engine::sccWaveformToBytes(triangle));
+}
+
+void testToneImportDefaultCandidateNames() {
+    const auto opll = mgstc::engine::formatMgsOpllDefinition(
+        mgstc::engine::decodeOpllPatch(
+            std::array<std::uint8_t, 8>{1, 2, 3, 4, 5, 6, 7, 8}),
+        5,
+        {});
+    const std::string titled = "#title { Storm Night }\n" + opll;
+    const std::vector<std::uint8_t> titled_bytes(titled.begin(), titled.end());
+    const auto titled_result = mgstc::engine::importTones(
+        titled_bytes, "mus", "ignored.mus");
+    REQUIRE_EQ(titled_result.valid(), true);
+    REQUIRE_EQ(titled_result.title, std::string("Storm Night"));
+    REQUIRE_EQ(titled_result.candidates.size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(
+        titled_result.candidates.front().name, std::string("Storm Night - 05"));
+
+    const std::string commented =
+        "; #title { Nope }\n" + opll;
+    const std::vector<std::uint8_t> commented_bytes(
+        commented.begin(), commented.end());
+    const auto file_result = mgstc::engine::importTones(
+        commented_bytes, "mus", "tune.mus");
+    REQUIRE_EQ(file_result.valid(), true);
+    REQUIRE_EQ(file_result.title.empty(), true);
+    REQUIRE_EQ(file_result.candidates.front().name, std::string("tune - 05"));
+
+    std::vector<std::uint8_t> mgs{
+        'M', 'G', 'S', '3', '\r', '\n', 'S', 't', 'o', 'r', 'm', '\r', '\n',
+        0x1A};
+    const auto header = mgs.size();
+    mgs.resize(header + 0x28, 0);
+    mgs[header] = 0x00;
+    mgs[header + 4] = 0x28;
+    mgs[header + 5] = 0x00;
+    mgs.push_back(0x00);
+    mgs.push_back(0x03);
+    for (int index = 0; index < 8; ++index) {
+        mgs.push_back(static_cast<std::uint8_t>(index + 1));
+    }
+    mgs.push_back(0xFF);
+    const auto mgs_result = mgstc::engine::importTones(mgs, "mgs", "song.mgs");
+    REQUIRE_EQ(mgs_result.valid(), true);
+    REQUIRE_EQ(mgs_result.title, std::string("Storm"));
+    REQUIRE_EQ(mgs_result.candidates.front().name, std::string("Storm - 03"));
+
+    std::vector<std::uint8_t> sng(80, 0);
+    const char sng_name[] = "SINEWAVE";
+    std::copy(sng_name, sng_name + 8, sng.begin());
+    for (int index = 0; index < 32; ++index) {
+        sng[8 + index] = static_cast<std::uint8_t>(index + 1);
+        sng[48 + index] = static_cast<std::uint8_t>(index + 2);
+    }
+    const auto sng_result = mgstc::engine::importTones(sng, "sng", "lead.sng");
+    REQUIRE_EQ(sng_result.valid(), true);
+    REQUIRE_EQ(sng_result.candidates.size(), static_cast<std::size_t>(2));
+    REQUIRE_EQ(sng_result.candidates[0].name, std::string("lead - SINEWAVE"));
+    REQUIRE_EQ(sng_result.candidates[1].name, std::string("lead - 01"));
+
+    std::vector<std::uint8_t> vcd(0x10B8, 0);
+    const char vcd_name[] = "LEAD";
+    std::copy(vcd_name, vcd_name + 4, vcd.begin());
+    vcd[0x05A0] = 0x21;
+    vcd[0x05A8] = 0x11;
+    const auto vcd_result = mgstc::engine::importTones(vcd, "vcd", "bank.vcd");
+    REQUIRE_EQ(vcd_result.valid(), true);
+    REQUIRE_EQ(vcd_result.candidates.size(), static_cast<std::size_t>(2));
+    REQUIRE_EQ(vcd_result.candidates[0].name, std::string("bank - LEAD"));
+    REQUIRE_EQ(vcd_result.candidates[1].name, std::string("bank - 01"));
+
+    const auto first = opllWrites({1, 2, 3, 4, 5, 6, 7, 8});
+    auto second = opllWrites({8, 7, 6, 5, 4, 3, 2, 1});
+    std::vector<std::uint8_t> commands = first;
+    commands.pop_back();
+    commands.insert(commands.end(), second.begin(), second.end());
+    const auto vgm_result = mgstc::engine::importTones(
+        makeVgm(commands), "vgm", "chip.vgm");
+    REQUIRE_EQ(vgm_result.valid(), true);
+    REQUIRE_EQ(vgm_result.candidates.size(), static_cast<std::size_t>(2));
+    REQUIRE_EQ(vgm_result.candidates[0].name, std::string("chip - 00"));
+    REQUIRE_EQ(vgm_result.candidates[1].name, std::string("chip - 01"));
 }
 
 void testImportedLibraryEntryKeepsEmptyName() {

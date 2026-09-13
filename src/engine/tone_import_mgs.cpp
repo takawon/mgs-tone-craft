@@ -9,6 +9,8 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace mgstc::engine {
@@ -50,6 +52,10 @@ std::optional<std::size_t> findMgsBinaryHeader(
     return *marker + 1;
 }
 
+[[nodiscard]] bool lineStartsWithIgnoreCase(
+    std::string_view text,
+    std::string_view prefix) noexcept;
+
 std::string stripPsgModeNoiseTokens(std::string_view body, bool& stripped) {
     stripped = false;
     std::string output;
@@ -81,6 +87,118 @@ std::string stripPsgModeNoiseTokens(std::string_view body, bool& stripped) {
         ++position;
     }
     return output;
+}
+
+std::string titleFromHeaderBytes(std::span<const std::uint8_t> bytes) {
+    std::string decoded = tone_import_detail::decodeCp932Name(bytes);
+    std::string title;
+    std::size_t line_begin = 0;
+    while (line_begin <= decoded.size()) {
+        const auto line_end = decoded.find_first_of("\r\n", line_begin);
+        const auto line = decoded.substr(
+            line_begin,
+            (line_end == std::string::npos ? decoded.size() : line_end)
+                - line_begin);
+        std::size_t start = 0;
+        while (start < line.size()
+               && std::isspace(static_cast<unsigned char>(line[start]))) {
+            ++start;
+        }
+        if (start < line.size() && line[start] != ';') {
+            auto piece = tone_import_detail::collapseImportLabel(
+                line.substr(start));
+            if (!piece.empty()) {
+                if (!title.empty()) {
+                    title.push_back(' ');
+                }
+                title += piece;
+            }
+        }
+        if (line_end == std::string::npos) {
+            break;
+        }
+        line_begin = line_end + 1;
+        if (line_end < decoded.size()
+            && decoded[line_end] == '\r'
+            && line_end + 1 < decoded.size()
+            && decoded[line_end + 1] == '\n') {
+            line_begin = line_end + 2;
+        }
+    }
+    return title;
+}
+
+std::string extractMgsBinaryTitle(std::span<const std::uint8_t> bytes) {
+    if (!isMgsMagic(bytes)) {
+        return {};
+    }
+    const auto marker = findMgsEofMarker(bytes);
+    if (!marker || *marker <= 4) {
+        return {};
+    }
+    return titleFromHeaderBytes(bytes.subspan(4, *marker - 4));
+}
+
+std::string extractMgsMmlTitle(std::string_view text) {
+    std::string cleaned;
+    cleaned.reserve(text.size());
+    bool comment = false;
+    for (const char character : text) {
+        if (comment) {
+            if (character == '\r' || character == '\n') {
+                comment = false;
+                cleaned.push_back(character);
+            }
+            continue;
+        }
+        if (character == ';') {
+            comment = true;
+            cleaned.push_back(' ');
+        } else {
+            cleaned.push_back(character);
+        }
+    }
+    for (std::size_t index = 0; index + 6 <= cleaned.size(); ++index) {
+        if (index > 0
+            && !std::isspace(static_cast<unsigned char>(cleaned[index - 1]))) {
+            continue;
+        }
+        if (!lineStartsWithIgnoreCase(
+                std::string_view(cleaned).substr(index), "#title")) {
+            continue;
+        }
+        auto position = index + 6;
+        if (position < cleaned.size()
+            && cleaned[position] != '{'
+            && !std::isspace(static_cast<unsigned char>(cleaned[position]))) {
+            continue;
+        }
+        while (position < cleaned.size()
+               && std::isspace(static_cast<unsigned char>(cleaned[position]))) {
+            ++position;
+        }
+        std::string body;
+        if (position < cleaned.size() && cleaned[position] == '{') {
+            ++position;
+            const auto end = cleaned.find('}', position);
+            body = cleaned.substr(
+                position,
+                end == std::string::npos ? std::string::npos : end - position);
+        } else {
+            const auto end = cleaned.find_first_of("\r\n", position);
+            body = cleaned.substr(
+                position,
+                end == std::string::npos ? std::string::npos : end - position);
+        }
+        const auto title = titleFromHeaderBytes(
+            std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(body.data()),
+                body.size()));
+        if (!title.empty()) {
+            return title;
+        }
+    }
+    return {};
 }
 
 struct EnvelopeDef {
@@ -673,7 +791,11 @@ void addEnvelopeCandidate(
         }
     }
     auto timbre = tone_import_detail::makeSelfContainedComposite(
-        std::move(layer), tones, {}, warnings, usage);
+        std::move(layer),
+        tones,
+        tone_import_detail::paddedImportNumber(envelope.number),
+        warnings,
+        usage);
     auto candidate = tone_import_detail::makeCompositeCandidate(
         std::move(timbre), source_format);
     candidate.warnings = std::move(warnings);
@@ -739,6 +861,7 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
         result.errors.emplace_back("compressed MGS is not supported");
         return result;
     }
+    result.title = extractMgsBinaryTitle(bytes);
     const auto header = findMgsBinaryHeader(bytes);
     if (!header || *header + 0x28 > bytes.size()) {
         result.errors.emplace_back("invalid MGS header");
@@ -876,16 +999,20 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
     collectBinaryMusicEnvelopeUse(bytes, *header, usage_by_envelope);
 
     for (const auto& [number, patch] : tones.opll) {
-        static_cast<void>(number);
         tone_import_detail::addCandidate(
             result.candidates,
-            tone_import_detail::makeOpllCandidate(patch, {}, "MGS"));
+            tone_import_detail::makeOpllCandidate(
+                patch,
+                tone_import_detail::paddedImportNumber(number),
+                "MGS"));
     }
     for (const auto& [number, wave] : tones.scc) {
-        static_cast<void>(number);
         tone_import_detail::addCandidate(
             result.candidates,
-            tone_import_detail::makeSccCandidate(wave, {}, "MGS"));
+            tone_import_detail::makeSccCandidate(
+                wave,
+                tone_import_detail::paddedImportNumber(number),
+                "MGS"));
     }
     for (const auto& envelope : envelopes) {
         const auto found = usage_by_envelope.find(envelope.number);
@@ -900,6 +1027,7 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
 ToneImportResult importMgsMml(std::string_view text) {
     ToneImportResult result;
     result.format = ToneImportFormat::MgsMml;
+    result.title = extractMgsMmlTitle(text);
     tone_import_detail::DefinedTones tones;
     for (const auto& definition : extractMgsSourceDefinitions(text, 'v')) {
         const auto parsed = parseMgsOpllDefinition(
@@ -911,7 +1039,10 @@ ToneImportResult importMgsMml(std::string_view text) {
         tones.opll[definition.number] = parsed->patch;
         tone_import_detail::addCandidate(
             result.candidates,
-            tone_import_detail::makeOpllCandidate(parsed->patch, {}, "MML"));
+            tone_import_detail::makeOpllCandidate(
+                parsed->patch,
+                tone_import_detail::paddedImportNumber(definition.number),
+                "MML"));
     }
     for (const auto& definition : extractMgsSourceDefinitions(text, 's')) {
         const auto parsed = parseMgsSccDefinition(
@@ -923,7 +1054,10 @@ ToneImportResult importMgsMml(std::string_view text) {
         tones.scc[definition.number] = parsed->waveform;
         tone_import_detail::addCandidate(
             result.candidates,
-            tone_import_detail::makeSccCandidate(parsed->waveform, {}, "MML"));
+            tone_import_detail::makeSccCandidate(
+                parsed->waveform,
+                tone_import_detail::paddedImportNumber(definition.number),
+                "MML"));
     }
     std::map<unsigned, tone_import_detail::EnvelopeChipUse> usage_by_envelope;
     collectMmlEnvelopeUse(text, usage_by_envelope);
@@ -946,7 +1080,11 @@ ToneImportResult importMgsMml(std::string_view text) {
             continue;
         }
         auto timbre = tone_import_detail::makeSelfContainedComposite(
-            std::move(layer), tones, {}, warnings, found->second);
+            std::move(layer),
+            tones,
+            tone_import_detail::paddedImportNumber(definition.number),
+            warnings,
+            found->second);
         auto candidate = tone_import_detail::makeCompositeCandidate(
             std::move(timbre), "MML");
         candidate.warnings = std::move(warnings);
@@ -968,7 +1106,11 @@ ToneImportResult importMgsMml(std::string_view text) {
             continue;
         }
         auto timbre = tone_import_detail::makeSelfContainedComposite(
-            std::move(layer), tones, {}, warnings, found->second);
+            std::move(layer),
+            tones,
+            tone_import_detail::paddedImportNumber(definition.number),
+            warnings,
+            found->second);
         tone_import_detail::addCandidate(
             result.candidates,
             tone_import_detail::makeCompositeCandidate(std::move(timbre), "MML"));

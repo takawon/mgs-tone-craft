@@ -53,6 +53,34 @@ std::string trimPaddedName(std::string_view text) {
     return asciiOrUtf8(std::string(text));
 }
 
+std::string paddedImportNumber(unsigned number) {
+    if (number >= 100U) {
+        return std::to_string(number);
+    }
+    std::string text(2, '0');
+    text[0] = static_cast<char>('0' + (number / 10U));
+    text[1] = static_cast<char>('0' + (number % 10U));
+    return text;
+}
+
+std::string collapseImportLabel(std::string text) {
+    std::string collapsed;
+    collapsed.reserve(text.size());
+    bool pending_space = false;
+    for (const unsigned char character : text) {
+        if (std::isspace(character)) {
+            pending_space = true;
+            continue;
+        }
+        if (pending_space && !collapsed.empty()) {
+            collapsed.push_back(' ');
+        }
+        pending_space = false;
+        collapsed.push_back(static_cast<char>(character));
+    }
+    return collapsed;
+}
+
 std::string decodeCp932Name(std::span<const std::uint8_t> bytes) {
     std::size_t length = bytes.size();
     while (length > 0 && bytes[length - 1] == 0) {
@@ -584,6 +612,37 @@ std::string normalizedExtension(std::string_view extension) {
     return text;
 }
 
+std::string importFileStem(std::string_view source_name) {
+    std::string text(source_name);
+    const auto slash = text.find_last_of("/\\");
+    if (slash != std::string::npos) {
+        text.erase(0, slash + 1);
+    }
+    const auto dot = text.find_last_of('.');
+    if (dot != std::string::npos && dot != 0) {
+        text.resize(dot);
+    }
+    return tone_import_detail::trimPaddedName(std::move(text));
+}
+
+void applyDefaultImportNames(ToneImportResult& result) {
+    const auto prefix = result.title.empty()
+        ? importFileStem(result.source_name)
+        : result.title;
+    unsigned sequential = 0;
+    for (auto& candidate : result.candidates) {
+        std::string id = candidate.name;
+        if (id.empty()) {
+            id = tone_import_detail::paddedImportNumber(sequential++);
+        }
+        if (prefix.empty()) {
+            candidate.name = std::move(id);
+        } else {
+            candidate.name = prefix + " - " + id;
+        }
+    }
+}
+
 }  // namespace
 
 ToneImportFormat detectToneImportFormat(
@@ -695,6 +754,9 @@ ToneImportResult importTones(
     if (result.format != ToneImportFormat::Unknown && result.errors.empty()
         && result.candidates.empty()) {
         result.errors.emplace_back("no complete tones were found");
+    }
+    if (!result.candidates.empty()) {
+        applyDefaultImportNames(result);
     }
     return result;
 }

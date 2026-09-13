@@ -98,6 +98,47 @@ const auto kPsgColour = juce::Colour(0xFFB990FF);
 const auto kSccColour = juce::Colour(0xFF53E3A6);
 const auto kOpllColour = juce::Colour(0xFFFFA75E);
 
+enum class SpectrogramColourMode : std::uint8_t { Source, Pseudo };
+
+[[nodiscard]] std::uint8_t combinedPseudoLevel(
+    std::uint8_t psg,
+    std::uint8_t scc,
+    std::uint8_t opll,
+    bool show_psg,
+    bool show_scc,
+    bool show_opll) noexcept {
+    double power = 0.0;
+    const auto add = [&](std::uint8_t level, bool visible) {
+        if (!visible || level == 0) return;
+        const auto db = static_cast<double>(kMinimumDb)
+            + static_cast<double>(level) / 255.0 * -static_cast<double>(kMinimumDb);
+        power += std::pow(10.0, db / 10.0);
+    };
+    add(psg, show_psg);
+    add(scc, show_scc);
+    add(opll, show_opll);
+    if (!(power > 0.0) || !std::isfinite(power)) return 0;
+    const auto db = 10.0 * std::log10(power);
+    const auto normalized = std::clamp(
+        (db - static_cast<double>(kMinimumDb)) / -static_cast<double>(kMinimumDb),
+        0.0,
+        1.0);
+    return static_cast<std::uint8_t>(std::lround(normalized * 255.0));
+}
+
+[[nodiscard]] juce::Colour pseudoColour(std::uint8_t level) noexcept {
+    constexpr std::array<juce::uint32, 7> stops{
+        0xFF050816, 0xFF143B8F, 0xFF00A6C7, 0xFF24C875,
+        0xFFE4D946, 0xFFFF6240, 0xFFFFFFFF};
+    const auto position = static_cast<float>(level) / 255.0F
+        * static_cast<float>(stops.size() - 1);
+    const auto first = std::min(
+        stops.size() - 1, static_cast<std::size_t>(position));
+    const auto second = std::min(first + 1, stops.size() - 1);
+    return juce::Colour(stops[first]).interpolatedWith(
+        juce::Colour(stops[second]), position - static_cast<float>(first));
+}
+
 using SpectrogramColumn = spectrum::Column;
 static_assert(std::is_trivially_copyable_v<SpectrogramColumn>);
 
@@ -360,6 +401,12 @@ public:
         show_psg_ = psg;
         show_scc_ = scc;
         show_opll_ = opll;
+        recomposeImage();
+    }
+
+    void setColourMode(SpectrogramColourMode mode) {
+        if (colour_mode_ == mode) return;
+        colour_mode_ = mode;
         recomposeImage();
     }
 
@@ -701,6 +748,15 @@ private:
 
     [[nodiscard]] juce::Colour colourFor(
         const SourceIntensity& intensity) const noexcept {
+        if (colour_mode_ == SpectrogramColourMode::Pseudo) {
+            return pseudoColour(combinedPseudoLevel(
+                intensity.psg,
+                intensity.scc,
+                intensity.opll,
+                show_psg_,
+                show_scc_,
+                show_opll_));
+        }
         float red = 0.0F;
         float green = 0.0F;
         float blue = 0.0F;
@@ -1268,6 +1324,7 @@ private:
     double frequency_zoom_{1.0};
     double frequency_offset_{};
     double emphasis_percent_{};
+    SpectrogramColourMode colour_mode_{SpectrogramColourMode::Source};
     int painted_write_x_{-1};
     GuideState painted_guide_state_{};
     bool painted_guide_valid_{true};
@@ -1487,7 +1544,7 @@ public:
         addAndMakeVisible(display_);
         addChildComponent(spectrum_display_);
         mode_gram_.setButtonText(juce::String::fromUTF8("スペクトログラム"));
-        mode_spectrum_.setButtonText(juce::String::fromUTF8("スペアナ"));
+        mode_spectrum_.setButtonText(juce::String::fromUTF8("スペクトラム"));
         for (auto* b : {&mode_gram_, &mode_spectrum_}) {
             b->setClickingTogglesState(true); b->setRadioGroupId(264);
             addAndMakeVisible(*b);
@@ -1495,12 +1552,31 @@ public:
         mode_gram_.setToggleState(true, juce::dontSendNotification);
         mode_gram_.onClick = [this] { setSpectrumMode(false); };
         mode_spectrum_.onClick = [this] { setSpectrumMode(true); };
+        colour_source_.setButtonText(juce::String::fromUTF8("音源色"));
+        colour_pseudo_.setButtonText(juce::String::fromUTF8("疑似カラー"));
+        for (auto* b : {&colour_source_, &colour_pseudo_}) {
+            b->setClickingTogglesState(true);
+            b->setRadioGroupId(265);
+            addAndMakeVisible(*b);
+        }
+        colour_source_.setToggleState(true, juce::dontSendNotification);
+        colour_source_.onClick = [this] {
+            display_.setColourMode(SpectrogramColourMode::Source);
+        };
+        colour_pseudo_.onClick = [this] {
+            display_.setColourMode(SpectrogramColourMode::Pseudo);
+        };
         configureZoomSlider(history_seconds_, 0, 5, 1);
         history_seconds_.setRange(0, 5, 0.1);
         history_seconds_.setDoubleClickReturnValue(true, 1.0);
         history_seconds_.setTextValueSuffix(" s");
         history_seconds_.onValueChange = [this] {
-            spectrum_display_.history_seconds = history_seconds_.getValue(); spectrum_display_.refresh();
+            const auto seconds = history_seconds_.getValue();
+            analyzer_.setHistorySeconds(seconds);
+            spectrum_model_.clearHistory();
+            spectrum_display_.history_seconds = seconds;
+            spectrum_display_.refresh();
+            updateSpectrumControls();
         };
         history_label_.setText(juce::String::fromUTF8("履歴時間"), juce::dontSendNotification);
         history_label_.setJustificationType(juce::Justification::centredRight);
@@ -1630,6 +1706,7 @@ public:
         history_seconds_.setValue(juce::jlimit(0.0, 5.0, seconds),
                                    juce::dontSendNotification);
         spectrum_display_.history_seconds = history_seconds_.getValue();
+        analyzer_.setHistorySeconds(history_seconds_.getValue());
         setSpectrumMode(readIniString(L"DisplayMode", L"0") == "1");
         updateScrollBar();
     }
@@ -1668,6 +1745,12 @@ public:
         mode_gram_.setBounds(modes.removeFromLeft(UiLayout::spectrumModeW));
         modes.removeFromLeft(UiLayout::controlGap);
         mode_spectrum_.setBounds(modes.removeFromLeft(UiLayout::spectrumActionW));
+        if (!spectrum_mode_) {
+            modes.removeFromLeft(UiLayout::controlGap);
+            colour_source_.setBounds(modes.removeFromLeft(UiLayout::spectrumActionW));
+            modes.removeFromLeft(UiLayout::controlGap);
+            colour_pseudo_.setBounds(modes.removeFromLeft(UiLayout::spectrumActionW));
+        }
         area.removeFromTop(UiLayout::controlGap);
         auto row = area.removeFromTop(UiLayout::fieldH);
         auto place = [&](juce::Component& c, int width) {
@@ -1738,6 +1821,8 @@ public:
         display_.setDrawingActive(!spectrum_mode);
         display_.setVisible(!spectrum_mode);
         spectrum_display_.setVisible(spectrum_mode);
+        colour_source_.setVisible(!spectrum_mode);
+        colour_pseudo_.setVisible(!spectrum_mode);
         for (auto* c : std::array<juce::Component*, 6>{&time_label_, &time_zoom_,
                 &frequency_label_, &frequency_zoom_, &emphasis_label_, &emphasis_}) c->setVisible(!spectrum_mode);
         for (auto* c : std::array<juce::Component*, 7>{&history_label_, &history_seconds_,
@@ -1830,6 +1915,10 @@ private:
         for (std::size_t count = 0; count < SpectrumAnalyzerThread::queueCapacity
              && analyzer_.pollFrame(*incoming_frame_); ++count) {
             if (incoming_frame_->info.context != analyzer_.context()) continue;
+            if (incoming_frame_->history_finalized
+                && incoming_frame_->finalized_history.interval_samples
+                    != SpectrumAnalyzerThread::historyIntervalSamples(history_seconds_.getValue()))
+                incoming_frame_->history_finalized = false;
             spectrum_model_.ingest(*incoming_frame_);
             display_.appendColumn(incoming_frame_->column);
             changed = true;
@@ -1884,7 +1973,8 @@ private:
     SpectrogramDisplay display_;
     spectrum::Display spectrum_display_;
     std::unique_ptr<spectrum::Frame> incoming_frame_;
-    juce::TextButton mode_gram_, mode_spectrum_, channels_button_, hold_button_,
+    juce::TextButton mode_gram_, mode_spectrum_, colour_source_, colour_pseudo_,
+        channels_button_, hold_button_,
         reference_button_, clear_button_, pause_button_;
     juce::Label history_label_, position_label_;
     juce::Slider history_seconds_, history_position_;
@@ -1907,11 +1997,15 @@ private:
     juce::ScrollBar frequency_scroll_;
 };
 
-SpectrogramWindow::SpectrogramWindow(engine::RealtimeEngineHost& engine)
+SpectrogramWindow::SpectrogramWindow(
+    engine::RealtimeEngineHost& engine,
+    std::function<void(bool)> performance_input_active_changed)
     : DocumentWindow(
           juce::String::fromUTF8("MGS Tone Craft - スペクトログラム"),
           juce::Colour(0xFF1B222C),
-          DocumentWindow::allButtons) {
+          DocumentWindow::allButtons),
+      performance_input_active_changed_(
+          std::move(performance_input_active_changed)) {
     g_spectrogram_window = this;
     setUsingNativeTitleBar(true);
     content_ = new Content(engine, [this](bool pinned) {
@@ -1933,6 +2027,7 @@ SpectrogramWindow::SpectrogramWindow(engine::RealtimeEngineHost& engine)
 }
 
 SpectrogramWindow::~SpectrogramWindow() {
+    notifyPerformanceInputActive(false);
     if (g_spectrogram_window == this) {
         g_spectrogram_window = nullptr;
     }
@@ -1950,6 +2045,7 @@ void SpectrogramWindow::showWindow() {
     }
     setVisible(true);
     toFront(true);
+    notifyPerformanceInputActive(isShowing() && isActiveWindow());
     updatePinZOrderHook();
 }
 
@@ -2040,13 +2136,25 @@ void SpectrogramWindow::closeButtonPressed() {
     hideWindow();
 }
 
+void SpectrogramWindow::activeWindowStatusChanged() {
+    DocumentWindow::activeWindowStatusChanged();
+    notifyPerformanceInputActive(isShowing() && isActiveWindow());
+}
+
 void SpectrogramWindow::hideWindow() {
+    notifyPerformanceInputActive(false);
     if (content_ != nullptr) {
         content_->setActive(false);
     }
     saveState();
     setVisible(false);
     updatePinZOrderHook();
+}
+
+void SpectrogramWindow::notifyPerformanceInputActive(bool active) {
+    if (performance_input_active_changed_) {
+        performance_input_active_changed_(active);
+    }
 }
 
 void SpectrogramWindow::loadState() {
