@@ -62,11 +62,27 @@ foreach ($name in @("emu2149", "emu2212", "emu2413")) {
     Copy-Item -LiteralPath $src `
         -Destination (Join-Path $licensesDir "$name-LICENSE.txt")
 }
-$juceBuildTree = Join-Path $env:LOCALAPPDATA `
-    ("MgsToneCraft\cmake-build-" + $Configuration.ToLowerInvariant())
-$asioLicense = Join-Path $juceBuildTree `
-    "_deps\juce-src\modules\juce_audio_devices\native\asio\LICENSE.txt"
-if (-not (Test-Path -LiteralPath $asioLicense)) {
+$asioLicense = $null
+$configKey = $Configuration.ToLowerInvariant()
+$asioCandidates = New-Object System.Collections.Generic.List[string]
+$asioRel = "_deps\juce-src\modules\juce_audio_devices\native\asio\LICENSE.txt"
+$asioCandidates.Add(
+    (Join-Path $env:LOCALAPPDATA "MgsToneCraft\cmake-build-$configKey\$asioRel"))
+$localCmakeRoots = Join-Path $env:LOCALAPPDATA "MgsToneCraft"
+if (Test-Path -LiteralPath $localCmakeRoots) {
+    Get-ChildItem -LiteralPath $localCmakeRoots -Directory -Filter "cmake-build-*" |
+        ForEach-Object {
+            $asioCandidates.Add((Join-Path $_.FullName $asioRel))
+        }
+}
+$asioCandidates.Add((Join-Path $projectRoot "build\$asioRel"))
+foreach ($candidate in $asioCandidates) {
+    if (Test-Path -LiteralPath $candidate) {
+        $asioLicense = $candidate
+        break
+    }
+}
+if (-not $asioLicense) {
     throw "JUCE ASIO license was not found. Build $Configuration before packaging."
 }
 Copy-Item -LiteralPath $asioLicense `

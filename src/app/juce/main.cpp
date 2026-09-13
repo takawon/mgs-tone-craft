@@ -6847,6 +6847,13 @@ public:
         tabs_.setTabBarDepth(UiLayout::fieldH);
     }
 
+    void setCaptureTab(int index) {
+        tabs_.setCurrentTabIndex(
+            juce::jlimit(0, 2, index),
+            juce::dontSendNotification);
+        resized();
+    }
+
     bool keyPressed(const juce::KeyPress& key) override {
         // Scale shortcuts are editor-only (Composite / SCC / OPLL).
         if (performance_keyboard_.shouldConsumeKeyPress(key)) {
@@ -18698,7 +18705,11 @@ private:
                     2, snapshot_file_)
                 : SnapshotResult::MissingContent;
         } else if (snapshot_target_ == "library") {
-            result = captureLibraryManagerSnapshot(snapshot_file_);
+            result = captureLibraryManagerSnapshot(snapshot_file_, 0);
+        } else if (snapshot_target_ == "library-tags") {
+            result = captureLibraryManagerSnapshot(snapshot_file_, 1);
+        } else if (snapshot_target_ == "library-import") {
+            result = captureLibraryManagerSnapshot(snapshot_file_, 2);
         } else if (snapshot_target_ == "spectrogram" || snapshot_target_ == "spectrum") {
             auto* const content = spectrogram_window_ != nullptr
                 ? spectrogram_window_->snapshotContent()
@@ -18715,7 +18726,8 @@ private:
     }
 
     [[nodiscard]] SnapshotResult captureLibraryManagerSnapshot(
-        const juce::File& output_file) {
+        const juce::File& output_file,
+        int tab_index) {
         ScopedLibraryIpcLock lock(
             tag_management_lock_);
         std::string error;
@@ -18739,6 +18751,7 @@ private:
             [](LibraryManagerKind, std::uint64_t, std::uint8_t) {},
             [](LibraryManagerKind, std::uint8_t) {},
             [] {});
+        content.setCaptureTab(tab_index);
         return writeComponentPngSnapshot(content, output_file);
     }
 
