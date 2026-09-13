@@ -26,7 +26,9 @@ enum class SpectrogramAnalysisMode : std::uint8_t {
 
 class SpectrogramWindow final : public juce::DocumentWindow {
 public:
-    explicit SpectrogramWindow(engine::RealtimeEngineHost& engine);
+    SpectrogramWindow(
+        engine::RealtimeEngineHost& engine,
+        std::function<void(bool)> performance_input_active_changed);
     ~SpectrogramWindow() override;
 
     SpectrogramWindow(const SpectrogramWindow&) = delete;
@@ -37,6 +39,7 @@ public:
     void setSpectrumMode(bool enabled);
     [[nodiscard]] juce::Component* snapshotContent() const noexcept;
     void closeButtonPressed() override;
+    void activeWindowStatusChanged() override;
 
     // Windows HWND subclass: rewrite a sibling's WINDOWPOS so this window
     // stays above it without WS_EX_TOPMOST. window_pos is WINDOWPOS*.
@@ -52,10 +55,12 @@ private:
     void applyGlobalUiScale();
     void hideWindow();
     void loadState();
+    void notifyPerformanceInputActive(bool active);
     void saveState();
     void updatePinZOrderHook();
 
     Content* content_{};
+    std::function<void(bool)> performance_input_active_changed_;
     bool internal_pin_{};
 };
 

@@ -64,6 +64,7 @@ struct ImportedToneCandidate {
 struct ToneImportResult {
     ToneImportFormat format{ToneImportFormat::Unknown};
     std::string source_name;
+    std::string title;
     std::vector<ImportedToneCandidate> candidates;
     std::vector<std::string> errors;
 

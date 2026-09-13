@@ -16,6 +16,10 @@ namespace tone_import_detail {
 
 [[nodiscard]] std::string decodeCp932Name(std::span<const std::uint8_t> bytes);
 
+[[nodiscard]] std::string paddedImportNumber(unsigned number);
+
+[[nodiscard]] std::string collapseImportLabel(std::string text);
+
 [[nodiscard]] ImportedToneCandidate makeOpllCandidate(
     const OpllPatchParameters& patch,
     std::string name,

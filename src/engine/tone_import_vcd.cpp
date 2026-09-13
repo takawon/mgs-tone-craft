@@ -127,11 +127,16 @@ ToneImportResult importMusicaVcd(std::span<const std::uint8_t> bytes) {
         }
         std::array<std::uint8_t, 8> registers{};
         std::copy(data.begin(), data.end(), registers.begin());
+        auto label = tone_import_detail::decodeCp932Name(name);
+        if (label.empty()) {
+            label = tone_import_detail::paddedImportNumber(
+                static_cast<unsigned>(index));
+        }
         tone_import_detail::addCandidate(
             result.candidates,
             tone_import_detail::makeOpllCandidate(
                 decodeOpllPatch(registers),
-                tone_import_detail::decodeCp932Name(name),
+                std::move(label),
                 "VCD"));
     }
     for (int index = 0; index < kSccCount; ++index) {
@@ -145,9 +150,14 @@ ToneImportResult importMusicaVcd(std::span<const std::uint8_t> bytes) {
         std::array<std::uint8_t, 32> wave{};
         std::copy(data.begin() + 4, data.end(), wave.begin());
         const auto waveform = sccWaveformFromBytes(wave);
+        auto label = tone_import_detail::decodeCp932Name(name);
+        if (label.empty()) {
+            label = tone_import_detail::paddedImportNumber(
+                static_cast<unsigned>(index));
+        }
         auto candidate = tone_import_detail::makeSccCandidate(
             waveform,
-            tone_import_detail::decodeCp932Name(name),
+            std::move(label),
             "VCD");
         if (data[2] > 15) {
             candidate.warnings.push_back(

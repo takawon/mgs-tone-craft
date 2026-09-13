@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "../../src/app/juce/spectrogram_window.cpp" // Exercise the private production spectrogram without opening a window.
 #include <iostream>
+#include <numeric>
 #include <numbers>
 #include <stdexcept>
 #include <chrono>
@@ -119,6 +120,42 @@ static void signalsAndTiming() {
     require(!model.live.nearest(8192),"missing audio must not be replaced by nearest distant frame");
     std::cout<<"analysis maximum ms (representative signal): "<<analyzer->maximumAnalysisMs()<<"\n";
 }
+static void averagedHistoryFrames() {
+    auto host=std::make_unique<engine::RealtimeEngineHost>();
+    auto analyzer=std::make_unique<s::Analyzer>(*host);
+    analyzer->setHistorySeconds(1.0);
+    auto b=std::make_unique<engine::SpectrumCaptureBlock>();
+    auto f=std::make_unique<s::Frame>();
+    b->context=15; b->pcm_epoch=1;
+    std::vector<double> pending_power;
+    int finalized=0;
+    for(std::uint64_t block=0;block<32;++block) {
+        b->first_sample=block*512;
+        for(std::size_t i=0;i<512;++i) {
+            const double t=(b->first_sample+i)/s::sampleRate;
+            b->mixed[i]=static_cast<float>((0.04+0.002*block)*std::sin(2*std::numbers::pi*750*t));
+            b->output_gain[i]=1;
+        }
+        analyzer->processBlock(*b);
+        while(analyzer->pollFrame(*f)) {
+            pending_power.push_back(f->mixed.power[32]);
+            if (!f->history_finalized) continue;
+            require(pending_power.size()>=2,"history interval must average multiple FFT frames");
+            const auto expected=std::accumulate(pending_power.begin(),pending_power.end(),0.0)
+                /static_cast<double>(pending_power.size());
+            requireNear(f->finalized_history.mixed.power[32],expected,1e-8,
+                        "history must average linear power");
+            require(f->finalized_history.info.id==f->info.id,"history finalization timestamp");
+            require(f->finalized_history.interval_samples==s::Analyzer::historyIntervalSamples(1.0),
+                    "history interval follows visible history density");
+            pending_power.clear();
+            ++finalized;
+        }
+    }
+    require(finalized>=5,"averaged history frames were not finalized periodically");
+    require(s::Analyzer::historyIntervalSamples(0.1)>=2*s::hop,
+            "short history interval must still contain multiple FFT frames");
+}
 static void historyAndSnapshots() {
     s::Model model;
     auto f=std::make_unique<s::Frame>();
@@ -126,12 +163,23 @@ static void historyAndSnapshots() {
     for(std::uint64_t i=1;i<=700;++i) {
         f->info.id=i; f->info.sample=i*512;
         f->mixed.power[20]=static_cast<float>(i)*1e-6F;
+        f->history_finalized=(i%4)==0;
+        if(f->history_finalized) f->finalized_history={f->info,f->mixed,4*s::hop};
         model.ingest(*f);
     }
-    require(model.live.size()==s::historyCapacity,"history must remain bounded");
-    requireNear(model.availableSeconds(),5,0,"five seconds retained");
+    require(model.live.size()>s::historyLines && model.live.size()<s::historyCapacity,
+            "averaged history must remain time-bounded without FFT-frame duplication");
+    requireNear(model.availableSeconds(),5,0.03,"five seconds retained");
     const auto* older=model.live.nearest(model.front()->info.sample-5*s::sampleRate);
-    require(older && older->info.id==231,"nearest five-second frame");
+    require(older && older->info.sample<=model.front()->info.sample-5*s::sampleRate+2*s::hop,
+            "nearest five-second averaged frame");
+    const auto finalized_id=model.live.latest()->info.id;
+    const auto finalized_power=model.live.latest()->mixed.power[20];
+    f->info.id=701; f->info.sample=701*512; f->mixed.power[20]=1;
+    f->history_finalized=false; model.ingest(*f);
+    require(model.live.latest()->info.id==finalized_id
+            && model.live.latest()->mixed.power[20]==finalized_power,
+            "finalized history changed with the live front frame");
     model.setPaused(true);
     const auto frozen_id=model.front()->info.id;
     const auto frozen_value=model.front()->mixed.power[20];
@@ -140,8 +188,10 @@ static void historyAndSnapshots() {
     model.hold();
     const auto ref_id=model.reference->info.id;
     model.selected_seconds=0;
-    for(std::uint64_t i=701;i<=1500;++i) {
+    for(std::uint64_t i=702;i<=1500;++i) {
         f->info.id=i; f->info.sample=i*512; f->mixed.power[20]=0;
+        f->history_finalized=(i%4)==0;
+        if(f->history_finalized) f->finalized_history={f->info,f->mixed,4*s::hop};
         model.ingest(*f);
     }
     require(model.front()->info.id==frozen_id && model.front()->mixed.power[20]==frozen_value,
@@ -150,8 +200,59 @@ static void historyAndSnapshots() {
     model.setPaused(false);
     require(model.front()->info.id==1500,"resume must jump to latest");
     model.setPaused(true);
-    f->info.context=23; ++f->info.id; f->info.sample+=512; model.ingest(*f);
+    f->info.context=23; ++f->info.id; f->info.sample+=512;
+    f->history_finalized=true; f->finalized_history={f->info,f->mixed,4*s::hop}; model.ingest(*f);
     require(!model.paused && model.live.size()==1 && model.reference->info.id==ref_id,"context transition");
+}
+
+static void colourMappings() {
+    require(app::combinedPseudoLevel(180,0,0,true,true,true)>0,"visible source contributes to pseudo colour");
+    require(app::combinedPseudoLevel(180,0,0,false,true,true)==0,"hidden source excluded from pseudo colour");
+    require(app::combinedPseudoLevel(180,180,0,true,true,true)>app::combinedPseudoLevel(180,0,0,true,true,true),
+            "pseudo colour combines source power");
+    require(app::pseudoColour(24)!=app::pseudoColour(220),"pseudo colour changes with intensity");
+    require(s::historyBrightness(0.05F)>s::historyBrightness(0.95F),
+            "history brightness must be monotonic");
+    requireNear(s::historyBrightness(0.0F),1.0,1.0e-6,
+                "history high peak brightness");
+    requireNear(s::historyBrightness(1.0F),0.03,1.0e-6,
+                "history weak floor brightness");
+    require(s::historyBrightness(0.5F)<0.4F,
+            "history gamma must sink medium/weak levels");
+    requireNear(s::historyAgeIntensity(0),0.78,1.0e-6,
+                "newest history age intensity");
+    requireNear(s::historyAgeIntensity(s::historyLines-1),0.2184,1.0e-6,
+                "oldest history age intensity");
+    requireNear(s::historyOcclusionFactor(50,49),0.25,1.0e-6,
+                "occluded history remains faintly visible");
+    requireNear(s::historyOcclusionFactor(47,49),1.0,1.0e-6,
+                "history above the front boundary stays visible");
+    requireNear(s::historyOcclusionFactor(
+                    50,std::numeric_limits<int>::max()),1.0,1.0e-6,
+                "history without a front boundary stays visible");
+
+    s::GuideState guide;
+    app::SpectrogramDisplay display(guide);
+    display.setVisible(true);
+    display.setBounds(0,0,800,480);
+    s::Column column;
+    column.context=15; column.sequence=1; column.sample_position=512;
+    for(std::size_t bin=0;bin<256;++bin) {
+        column.psg[bin]=static_cast<std::uint8_t>(80+bin/2);
+        column.scc[bin]=static_cast<std::uint8_t>(40+bin/3);
+    }
+    display.appendColumn(column);
+    const auto source=display.createComponentSnapshot(display.getLocalBounds(),true,1.0F,juce::SoftwareImageType{});
+    display.setColourMode(app::SpectrogramColourMode::Pseudo);
+    const auto pseudo=display.createComponentSnapshot(display.getLocalBounds(),true,1.0F,juce::SoftwareImageType{});
+    int changed=0;
+    for(int y=0;y<source.getHeight();++y) for(int x=0;x<source.getWidth();++x)
+        changed += source.getPixelAt(x,y)!=pseudo.getPixelAt(x,y);
+    require(changed>100,"spectrogram pseudo-colour mode did not recompose retained history");
+    display.setColourMode(app::SpectrogramColourMode::Source);
+    const auto restored=display.createComponentSnapshot(display.getLocalBounds(),true,1.0F,juce::SoftwareImageType{});
+    for(int y=0;y<source.getHeight();++y) for(int x=0;x<source.getWidth();++x)
+        require(source.getPixelAt(x,y)==restored.getPixelAt(x,y),"source-colour mode was not preserved");
 }
 
 
@@ -328,10 +429,19 @@ static void displayAndCache(const juce::File& imageDirectory) {
     display.setBounds(0,0,1100,650);
     display.refresh();
     auto builds=display.pathBuilds();
+    auto history_builds=display.historyLayerBuilds();
     guide.click(220); display.refresh();
     require(display.pathBuilds()==builds,"guide rebuilt spectral paths");
+    require(display.historyLayerBuilds()==history_builds,
+            "guide rebuilt cached history layer");
     display.setBounds(0,0,1200,700);
     require(display.pathBuilds()==builds,"resize rebuilt normalized spectral paths");
+    require(display.historyLayerBuilds()>history_builds,
+            "resize did not rebuild the history layer");
+    history_builds=display.historyLayerBuilds();
+    display.refresh();
+    require(display.historyLayerBuilds()==history_builds,
+            "unchanged history rebuilt its cached layer");
     require(display.keyPressed(juce::KeyPress(juce::KeyPress::escapeKey)) && !guide.fixed(),"Esc releases guide");
     model.setPaused(true); display.refresh();
     const auto before=display.createComponentSnapshot(display.getLocalBounds(), true, 1.0F, juce::SoftwareImageType{});
@@ -362,6 +472,15 @@ static void displayAndCache(const juce::File& imageDirectory) {
             require(png.writeImageToStream(display.createComponentSnapshot(display.getLocalBounds(), true, 1.0F, juce::SoftwareImageType{}),output),"PNG write");
         }
     }
+    s::Display rebuild_display(model,guide,
+        {juce::Colour(0xffb990ff),juce::Colour(0xff53e3a6),juce::Colour(0xffffa75e)});
+    rebuild_display.setVisible(true); rebuild_display.setBounds(0,0,1200,700);
+    rebuild_display.history_seconds=0; rebuild_display.refresh();
+    rebuild_display.history_seconds=1;
+    const auto history_rebuild_started=juce::Time::getMillisecondCounterHiRes();
+    rebuild_display.refresh();
+    std::cout<<"24-line history layer rebuild ms: "
+             <<juce::Time::getMillisecondCounterHiRes()-history_rebuild_started<<"\n";
     model.hold(); model.selected_seconds=0.43; display.refresh();
     if(imageDirectory!=juce::File{}) {
         juce::FileOutputStream output(imageDirectory.getChildFile("spectrum-comparison.png"));
@@ -374,7 +493,8 @@ static void displayAndCache(const juce::File& imageDirectory) {
 int main(int argc,char** argv) {
     juce::ScopedJuceInitialiser_GUI gui;
     try {
-        capturePreservesAudio(); captureBlocksAndGain(); signalsAndTiming(); historyAndSnapshots(); maximumChannelsAndGaps(); spectrogramGaps();
+        capturePreservesAudio(); captureBlocksAndGain(); signalsAndTiming(); averagedHistoryFrames();
+        historyAndSnapshots(); colourMappings(); maximumChannelsAndGaps(); spectrogramGaps();
         displayAndCache(argc>1 ? juce::File(juce::String::fromUTF8(argv[1])) : juce::File{});
         std::cout<<"spectrum tests passed\n";
         return 0;

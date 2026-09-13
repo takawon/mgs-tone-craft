@@ -41,11 +41,26 @@ public:
     void setCaptureEnabled(bool enabled) {
         enabled_.store(enabled, std::memory_order_release);
         host_.setSpectrumCaptureEnabled(enabled);
-        if (enabled && !isThreadRunning()) startThread();
+        if (enabled) {
+            history_generation_.fetch_add(1, std::memory_order_release);
+            if (!isThreadRunning()) startThread();
+        }
         notify();
     }
     void setChannelsEnabled(bool enabled) { host_.setSpectrumChannelsEnabled(enabled); }
     void setSourceMask(std::uint8_t mask) { host_.setSpectrumSourceMask(mask); notify(); }
+    void setHistorySeconds(double seconds) noexcept {
+        history_interval_samples_.store(historyIntervalSamples(seconds), std::memory_order_release);
+        history_generation_.fetch_add(1, std::memory_order_release);
+    }
+    static std::uint64_t historyIntervalSamples(double seconds) noexcept {
+        const auto effective_seconds = std::isfinite(seconds) && seconds > 0 ? seconds : 1.0;
+        const auto requested = static_cast<std::uint64_t>(std::llround(
+            effective_seconds * sampleRate / static_cast<double>(historyLines)));
+        // A history line must summarize multiple FFT frames even for very
+        // short display ranges.
+        return std::max<std::uint64_t>(requested, hop * 2);
+    }
     bool pollFrame(Frame& f) noexcept { return queue_->tryPop(f); }
     std::uint64_t context() const noexcept { return host_.spectrumContext(); }
     std::uint64_t droppedInput() const noexcept { return host_.spectrumDroppedBlocks(); }
@@ -98,6 +113,7 @@ private:
         for (auto& f : filters_) f.reset();
         write_ = filled_ = since_fft_ = channel_samples_ = 0;
         channels_active_ = false;
+        resetHistoryAccumulator();
     }
     void run() override {
         const juce::ScopedNoDenormals no_denormals;
@@ -138,6 +154,43 @@ private:
             trace.power[i] = power_[i] * ((i == 0 || i == fftSize / 2) ? scale * 0.25F : scale);
         findPeaks(trace);
     }
+    void resetHistoryAccumulator() noexcept {
+        history_power_sum_.fill(0);
+        history_frame_count_ = 0;
+        next_history_boundary_ = 0;
+    }
+    void updateHistory(Frame& frame) noexcept {
+        frame.history_finalized = false;
+        const auto requested_interval = history_interval_samples_.load(std::memory_order_acquire);
+        const auto requested_generation = history_generation_.load(std::memory_order_acquire);
+        if (active_history_interval_ != requested_interval
+            || active_history_generation_ != requested_generation) {
+            active_history_interval_ = requested_interval;
+            active_history_generation_ = requested_generation;
+            resetHistoryAccumulator();
+        }
+        if (!next_history_boundary_)
+            next_history_boundary_ = frame.info.sample + active_history_interval_;
+        for (std::size_t bin = 0; bin < bins; ++bin)
+            history_power_sum_[bin] += frame.mixed.power[bin];
+        ++history_frame_count_;
+        if (history_frame_count_ < 2 || frame.info.sample + hop < next_history_boundary_) return;
+
+        auto& history = frame.finalized_history;
+        history.info = frame.info;
+        history.interval_samples = active_history_interval_;
+        history.mixed = {};
+        const auto divisor = static_cast<double>(history_frame_count_);
+        for (std::size_t bin = 0; bin < bins; ++bin)
+            history.mixed.power[bin] = static_cast<float>(history_power_sum_[bin] / divisor);
+        findPeaks(history.mixed);
+        frame.history_finalized = true;
+
+        do next_history_boundary_ += active_history_interval_;
+        while (next_history_boundary_ <= frame.info.sample + hop);
+        history_power_sum_.fill(0);
+        history_frame_count_ = 0;
+    }
     void legacy(std::size_t source, std::array<std::uint8_t, 256>& levels,
                 spectrogram::HarmonicPeakList& harmonics, const engine::SpectrumGuideNote& note) noexcept {
         if (!transform(source)) { levels = {}; harmonics = {}; return; }
@@ -167,6 +220,7 @@ private:
         if (f.channels_available)
             for (std::size_t ch = 0; ch < channels; ++ch) analyzeTrace(3 + ch, f.channel[ch]);
         analyzeTrace(3 + channels, f.mixed);
+        updateHistory(f);
         if (!queue_->tryPush(f)) dropped_output_.fetch_add(1, std::memory_order_relaxed);
         const auto elapsed = juce::Time::getMillisecondCounterHiRes() - started;
         if (elapsed > max_analysis_ms_.load(std::memory_order_relaxed))
@@ -183,13 +237,19 @@ private:
     std::array<engine::SpectrumGuideNote, fftSize> notes_{};
     std::array<float, fftSize * 2> fft_data_{};
     std::array<float, bins> power_{};
+    std::array<double, bins> history_power_sum_{};
     std::array<std::size_t, 257> edges_{};
     std::array<float, 255> thresholds_{};
     std::size_t write_{}, filled_{}, since_fft_{};
+    std::size_t history_frame_count_{};
     std::uint64_t context_{}, epoch_{}, next_sample_{}, sequence_{};
+    std::uint64_t next_history_boundary_{}, active_history_interval_{};
+    std::uint64_t active_history_generation_{};
     bool remote_{}, channels_active_{};
     std::size_t channel_samples_{};
     std::atomic<bool> enabled_{};
+    std::atomic<std::uint64_t> history_interval_samples_{historyIntervalSamples(1.0)};
+    std::atomic<std::uint64_t> history_generation_{};
     std::atomic<std::uint64_t> dropped_output_{}, channel_fft_count_{};
     std::atomic<double> max_analysis_ms_{};
 };

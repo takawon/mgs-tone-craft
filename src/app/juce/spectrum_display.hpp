@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #pragma once
+#include <limits>
+#include <vector>
+
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "spectrum_analyzer.hpp"
 #include "ui_fonts.hpp"
@@ -26,6 +29,27 @@ inline juce::String sourceNames(std::uint64_t context) {
     if (context & 4) names.add("OPLL");
     return names.isEmpty() ? juce::String::fromUTF8("対象なし") : names.joinIntoString("+");
 }
+inline float historyBrightness(float normalized_y) noexcept {
+    const auto strength = 1.0F - std::clamp(normalized_y, 0.0F, 1.0F);
+    return 0.03F + 0.97F * std::pow(strength, 1.6F);
+}
+inline float historyAgeIntensity(std::size_t index) noexcept {
+    const auto depth = static_cast<float>(
+        std::min(index, historyLines - 1))
+        / static_cast<float>(historyLines - 1);
+    return 0.78F * (1.0F - depth * 0.72F);
+}
+inline bool historyPixelIsOccluded(int y, int occlusion_y) noexcept {
+    constexpr int tolerance = 1;
+    return occlusion_y != std::numeric_limits<int>::max()
+        && y >= occlusion_y - tolerance;
+}
+inline float historyOcclusionFactor(int y, int occlusion_y) noexcept {
+    constexpr float hidden_factor = 0.25F;
+    return historyPixelIsOccluded(y, occlusion_y)
+        ? hidden_factor
+        : 1.0F;
+}
 class Display final : public juce::Component {
 public:
     Display(Model& model, GuideState& guide, std::array<juce::Colour, 3> colours)
@@ -39,22 +63,27 @@ public:
     double history_seconds{1.0};
     std::function<void()> guide_changed;
     std::uint64_t pathBuilds() const noexcept { return path_builds_; }
+    std::uint64_t historyLayerBuilds() const noexcept {
+        return history_layer_builds_;
+    }
 
     void refresh() {
         if (!isVisible()) return;
-        history_paths_.fill(nullptr);
+        std::array<const HistoryFrame*, historyLines> history_frames{};
         front_path_ = nullptr;
         if (const auto* front = model_.front()) {
-            auto& caches = model_.paused ? stopped_cache_ : live_cache_;
-            front_path_ = &cached(caches[front->info.id % historyCapacity], *front);
-            if (history_seconds > 0)
+            auto& front_caches = model_.paused ? stopped_cache_ : live_cache_;
+            front_path_ = &cached(front_caches[front->info.id % historyCapacity], *front);
+            if (history_seconds > 0) {
                 for (std::size_t i = 0; i < historyLines; ++i) {
                     const double at = static_cast<double>(front->info.sample)
                         - history_seconds * sampleRate * (i + 1) / historyLines;
                     if (const auto* f = model_.history().nearest(at))
-                        history_paths_[i] = &cached(caches[f->info.id % historyCapacity], *f);
+                        history_frames[i] = f;
                 }
+            }
         }
+        rebuildHistoryLayer(history_frames);
         if (const auto* f = model_.channelFrame())
             for (std::size_t ch = 0; ch < channels; ++ch)
                 if (channel_cache_[ch].id != f->info.id || channel_cache_[ch].context != f->info.context) {
@@ -117,17 +146,12 @@ public:
         g.fillAll(juce::Colours::black);
         const auto front = frontBounds();
         if (front.getWidth() <= 0 || front.getHeight() <= 0) return;
+        if (history_layer_.isValid())
+            g.drawImageAt(history_layer_, history_layer_bounds_.getX(), history_layer_bounds_.getY(), false);
         drawAxes(g, front);
         {
             juce::Graphics::ScopedSaveState save(g);
             g.reduceClipRegion(graphBounds().toNearestInt());
-            for (std::size_t n = historyLines; n > 0; --n) {
-                const auto* path = history_paths_[n - 1];
-                if (!path) continue;
-                const auto depth = static_cast<float>(n) / historyLines;
-                g.setColour(juce::Colours::lightgrey.withAlpha(0.27F * (1.0F - depth * 0.78F)));
-                g.strokePath(*path, juce::PathStrokeType(1.0F), transformFor(depth));
-            }
             if (model_.reference && model_.reference_visible) {
                 g.setColour(juce::Colours::lightgrey.withAlpha(0.65F)); g.fillPath(reference_stroke_);
             }
@@ -283,6 +307,144 @@ private:
         }
         return c.path;
     }
+    static void addHistoryPixel(
+        juce::Image::BitmapData& pixels,
+        int x,
+        int y,
+        juce::uint8 intensity) noexcept {
+        auto* pixel = reinterpret_cast<juce::PixelRGB*>(pixels.getPixelPointer(x, y));
+        if (intensity > pixel->getRed())
+            pixel->setARGB(255, intensity, intensity, intensity);
+    }
+    static void drawHistorySegment(
+        juce::Image::BitmapData& pixels,
+        juce::Point<float> from,
+        juce::Point<float> to,
+        float intensity,
+        const std::vector<int>& occlusion_y,
+        std::vector<int>& line_top_y) {
+        auto x0 = std::clamp(
+            static_cast<int>(std::lround(from.x)), 0, pixels.width - 1);
+        auto y0 = std::clamp(
+            static_cast<int>(std::lround(from.y)), 0, pixels.height - 1);
+        const auto x1 = std::clamp(
+            static_cast<int>(std::lround(to.x)), 0, pixels.width - 1);
+        const auto y1 = std::clamp(
+            static_cast<int>(std::lround(to.y)), 0, pixels.height - 1);
+        const auto visible_intensity = static_cast<juce::uint8>(
+            std::clamp(intensity, 0.0F, 1.0F) * 255.0F + 0.5F);
+        const auto hidden_intensity = static_cast<juce::uint8>(
+            static_cast<float>(visible_intensity) * 0.25F + 0.5F);
+        const auto dx = std::abs(x1 - x0);
+        const auto dy = -std::abs(y1 - y0);
+        const auto sx = x0 < x1 ? 1 : -1;
+        const auto sy = y0 < y1 ? 1 : -1;
+        auto error = dx + dy;
+        const auto* const occlusion = occlusion_y.data();
+        auto* const line_top = line_top_y.data();
+        for (;;) {
+            const auto hidden = historyPixelIsOccluded(y0, occlusion[x0]);
+            addHistoryPixel(
+                pixels,
+                x0,
+                y0,
+                hidden ? hidden_intensity : visible_intensity);
+            line_top[x0] = std::min(line_top[x0], y0);
+            if (x0 == x1 && y0 == y1) break;
+            const auto twice_error = error * 2;
+            if (twice_error >= dy) { error += dy; x0 += sx; }
+            if (twice_error <= dx) { error += dx; y0 += sy; }
+        }
+    }
+    void rebuildHistoryLayer(const std::array<const HistoryFrame*, historyLines>& frames) {
+        std::array<std::uint64_t, historyLines> ids{};
+        for (std::size_t i = 0; i < historyLines; ++i)
+            if (frames[i]) ids[i] = frames[i]->info.id;
+        const auto layer_bounds = graphBounds().toNearestInt();
+        if (ids == history_layer_ids_
+            && history_layer_bounds_ == layer_bounds) return;
+        ++history_layer_builds_;
+        history_layer_ids_ = ids;
+        history_layer_bounds_ = layer_bounds;
+        if (std::none_of(ids.begin(), ids.end(), [](std::uint64_t id) { return id != 0; })) {
+            history_layer_ = {};
+            return;
+        }
+        history_layer_ = juce::Image(
+            juce::Image::RGB,
+            std::max(1, layer_bounds.getWidth()),
+            std::max(1, layer_bounds.getHeight()),
+            true);
+        juce::Image::BitmapData pixels(history_layer_, juce::Image::BitmapData::readWrite);
+        const auto clear_y = std::numeric_limits<int>::max();
+        std::vector<int> occlusion_y(
+            static_cast<std::size_t>(pixels.width), clear_y);
+        std::vector<int> line_top_y(
+            static_cast<std::size_t>(pixels.width), clear_y);
+        for (std::size_t index = 0; index < historyLines; ++index) {
+            const auto* frame = frames[index];
+            if (!frame || !frame->mixed.audible) continue;
+            std::fill(line_top_y.begin(), line_top_y.end(), clear_y);
+            const auto depth = static_cast<float>(index + 1) / static_cast<float>(historyLines);
+            const auto age_intensity = historyAgeIntensity(index);
+            const auto transform = transformFor(depth);
+            bool started = false;
+            juce::Point<float> previous{};
+            float previous_normalized_y{};
+            auto plotPoint = [&](double frequency, float db) {
+                auto x = static_cast<float>(frequencyU(frequency));
+                auto y = -std::clamp(db, minDb, 0.0F) / -minDb;
+                const auto normalized_y = y;
+                transform.transformPoint(x, y);
+                x -= static_cast<float>(layer_bounds.getX());
+                y -= static_cast<float>(layer_bounds.getY());
+                const juce::Point<float> next{x, y};
+                if (started) {
+                    const auto level = historyBrightness(
+                        (previous_normalized_y + normalized_y) * 0.5F);
+                    drawHistorySegment(
+                        pixels,
+                        previous,
+                        next,
+                        age_intensity * level,
+                        occlusion_y,
+                        line_top_y);
+                }
+                previous = next;
+                previous_normalized_y = normalized_y;
+                started = true;
+            };
+            double previous_frequency = 0;
+            float previous_db = minDb;
+            auto add = [&](double frequency, float db) {
+                if (frequency < minFrequency) {
+                    previous_frequency = frequency;
+                    previous_db = db;
+                    return;
+                }
+                if (frequency > maxFrequency) return;
+                if (!started && previous_frequency > 0 && frequency > minFrequency) {
+                    const auto weight = std::log(minFrequency / previous_frequency)
+                        / std::log(frequency / previous_frequency);
+                    plotPoint(minFrequency, previous_db
+                        + static_cast<float>(weight) * (db - previous_db));
+                }
+                plotPoint(frequency, db);
+            };
+            std::size_t peak = 0;
+            for (std::size_t bin = 1; bin < bins; ++bin) {
+                const auto frequency = bin * sampleRate / fftSize;
+                while (peak < frame->mixed.peak_count
+                    && frame->mixed.peaks[peak].frequency < frequency) {
+                    add(frame->mixed.peaks[peak].frequency, frame->mixed.peaks[peak].db);
+                    ++peak;
+                }
+                add(frequency, decibels(frame->mixed.power[bin]));
+            }
+            for (std::size_t x = 0; x < occlusion_y.size(); ++x)
+                occlusion_y[x] = std::min(occlusion_y[x], line_top_y[x]);
+        }
+    }
     double guideFrequency() const {
         if (guide_.fixed()) return guide_.fixed_frequency;
         const auto b = frontBounds();
@@ -431,11 +593,14 @@ private:
     std::uint64_t reference_stroke_id_{}, reference_stroke_context_{};
     float reference_stroke_scale_{};
     const juce::Path* front_path_{};
-    std::array<const juce::Path*, historyLines> history_paths_{};
+    juce::Image history_layer_;
+    juce::Rectangle<int> history_layer_bounds_;
+    std::array<std::uint64_t, historyLines> history_layer_ids_{};
     juce::Point<float> cursor_{};
     bool cursor_inside_{};
     std::optional<Selection> selected_;
     std::uint64_t path_builds_{};
+    std::uint64_t history_layer_builds_{};
     juce::Font dense_font_{UiFonts::dense()}, body_font_{UiFonts::body()};
     float font_scale_{UiScale::active_factor};
 };
