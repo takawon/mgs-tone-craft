@@ -8,7 +8,10 @@ param(
         "settings-midi",
         "settings-output",
         "library",
-        "spectrogram")]
+        "library-tags",
+        "library-import",
+        "spectrogram",
+        "spectrum")]
     [string]$Target = "editor",
     [string]$OutputPath = ""
 )
@@ -27,7 +30,10 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
         "settings-midi" { "settings-midi" }
         "settings-output" { "settings-output" }
         "library" { "library-manager" }
+        "library-tags" { "library-tags" }
+        "library-import" { "library-import" }
         "spectrogram" { "spectrogram-playing" }
+        "spectrum" { "spectrum" }
         default { "$Editor-editor" }
     }
     $OutputPath = Join-Path `
