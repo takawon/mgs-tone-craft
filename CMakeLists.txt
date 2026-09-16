@@ -416,6 +416,26 @@ if(MGSTC_BUILD_TESTS)
             target_compile_options(mgstc_opll_envelope_graph_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
         endif()
         add_test(NAME mgstc_opll_envelope_graph_tests COMMAND mgstc_opll_envelope_graph_tests)
+
+        add_executable(
+            mgstc_composite_envelope_compile_tests
+            tests/cpp/composite_envelope_compile_tests.cpp)
+        target_link_libraries(
+            mgstc_composite_envelope_compile_tests
+            PRIVATE mgstc_engine juce::juce_core)
+        target_compile_features(
+            mgstc_composite_envelope_compile_tests PRIVATE cxx_std_20)
+        target_compile_definitions(
+            mgstc_composite_envelope_compile_tests
+            PRIVATE JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
+        if(MSVC)
+            target_compile_options(
+                mgstc_composite_envelope_compile_tests PRIVATE
+                    /W4 /permissive- /EHsc /utf-8)
+        endif()
+        add_test(
+            NAME mgstc_composite_envelope_compile_tests
+            COMMAND mgstc_composite_envelope_compile_tests)
     endif()
 
     add_executable(

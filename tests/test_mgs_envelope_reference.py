@@ -9,6 +9,7 @@ from tools.mgs_envelope_reference import (
     automatic_volume_opcode,
     RateEnvelopeState,
     sequence_output_volume,
+    step_sequence_key_off_decay,
 )
 
 
@@ -482,6 +483,16 @@ class EnvelopeReferenceTests(unittest.TestCase):
             [event.args for event in events],
             [(0x0E, 0x20), (0x0E, 0x21)],
         )
+
+    def test_sequence_key_off_decay_matches_k0_k1_k2(self):
+        wrote, progress, volume = step_sequence_key_off_decay(0, 0, 15)
+        self.assertEqual((wrote, volume), (True, 0))
+        wrote, progress, volume = step_sequence_key_off_decay(1, 0, 15)
+        self.assertEqual((wrote, progress, volume), (True, 0, 14))
+        wrote, progress, volume = step_sequence_key_off_decay(2, 0, 15)
+        self.assertEqual((wrote, progress, volume), (False, 1, 15))
+        wrote, progress, volume = step_sequence_key_off_decay(2, progress, volume)
+        self.assertEqual((wrote, progress, volume), (True, 0, 14))
 
 
 if __name__ == "__main__":

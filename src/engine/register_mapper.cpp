@@ -30,7 +30,7 @@ constexpr std::uint16_t kOpllPackedOctaveDown = 0xFEAD;
     std::uint16_t current,
     std::int32_t period_offset) noexcept {
     return static_cast<std::uint16_t>(
-        (static_cast<int>(current) + period_offset) & 0x1FFF);
+        static_cast<int>(current) + period_offset);
 }
 
 void applyOpllPackedFrequencyDelta(

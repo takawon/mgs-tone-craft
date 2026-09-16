@@ -10,6 +10,8 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <string>
+#include <string_view>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -27,6 +29,102 @@ namespace {
 
 constexpr std::uint64_t kImportLibraryIdBase = 0x4D47535400020001ULL;
 
+// JIS X 0201 halfwidth katakana U+FF61–FF9F → fullwidth.
+constexpr char32_t kHalfwidthKatakanaToFullwidth[] = {
+    0x3002, 0x300C, 0x300D, 0x3001, 0x30FB, 0x30F2, 0x30A1, 0x30A3,
+    0x30A5, 0x30A7, 0x30A9, 0x30E3, 0x30E5, 0x30E7, 0x30C3, 0x30FC,
+    0x30A2, 0x30A4, 0x30A6, 0x30A8, 0x30AA, 0x30AB, 0x30AD, 0x30AF,
+    0x30B1, 0x30B3, 0x30B5, 0x30B7, 0x30B9, 0x30BB, 0x30BD, 0x30BF,
+    0x30C1, 0x30C4, 0x30C6, 0x30C8, 0x30CA, 0x30CB, 0x30CC, 0x30CD,
+    0x30CE, 0x30CF, 0x30D2, 0x30D5, 0x30D8, 0x30DB, 0x30DE, 0x30DF,
+    0x30E0, 0x30E1, 0x30E2, 0x30E4, 0x30E6, 0x30E8, 0x30E9, 0x30EA,
+    0x30EB, 0x30EC, 0x30ED, 0x30EF, 0x30F3, 0x309B, 0x309C,
+};
+
+void appendUtf8(std::string& out, char32_t codepoint) {
+    if (codepoint <= 0x7F) {
+        out.push_back(static_cast<char>(codepoint));
+        return;
+    }
+    if (codepoint <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        return;
+    }
+    if (codepoint <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        return;
+    }
+    out.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+}
+
+bool nextUtf8(
+    std::string_view text, std::size_t& offset, char32_t& codepoint) {
+    if (offset >= text.size()) {
+        return false;
+    }
+    const auto lead = static_cast<unsigned char>(text[offset]);
+    std::size_t width = 1;
+    char32_t value = lead;
+    if (lead >= 0x80) {
+        if ((lead & 0xE0) == 0xC0 && offset + 1 < text.size()) {
+            width = 2;
+            value = lead & 0x1F;
+        } else if ((lead & 0xF0) == 0xE0 && offset + 2 < text.size()) {
+            width = 3;
+            value = lead & 0x0F;
+        } else if ((lead & 0xF8) == 0xF0 && offset + 3 < text.size()) {
+            width = 4;
+            value = lead & 0x07;
+        } else {
+            ++offset;
+            codepoint = lead;
+            return true;
+        }
+        for (std::size_t index = 1; index < width; ++index) {
+            const auto unit = static_cast<unsigned char>(text[offset + index]);
+            if ((unit & 0xC0) != 0x80) {
+                ++offset;
+                codepoint = lead;
+                return true;
+            }
+            value = (value << 6) | (unit & 0x3F);
+        }
+    }
+    offset += width;
+    codepoint = value;
+    return true;
+}
+
+std::string widenMsxWindowsText(std::string text) {
+    std::string out;
+    out.reserve(text.size());
+    std::size_t offset = 0;
+    char32_t codepoint = 0;
+    while (nextUtf8(text, offset, codepoint)) {
+        if (codepoint >= 0xFF61 && codepoint <= 0xFF9F) {
+            codepoint = kHalfwidthKatakanaToFullwidth[codepoint - 0xFF61];
+            appendUtf8(out, codepoint);
+            continue;
+        }
+        if (codepoint >= 0x2460 && codepoint <= 0x2473) {
+            const int number = static_cast<int>(codepoint - 0x2460) + 1;
+            if (number >= 10) {
+                out.push_back(static_cast<char>('0' + (number / 10)));
+            }
+            out.push_back(static_cast<char>('0' + (number % 10)));
+            continue;
+        }
+        appendUtf8(out, codepoint);
+    }
+    return out;
+}
+
 std::string asciiOrUtf8(std::string text) {
     while (!text.empty()
            && (text.back() == '\0' || std::isspace(
@@ -38,7 +136,7 @@ std::string asciiOrUtf8(std::string text) {
            && std::isspace(static_cast<unsigned char>(text[begin]))) {
         ++begin;
     }
-    return text.substr(begin);
+    return widenMsxWindowsText(text.substr(begin));
 }
 
 }  // namespace
@@ -78,7 +176,7 @@ std::string collapseImportLabel(std::string text) {
         pending_space = false;
         collapsed.push_back(static_cast<char>(character));
     }
-    return collapsed;
+    return widenMsxWindowsText(std::move(collapsed));
 }
 
 std::string decodeCp932Name(std::span<const std::uint8_t> bytes) {
@@ -193,6 +291,7 @@ bool envelopeBytecodeToLayer(
     std::vector<EnvelopeEvent> pitch;
     std::vector<EnvelopeEvent> timbre;
     bool dropped_psg = false;
+    bool after_loop_start = false;
     const auto fail = [&](const char* message) {
         issues.emplace_back(message);
         return false;
@@ -204,6 +303,7 @@ bool envelopeBytecodeToLayer(
                 .kind = EnvelopeEventKind::Volume,
                 .value = opcode,
                 .count = count,
+                .after_loop_start = after_loop_start,
             });
             count = std::min<std::uint32_t>(
                 EnvelopeTimeline::kMaximumLengthCounts, count + 1);
@@ -217,6 +317,7 @@ bool envelopeBytecodeToLayer(
                 .kind = EnvelopeEventKind::Timbre,
                 .value = bytecode[position++],
                 .count = count,
+                .after_loop_start = after_loop_start,
             });
             continue;
         }
@@ -231,6 +332,7 @@ bool envelopeBytecodeToLayer(
                 .value = reg,
                 .secondary = value,
                 .count = count,
+                .after_loop_start = after_loop_start,
             });
             continue;
         }
@@ -246,6 +348,7 @@ bool envelopeBytecodeToLayer(
                 .kind = EnvelopeEventKind::Pitch,
                 .value = delta,
                 .count = count,
+                .after_loop_start = after_loop_start,
             });
             continue;
         }
@@ -254,26 +357,21 @@ bool envelopeBytecodeToLayer(
                 return fail("truncated envelope ramp command");
             }
             const auto hold = bytecode[position++];
-            auto origin = count;
-            if (!volume.empty()
-                && volume.back().kind == EnvelopeEventKind::Volume
-                && volume.back().count + 1 == count
-                && !volume.back().automatic) {
-                origin = volume.back().count;
-            }
             count = std::min<std::uint32_t>(
                 EnvelopeTimeline::kMaximumLengthCounts,
-                origin + hold);
+                count + hold);
             volume.push_back({
                 .kind = EnvelopeEventKind::Volume,
                 .value = opcode & 0x0F,
                 .count = count,
+                .after_loop_start = after_loop_start,
                 .automatic = true,
             });
             continue;
         }
         if (opcode == 0x40) {
             loop_start = count;
+            after_loop_start = true;
             continue;
         }
         if (opcode == 0x60) {
@@ -293,6 +391,7 @@ bool envelopeBytecodeToLayer(
                 .kind = EnvelopeEventKind::Volume,
                 .value = opcode & 0x0F,
                 .count = count,
+                .after_loop_start = after_loop_start,
             });
             count = std::min<std::uint32_t>(
                 EnvelopeTimeline::kMaximumLengthCounts,
@@ -365,7 +464,10 @@ CompositeTimbre makeSelfContainedComposite(
         SavedTimbreReference reference;
         reference.library_id = next_id++;
         reference.source = TimbreSource::Opll;
-        reference.number_mode = TimbreNumberMode::Automatic;
+        reference.name = envelope_layer.name;
+        reference.number_mode = TimbreNumberMode::Manual;
+        reference.manual_number =
+            static_cast<std::uint8_t>(std::min(number, 31U));
         reference.opll_registers = encodeOpllPatch(defined->second);
         opll_refs.emplace(number, reference);
         return reference.library_id;
@@ -382,7 +484,10 @@ CompositeTimbre makeSelfContainedComposite(
         SavedTimbreReference reference;
         reference.library_id = next_id++;
         reference.source = TimbreSource::Scc;
-        reference.number_mode = TimbreNumberMode::Automatic;
+        reference.name = envelope_layer.name;
+        reference.number_mode = TimbreNumberMode::Manual;
+        reference.manual_number =
+            static_cast<std::uint8_t>(std::min(number, 31U));
         reference.scc_waveform = sccWaveformToBytes(defined->second);
         scc_refs.emplace(number, reference);
         return reference.library_id;
@@ -419,6 +524,10 @@ CompositeTimbre makeSelfContainedComposite(
         want_psg = true;
     }
 
+    CompositeTimbre timbre;
+    timbre.format_version = CompositeTimbre::kFormatVersion;
+    timbre.name = std::move(name);
+
     const auto rewriteLayerEvents = [&](CompositeLayer& layer) {
         for (auto& event : layer.timbre_automation) {
             if (event.kind != EnvelopeEventKind::Timbre) {
@@ -446,7 +555,6 @@ CompositeTimbre makeSelfContainedComposite(
                 if (const auto id = embedOpll(number)) {
                     event.timbre_pick = TimbrePick::Library;
                     event.target_library_id = *id;
-                    event.value = 0;
                 } else {
                     warnings.push_back(
                         {"envelope references an undefined OPLL tone"});
@@ -455,7 +563,6 @@ CompositeTimbre makeSelfContainedComposite(
                 if (const auto id = embedScc(number)) {
                     event.timbre_pick = TimbrePick::Library;
                     event.target_library_id = *id;
-                    event.value = 0;
                 } else {
                     warnings.push_back(
                         {"envelope references an undefined SCC tone"});
@@ -465,6 +572,18 @@ CompositeTimbre makeSelfContainedComposite(
         if (layer.base_timbre) {
             return;
         }
+        const auto firstToneNumber =
+            [](const std::optional<unsigned>& primary,
+               const std::set<unsigned>& track)
+                -> std::optional<unsigned> {
+            if (primary) {
+                return primary;
+            }
+            if (!track.empty()) {
+                return *track.begin();
+            }
+            return std::nullopt;
+        };
         const bool envelope_has_timbre = std::any_of(
             envelope_layer.timbre_automation.begin(),
             envelope_layer.timbre_automation.end(),
@@ -473,45 +592,63 @@ CompositeTimbre makeSelfContainedComposite(
             });
         if (!envelope_has_timbre) {
             if (layer.source == TimbreSource::Opll && usage.opll) {
-                if (usage.primary_opll) {
-                    const auto number = *usage.primary_opll;
-                    if (embedOpll(number)) {
-                        layer.base_timbre = opll_refs[number];
+                if (const auto number = firstToneNumber(
+                        usage.primary_opll, usage.track_opll)) {
+                    if (embedOpll(*number)) {
+                        layer.base_timbre = opll_refs[*number];
+                        layer.base_timbre->name = envelope_layer.name;
                         return;
                     }
-                    if (number <= 14) {
+                    if (*number <= 14) {
                         layer.base_opll_rom =
-                            static_cast<std::uint8_t>(number);
+                            static_cast<std::uint8_t>(*number);
                         return;
                     }
                 }
-                seedDefaultLayerTimbre(layer);
+                if (!opll_refs.empty()) {
+                    layer.base_timbre = opll_refs.begin()->second;
+                    if (layer.base_timbre->name.empty()) {
+                        layer.base_timbre->name = envelope_layer.name;
+                    }
+                    return;
+                }
+                seedDefaultLayerTimbre(timbre, layer);
                 return;
             }
             if (layer.source == TimbreSource::Scc && usage.scc) {
-                if (usage.primary_scc) {
-                    const auto number = *usage.primary_scc;
-                    if (embedScc(number)) {
-                        layer.base_timbre = scc_refs[number];
+                if (const auto number = firstToneNumber(
+                        usage.primary_scc, usage.track_scc)) {
+                    if (embedScc(*number)) {
+                        layer.base_timbre = scc_refs[*number];
+                        layer.base_timbre->name = envelope_layer.name;
                         return;
                     }
                 }
-                seedDefaultLayerTimbre(layer);
+                if (!scc_refs.empty()) {
+                    layer.base_timbre = scc_refs.begin()->second;
+                    if (layer.base_timbre->name.empty()) {
+                        layer.base_timbre->name = envelope_layer.name;
+                    }
+                    return;
+                }
+                seedDefaultLayerTimbre(timbre, layer);
                 return;
             }
         }
         if (layer.source == TimbreSource::Opll && !opll_refs.empty()) {
             layer.base_timbre = opll_refs.begin()->second;
+            if (layer.base_timbre->name.empty()) {
+                layer.base_timbre->name = envelope_layer.name;
+            }
         } else if (layer.source == TimbreSource::Scc && !scc_refs.empty()) {
             layer.base_timbre = scc_refs.begin()->second;
+            if (layer.base_timbre->name.empty()) {
+                layer.base_timbre->name = envelope_layer.name;
+            }
         } else {
-            seedDefaultLayerTimbre(layer);
+            seedDefaultLayerTimbre(timbre, layer);
         }
     };
-
-    CompositeTimbre timbre;
-    timbre.format_version = CompositeTimbre::kFormatVersion;
-    timbre.name = std::move(name);
 
     const auto addLayer = [&](TimbreSource source) {
         CompositeLayer layer = envelope_layer;

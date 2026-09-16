@@ -73,7 +73,7 @@ public:
     [[nodiscard]] bool setTrackPitchSweep(
         std::uint8_t track,
         PitchSweepSettings settings) noexcept;
-    // Track MML `k` (PSG/SCC). 0 = immediate. Ignored with `@r` / hardware EG.
+    // Track MML `k` (PSG/SCC). Ticks per 1-volume decay after `@e` key-off.
     [[nodiscard]] bool setTrackKeyOffHang(
         std::uint8_t track,
         std::uint8_t hang_ticks) noexcept;
@@ -105,7 +105,7 @@ public:
         std::uint8_t midi_note) noexcept;
     [[nodiscard]] bool queueKeyOn(std::uint8_t track) noexcept;
     [[nodiscard]] bool queueKeyOff(std::uint8_t track) noexcept;
-    // Force the track silent after key-off hang (e.g. OPLL RR=0).
+    // Force the track silent (e.g. OPLL RR=0, or editor stop).
     [[nodiscard]] bool forceMuteTrack(std::uint8_t track) noexcept;
 
     // Program snapshots are prepared before they are auditioned.  Gating
@@ -146,13 +146,15 @@ private:
     std::array<SoftwareLfoRuntime, kTrackCount> track_lfo_{};
     std::array<PitchSweepRuntime, kTrackCount> track_pitch_sweep_{};
     std::array<std::uint8_t, kTrackCount> track_key_off_hang_{};
-    std::array<std::uint8_t, kTrackCount> key_off_hang_remaining_{};
+    std::array<bool, kTrackCount> key_off_decay_active_{};
+    std::array<std::uint8_t, kTrackCount> key_off_decay_progress_{};
+    std::array<std::uint8_t, kTrackCount> key_off_decay_volume_{};
     std::array<bool, kTrackCount> track_opll_sustain_{};
     std::array<PendingKey, kTrackCount> pending_keys_{};
     std::array<bool, kTrackCount> audition_track_running_{};
     std::array<bool, kTrackCount> force_mute_pending_{};
     std::array<bool, kTrackCount> sequence_faulted_{};
-    std::array<bool, 3> psg_sequence_muted_{};
+    std::array<bool, kTrackCount> sequence_key_off_{};
     std::array<std::uint8_t, kTrackCount> current_notes_{};
     std::array<std::uint8_t, 3> psg_tone_noise_modes_{};
     std::array<std::uint8_t, 3> psg_noise_periods_{};
@@ -171,7 +173,11 @@ private:
     [[nodiscard]] MapError applyTrackPatch(std::uint8_t track);
     [[nodiscard]] MapError applyTrackLfo(std::uint8_t track);
     [[nodiscard]] MapError applyTrackPitchSweep(std::uint8_t track);
-    [[nodiscard]] bool keyOffHangApplies(std::uint8_t track) const noexcept;
+    [[nodiscard]] MapError applyLogicalVolume(
+        std::uint8_t track,
+        std::uint8_t logical_volume);
+    [[nodiscard]] bool sequenceKeyOffDecayApplies(
+        std::uint8_t track) const noexcept;
 };
 
 }  // namespace mgstc::engine

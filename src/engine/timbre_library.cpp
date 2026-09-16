@@ -250,10 +250,20 @@ bool TimbreLibrary::update(
         current->last_used_unix_seconds;
     updated.use_count = current->use_count;
     updated.data_version = 1;
-    updated.revision = current->revision
-        == std::numeric_limits<std::uint32_t>::max()
-        ? current->revision
-        : current->revision + 1;
+    const bool data_changed =
+        current->category != updated.category
+        || current->name != updated.name
+        || current->tags != updated.tags
+        || current->memo != updated.memo
+        || current->opll_registers != updated.opll_registers
+        || current->scc_waveform != updated.scc_waveform;
+    if (data_changed
+        && current->revision
+            != std::numeric_limits<std::uint32_t>::max()) {
+        updated.revision = current->revision + 1;
+    } else {
+        updated.revision = current->revision;
+    }
     *current = std::move(updated);
     return true;
 }

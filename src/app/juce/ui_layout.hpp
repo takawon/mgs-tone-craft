@@ -46,6 +46,7 @@ constexpr int libraryMemoH = 80;
 constexpr int libraryButtonH = 36;
 constexpr int libraryButtonMinW = 80;
 constexpr int libraryManageButtonW = 108;
+constexpr int importTypeColumnW = 96; // 「総合 OPLL」等
 constexpr int compositeToolRowH = 34; // match fieldH; header uses textButtonH
 constexpr int commandStackH = 108;
 constexpr int commandSummaryH = 36;
@@ -89,7 +90,7 @@ constexpr int compositeDockLengthLabelW = 32;
 constexpr int countColumnMinW = 28;
 constexpr int countColumnMaxW = 72;
 constexpr int compositeTimbrePickW = 360;
-constexpr int compositeTimbrePickH = 560;
+constexpr int compositeTimbrePickH = 600;
 constexpr int editVolumeLaneShare = 1;
 constexpr int editPitchLaneShare = 3;
 constexpr int editVolumeLaneH = 265; // 100%; quiet steps round to ≥1px
@@ -156,6 +157,7 @@ inline int libraryMemoH = Base::libraryMemoH;
 inline int libraryButtonH = Base::libraryButtonH;
 inline int libraryButtonMinW = Base::libraryButtonMinW;
 inline int libraryManageButtonW = Base::libraryManageButtonW;
+inline int importTypeColumnW = Base::importTypeColumnW;
 inline int compositeToolRowH = Base::compositeToolRowH;
 inline int commandStackH = Base::commandStackH;
 inline int commandSummaryH = Base::commandSummaryH;
@@ -244,11 +246,11 @@ constexpr juce::uint32 pageFillBottom = 0xFF161B22;
 
 inline void recomputeDerived() {
     // Setup column: panelPad inset, fieldH rows, sm between rows
-    // (title + 7 control rows including @e/@r).
+    // (title + 8 control rows including @e/@r and PSG Mode/Noise).
     compositeSetupContentH =
         panelPad * 2
-        + fieldH * 8
-        + sm * 7;
+        + fieldH * 9
+        + sm * 8;
     compositeChannelLaneH =
         compositeSetupContentH + editLaneFramePadV * 2;
     compositeHeaderControlsW =
@@ -347,6 +349,7 @@ inline void applyScale(float factor) {
     libraryButtonH = s(Base::libraryButtonH);
     libraryButtonMinW = s(Base::libraryButtonMinW);
     libraryManageButtonW = s(Base::libraryManageButtonW);
+    importTypeColumnW = s(Base::importTypeColumnW);
     compositeToolRowH = s(Base::compositeToolRowH);
     commandStackH = s(Base::commandStackH);
     commandSummaryH = s(Base::commandSummaryH);

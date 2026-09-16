@@ -58,6 +58,67 @@ using mgstc::app::envelopeTimbreCatalogLabel;
 
 namespace {
 
+void insertCurrentAssignmentCatalogItem(
+    std::vector<EnvelopeTimbreCatalogItem>& catalog,
+    const EnvelopeTimbreChoice& current,
+    const mgstc::engine::CompositeTimbre& timbre,
+    const juce::String& fallback_name) {
+    if (current.pick != mgstc::engine::TimbrePick::Library
+        || current.library_id == 0) {
+        return;
+    }
+    for (auto& item : catalog) {
+        if (item.library_id == current.library_id) {
+            item.current_assignment = true;
+            return;
+        }
+    }
+    EnvelopeTimbreCatalogItem item;
+    item.library_id = current.library_id;
+    item.current_assignment = true;
+    if (const auto* snap =
+            mgstc::engine::findEmbeddedTimbreSnapshot(
+                timbre, current.library_id)) {
+        item.name = juce::String::fromUTF8(snap->name.c_str());
+        item.revision = snap->revision;
+    }
+    if (item.name.isEmpty()) {
+        item.name = fallback_name.isNotEmpty()
+            ? fallback_name
+            : juce::String::fromUTF8("オリジナル");
+    }
+    const auto numbers = mgstc::engine::resolveTimbreNumbers(timbre);
+    item.assigned_number = mgstc::engine::assignedNumberForLibraryId(
+        numbers, current.library_id);
+    catalog.insert(catalog.begin(), std::move(item));
+}
+
+[[nodiscard]] juce::String currentAssignmentCaption(
+    mgstc::engine::TimbreSource source,
+    const EnvelopeTimbreChoice& current,
+    const std::vector<EnvelopeTimbreCatalogItem>& catalog) {
+    if (source == mgstc::engine::TimbreSource::Opll
+        && current.pick == mgstc::engine::TimbrePick::OpllRom) {
+        return juce::String::fromUTF8("現在: ")
+            + opllRomPatchLabel(current.rom_number);
+    }
+    if (current.pick == mgstc::engine::TimbrePick::Library
+        && current.library_id != 0) {
+        for (const auto& item : catalog) {
+            if (item.library_id == current.library_id) {
+                auto name = item.name;
+                if (name.isEmpty()) {
+                    name = juce::String::fromUTF8("オリジナル");
+                }
+                return juce::String::fromUTF8("現在: ") + name;
+            }
+        }
+        return juce::String::fromUTF8("現在: オリジナル");
+    }
+    return juce::String::fromUTF8("現在: （なし）");
+}
+
+
 class EnvelopeNumericEntryContent final : public juce::Component {
 public:
     EnvelopeNumericEntryContent(
@@ -217,6 +278,13 @@ public:
           on_set_tags_(std::move(on_set_tags)),
           on_set_memo_(std::move(on_set_memo)),
           layer_base_(layer_base) {
+        current_label_.setText(
+            currentAssignmentCaption(source_, current_, catalog_),
+            juce::dontSendNotification);
+        current_label_.setFont(UiFonts::body());
+        current_label_.setTooltip(juce::String::fromUTF8(
+            "このステップ（またはチャンネル）にいま割り当てられている音色"));
+        addAndMakeVisible(current_label_);
         preset_label_.setText(
             juce::String::fromUTF8("プリセット音色"),
             juce::dontSendNotification);
@@ -260,13 +328,23 @@ public:
 
         edit_.setButtonText(juce::String::fromUTF8("音色を編集"));
         edit_.setTooltip(juce::String::fromUTF8(
-            "選択したライブラリ／オリジナル音色を総合音色編集ウィンドウで開きます。"
-            "ROMは開けません"));
+            "現在の割り当て、または一覧で選んだライブラリ／オリジナル音色を"
+            "総合音色編集ウィンドウで開きます。ROMは開けません"));
         edit_.onClick = [this] {
-            if (const auto id = selectedLibraryId()) {
-                on_edit_(*id);
-                closeHost();
+            std::optional<std::uint64_t> id = selectedLibraryId();
+            if (!id
+                && current_.pick == mgstc::engine::TimbrePick::Library
+                && current_.library_id != 0) {
+                id = current_.library_id;
             }
+            if (!id || !on_edit_) {
+                return;
+            }
+            auto edit = on_edit_;
+            const auto library_id = *id;
+            closeHost();
+            juce::MessageManager::callAsync(
+                [edit, library_id] { edit(library_id); });
         };
         addAndMakeVisible(edit_);
 
@@ -374,6 +452,8 @@ public:
     void resized() override {
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(panelPad);
+        current_label_.setBounds(area.removeFromTop(fieldH));
+        area.removeFromTop(sm);
         auto preset_row = area.removeFromTop(fieldH);
         preset_label_.setBounds(preset_row.removeFromLeft(UiScale::sx(108)));
         preset_row.removeFromLeft(controlGap);
@@ -408,8 +488,13 @@ private:
 
     [[nodiscard]] std::vector<const EnvelopeTimbreCatalogItem*>
     filteredCatalog() const {
+        std::vector<const EnvelopeTimbreCatalogItem*> pinned;
         std::vector<const EnvelopeTimbreCatalogItem*> ordered;
         for (const auto& item : catalog_) {
+            if (item.current_assignment) {
+                pinned.push_back(&item);
+                continue;
+            }
             if (!favorite_only_.getToggleState() || item.favorite) {
                 ordered.push_back(&item);
             }
@@ -439,7 +524,7 @@ private:
                 return false;
             });
         const auto filter = filter_.getText().trim();
-        std::vector<const EnvelopeTimbreCatalogItem*> visible;
+        std::vector<const EnvelopeTimbreCatalogItem*> visible = pinned;
         for (const auto* item : ordered) {
             if (filter.isNotEmpty()) {
                 const auto tags = juce::String::fromUTF8(
@@ -499,10 +584,13 @@ private:
             tags_.setButtonText(juce::String::fromUTF8("タグを選択"));
         }
         const bool library_selected = item != nullptr;
-        edit_.setEnabled(library_selected);
-        rename_.setEnabled(library_selected && on_rename_ != nullptr);
-        tags_.setEnabled(library_selected && on_set_tags_ != nullptr);
-        memo_.setReadOnly(!library_selected || on_set_memo_ == nullptr);
+        const bool standalone_selected =
+            library_selected
+            && mgstc::engine::isStandaloneLibraryTimbreId(item->library_id);
+        edit_.setEnabled(canEditAssigned());
+        rename_.setEnabled(standalone_selected && on_rename_ != nullptr);
+        tags_.setEnabled(standalone_selected && on_set_tags_ != nullptr);
+        memo_.setReadOnly(!standalone_selected || on_set_memo_ == nullptr);
         load_.setEnabled(selectedChoice().has_value());
         syncing_ = false;
     }
@@ -530,6 +618,18 @@ private:
             return item->library_id;
         }
         return std::nullopt;
+    }
+
+    [[nodiscard]] bool canEditAssigned() const {
+        if (source_ == mgstc::engine::TimbreSource::Opll
+            && preset_.getSelectedId() > 0) {
+            return false;
+        }
+        if (selectedLibraryId()) {
+            return true;
+        }
+        return current_.pick == mgstc::engine::TimbrePick::Library
+            && current_.library_id != 0;
     }
 
     [[nodiscard]] std::optional<EnvelopeTimbreChoice> selectedChoice() const {
@@ -687,6 +787,7 @@ private:
     std::function<bool(std::uint64_t, juce::String)> on_set_memo_;
     bool layer_base_{};
     SwitchLookAndFeel switch_look_and_feel_;
+    juce::Label current_label_;
     juce::Label preset_label_;
     juce::ComboBox preset_;
     juce::TextButton edit_;
@@ -1840,12 +1941,12 @@ public:
         configureBar(sustain_level_, sustain_level_label_, "SL");
         configureBar(sustain_rate_, sustain_rate_label_, "SR");
         configureBar(release_rate_, release_rate_label_, "RR");
-        mode_.addItem(juce::String::fromUTF8("/0 オフ"), 1);
-        mode_.addItem(juce::String::fromUTF8("/1 トーン"), 2);
-        mode_.addItem(juce::String::fromUTF8("/2 ノイズ"), 3);
-        mode_.addItem(juce::String::fromUTF8("/3 トーン+ノイズ"), 4);
+        mode_.addItem(juce::String::fromUTF8("0 変化なし"), 1);
+        mode_.addItem(juce::String::fromUTF8("1 トーン"), 2);
+        mode_.addItem(juce::String::fromUTF8("2 ノイズ"), 3);
+        mode_.addItem(juce::String::fromUTF8("3 トーン+ノイズ"), 4);
         mode_.setTooltip(juce::String::fromUTF8(
-            "PSG Tone/Noise モード（@r 定義の Mode。0～3）"));
+            "PSG Tone/Noise モード（@r = { Mode, Noise, AL... } の Mode。0～3）"));
         mode_.onChange = [this] {
             if (!assigning_) {
                 commitFromEditors(true);
@@ -1865,7 +1966,7 @@ public:
         noise_.setTextBoxStyle(
             juce::Slider::TextBoxLeft, false, 48, UiLayout::fieldH - 10);
         noise_.setTooltip(juce::String::fromUTF8(
-            "PSG ノイズ周期（@r 定義の Noise。0～31）"));
+            "PSG ノイズ周期（@r = { Mode, Noise, AL... } の Noise。0～31）"));
         noise_.onValueChange = [this] {
             if (!assigning_) {
                 commitFromEditors(false);
@@ -2268,6 +2369,13 @@ public:
             "@e の命令列は残し、@r のときは使いません"));
         rate_kind_.onClick = [this] {
             rate_edit_.setEnabled(rate_kind_.getToggleState());
+            const bool psg_sequence = !rate_kind_.getToggleState()
+                && source_.getText() == "PSG";
+            mixer_mode_.setVisible(psg_sequence);
+            mixer_mode_label_.setVisible(psg_sequence);
+            mixer_noise_.setVisible(psg_sequence);
+            mixer_noise_label_.setVisible(psg_sequence);
+            resized();
             if (changed_) {
                 changed_(true);
             }
@@ -2425,6 +2533,7 @@ public:
         configureValueSlider(delay_, 0.0, 256.0, "");
         configureValueSlider(volume_, 0.0, 15.0, "");
         configureValueSlider(key_off_hang_, 0.0, 255.0, "");
+        configureValueSlider(mixer_noise_, 0.0, 31.0, "");
         delay_form_.addItem("r", 1);
         delay_form_.addItem("r%", 2);
         delay_form_.setSelectedId(2, juce::dontSendNotification);
@@ -2438,6 +2547,23 @@ public:
             "発音前休符の記法。r=音符長（テンポ依存）、"
             "r%=1/60秒ティック（テンポ非依存）。@e内の待ちではない"));
         addAndMakeVisible(delay_form_);
+        mixer_mode_.addItem(juce::String::fromUTF8("0 変化なし"), 1);
+        mixer_mode_.addItem(juce::String::fromUTF8("1 トーン"), 2);
+        mixer_mode_.addItem(juce::String::fromUTF8("2 ノイズ"), 3);
+        mixer_mode_.addItem(juce::String::fromUTF8("3 トーン+ノイズ"), 4);
+        mixer_mode_.setSelectedId(2, juce::dontSendNotification);
+        mixer_mode_.setTooltip(juce::String::fromUTF8(
+            "MGSC @e = { Mode, Noise, data } の先頭 Mode。"
+            "キーオン時のトーン／ノイズ（0～3。省略時は1）"));
+        mixer_mode_.onChange = [this] {
+            if (!assigning_ && changed_) {
+                changed_(true);
+            }
+        };
+        addAndMakeVisible(mixer_mode_);
+        mixer_noise_.setTooltip(juce::String::fromUTF8(
+            "MGSC @e = { Mode, Noise, data } の先頭 Noise（0～31。省略時は0）。"
+            "Mode 2以上で有効"));
         pitch_label_.setText(
             juce::String::fromUTF8("相対音程"),
             juce::dontSendNotification);
@@ -2448,6 +2574,10 @@ public:
         volume_label_.setText(juce::String::fromUTF8("v"), juce::dontSendNotification);
         key_off_hang_label_.setText(
             juce::String::fromUTF8("k"), juce::dontSendNotification);
+        mixer_mode_label_.setText(
+            juce::String::fromUTF8("Mode"), juce::dontSendNotification);
+        mixer_noise_label_.setText(
+            juce::String::fromUTF8("Noise"), juce::dontSendNotification);
         pitch_.setTooltip(juce::String::fromUTF8(
             "相対音程（半音）。鍵盤／PCキー／MIDI試聴の音程オフセット（§6.5.3）"));
         detune_.setTooltip(juce::String::fromUTF8(
@@ -2455,7 +2585,8 @@ public:
             "キーオン時に先に適用し、エンベロープ\\はこれに加算"));
         micro_detune_.setTooltip(juce::String::fromUTF8(
             "トラック微デチューン（MML @\\）。\\と同時利用で効果が重なる。"
-            "PSG/SCC: -32768～32767（128≒半音）、FM: 0～255（255≒半音上）"));
+            "PSG/SCC: -32768～32767（音程表へ加算してからオクターブ変換）。"
+            "FM: 0～255（255で次の半音）"));
         delay_.setTooltip(juce::String::fromUTF8(
             "キーオン前の休符ディレイ（トラックMML。エンベロープ内カウントではない）。"
             "r<n>は音符長（例 r4＝4分、実時間は複合音色のテンポ依存）。"
@@ -2464,8 +2595,8 @@ public:
         volume_.setTooltip(juce::String::fromUTF8(
             "トラック音量 v（発音前MML）。@eのfはこの値を最大として引き算"));
         key_off_hang_.setTooltip(juce::String::fromUTF8(
-            "発音前 k（PSG／SCC）。キーオフ後に音を残す長さ 0～255。"
-            "0＝即時。@r およびハードウェアEG使用時は無効（値は残る）"));
+            "発音前 k（PSG／SCC）。キーオフ後に合成音量を1下げる間隔 0～255。"
+            "0＝即時消音。大きいほど減衰が遅い。@r およびハードウェアEG使用時は無効（値は残る）"));
         key_off_hang_label_.setTooltip(key_off_hang_.getTooltip());
         sustain_.addItem("sf", 1);
         sustain_.addItem("so", 2);
@@ -2485,7 +2616,9 @@ public:
                  &micro_detune_label_,
                  &delay_label_,
                  &volume_label_,
-                 &key_off_hang_label_}) {
+                 &key_off_hang_label_,
+                 &mixer_mode_label_,
+                 &mixer_noise_label_}) {
             label->setFont(UiFonts::dense());
             label->setJustificationType(juce::Justification::centredLeft);
             addAndMakeVisible(*label);
@@ -2579,7 +2712,7 @@ public:
         const bool triangle_preset = library_base
             && layer.base_timbre->library_id
                 == mgstc::engine::kSccTrianglePresetLibraryId;
-        edit_.setEnabled(library_base && !triangle_preset);
+        edit_.setEnabled(library_base && !rom_base);
         number_mode_.setEnabled(library_base && !rom_base);
         if (!has_timbre_choice) {
             timbre_settings_.setTooltip(juce::String::fromUTF8("PSGは@なし"));
@@ -2628,10 +2761,11 @@ public:
             edit_.setTooltip(
                 triangle_preset
                     ? juce::String::fromUTF8(
-                        "初期Triangleはライブラリ未登録です。"
-                        "音色設定から保存音色を選ぶと個別編集できます")
+                        "この総合音色にコピーしたTriangleを編集します。"
+                        "単音色ライブラリとは独立です")
                     : juce::String::fromUTF8(
-                        "割り当て音色を個別画面で開く"));
+                        "この総合音色にコピーしたオリジナルを編集します。"
+                        "単音色ライブラリとは独立です"));
             number_mode_.setTooltip(juce::String::fromUTF8(
                 "MGSC音色番号の割り付け。自動＝空き番号、手動＝右の音色番号を使用"));
             timbre_number_label_.setTooltip(juce::String::fromUTF8(
@@ -2687,6 +2821,18 @@ public:
             static_cast<double>(layer.start_delay_value),
             juce::dontSendNotification);
         volume_.setValue(layer.volume, juce::dontSendNotification);
+        const bool psg_sequence =
+            layer.source == mgstc::engine::TimbreSource::Psg && !rate;
+        mixer_mode_.setVisible(psg_sequence);
+        mixer_mode_label_.setVisible(psg_sequence);
+        mixer_noise_.setVisible(psg_sequence);
+        mixer_noise_label_.setVisible(psg_sequence);
+        const auto mixer =
+            mgstc::engine::sequenceEnvelopeMixer(layer.volume_envelope.rate);
+        mixer_mode_.setSelectedId(
+            static_cast<int>(mixer.tone_mode) + 1,
+            juce::dontSendNotification);
+        mixer_noise_.setValue(mixer.noise, juce::dontSendNotification);
         assigning_ = false;
     }
 
@@ -2724,6 +2870,21 @@ public:
         layer.start_delay_value =
             static_cast<std::uint32_t>(delay_.getValue());
         layer.volume = static_cast<std::uint8_t>(volume_.getValue());
+        if (layer.source == mgstc::engine::TimbreSource::Psg
+            && layer.volume_envelope.kind
+                == mgstc::engine::EnvelopeKind::Sequence) {
+            const auto mode = static_cast<std::uint8_t>(
+                juce::jmax(0, mixer_mode_.getSelectedId() - 1));
+            const auto noise = static_cast<std::uint8_t>(mixer_noise_.getValue());
+            if (mode == mgstc::engine::kMgscSequenceToneModeDefault
+                && noise == mgstc::engine::kMgscSequenceNoiseDefault) {
+                layer.volume_envelope.rate.tone_mode = 0;
+                layer.volume_envelope.rate.noise = 0;
+            } else {
+                layer.volume_envelope.rate.tone_mode = mode;
+                layer.volume_envelope.rate.noise = noise;
+            }
+        }
         layer.key_off_hang = static_cast<std::uint8_t>(
             key_off_hang_.getValue());
         layer.opll_sustain = layer.source == mgstc::engine::TimbreSource::Opll
@@ -2845,6 +3006,23 @@ public:
             key_off_hang_.setBounds({});
             sustain_.setBounds(delay_row.removeFromLeft(setupSustainComboW));
         }
+        area.removeFromTop(sm);
+        auto mixer_row = area.removeFromTop(fieldH);
+        if (mixer_mode_.isVisible()) {
+            auto noise_area = mixer_row.removeFromRight(
+                juce::jmax(1, (mixer_row.getWidth() - controlGap) / 2));
+            mixer_row.removeFromRight(controlGap);
+            mixer_mode_label_.setBounds(
+                mixer_row.removeFromLeft(editSubLaneLabelW));
+            mixer_row.removeFromLeft(controlGap);
+            mixer_mode_.setBounds(mixer_row);
+            layoutValue(noise_area, mixer_noise_label_, mixer_noise_);
+        } else {
+            mixer_mode_.setBounds({});
+            mixer_mode_label_.setBounds({});
+            mixer_noise_.setBounds({});
+            mixer_noise_label_.setBounds({});
+        }
     }
 
     void mouseDown(const juce::MouseEvent&) override {
@@ -2957,14 +3135,18 @@ private:
     juce::Label delay_label_;
     juce::Label volume_label_;
     juce::Label key_off_hang_label_;
+    juce::Label mixer_mode_label_;
+    juce::Label mixer_noise_label_;
     juce::ComboBox delay_form_;
     juce::ComboBox sustain_;
+    juce::ComboBox mixer_mode_;
     juce::Slider pitch_;
     juce::Slider detune_;
     juce::Slider micro_detune_;
     juce::Slider delay_;
     juce::Slider volume_;
     juce::Slider key_off_hang_;
+    juce::Slider mixer_noise_;
 };
 
 class CountCommandStackView final
@@ -3953,6 +4135,15 @@ public:
                 parameter_.setSelectedId(
                     static_cast<int>(Parameter::Timbre),
                     juce::dontSendNotification);
+                if (const auto marked = timbreMarkerCountAt(
+                        selected_layer,
+                        slots.timbre,
+                        event.getPosition())) {
+                    selected_count_ = *marked;
+                    position_.setText(
+                        "ct " + juce::String(selected_count_),
+                        juce::dontSendNotification);
+                }
                 pickTimbreAt(selected_count_, false);
                 drawing_ = false;
                 repaint();
@@ -4989,7 +5180,7 @@ private:
             + std::to_string(static_cast<int>(layer.channel) + 1);
         layer.envelope_number =
             mgstc::engine::nextFreeEnvelopeNumber(timbre_);
-        mgstc::engine::seedDefaultLayerTimbre(layer);
+        mgstc::engine::seedDefaultLayerTimbre(timbre_, layer);
         timbre_.layers.push_back(std::move(layer));
         selected_layer_ = static_cast<int>(timbre_.layers.size()) - 1;
         refreshCountCeilingCache();
@@ -7341,6 +7532,43 @@ private:
         return nullptr;
     }
 
+    [[nodiscard]] std::optional<int> timbreMarkerCountAt(
+        const mgstc::engine::CompositeLayer& layer,
+        juce::Rectangle<int> bounds,
+        juce::Point<int> point) const {
+        if (bounds.isEmpty() || !bounds.contains(point)) {
+            return std::nullopt;
+        }
+        const auto font = UiFonts::dense(true);
+        std::optional<int> hit;
+        int best_distance = std::numeric_limits<int>::max();
+        for (const auto& event : layer.timbre_automation) {
+            if (event.kind != mgstc::engine::EnvelopeEventKind::Timbre) {
+                continue;
+            }
+            const int x = xForCount(bounds, static_cast<int>(event.count));
+            const auto label = timbreCommandLabel(event);
+            const int text_w = juce::jmax(
+                48,
+                juce::GlyphArrangement::getStringWidthInt(font, label) + 10);
+            auto area = juce::Rectangle<int>(
+                x - 6,
+                bounds.getY(),
+                12 + text_w,
+                bounds.getHeight());
+            area = area.getIntersection(bounds);
+            if (!area.contains(point)) {
+                continue;
+            }
+            const int distance = point.x >= x ? point.x - x : x - point.x;
+            if (distance < best_distance) {
+                best_distance = distance;
+                hit = static_cast<int>(event.count);
+            }
+        }
+        return hit;
+    }
+
     void pickTimbreAt(int timeline_count, bool) {
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
@@ -7357,13 +7585,17 @@ private:
             catalog = catalog_callback_(layer.source);
         }
         EnvelopeTimbreChoice current;
+        juce::String current_name;
         if (const auto* existing = timbreEventAt(
                 layer, static_cast<std::uint32_t>(timeline_count))) {
             current.pick = existing->timbre_pick;
             current.library_id = existing->target_library_id;
             current.rom_number = static_cast<std::uint8_t>(
                 juce::jlimit(0, 14, existing->value));
+            current_name = timbreCommandLabel(*existing);
         }
+        insertCurrentAssignmentCatalogItem(
+            catalog, current, timbre_, current_name);
         const auto count = timeline_count;
         auto* dialog = new ModalDialogWindow(
             juce::String::fromUTF8("音色（@）"),
@@ -7375,7 +7607,23 @@ private:
             [this, count](EnvelopeTimbreChoice choice) {
                 applyTimbreChoice(count, choice);
             },
-            [this, source = layer.source](std::uint64_t library_id) {
+            [this, count, source = layer.source](std::uint64_t library_id) {
+                if (mgstc::engine::isStandaloneLibraryTimbreId(library_id)) {
+                    EnvelopeTimbreChoice choice;
+                    choice.pick = mgstc::engine::TimbrePick::Library;
+                    choice.library_id = library_id;
+                    applyTimbreChoice(count, choice);
+                    if (selected_layer_ >= 0
+                        && selected_layer_
+                            < static_cast<int>(timbre_.layers.size())) {
+                        if (const auto* event = timbreEventAt(
+                                timbre_.layers[static_cast<std::size_t>(
+                                    selected_layer_)],
+                                static_cast<std::uint32_t>(count))) {
+                            library_id = event->target_library_id;
+                        }
+                    }
+                }
                 if (open_timbre_callback_) {
                     open_timbre_callback_(
                         source == mgstc::engine::TimbreSource::Scc
@@ -7428,13 +7676,25 @@ private:
             catalog = catalog_callback_(layer.source);
         }
         EnvelopeTimbreChoice current;
+        juce::String current_name;
         if (mgstc::engine::layerUsesOpllRomBase(layer) && layer.base_opll_rom) {
             current.pick = mgstc::engine::TimbrePick::OpllRom;
             current.rom_number = *layer.base_opll_rom;
+            current_name = opllRomPatchLabel(
+                static_cast<int>(*layer.base_opll_rom));
         } else if (layer.base_timbre) {
             current.pick = mgstc::engine::TimbrePick::Library;
             current.library_id = layer.base_timbre->library_id;
+            if (timbre_name_callback_) {
+                current_name = timbre_name_callback_(current.library_id);
+            }
+            if (current_name.isEmpty()) {
+                current_name = juce::String::fromUTF8(
+                    layer.base_timbre->name.c_str());
+            }
         }
+        insertCurrentAssignmentCatalogItem(
+            catalog, current, timbre_, current_name);
         auto* dialog = new ModalDialogWindow(
             juce::String::fromUTF8("音色設定"),
             juce::Colour(0xFF1B222C));
@@ -7445,11 +7705,24 @@ private:
             [this, layer_index](EnvelopeTimbreChoice choice) {
                 applyLayerBaseChoice(layer_index, choice);
             },
-            [this, source = layer.source](std::uint64_t library_id) {
+            [this, layer_index, source = layer.source](
+                std::uint64_t library_id) {
+                if (mgstc::engine::isStandaloneLibraryTimbreId(library_id)) {
+                    EnvelopeTimbreChoice choice;
+                    choice.pick = mgstc::engine::TimbrePick::Library;
+                    choice.library_id = library_id;
+                    applyLayerBaseChoice(layer_index, choice);
+                    if (layer_index < timbre_.layers.size()
+                        && timbre_.layers[layer_index].base_timbre) {
+                        library_id =
+                            timbre_.layers[layer_index]
+                                .base_timbre->library_id;
+                    }
+                }
                 if (open_timbre_callback_) {
                     open_timbre_callback_(
                         source == mgstc::engine::TimbreSource::Scc
-                            ? "scc" : "opll",
+                            ? "scc-envelope" : "opll-envelope",
                         library_id);
                 }
             },
@@ -7887,6 +8160,18 @@ private:
         event.count = static_cast<std::uint32_t>(timeline_count);
         event.timbre_pick = choice.pick;
         event.target_library_id = choice.library_id;
+        if (choice.pick == mgstc::engine::TimbrePick::Library
+            && mgstc::engine::isStandaloneLibraryTimbreId(choice.library_id)
+            && timbre_library_callback_) {
+            if (const auto* library = timbre_library_callback_()) {
+                if (const auto* entry = library->find(choice.library_id)) {
+                    auto adopted =
+                        mgstc::engine::adoptLibraryTimbre(timbre_, *entry);
+                    timbre_.embedded_timbres.push_back(adopted);
+                    event.target_library_id = adopted.library_id;
+                }
+            }
+        }
         event.value = choice.pick == mgstc::engine::TimbrePick::OpllRom
             ? static_cast<std::int32_t>(choice.rom_number)
             : 0;
@@ -8218,14 +8503,22 @@ private:
                     }
                     const auto& layer = timbre_.layers[layer_index];
                     if (!layer.base_timbre
-                        || layer.base_timbre->library_id
-                            == mgstc::engine::kSccTrianglePresetLibraryId) {
+                        || mgstc::engine::layerUsesOpllRomBase(layer)) {
                         return;
+                    }
+                    if (layer.base_timbre->library_id
+                        == mgstc::engine::kSccTrianglePresetLibraryId) {
+                        timbre_.layers[layer_index].base_timbre->library_id =
+                            mgstc::engine::allocateCompositeOwnedTimbreId(
+                                timbre_);
+                        if (edit_callback_) {
+                            edit_callback_(timbre_, true, false);
+                        }
                     }
                     open_timbre_callback_(
                         layer.source == mgstc::engine::TimbreSource::Scc
-                            ? "scc" : "opll",
-                        layer.base_timbre->library_id);
+                            ? "scc-envelope" : "opll-envelope",
+                        timbre_.layers[layer_index].base_timbre->library_id);
                 },
                 [this, layer_index] {
                     pickBaseTimbre(layer_index);

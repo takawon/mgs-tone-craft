@@ -227,19 +227,31 @@ enum class CompositeEnvelopeLane : std::uint8_t {
     events.erase(
         std::remove_if(
             events.begin(), events.end(),
-            [timeline](const TimedEvent& event) {
-                return event.count > timeline->length_counts;
+            [timeline, valid_loop](const TimedEvent& event) {
+                if (event.count > timeline->length_counts) {
+                    return true;
+                }
+                // Match formatMgsCompositeEnvelope: loop_end is the `]`
+                // marker only. A volume at that count must not sit after
+                // `[` with no wait (1-step `[f]` would compile to `[]`).
+                return valid_loop
+                    && event.count == *timeline->loop_end_count
+                    && event.kind
+                        != mgstc::engine::EnvelopeEventKind::LoopEnd;
             }),
         events.end());
 
     const auto priority = [](const TimedEvent& event) {
-        // §6.2.3 at one count: before-`[` cmds → `[` → after-`[` cmds.
-        // `]` (loop end) sorts first only when it shares a count.
+        // §6.2.3 at one count: before-`[` cmds → `[` → after-`[` cmds
+        // → volume wait. Volume is the 1-count (or hold) that `[f]` loops.
         if (event.kind == mgstc::engine::EnvelopeEventKind::LoopEnd) {
             return 0;
         }
         if (event.kind == mgstc::engine::EnvelopeEventKind::LoopStart) {
             return 2;
+        }
+        if (event.kind == mgstc::engine::EnvelopeEventKind::Volume) {
+            return 4;
         }
         return event.after_loop_start ? 3 : 1;
     };

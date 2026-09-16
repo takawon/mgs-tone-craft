@@ -189,6 +189,33 @@ def sequence_output_volume(
     )
 
 
+def step_sequence_key_off_decay(
+    k: int,
+    progress: int,
+    premaster_volume: int,
+) -> tuple[bool, int, int]:
+    """Advance one tick of track MML `k` after PSG/SCC `@e` key-off.
+
+    Returns (wrote_volume, new_progress, new_premaster_volume).
+    `k==0` writes 0 immediately. `k>=1` decreases volume by 1 when
+    progress reaches `k-1` (8-bit subtract).
+    """
+    if not 0 <= k <= 255:
+        raise ValueError("k must be in 0..255")
+    if not 0 <= progress <= 255:
+        raise ValueError("progress must be in 0..255")
+    if not 0 <= premaster_volume <= 15:
+        raise ValueError("premaster_volume must be in 0..15")
+    if k == 0:
+        return True, progress, 0
+    remainder = ((k - 1) - progress) & 0xFF
+    if remainder != 0:
+        return False, (progress + 1) & 0xFF, premaster_volume
+    if premaster_volume == 0:
+        return False, 0, 0
+    return True, 0, premaster_volume - 1
+
+
 @dataclass
 class PSGHardwareEnvelopeState:
     """Shared YM2149 hardware-envelope state used by MGS playback.

@@ -27,6 +27,7 @@ struct EnvelopeTimbreCatalogItem {
     juce::String name;
     std::uint32_t revision{1};
     bool favorite{};
+    bool current_assignment{};
     std::optional<std::uint8_t> assigned_number;
     std::vector<std::string> tags;
     juce::String memo;
@@ -43,6 +44,9 @@ struct EnvelopeTimbreChoice {
 [[nodiscard]] inline juce::String envelopeTimbreCatalogLabel(
     const EnvelopeTimbreCatalogItem& item) {
     auto label = item.name;
+    if (item.current_assignment) {
+        label = juce::String::fromUTF8("現在 ") + label;
+    }
     if (item.favorite) {
         label = juce::String::fromUTF8("★ ") + label;
     }

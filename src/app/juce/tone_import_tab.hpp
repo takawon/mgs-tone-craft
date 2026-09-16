@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <variant>
 #include <vector>
 
 #include <juce_gui_extra/juce_gui_extra.h>
@@ -57,8 +58,7 @@ public:
         open_file_.setButtonText(juce::String::fromUTF8("ファイルを開く"));
         open_file_.setTooltip(
             juce::String::fromUTF8(
-                "1つまたは複数の音色データを開いてリストへ追加する。"
-                "リストはアプリ終了まで保持する"));
+                "1つまたは複数の音色データを開いてリストへ追加する"));
         open_file_.onClick = [this] { openFiles(); };
         addAndMakeVisible(open_file_);
 
@@ -374,6 +374,8 @@ private:
             };
             addAndMakeVisible(checked_);
             type_.setInterceptsMouseClicks(false, false);
+            type_.setJustificationType(juce::Justification::centredLeft);
+            type_.setMinimumHorizontalScale(1.0F);
             type_.setFont(UiFonts::body());
             addAndMakeVisible(type_);
             UiFonts::styleBodyField(name_);
@@ -425,7 +427,7 @@ private:
             auto area = getLocalBounds().reduced(xs, xs);
             checked_.setBounds(area.removeFromLeft(UiScale::sx(28)));
             area.removeFromLeft(controlGap);
-            type_.setBounds(area.removeFromLeft(UiScale::sx(56)));
+            type_.setBounds(area.removeFromLeft(importTypeColumnW));
             area.removeFromLeft(controlGap);
             preview_.setBounds(area.removeFromLeft(UiScale::sx(110)));
             area.removeFromLeft(controlGap);
@@ -505,10 +507,48 @@ private:
             return owner_.files_[file_index_].result.candidates[candidate_index_];
         }
 
+        static const char* chipLabel(mgstc::engine::TimbreSource source) {
+            switch (source) {
+            case mgstc::engine::TimbreSource::Psg:
+                return "PSG";
+            case mgstc::engine::TimbreSource::Scc:
+                return "SCC";
+            case mgstc::engine::TimbreSource::Opll:
+                return "OPLL";
+            }
+            return "PSG";
+        }
+
+        static juce::String compositeChipLabel(
+            const mgstc::engine::ImportedToneCandidate& candidate) {
+            const auto* timbre =
+                std::get_if<mgstc::engine::CompositeTimbre>(&candidate.data);
+            if (timbre == nullptr && candidate.composite_alternative) {
+                timbre = &*candidate.composite_alternative;
+            }
+            if (timbre != nullptr && !timbre->layers.empty()) {
+                return juce::String(chipLabel(timbre->layers.front().source));
+            }
+            if (candidate.type == mgstc::engine::ImportedToneType::Scc
+                || std::holds_alternative<mgstc::engine::SccWaveform>(
+                    candidate.data)) {
+                return "SCC";
+            }
+            if (candidate.type == mgstc::engine::ImportedToneType::Opll
+                || std::holds_alternative<mgstc::engine::OpllPatchParameters>(
+                    candidate.data)) {
+                return "OPLL";
+            }
+            return "PSG";
+        }
+
         static juce::String typeLabel(
             const mgstc::engine::ImportedToneCandidate& candidate) {
-            if (candidate.type == mgstc::engine::ImportedToneType::Composite) {
-                return juce::String::fromUTF8("総合");
+            const bool composite =
+                mgstc::engine::importedCandidateDisplaysAsComposite(candidate);
+            if (composite) {
+                return juce::String::fromUTF8("総合 ")
+                    + compositeChipLabel(candidate);
             }
             if (candidate.type == mgstc::engine::ImportedToneType::Scc) {
                 return juce::String::fromUTF8("SCC");
@@ -702,7 +742,7 @@ private:
         if (files_.empty()) {
             status_.setText(
                 juce::String::fromUTF8(
-                    "ファイルを開くと候補をリストへ追加します（アプリ終了まで保持）"),
+                    "ファイルを開くと候補をリストへ追加します"),
                 juce::dontSendNotification);
             return;
         }

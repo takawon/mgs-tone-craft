@@ -21,6 +21,12 @@ constexpr std::array<std::uint16_t, 12> kMgsdrvOpllFNumbers{
     0x111, 0x122, 0x133, 0x145,
 };
 
+// Per-note spans used by track `@\` interpolation (MGSDRV 3.20). B is 17,
+// not the doubled-C octave step of 19.
+constexpr std::array<int, 12> kMgsdrvOpllMicroDeltas{
+    10, 12, 11, 12, 13, 14, 14, 15, 17, 17, 18, 17,
+};
+
 constexpr std::size_t kNotesPerOctave = 12;
 constexpr std::size_t kMgsdrvOctaveCount = 8;
 constexpr std::size_t kMgsdrvNoteCount =
@@ -67,6 +73,44 @@ bool notePitch(std::uint8_t midi_note, NotePitch& output) noexcept {
         midi_note - kFirstMidiNote);
     output = kMgsdrvNoteTable[index];
     return true;
+}
+
+bool psgSccPeriodWithMicroDetune(
+    std::uint8_t midi_note,
+    std::int32_t micro,
+    std::uint16_t& period) noexcept {
+    constexpr std::uint8_t kFirstMidiNote = 24;
+    constexpr std::uint8_t kLastMidiNote = 119;
+    if (midi_note < kFirstMidiNote || midi_note > kLastMidiNote) {
+        return false;
+    }
+
+    const auto index = static_cast<std::size_t>(midi_note - kFirstMidiNote);
+    const auto octave = index / kNotesPerOctave;
+    const auto semitone = index % kNotesPerOctave;
+    const auto summed = static_cast<std::uint16_t>(
+        kMgsdrvPsgSccOctaveOne[semitone]
+        + static_cast<std::uint16_t>(micro));
+    period = static_cast<std::uint16_t>(summed >> octave);
+    return true;
+}
+
+std::int32_t opllMicroDetuneDelta(
+    std::uint8_t midi_note,
+    std::int32_t micro) noexcept {
+    constexpr std::uint8_t kFirstMidiNote = 24;
+    constexpr std::uint8_t kLastMidiNote = 119;
+    if (micro <= 0
+        || midi_note < kFirstMidiNote
+        || midi_note > kLastMidiNote) {
+        return 0;
+    }
+
+    const auto n = micro > 255 ? 255 : micro;
+    const auto semitone =
+        static_cast<std::size_t>(midi_note - kFirstMidiNote) % kNotesPerOctave;
+    return static_cast<std::int32_t>(
+        kMgsdrvOpllMicroDeltas[semitone] * (n + 1) / 256);
 }
 
 }  // namespace mgstc::engine
