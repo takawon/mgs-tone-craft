@@ -41,16 +41,14 @@ public:
         PreviewCallback preview,
         EditCallback edit,
         ReloadCallback reload,
-        PersistCallback persist_timbres,
-        PersistCallback persist_composites,
+        PersistCallback persist,
         std::function<mgstc::engine::TimbreLibrary*()> timbres,
         std::function<mgstc::engine::CompositeTimbreLibrary*()> composites,
         LibrariesChangedCallback libraries_changed)
         : preview_(std::move(preview)),
           edit_(std::move(edit)),
           reload_(std::move(reload)),
-          persist_timbres_(std::move(persist_timbres)),
-          persist_composites_(std::move(persist_composites)),
+          persist_(std::move(persist)),
           timbres_(std::move(timbres)),
           composites_(std::move(composites)),
           libraries_changed_(std::move(libraries_changed)) {
@@ -841,7 +839,7 @@ private:
     }
 
     void registerChecked() {
-        int registered = 0;
+        std::vector<PendingRegister> pending;
         for (std::size_t file_index = 0; file_index < files_.size(); ++file_index) {
             auto& group = files_[file_index];
             for (std::size_t candidate_index = 0;
@@ -851,18 +849,23 @@ private:
                     || group.checked[candidate_index] == 0) {
                     continue;
                 }
-                if (group.result.candidates[candidate_index].registered) {
+                auto& candidate = group.result.candidates[candidate_index];
+                if (candidate.registered) {
                     continue;
                 }
-                registerAt(file_index, candidate_index, std::nullopt);
-                ++registered;
+                pending.push_back(
+                    {file_index,
+                     candidate_index,
+                     candidate.default_register_as});
             }
         }
-        if (registered == 0) {
+        if (pending.empty()) {
             status_.setText(
                 juce::String::fromUTF8("チェックした未登録の音色がありません"),
                 juce::dontSendNotification);
+            return;
         }
+        commitRegisters(pending);
     }
 
     void editAt(std::size_t file_index, std::size_t candidate_index) {
@@ -874,16 +877,23 @@ private:
     }
 
     void registerAll() {
+        std::vector<PendingRegister> pending;
         for (std::size_t file_index = 0; file_index < files_.size(); ++file_index) {
             auto& group = files_[file_index];
             for (std::size_t candidate_index = 0;
                  candidate_index < group.result.candidates.size();
                  ++candidate_index) {
-                if (!group.result.candidates[candidate_index].registered) {
-                    registerAt(file_index, candidate_index, std::nullopt);
+                auto& candidate = group.result.candidates[candidate_index];
+                if (candidate.registered) {
+                    continue;
                 }
+                pending.push_back(
+                    {file_index,
+                     candidate_index,
+                     candidate.default_register_as});
             }
         }
+        commitRegisters(pending);
     }
 
     [[nodiscard]] mgstc::engine::ImportedToneCandidate* mutableCandidate(
@@ -898,6 +908,12 @@ private:
         return &candidates[candidate_index];
     }
 
+    struct PendingRegister {
+        std::size_t file_index{};
+        std::size_t candidate_index{};
+        mgstc::engine::ImportRegisterAs register_as{};
+    };
+
     void registerAt(
         std::size_t file_index,
         std::size_t candidate_index,
@@ -906,8 +922,16 @@ private:
         if (item == nullptr) {
             return;
         }
-        auto& candidate = *item;
-        const auto chosen = register_as.value_or(candidate.default_register_as);
+        commitRegisters(
+            {{file_index,
+              candidate_index,
+              register_as.value_or(item->default_register_as)}});
+    }
+
+    void commitRegisters(const std::vector<PendingRegister>& pending) {
+        if (pending.empty()) {
+            return;
+        }
         if (!reload_ || !reload_()) {
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::WarningIcon,
@@ -918,46 +942,63 @@ private:
         }
         const auto now = static_cast<std::int64_t>(
             juce::Time::getCurrentTime().toMilliseconds() / 1000);
-        if (chosen == mgstc::engine::ImportRegisterAs::Composite) {
-            auto* library = composites_ ? composites_() : nullptr;
-            auto timbre = mgstc::engine::makeImportedComposite(candidate, chosen);
-            if (library == nullptr || !timbre) {
-                return;
+        std::vector<PendingRegister> applied;
+        applied.reserve(pending.size());
+        for (const auto& item : pending) {
+            auto* candidate = mutableCandidate(
+                item.file_index, item.candidate_index);
+            if (candidate == nullptr || candidate->registered) {
+                continue;
             }
-            if (!timbre->name.empty()) {
-                timbre->name = library->uniqueName(timbre->name);
+            if (item.register_as
+                == mgstc::engine::ImportRegisterAs::Composite) {
+                auto* library = composites_ ? composites_() : nullptr;
+                auto timbre = mgstc::engine::makeImportedComposite(
+                    *candidate, item.register_as);
+                if (library == nullptr || !timbre) {
+                    continue;
+                }
+                if (!timbre->name.empty()) {
+                    timbre->name = library->uniqueName(timbre->name);
+                }
+                library->add(std::move(*timbre), now);
+            } else {
+                auto* library = timbres_ ? timbres_() : nullptr;
+                if (library == nullptr) {
+                    continue;
+                }
+                auto entry = mgstc::engine::makeImportedLibraryEntry(
+                    *candidate, item.register_as);
+                if (!entry.name.empty()) {
+                    entry.name = library->uniqueName(
+                        entry.category, entry.name);
+                }
+                library->add(std::move(entry), now);
             }
-            library->add(std::move(*timbre), now);
-            if (!persist_composites_ || !persist_composites_()) {
-                juce::AlertWindow::showMessageBoxAsync(
-                    juce::MessageBoxIconType::WarningIcon,
-                    juce::String::fromUTF8("インポート"),
-                    juce::String::fromUTF8("ライブラリへ保存できませんでした"));
-                return;
-            }
-        } else {
-            auto* library = timbres_ ? timbres_() : nullptr;
-            if (library == nullptr) {
-                return;
-            }
-            auto entry =
-                mgstc::engine::makeImportedLibraryEntry(candidate, chosen);
-            if (!entry.name.empty()) {
-                entry.name = library->uniqueName(entry.category, entry.name);
-            }
-            library->add(std::move(entry), now);
-            if (!persist_timbres_ || !persist_timbres_()) {
-                juce::AlertWindow::showMessageBoxAsync(
-                    juce::MessageBoxIconType::WarningIcon,
-                    juce::String::fromUTF8("インポート"),
-                    juce::String::fromUTF8("ライブラリへ保存できませんでした"));
-                return;
-            }
+            applied.push_back(item);
         }
-        candidate.registered = true;
-        const int flat = flatIndex(file_index, candidate_index);
-        if (flat >= 0 && static_cast<std::size_t>(flat) < rows_.size()) {
-            rows_[static_cast<std::size_t>(flat)]->refreshFromModel();
+        if (applied.empty()) {
+            return;
+        }
+        if (!persist_ || !persist_()) {
+            if (reload_) {
+                reload_();
+            }
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("インポート"),
+                juce::String::fromUTF8("ライブラリへ保存できませんでした"));
+            return;
+        }
+        for (const auto& item : applied) {
+            if (auto* candidate = mutableCandidate(
+                    item.file_index, item.candidate_index)) {
+                candidate->registered = true;
+            }
+            const int flat = flatIndex(item.file_index, item.candidate_index);
+            if (flat >= 0 && static_cast<std::size_t>(flat) < rows_.size()) {
+                rows_[static_cast<std::size_t>(flat)]->refreshFromModel();
+            }
         }
         if (libraries_changed_) {
             libraries_changed_();
@@ -967,8 +1008,7 @@ private:
     PreviewCallback preview_;
     EditCallback edit_;
     ReloadCallback reload_;
-    PersistCallback persist_timbres_;
-    PersistCallback persist_composites_;
+    PersistCallback persist_;
     std::function<mgstc::engine::TimbreLibrary*()> timbres_;
     std::function<mgstc::engine::CompositeTimbreLibrary*()> composites_;
     LibrariesChangedCallback libraries_changed_;

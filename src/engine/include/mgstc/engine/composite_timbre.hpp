@@ -366,6 +366,8 @@ struct CompositeLayer {
 };
 
 struct CompositeTimbre {
+    // Portable .mgstc / clipboard layout (name, tags, memo, favorite, then
+    // sound body). Independent of SQLite kCompositeSoundPayloadVersion.
     static constexpr std::uint32_t kFormatVersion = 19;
     static constexpr std::uint32_t kMinimumReadableFormatVersion = 5;
 

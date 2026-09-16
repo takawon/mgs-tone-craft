@@ -175,6 +175,8 @@ ctest --test-dir build --output-on-failure
   - UI非依存のC++20静的ライブラリ
 - `emu2149` / `emu2212` / `emu2413`
   - `third_party`へ固定した音源エミュレータ
+- `sqlite3`
+  - `third_party/sqlite`へ固定した SQLite amalgamation（音色ライブラリ）
 - `mgstc_engine_tests`
   - 外部テストフレームワークに依存しないコア・音声生成テスト
 - `mgstc_chip_level_probe`

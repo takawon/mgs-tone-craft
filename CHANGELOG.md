@@ -17,6 +17,12 @@
 - **Removed**: 削除した機能
 - **Notes**: 互換性・Alpha制限など、利用者への注意
 
+## [0.292] - 2026-09-16
+
+### Changed
+
+- ユーザー音色ライブラリの保存先を `%LOCALAPPDATA%\MgsToneCraft\tone_library.sqlite`（Schema v1）へ変更した。旧独自ライブラリファイルは読み込まない。単体 `.mgstc` の取込／書出は従来どおり
+
 ## [0.291] - 2026-09-16
 
 ### Fixed

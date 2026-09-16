@@ -1,0 +1,28 @@
+SQLite Is Public Domain
+
+All of the code and documentation in SQLite has been dedicated to the public
+domain by the authors. All code authors, and representatives of the companies
+they work for, have signed affidavits dedicating their contributions to the
+public domain and originals of those signed affidavits are stored in a firesafe
+at the main offices of Hwaci. All contributors are listed in the SQLite
+AUTHORS file in the canonical source tree.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or distribute the
+original SQLite code, either in source code form or as a compiled binary, for
+any purpose, commercial or non-commercial, and by any means.
+
+The previous paragraph applies to the work of the original authors. SQLite
+contains additional code written by other people, who may or may not have
+dedicated their work to the public domain. Where this is known, the source
+files note that fact. Where it is not known, the SQLite project treats the
+code as public domain.
+
+In lieu of a legal notice, here is a blessing:
+
+    May you do good and not evil.
+    May you find forgiveness for yourself and forgive others.
+    May you share freely, never taking more than you give.
+
+This tree vendors the official amalgamation of SQLite 3.53.4
+(`sqlite-amalgamation-3530400`) from https://www.sqlite.org/download.html
+(https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip).

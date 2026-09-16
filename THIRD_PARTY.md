@@ -33,6 +33,22 @@ Steinberg ASIO SDK 2.3ヘッダーを使用する。外部SDKは追加取得し�
 `modules/juce_audio_devices/native/asio/LICENSE.txt`にあり、Windows配布ZIPには
 `licenses/Steinberg-ASIO-SDK-LICENSE.txt`として同梱する。
 
+## SQLite
+
+ユーザー音色ライブラリ（`tone_library.sqlite`）には公式 amalgamation を
+`third_party/sqlite` へ固定して使用する。ネストした`.git`は含めない。
+
+| 項目 | 値 |
+|---|---|
+| ライブラリ | SQLite |
+| 版 | 3.53.4（`sqlite-amalgamation-3530400`） |
+| 取得方法 | 公式 amalgamation を `third_party/sqlite` へ vendor |
+| ライセンス | Public Domain（blessing） |
+| 用途 | ユーザー音色ライブラリの永続化 |
+
+著作権の扱いと blessing 全文は `third_party/sqlite/LICENSE` に置く。
+ソース公開物と実行形式の配布物には同ファイルを同梱する。
+
 ## 音源エミュレータ
 
 音源プレビューでは、Digital Sound Antiquesによる次のMITライセンス実装を
