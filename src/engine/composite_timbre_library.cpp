@@ -172,15 +172,7 @@ public:
         }
     }
 
-    void timbre(const CompositeTimbre& value) {
-        unsignedInteger(CompositeTimbre::kFormatVersion, 4);
-        string(value.name);
-        unsignedInteger(value.tags.size(), 4);
-        for (const auto& tag : value.tags) {
-            string(tag);
-        }
-        string(value.memo);
-        boolean(value.favorite);
+    void soundBody(const CompositeTimbre& value) {
         unsignedInteger(
             static_cast<std::uint16_t>(std::clamp(
                 value.playback_tempo, kMgscTempoMin, kMgscTempoMax)),
@@ -244,6 +236,22 @@ public:
         for (const auto& reference_value : value.embedded_timbres) {
             reference(reference_value);
         }
+    }
+
+    void timbre(const CompositeTimbre& value) {
+        unsignedInteger(CompositeTimbre::kFormatVersion, 4);
+        string(value.name);
+        unsignedInteger(value.tags.size(), 4);
+        for (const auto& tag : value.tags) {
+            string(tag);
+        }
+        string(value.memo);
+        boolean(value.favorite);
+        soundBody(value);
+    }
+
+    void soundPayload(const CompositeTimbre& value) {
+        soundBody(value);
     }
 
     void registerAuto(const OpllRegisterAutoLane& value) {
@@ -475,7 +483,6 @@ public:
     }
 
     bool timbre(CompositeTimbre& value) {
-        std::uint32_t layer_count{};
         if (!integer(format_version_, 4)
             || format_version_
                 < CompositeTimbre::kMinimumReadableFormatVersion
@@ -500,6 +507,24 @@ public:
             || !boolean(value.favorite)) {
             return false;
         }
+        return soundBody(value);
+    }
+
+    bool soundPayload(
+        CompositeTimbre& value,
+        std::uint32_t payload_version) {
+        if (payload_version != kCompositeSoundPayloadVersion) {
+            return false;
+        }
+        // v1 is the current sound-only layout (tempo, layers, embedded).
+        // Reuse the portable layer reader by treating it as the latest
+        // CompositeTimbre format; this is not the portable file version.
+        format_version_ = CompositeTimbre::kFormatVersion;
+        return soundBody(value);
+    }
+
+    bool soundBody(CompositeTimbre& value) {
+        std::uint32_t layer_count{};
         if (format_version_ >= 10) {
             std::uint16_t tempo{};
             if (!integer(tempo, 2)) {
@@ -770,6 +795,27 @@ std::optional<CompositeTimbre> decodeTimbre(
 
 }  // namespace
 
+std::string serializeCompositeSoundPayload(const CompositeTimbre& timbre) {
+    BinaryWriter writer;
+    writer.soundPayload(timbre);
+    return writer.data();
+}
+
+std::optional<CompositeTimbre> deserializeCompositeSoundPayload(
+    std::string_view blob,
+    std::uint32_t payload_version,
+    std::string* error) {
+    CompositeTimbre timbre;
+    BinaryReader reader(blob);
+    if (!reader.soundPayload(timbre, payload_version)) {
+        if (error) {
+            *error = "invalid composite sound payload";
+        }
+        return std::nullopt;
+    }
+    return timbre;
+}
+
 const std::vector<CompositeTimbreLibraryEntry>&
 CompositeTimbreLibrary::entries() const noexcept {
     return entries_;
@@ -1027,6 +1073,19 @@ CompositeTimbreLibrary::deserialize(
         line_begin = line_end + 1;
     }
     return library;
+}
+
+void CompositeTimbreLibrary::installEntries(
+    std::vector<CompositeTimbreLibraryEntry> entries) {
+    entries_ = std::move(entries);
+    next_id_ = 1;
+    for (const auto& entry : entries_) {
+        if (entry.id != 0
+            && entry.id
+                != std::numeric_limits<std::uint64_t>::max()) {
+            next_id_ = std::max(next_id_, entry.id + 1);
+        }
+    }
 }
 
 }  // namespace mgstc::engine

@@ -52,6 +52,7 @@
 #include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/timbre_library.hpp"
 #include "mgstc/engine/timbre_tags.hpp"
+#include "mgstc/engine/tone_library_store.hpp"
 #include "mgstc/engine/spsc_queue.hpp"
 #include "mgstc/engine/shared_state.hpp"
 #include "mgstc/engine/tick_clock.hpp"
@@ -65,6 +66,7 @@
 #endif
 
 #include "rpc/server.h"
+#include <sqlite3.h>
 
 namespace {
 
@@ -3535,6 +3537,362 @@ void testTimbreLibrarySelectedExportAndNonDestructiveImport() {
     REQUIRE_EQ(destination.entries().size(), size_before_invalid);
 }
 
+void testToneLibrarySqliteV1RoundTripAndPortableFormat() {
+    using namespace mgstc::engine;
+
+    const auto db_path =
+        std::filesystem::temp_directory_path()
+        / "mgstc_tone_library_v1_test.sqlite";
+    std::error_code remove_error;
+    std::filesystem::remove(db_path, remove_error);
+    const auto utf8_path = db_path.string();
+
+    TimbreLibrary timbres;
+    TimbreLibraryEntry opll;
+    opll.category = TimbreCategory::Opll;
+    opll.name = "SQLite OPLL";
+    opll.tags = {"bright", "lead"};
+    opll.memo = "opll memo";
+    opll.favorite = true;
+    opll.opll_registers = {0x21, 0x24, 0x0A, 0x02, 0xF3, 0xAF, 0x60, 0x26};
+    const auto opll_id = timbres.add(opll, 100);
+
+    TimbreLibraryEntry scc;
+    scc.category = TimbreCategory::Scc;
+    scc.name = "SQLite SCC";
+    scc.tags = {"bass", "lead"};
+    scc.memo = "scc memo";
+    for (std::size_t index = 0; index < scc.scc_waveform.size(); ++index) {
+        scc.scc_waveform[index] = static_cast<std::uint8_t>(index * 7);
+    }
+    const auto scc_id = timbres.add(scc, 101);
+    REQUIRE_EQ(timbres.touch(opll_id, 150), true);
+
+    auto favorite_only = *timbres.find(opll_id);
+    favorite_only.favorite = false;
+    REQUIRE_EQ(timbres.update(opll_id, favorite_only, 160), true);
+    REQUIRE_EQ(timbres.find(opll_id)->revision, static_cast<std::uint32_t>(1));
+
+    CompositeTimbreLibrary composites;
+    auto composite = defaultCompositeTimbre();
+    composite.name = "SQLite Composite";
+    composite.tags = {"layered", "lead"};
+    composite.memo = "composite memo";
+    composite.favorite = true;
+    composite.playback_tempo = 130;
+    composite.layers[1].base_timbre =
+        makeSavedTimbreReference(*timbres.find(scc_id));
+    const auto composite_id = composites.add(composite, 200);
+
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(utf8_path, &error), true);
+        REQUIRE_EQ(error.empty(), true);
+        REQUIRE_EQ(database.userVersion(), ToneLibraryDatabase::kSchemaVersion);
+        REQUIRE_EQ(database.replaceAll(timbres, composites, &error), true);
+    }
+
+    sqlite3* raw = nullptr;
+    REQUIRE_EQ(sqlite3_open(utf8_path.c_str(), &raw), SQLITE_OK);
+    sqlite3_stmt* version_stmt = nullptr;
+    REQUIRE_EQ(
+        sqlite3_prepare_v2(raw, "PRAGMA user_version;", -1, &version_stmt, nullptr),
+        SQLITE_OK);
+    REQUIRE_EQ(sqlite3_step(version_stmt), SQLITE_ROW);
+    REQUIRE_EQ(sqlite3_column_int(version_stmt, 0), 1);
+    sqlite3_finalize(version_stmt);
+    sqlite3_stmt* app_stmt = nullptr;
+    REQUIRE_EQ(
+        sqlite3_prepare_v2(raw, "PRAGMA application_id;", -1, &app_stmt, nullptr),
+        SQLITE_OK);
+    REQUIRE_EQ(sqlite3_step(app_stmt), SQLITE_ROW);
+    REQUIRE_EQ(
+        sqlite3_column_int(app_stmt, 0),
+        static_cast<int>(ToneLibraryDatabase::kApplicationId));
+    sqlite3_finalize(app_stmt);
+    sqlite3_stmt* payload_stmt = nullptr;
+    REQUIRE_EQ(
+        sqlite3_prepare_v2(
+            raw,
+            "SELECT payload_version FROM composite_timbres LIMIT 1;",
+            -1,
+            &payload_stmt,
+            nullptr),
+        SQLITE_OK);
+    REQUIRE_EQ(sqlite3_step(payload_stmt), SQLITE_ROW);
+    REQUIRE_EQ(
+        sqlite3_column_int(payload_stmt, 0),
+        static_cast<int>(kCompositeSoundPayloadVersion));
+    sqlite3_finalize(payload_stmt);
+    sqlite3_close(raw);
+
+    TimbreLibrary loaded_timbres;
+    CompositeTimbreLibrary loaded_composites;
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(utf8_path, &error), true);
+        REQUIRE_EQ(database.load(loaded_timbres, loaded_composites, &error), true);
+        REQUIRE_EQ(database.userVersion(), 1);
+    }
+
+    REQUIRE_EQ(loaded_timbres.entries().size(), static_cast<std::size_t>(2));
+    const auto* loaded_opll = loaded_timbres.find(opll_id);
+    const auto* loaded_scc = loaded_timbres.find(scc_id);
+    REQUIRE_EQ(loaded_opll != nullptr, true);
+    REQUIRE_EQ(loaded_scc != nullptr, true);
+    REQUIRE_EQ(loaded_opll->name, std::string("SQLite OPLL"));
+    REQUIRE_EQ(loaded_opll->memo, std::string("opll memo"));
+    REQUIRE_EQ(loaded_opll->favorite, false);
+    REQUIRE_EQ(loaded_opll->use_count, static_cast<std::uint32_t>(1));
+    REQUIRE_EQ(loaded_opll->last_used_unix_seconds, static_cast<std::int64_t>(150));
+    REQUIRE_EQ(loaded_opll->opll_registers, opll.opll_registers);
+    REQUIRE_EQ(loaded_scc->scc_waveform, scc.scc_waveform);
+    REQUIRE_EQ(loaded_scc->tags.size(), static_cast<std::size_t>(2));
+
+    REQUIRE_EQ(loaded_timbres.rewriteTag("lead", "solo", 300), static_cast<std::size_t>(2));
+    REQUIRE_EQ(loaded_composites.rewriteTag("lead", "solo", 300), static_cast<std::size_t>(1));
+    REQUIRE_EQ(loaded_timbres.erase(opll_id), true);
+
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(utf8_path, &error), true);
+        REQUIRE_EQ(
+            database.replaceAll(loaded_timbres, loaded_composites, &error),
+            true);
+    }
+
+    TimbreLibrary restored_timbres;
+    CompositeTimbreLibrary restored_composites;
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(utf8_path, &error), true);
+        REQUIRE_EQ(
+            database.load(restored_timbres, restored_composites, &error),
+            true);
+    }
+    REQUIRE_EQ(restored_timbres.find(opll_id) == nullptr, true);
+    REQUIRE_EQ(restored_timbres.entries().size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(restored_timbres.find(scc_id)->tags, std::vector<std::string>({"bass", "solo"}));
+    REQUIRE_EQ(restored_composites.entries().size(), static_cast<std::size_t>(1));
+    const auto* restored_composite = restored_composites.find(composite_id);
+    REQUIRE_EQ(restored_composite != nullptr, true);
+    REQUIRE_EQ(restored_composite->timbre.name, std::string("SQLite Composite"));
+    REQUIRE_EQ(restored_composite->timbre.memo, std::string("composite memo"));
+    REQUIRE_EQ(restored_composite->timbre.favorite, true);
+    REQUIRE_EQ(restored_composite->timbre.playback_tempo, 130);
+    REQUIRE_EQ(restored_composite->timbre.tags, std::vector<std::string>({"layered", "solo"}));
+    REQUIRE_EQ(
+        restored_composite->timbre.layers[1].base_timbre.has_value(),
+        true);
+    REQUIRE_EQ(
+        restored_composite->timbre.layers[1].base_timbre->library_id,
+        scc_id);
+
+    auto original_sound = composite;
+    original_sound.name.clear();
+    original_sound.tags.clear();
+    original_sound.memo.clear();
+    original_sound.favorite = false;
+    auto restored_sound = restored_composite->timbre;
+    restored_sound.name.clear();
+    restored_sound.tags.clear();
+    restored_sound.memo.clear();
+    restored_sound.favorite = false;
+    REQUIRE_EQ(
+        serializeCompositeSoundPayload(original_sound),
+        serializeCompositeSoundPayload(restored_sound));
+    {
+        std::string payload_error;
+        const auto blob = serializeCompositeSoundPayload(original_sound);
+        REQUIRE_EQ(
+            deserializeCompositeSoundPayload(
+                blob,
+                CompositeTimbre::kFormatVersion,
+                &payload_error)
+                .has_value(),
+            false);
+        const auto parsed_payload = deserializeCompositeSoundPayload(
+            blob,
+            kCompositeSoundPayloadVersion,
+            &payload_error);
+        REQUIRE_EQ(parsed_payload.has_value(), true);
+    }
+
+    restored_composites.erase(composite_id);
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(utf8_path, &error), true);
+        REQUIRE_EQ(database.replaceComposites(restored_composites, &error), true);
+    }
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        CompositeTimbreLibrary emptied;
+        TimbreLibrary ignored;
+        REQUIRE_EQ(database.open(utf8_path, &error), true);
+        REQUIRE_EQ(database.load(ignored, emptied, &error), true);
+        REQUIRE_EQ(emptied.entries().empty(), true);
+        REQUIRE_EQ(ignored.find(scc_id) != nullptr, true);
+    }
+
+    auto exported = timbres.serializeEntry(scc_id);
+    REQUIRE_EQ(exported.has_value(), true);
+    REQUIRE_EQ(exported->find("MGSTC_TIMBRE_LIBRARY\t4") == 0, true);
+    TimbreLibrary importer;
+    std::string import_error;
+    const auto imported_ids =
+        importer.importSerialized(*exported, 500, &import_error);
+    REQUIRE_EQ(imported_ids.has_value(), true);
+    REQUIRE_EQ(imported_ids->size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(importer.find((*imported_ids)[0])->scc_waveform, scc.scc_waveform);
+
+    const auto composite_file =
+        CompositeTimbreLibrary::serializeTimbreFile(composite, 600);
+    REQUIRE_EQ(
+        composite_file.find("MGSTC_COMPOSITE_TIMBRE_LIBRARY\t3") == 0,
+        true);
+    std::string file_error;
+    const auto parsed_file =
+        CompositeTimbreLibrary::deserializeTimbreFile(composite_file, &file_error);
+    REQUIRE_EQ(parsed_file.has_value(), true);
+    REQUIRE_EQ(parsed_file->name, composite.name);
+    REQUIRE_EQ(parsed_file->tags, composite.tags);
+
+    {
+        const auto gc_path =
+            std::filesystem::temp_directory_path()
+            / "mgstc_tone_library_tag_gc.sqlite";
+        std::filesystem::remove(gc_path, remove_error);
+        const auto gc_utf8 = gc_path.string();
+        TimbreLibrary tagged_timbres;
+        TimbreLibraryEntry brass_timbre;
+        brass_timbre.category = TimbreCategory::Opll;
+        brass_timbre.name = "Brass Tone";
+        brass_timbre.tags = {"Brass"};
+        tagged_timbres.add(brass_timbre, 1);
+        CompositeTimbreLibrary tagged_composites;
+        auto brass_composite = defaultCompositeTimbre();
+        brass_composite.name = "Brass Program";
+        brass_composite.tags = {"Brass"};
+        tagged_composites.add(brass_composite, 2);
+        {
+            ToneLibraryDatabase database;
+            std::string error;
+            REQUIRE_EQ(database.open(gc_utf8, &error), true);
+            REQUIRE_EQ(
+                database.replaceAll(tagged_timbres, tagged_composites, &error),
+                true);
+            tagged_timbres = {};
+            REQUIRE_EQ(database.replaceTimbres(tagged_timbres, &error), true);
+        }
+        {
+            ToneLibraryDatabase database;
+            std::string error;
+            TimbreLibrary loaded_t;
+            CompositeTimbreLibrary loaded_c;
+            REQUIRE_EQ(database.open(gc_utf8, &error), true);
+            REQUIRE_EQ(database.load(loaded_t, loaded_c, &error), true);
+            REQUIRE_EQ(loaded_t.entries().empty(), true);
+            REQUIRE_EQ(loaded_c.entries().size(), static_cast<std::size_t>(1));
+            REQUIRE_EQ(
+                loaded_c.entries().front().timbre.tags,
+                std::vector<std::string>{"Brass"});
+        }
+        sqlite3* tags_db = nullptr;
+        REQUIRE_EQ(sqlite3_open(gc_utf8.c_str(), &tags_db), SQLITE_OK);
+        sqlite3_stmt* brass_stmt = nullptr;
+        REQUIRE_EQ(
+            sqlite3_prepare_v2(
+                tags_db,
+                "SELECT COUNT(*) FROM tags WHERE name = 'Brass';",
+                -1,
+                &brass_stmt,
+                nullptr),
+            SQLITE_OK);
+        REQUIRE_EQ(sqlite3_step(brass_stmt), SQLITE_ROW);
+        REQUIRE_EQ(sqlite3_column_int(brass_stmt, 0), 1);
+        sqlite3_finalize(brass_stmt);
+        sqlite3_close(tags_db);
+        {
+            ToneLibraryDatabase database;
+            std::string error;
+            REQUIRE_EQ(database.open(gc_utf8, &error), true);
+            tagged_composites = {};
+            REQUIRE_EQ(
+                database.replaceAll(tagged_timbres, tagged_composites, &error),
+                true);
+        }
+        REQUIRE_EQ(sqlite3_open(gc_utf8.c_str(), &tags_db), SQLITE_OK);
+        REQUIRE_EQ(
+            sqlite3_prepare_v2(
+                tags_db,
+                "SELECT COUNT(*) FROM tags;",
+                -1,
+                &brass_stmt,
+                nullptr),
+            SQLITE_OK);
+        REQUIRE_EQ(sqlite3_step(brass_stmt), SQLITE_ROW);
+        REQUIRE_EQ(sqlite3_column_int(brass_stmt, 0), 0);
+        sqlite3_finalize(brass_stmt);
+        sqlite3_close(tags_db);
+        std::filesystem::remove(gc_path, remove_error);
+    }
+
+    sqlite3* bump = nullptr;
+    REQUIRE_EQ(sqlite3_open(utf8_path.c_str(), &bump), SQLITE_OK);
+    REQUIRE_EQ(
+        sqlite3_exec(bump, "PRAGMA user_version = 99;", nullptr, nullptr, nullptr),
+        SQLITE_OK);
+    sqlite3_close(bump);
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(utf8_path, &error), false);
+        REQUIRE_EQ(error.empty(), false);
+    }
+    sqlite3* check = nullptr;
+    REQUIRE_EQ(sqlite3_open(utf8_path.c_str(), &check), SQLITE_OK);
+    sqlite3_stmt* check_stmt = nullptr;
+    REQUIRE_EQ(
+        sqlite3_prepare_v2(check, "PRAGMA user_version;", -1, &check_stmt, nullptr),
+        SQLITE_OK);
+    REQUIRE_EQ(sqlite3_step(check_stmt), SQLITE_ROW);
+    REQUIRE_EQ(sqlite3_column_int(check_stmt, 0), 99);
+    sqlite3_finalize(check_stmt);
+    sqlite3_close(check);
+
+    {
+        const auto foreign_path =
+            std::filesystem::temp_directory_path()
+            / "mgstc_tone_library_foreign.sqlite";
+        std::filesystem::remove(foreign_path, remove_error);
+        const auto foreign_utf8 = foreign_path.string();
+        sqlite3* foreign = nullptr;
+        REQUIRE_EQ(sqlite3_open(foreign_utf8.c_str(), &foreign), SQLITE_OK);
+        REQUIRE_EQ(
+            sqlite3_exec(
+                foreign,
+                "PRAGMA application_id = 1345474636; PRAGMA user_version = 1;",
+                nullptr,
+                nullptr,
+                nullptr),
+            SQLITE_OK);
+        sqlite3_close(foreign);
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(foreign_utf8, &error), false);
+        REQUIRE_EQ(error.empty(), false);
+        std::filesystem::remove(foreign_path, remove_error);
+    }
+
+    std::filesystem::remove(db_path, remove_error);
+}
+
 void testWavePcmCycleConvertsToScc() {
     constexpr std::uint32_t sample_rate = 8000;
     constexpr std::uint16_t sample_count = 64;
@@ -6147,6 +6505,7 @@ int main(int argc, char** argv) {
         {"TimbreLibraryCrudAndVersionedRoundTrip", testTimbreLibraryCrudAndVersionedRoundTrip},
         {"TimbreTagsNormalizeMatchAndCollectUsage", testTimbreTagsNormalizeMatchAndCollectUsage},
         {"TimbreLibrarySelectedExportAndNonDestructiveImport", testTimbreLibrarySelectedExportAndNonDestructiveImport},
+        {"ToneLibrarySqliteV1RoundTripAndPortableFormat", testToneLibrarySqliteV1RoundTripAndPortableFormat},
         {"WavePcmCycleConvertsToScc", testWavePcmCycleConvertsToScc},
         {"WaveCycleProducesValidOpllApproximation", testWaveCycleProducesValidOpllApproximation},
         {"SccApproximationMatchesSameRuntimeMidiPitch", testSccApproximationMatchesSameRuntimeMidiPitch},

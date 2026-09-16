@@ -70,6 +70,10 @@ public:
         std::string_view text,
         std::string* error = nullptr);
 
+    // Restore rows with their stored IDs (SQLite load). Does not assign
+    // new IDs; next_id_ becomes max(id)+1.
+    void installEntries(std::vector<TimbreLibraryEntry> entries);
+
 private:
     std::vector<TimbreLibraryEntry> entries_;
     std::uint64_t next_id_{1};

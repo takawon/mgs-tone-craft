@@ -57,7 +57,7 @@ if (Test-Path -LiteralPath $changelog) {
 
 $licensesDir = Join-Path $stageDir "licenses"
 New-Item -ItemType Directory -Path $licensesDir -Force | Out-Null
-foreach ($name in @("emu2149", "emu2212", "emu2413")) {
+foreach ($name in @("emu2149", "emu2212", "emu2413", "sqlite")) {
     $src = Join-Path $projectRoot "third_party\$name\LICENSE"
     Copy-Item -LiteralPath $src `
         -Destination (Join-Path $licensesDir "$name-LICENSE.txt")

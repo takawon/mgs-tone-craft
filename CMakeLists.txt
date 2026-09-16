@@ -111,14 +111,28 @@ target_include_directories(
     emu2413 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/emu2413
 )
 
+add_library(sqlite3 STATIC third_party/sqlite/sqlite3.c)
+target_include_directories(
+    sqlite3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite
+)
+target_compile_definitions(
+    sqlite3
+    PRIVATE
+        SQLITE_DQS=0
+        SQLITE_OMIT_LOAD_EXTENSION
+        SQLITE_THREADSAFE=1
+)
+
 if(MSVC)
     target_compile_options(emu2149 PRIVATE /W0)
     target_compile_options(emu2212 PRIVATE /W0)
     target_compile_options(emu2413 PRIVATE /W0)
+    target_compile_options(sqlite3 PRIVATE /W0)
 else()
     target_compile_options(emu2149 PRIVATE -Wall -Wextra)
     target_compile_options(emu2212 PRIVATE -Wall -Wextra)
     target_compile_options(emu2413 PRIVATE -Wall -Wextra)
+    target_compile_options(sqlite3 PRIVATE -w)
 endif()
 
 add_library(mgstc_engine STATIC
@@ -150,6 +164,7 @@ add_library(mgstc_engine STATIC
     src/engine/stereo_sample_rate_converter.cpp
     src/engine/timbre_library.cpp
     src/engine/timbre_tags.cpp
+    src/engine/tone_library_store.cpp
     src/engine/tone_import.cpp
     src/engine/tone_import_mgs.cpp
     src/engine/tone_import_sng.cpp
@@ -167,6 +182,7 @@ target_link_libraries(
         emu2149
         emu2212
         emu2413
+        sqlite3
         rpc
         Threads::Threads
 )
@@ -283,6 +299,8 @@ if(WIN32)
                 src/app/juce/rate_envelope_trace.hpp
                 src/app/juce/composite_timeline.cpp
                 src/app/juce/composite_timeline.hpp
+                src/app/juce/tone_library_session.cpp
+                src/app/juce/tone_library_session.hpp
                 src/app/juce/main.cpp
         )
         target_link_libraries(
@@ -320,7 +338,7 @@ if(MGSTC_BUILD_TESTS)
     add_executable(mgstc_engine_tests
         tests/cpp/engine_tests.cpp
     )
-    target_link_libraries(mgstc_engine_tests PRIVATE mgstc_engine)
+    target_link_libraries(mgstc_engine_tests PRIVATE mgstc_engine sqlite3)
     if(WIN32)
         target_link_libraries(
             mgstc_engine_tests PRIVATE mgstc_windows_audio

@@ -74,9 +74,26 @@ public:
             std::string_view text,
             std::string* error = nullptr);
 
+    // Restore rows with their stored IDs (SQLite load). Does not assign
+    // new IDs; next_id_ becomes max(id)+1.
+    void installEntries(std::vector<CompositeTimbreLibraryEntry> entries);
+
 private:
     std::vector<CompositeTimbreLibraryEntry> entries_;
     std::uint64_t next_id_{1};
 };
+
+[[nodiscard]] std::string serializeCompositeSoundPayload(
+    const CompositeTimbre& timbre);
+// `payload_version` is the SQLite column value (kCompositeSoundPayloadVersion),
+// not CompositeTimbre::kFormatVersion and not a prefix inside the blob.
+[[nodiscard]] std::optional<CompositeTimbre>
+deserializeCompositeSoundPayload(
+    std::string_view blob,
+    std::uint32_t payload_version,
+    std::string* error = nullptr);
+
+// SQLite composite sound-only blob. Independent of portable .mgstc format 19.
+inline constexpr std::uint32_t kCompositeSoundPayloadVersion = 1;
 
 }  // namespace mgstc::engine

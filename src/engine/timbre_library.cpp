@@ -463,4 +463,17 @@ std::optional<TimbreLibrary> TimbreLibrary::deserialize(
     return library;
 }
 
+void TimbreLibrary::installEntries(
+    std::vector<TimbreLibraryEntry> entries) {
+    entries_ = std::move(entries);
+    next_id_ = 1;
+    for (const auto& entry : entries_) {
+        if (entry.id != 0
+            && entry.id
+                != std::numeric_limits<std::uint64_t>::max()) {
+            next_id_ = std::max(next_id_, entry.id + 1);
+        }
+    }
+}
+
 }  // namespace mgstc::engine
