@@ -340,80 +340,6 @@ loadTimbreLibrary(std::string* error = nullptr) {
         && temporary.overwriteTargetFileWithTemporary();
 }
 
-struct CompositeTimbreImpact {
-    bool readable{true};
-    std::vector<mgstc::engine::TimbreUse> uses;
-};
-
-[[nodiscard]] CompositeTimbreImpact inspectCompositeTimbreImpact(
-    std::uint64_t timbre_library_id) {
-    CompositeTimbreImpact impact;
-    std::string error;
-    const auto library = loadCompositeTimbreLibrary(&error);
-    if (!library) {
-        impact.readable = false;
-        return impact;
-    }
-    impact.uses = library->findTimbreUses(timbre_library_id);
-    return impact;
-}
-
-[[nodiscard]] std::size_t impactedCompositeCount(
-    std::span<const mgstc::engine::TimbreUse> uses) {
-    std::vector<std::size_t> indices;
-    for (const auto& use : uses) {
-        if (std::find(
-                indices.begin(),
-                indices.end(),
-                use.composite_index)
-            == indices.end()) {
-            indices.push_back(use.composite_index);
-        }
-    }
-    return indices.size();
-}
-
-[[nodiscard]] juce::String describeCompositeTimbreImpact(
-    const CompositeTimbreImpact& impact) {
-    if (!impact.readable) {
-        return juce::String::fromUTF8(
-            "総合音色ライブラリを読み込めないため、"
-            "影響対象を確認できません。");
-    }
-    if (impact.uses.empty()) {
-        return juce::String::fromUTF8(
-            "保存済み総合音色への影響はありません。");
-    }
-    juce::String result =
-        juce::String::fromUTF8("影響対象: ")
-        + juce::String(static_cast<int>(
-            impactedCompositeCount(impact.uses)))
-        + juce::String::fromUTF8("件の総合音色 / ")
-        + juce::String(static_cast<int>(impact.uses.size()))
-        + juce::String::fromUTF8("レイヤー\n");
-    std::vector<std::size_t> listed;
-    for (const auto& use : impact.uses) {
-        if (std::find(
-                listed.begin(), listed.end(), use.composite_index)
-            != listed.end()) {
-            continue;
-        }
-        listed.push_back(use.composite_index);
-        result += juce::String::fromUTF8("・")
-            + juce::String::fromUTF8(use.composite_name.c_str())
-            + "\n";
-        if (listed.size() == 6) {
-            if (listed.size()
-                < impactedCompositeCount(impact.uses)) {
-                result += juce::String::fromUTF8("・ほか\n");
-            }
-            break;
-        }
-    }
-    return result.trimEnd();
-}
-
-
 [[nodiscard]] bool isCommandLetter(
     const juce::KeyPress& key, int letter_lower) {
     if (!key.getModifiers().isCommandDown()
@@ -2423,6 +2349,31 @@ public:
         return shared_opll_patch_revision_;
     }
 
+    void setCompositeOwnedEditTarget(
+        std::optional<mgstc::engine::SavedTimbreReference> target) {
+        composite_owned_edit_target_ = std::move(target);
+    }
+
+    [[nodiscard]] const std::optional<mgstc::engine::SavedTimbreReference>&
+    compositeOwnedEditTarget() const noexcept {
+        return composite_owned_edit_target_;
+    }
+
+    void publishCompositeOwnedTimbre(
+        mgstc::engine::SavedTimbreReference snapshot) {
+        published_composite_owned_ = std::move(snapshot);
+        ++composite_owned_timbre_revision_;
+    }
+
+    [[nodiscard]] std::uint64_t compositeOwnedTimbreRevision() const noexcept {
+        return composite_owned_timbre_revision_;
+    }
+
+    [[nodiscard]] const std::optional<mgstc::engine::SavedTimbreReference>&
+    publishedCompositeOwnedTimbre() const noexcept {
+        return published_composite_owned_;
+    }
+
     [[nodiscard]] bool sharedEditorProgramActive() const noexcept {
         return shared_editor_program_active_;
     }
@@ -2957,6 +2908,11 @@ private:
         mgstc::engine::defaultOpllPatch()};
     std::uint64_t shared_scc_wave_revision_{1};
     std::uint64_t shared_opll_patch_revision_{1};
+    std::optional<mgstc::engine::SavedTimbreReference>
+        composite_owned_edit_target_;
+    std::optional<mgstc::engine::SavedTimbreReference>
+        published_composite_owned_;
+    std::uint64_t composite_owned_timbre_revision_{1};
     bool shared_editor_program_active_{};
     PcAudioBackend pc_audio_backend_{PcAudioBackend::Wasapi};
     std::string asio_driver_name_;
@@ -4860,22 +4816,6 @@ private:
             juce::String::fromUTF8("選択した ")
             + juce::String(static_cast<int>(selected.size()))
             + juce::String::fromUTF8(" 件をライブラリから削除しますか？");
-        for (const auto& row : selected) {
-            if (row.kind != LibraryManagerKind::Composite) {
-                const auto impact = inspectCompositeTimbreImpact(row.id);
-                if (!impact.readable || !impact.uses.empty()) {
-                    juce::AlertWindow::showMessageBoxAsync(
-                        juce::MessageBoxIconType::WarningIcon,
-                        juce::String::fromUTF8("ライブラリ管理"),
-                        juce::String::fromUTF8("「")
-                            + juce::String::fromUTF8(row.name.c_str())
-                            + juce::String::fromUTF8(
-                                  "」は総合音色から参照中のため削除できません。\n\n")
-                            + describeCompositeTimbreImpact(impact));
-                    return;
-                }
-            }
-        }
         juce::Component::SafePointer<LibraryManagerListTab> safe(this);
         juce::AlertWindow::showAsync(
             juce::MessageBoxOptions()
@@ -7502,25 +7442,7 @@ public:
                 if (index >= timbre_.layers.size()) {
                     return;
                 }
-                if (timbre_.layers[index].source
-                    == mgstc::engine::TimbreSource::Scc) {
-                    open_editor_(
-                        "scc",
-                        timbre_.layers[index].base_timbre
-                            ? std::optional<std::uint64_t>{
-                                  timbre_.layers[index]
-                                      .base_timbre->library_id}
-                            : std::nullopt);
-                } else if (timbre_.layers[index].source
-                           == mgstc::engine::TimbreSource::Opll) {
-                    open_editor_(
-                        "opll",
-                        timbre_.layers[index].base_timbre
-                            ? std::optional<std::uint64_t>{
-                                  timbre_.layers[index]
-                                      .base_timbre->library_id}
-                            : std::nullopt);
-                }
+                openOwnedLayerTimbreEditor(index);
             };
             edit_[index].setEnabled(index != 0);
             edit_[index].setTooltip(
@@ -7528,7 +7450,8 @@ public:
                     ? juce::String::fromUTF8(
                           "PSG詳細設定は次の実装段階です")
                     : juce::String::fromUTF8(
-                          "音源別の単音色エディタを開きます"));
+                          "この総合音色にコピーしたオリジナルを編集します。"
+                          "単音色ライブラリとは独立です"));
             addAndMakeVisible(edit_[index]);
         }
 
@@ -7600,7 +7523,7 @@ public:
             [this](
                 const juce::String& kind,
                 std::optional<std::uint64_t> library_id) {
-                open_editor_(kind, library_id);
+                openOwnedTimbreEditor(kind, library_id);
             });
         timeline_.setAssignTimbreCallback(
             [this](std::size_t index, LayerBaseTimbreAssign assign) {
@@ -7614,6 +7537,11 @@ public:
             [this](std::uint64_t library_id) {
                 if (const auto* entry = timbre_library_.find(library_id)) {
                     return juce::String::fromUTF8(entry->name.c_str());
+                }
+                if (const auto* snap =
+                        mgstc::engine::findEmbeddedTimbreSnapshot(
+                            timbre_, library_id)) {
+                    return juce::String::fromUTF8(snap->name.c_str());
                 }
                 return juce::String{};
             });
@@ -7791,23 +7719,8 @@ public:
                 == nullptr) {
             selected_composite_id_.reset();
         }
-        std::size_t updated_references{};
-        for (const auto& entry : timbre_library_.entries()) {
-            updated_references +=
-                mgstc::engine::updateTimbreReferences(
-                    std::span<mgstc::engine::CompositeTimbre>{
-                        &timbre_, 1},
-                    entry);
-        }
         refreshCompositeSelector();
         refreshTimbreSelectors();
-        if (updated_references != 0) {
-            syncControlsFromModel();
-            updateStatus(
-                juce::String::fromUTF8(
-                    "保存された単音色の更新を総合音色へ反映しました"
-                    "（総合音色は未保存です）"));
-        }
     }
 
     void requestLibraryEntry(std::uint64_t id) {
@@ -9250,6 +9163,59 @@ private:
         });
     }
 
+    void openOwnedTimbreEditor(
+        const juce::String& kind,
+        std::optional<std::uint64_t> library_id) {
+        if (library_id) {
+            if (*library_id == mgstc::engine::kSccTrianglePresetLibraryId) {
+                for (auto& layer : timbre_.layers) {
+                    if (layer.base_timbre
+                        && layer.base_timbre->library_id
+                            == *library_id) {
+                        layer.base_timbre->library_id =
+                            mgstc::engine::allocateCompositeOwnedTimbreId(
+                                timbre_);
+                        library_id = layer.base_timbre->library_id;
+                        recordHistory();
+                        break;
+                    }
+                }
+            }
+            if (const auto* snap =
+                    mgstc::engine::findEmbeddedTimbreSnapshot(
+                        timbre_, *library_id)) {
+                audio_service_.setCompositeOwnedEditTarget(*snap);
+            } else {
+                audio_service_.setCompositeOwnedEditTarget(std::nullopt);
+            }
+        } else {
+            audio_service_.setCompositeOwnedEditTarget(std::nullopt);
+        }
+        open_editor_(kind, library_id);
+    }
+
+    void openOwnedLayerTimbreEditor(std::size_t index) {
+        if (index >= timbre_.layers.size()) {
+            return;
+        }
+        auto& layer = timbre_.layers[index];
+        if (!layer.base_timbre
+            || mgstc::engine::layerUsesOpllRomBase(layer)) {
+            return;
+        }
+        if (layer.base_timbre->library_id
+            == mgstc::engine::kSccTrianglePresetLibraryId) {
+            layer.base_timbre->library_id =
+                mgstc::engine::allocateCompositeOwnedTimbreId(timbre_);
+            recordHistory();
+        }
+        const auto kind =
+            layer.source == mgstc::engine::TimbreSource::Scc
+                ? juce::String("scc-envelope")
+                : juce::String("opll-envelope");
+        openOwnedTimbreEditor(kind, layer.base_timbre->library_id);
+    }
+
     void assignLayerLibraryId(
         std::size_t index,
         std::optional<std::uint64_t> library_id) {
@@ -9270,7 +9236,7 @@ private:
         if (entry == nullptr) {
             return;
         }
-        auto reference = mgstc::engine::makeSavedTimbreReference(*entry);
+        auto reference = mgstc::engine::adoptLibraryTimbre(timbre_, *entry);
         if (const auto& current = timbre_.layers[index].base_timbre) {
             reference.number_mode = current->number_mode;
             reference.manual_number = current->manual_number;
@@ -9380,7 +9346,7 @@ private:
             return;
         }
         auto reference =
-            mgstc::engine::makeSavedTimbreReference(*entry);
+            mgstc::engine::adoptLibraryTimbre(timbre_, *entry);
         if (const auto& current =
                 timbre_.layers[index].base_timbre) {
             reference.number_mode = current->number_mode;
@@ -9566,7 +9532,8 @@ private:
                                 layer.base_timbre->name.c_str())
                     : juce::String::fromUTF8("単音色編集"));
             edit_[index].setEnabled(
-                has_saved_timbre && layer.base_timbre.has_value());
+                has_saved_timbre && layer.base_timbre.has_value()
+                    && !mgstc::engine::layerUsesOpllRomBase(layer));
             enabled_[index].setToggleState(
                 layer.enabled, juce::dontSendNotification);
             mute_[index].setToggleState(
@@ -9809,24 +9776,15 @@ private:
                    .defineOpllOriginalPatch(16, opll)
                 == mgstc::engine::MapError::None;
         for (const auto& assignment : numbers.assignments) {
-            const auto* live = timbre_library_.find(assignment.library_id);
-            const mgstc::engine::SavedTimbreReference* snap{};
+            const mgstc::engine::SavedTimbreReference* snap =
+                mgstc::engine::findEmbeddedTimbreSnapshot(
+                    timbre_, assignment.library_id);
             mgstc::engine::SavedTimbreReference live_ref;
-            if (live != nullptr) {
-                live_ref = mgstc::engine::makeSavedTimbreReference(*live);
-                snap = &live_ref;
-            } else {
-                for (const auto& layer : timbre_.layers) {
-                    if (layer.base_timbre
-                        && layer.base_timbre->library_id
-                            == assignment.library_id) {
-                        snap = &*layer.base_timbre;
-                        break;
-                    }
-                }
-                if (snap == nullptr) {
-                    snap = mgstc::engine::findEmbeddedTimbreSnapshot(
-                        timbre_, assignment.library_id);
+            if (snap == nullptr) {
+                if (const auto* live =
+                        timbre_library_.find(assignment.library_id)) {
+                    live_ref = mgstc::engine::makeSavedTimbreReference(*live);
+                    snap = &live_ref;
                 }
             }
             if (snap == nullptr) {
@@ -9927,11 +9885,13 @@ private:
             if (layer.source == mgstc::engine::TimbreSource::Psg) {
                 const auto rate = mgstc::engine::clampRateEnvelope(
                     layer.volume_envelope.rate);
-                const auto mode = rate_kind ? rate.tone_mode : std::uint8_t{1};
-                const auto noise = rate_kind ? rate.noise : std::uint8_t{0};
+                const auto mixer = rate_kind
+                    ? rate
+                    : mgstc::engine::sequenceEnvelopeMixer(
+                          layer.volume_envelope.rate);
                 configured = configured
                     && edit.engine->session().setPsgToneNoise(
-                        track, mode, noise)
+                        track, mixer.tone_mode, mixer.noise)
                     && edit.engine->session().setPsgFixedVolume(
                         track, layer.volume);
             }
@@ -10178,6 +10138,18 @@ private:
                 startCompositeNote(last_audition_note_, true, true);
             }
         }
+        const auto owned_rev = audio_service_.compositeOwnedTimbreRevision();
+        if (owned_rev != applied_owned_revision_) {
+            applied_owned_revision_ = owned_rev;
+            if (const auto& snap =
+                    audio_service_.publishedCompositeOwnedTimbre()) {
+                if (mgstc::engine::replaceOwnedTimbreSnapshot(timbre_, *snap)) {
+                    timeline_.setTimbre(timbre_);
+                    syncControlsFromModel();
+                    static_cast<void>(configureEngine());
+                }
+            }
+        }
         if (audition_stop_time_ms_
             && now >= *audition_stop_time_ms_) {
             stopAudition();
@@ -10280,6 +10252,7 @@ private:
     mgstc::engine::CompositeTimbreLibrary composite_library_;
     std::vector<std::uint64_t> composite_library_ids_;
     std::optional<std::uint64_t> selected_composite_id_;
+    std::uint64_t applied_owned_revision_{1};
     std::optional<mgstc::engine::CompositeTimbre>
         composite_preview_;
     std::optional<std::uint64_t> library_manager_performance_id_;
@@ -11400,7 +11373,59 @@ public:
         }
     }
 
+    [[nodiscard]] bool tryLoadOwnedSnapshot(std::uint64_t id) {
+        const auto& target = audio_service_.compositeOwnedEditTarget();
+        if (!target
+            || target->library_id != id
+            || target->source != mgstc::engine::TimbreSource::Scc) {
+            return false;
+        }
+        owned_edit_id_ = id;
+        selected_library_id_.reset();
+        SccWaveform waveform{};
+        std::transform(
+            target->scc_waveform.begin(),
+            target->scc_waveform.end(),
+            waveform.begin(),
+            [](std::uint8_t value) {
+                return static_cast<std::int8_t>(value);
+            });
+        name_.setText(
+            juce::String::fromUTF8(target->name.c_str()),
+            juce::dontSendNotification);
+        commitWave(waveform);
+        setEditorBaseline();
+        updateStatus(
+            juce::String::fromUTF8(
+                "総合音色のオリジナルコピーを編集中"));
+        return true;
+    }
+
+    void publishOwnedSnapshot() {
+        if (!owned_edit_id_) {
+            return;
+        }
+        auto snapshot = audio_service_.compositeOwnedEditTarget();
+        if (!snapshot || snapshot->library_id != *owned_edit_id_) {
+            snapshot = mgstc::engine::SavedTimbreReference{};
+            snapshot->library_id = *owned_edit_id_;
+            snapshot->source = mgstc::engine::TimbreSource::Scc;
+        }
+        std::transform(
+            scc_wave_.begin(),
+            scc_wave_.end(),
+            snapshot->scc_waveform.begin(),
+            [](std::int8_t value) {
+                return static_cast<std::uint8_t>(value);
+            });
+        audio_service_.setCompositeOwnedEditTarget(*snapshot);
+        audio_service_.publishCompositeOwnedTimbre(*snapshot);
+    }
+
     void requestLibraryEntry(std::uint64_t id) {
+        if (tryLoadOwnedSnapshot(id)) {
+            return;
+        }
         {
             ScopedLibraryIpcLock lock(library_lock_);
             if (!lock.isLocked() || !reloadLibraryFromDisk()
@@ -11412,6 +11437,7 @@ public:
                 return;
             }
         }
+        owned_edit_id_.reset();
         selected_library_id_ = id;
         refreshLibraryList();
         loadSelectedLibraryEntry();
@@ -13138,8 +13164,6 @@ private:
             ? juce::String::fromUTF8(current->name.c_str())
             : juce::String::fromUTF8("選択中の音色");
         const auto revision = current ? current->revision : 1;
-        const auto impact = inspectCompositeTimbreImpact(
-            *selected_library_id_);
         juce::Component::SafePointer<SccEditorComponent> safe(this);
         juce::AlertWindow::showAsync(
             juce::MessageBoxOptions()
@@ -13151,10 +13175,7 @@ private:
                     juce::String::fromUTF8("「")
                     + name
                     + juce::String::fromUTF8(
-                        "」を上書きしてリビジョンを更新します。\n"
-                        "保存済み総合音色の参照も同時に更新します。\n\n")
-                    + describeCompositeTimbreImpact(impact)
-                    + juce::String::fromUTF8("\n\n現在: r")
+                        "」を上書きしてリビジョンを更新します。\n\n現在: r")
                     + juce::String(static_cast<int>(revision))
                     + juce::String::fromUTF8("  更新後: r")
                     + juce::String(static_cast<int>(revision + 1)))
@@ -13189,18 +13210,6 @@ private:
                     "共有ライブラリを更新できません"));
             return;
         }
-        auto composite_library = loadCompositeTimbreLibrary();
-        if (!save_as && selected_library_id_
-            && !composite_library) {
-            showError(
-                juce::String::fromUTF8("音色ライブラリ"),
-                juce::String::fromUTF8(
-                    "総合音色ライブラリを読み込めないため、"
-                    "安全に上書き更新できません"));
-            return;
-        }
-        const auto original_library = library_;
-        std::size_t updated_composite_references{};
         if (save_as || !selected_library_id_) {
             entry.name = library_.uniqueName(
                 mgstc::engine::TimbreCategory::Scc, entry.name);
@@ -13216,34 +13225,7 @@ private:
                     "選択中の音色を更新できませんでした"));
             return;
         }
-        if (!save_as && selected_library_id_
-            && composite_library) {
-            const auto* updated_entry =
-                library_.find(*selected_library_id_);
-            if (updated_entry) {
-                updated_composite_references =
-                    composite_library->updateTimbreReferences(
-                        *updated_entry, unixTimeNow());
-            }
-        }
         const auto saved = persistLibrary();
-        if (saved && updated_composite_references != 0
-            && !persistCompositeTimbreLibrary(
-                *composite_library)) {
-            library_ = original_library;
-            const bool rolled_back = persistLibrary();
-            refreshLibraryList();
-            showError(
-                juce::String::fromUTF8("音色ライブラリ"),
-                rolled_back
-                    ? juce::String::fromUTF8(
-                          "総合音色を更新できなかったため、"
-                          "音色の上書きを取り消しました")
-                    : juce::String::fromUTF8(
-                          "総合音色の更新と音色の復元に失敗しました。"
-                          "ライブラリファイルを確認してください"));
-            return;
-        }
         refreshLibraryList();
         selectLibraryEntryFromList();
         if (!saved) {
@@ -13260,11 +13242,7 @@ private:
             save_as
                 ? juce::String::fromUTF8(
                     "新しい音色として保存しました")
-                : juce::String::fromUTF8("音色を保存しました")
-                    + (updated_composite_references == 0
-                           ? juce::String{}
-                           : juce::String::fromUTF8(
-                                 "（総合音色の参照も更新）")));
+                : juce::String::fromUTF8("音色を保存しました"));
     }
 
     void notifyLibraryContentsChanged() {
@@ -13338,19 +13316,6 @@ private:
             return;
         }
         const auto id = entry->id;
-        const auto impact = inspectCompositeTimbreImpact(id);
-        if (!impact.readable || !impact.uses.empty()) {
-            showError(
-                juce::String::fromUTF8("音色ライブラリ"),
-                !impact.readable
-                    ? juce::String::fromUTF8(
-                          "総合音色ライブラリを確認できないため、"
-                          "安全に削除できません")
-                    : juce::String::fromUTF8(
-                          "総合音色から参照中のため削除できません。\n\n")
-                        + describeCompositeTimbreImpact(impact));
-            return;
-        }
         const auto name =
             juce::String::fromUTF8(entry->name.c_str());
         juce::Component::SafePointer<SccEditorComponent> safe(this);
@@ -13789,6 +13754,7 @@ private:
             if (engine_ready_) {
                 static_cast<void>(configureEngine(false));
             }
+            publishOwnedSnapshot();
             return;
         }
         scc_wave_ = waveform;
@@ -13815,6 +13781,7 @@ private:
                 ? juce::String::fromUTF8("波形を更新しました")
                 : juce::String::fromUTF8(
                     "音源への波形反映を待機できませんでした"));
+        publishOwnedSnapshot();
     }
 
     void restoreHistory() {
@@ -14027,6 +13994,7 @@ private:
     juce::TooltipWindow tooltip_window_;
     SwitchLookAndFeel switch_look_and_feel_;
     bool envelope_context_{};
+    std::optional<std::uint64_t> owned_edit_id_;
     SccWaveform scc_wave_{};
     std::optional<int> ui_scale_session_override_;
     std::vector<SccWaveform> history_;
@@ -15050,7 +15018,45 @@ public:
         }
     }
 
+    [[nodiscard]] bool tryLoadOwnedSnapshot(std::uint64_t id) {
+        const auto& target = audio_service_.compositeOwnedEditTarget();
+        if (!target
+            || target->library_id != id
+            || target->source != mgstc::engine::TimbreSource::Opll) {
+            return false;
+        }
+        owned_edit_id_ = id;
+        selected_library_id_.reset();
+        name_.setText(
+            juce::String::fromUTF8(target->name.c_str()),
+            juce::dontSendNotification);
+        commitPatch(mgstc::engine::decodeOpllPatch(target->opll_registers));
+        setEditorBaseline();
+        updateStatus(
+            juce::String::fromUTF8(
+                "総合音色のオリジナルコピーを編集中"));
+        return true;
+    }
+
+    void publishOwnedSnapshot() {
+        if (!owned_edit_id_) {
+            return;
+        }
+        auto snapshot = audio_service_.compositeOwnedEditTarget();
+        if (!snapshot || snapshot->library_id != *owned_edit_id_) {
+            snapshot = mgstc::engine::SavedTimbreReference{};
+            snapshot->library_id = *owned_edit_id_;
+            snapshot->source = mgstc::engine::TimbreSource::Opll;
+        }
+        snapshot->opll_registers = mgstc::engine::encodeOpllPatch(patch_);
+        audio_service_.setCompositeOwnedEditTarget(*snapshot);
+        audio_service_.publishCompositeOwnedTimbre(*snapshot);
+    }
+
     void requestLibraryEntry(std::uint64_t id) {
+        if (tryLoadOwnedSnapshot(id)) {
+            return;
+        }
         {
             ScopedLibraryIpcLock lock(library_lock_);
             if (!lock.isLocked() || !reloadLibraryFromDisk()
@@ -15062,6 +15068,7 @@ public:
                 return;
             }
         }
+        owned_edit_id_.reset();
         selected_library_id_ = id;
         refreshLibraryList();
         loadSelectedLibraryEntry();
@@ -16384,8 +16391,6 @@ private:
             ? juce::String::fromUTF8(current->name.c_str())
             : juce::String::fromUTF8("選択中の音色");
         const auto revision = current ? current->revision : 1;
-        const auto impact = inspectCompositeTimbreImpact(
-            *selected_library_id_);
         juce::Component::SafePointer<OpllEditorComponent> safe(this);
         juce::AlertWindow::showAsync(
             juce::MessageBoxOptions()
@@ -16397,10 +16402,7 @@ private:
                     juce::String::fromUTF8("「")
                     + name
                     + juce::String::fromUTF8(
-                        "」を上書きしてリビジョンを更新します。\n"
-                        "保存済み総合音色の参照も同時に更新します。\n\n")
-                    + describeCompositeTimbreImpact(impact)
-                    + juce::String::fromUTF8("\n\n現在: r")
+                        "」を上書きしてリビジョンを更新します。\n\n現在: r")
                     + juce::String(static_cast<int>(revision))
                     + juce::String::fromUTF8("  更新後: r")
                     + juce::String(static_cast<int>(revision + 1)))
@@ -16437,19 +16439,6 @@ private:
                     "共有ライブラリを更新できません"));
             return;
         }
-        auto composite_library = loadCompositeTimbreLibrary();
-        if (!save_as && selected_library_id_
-            && !composite_library) {
-            showError(
-                juce::String::fromUTF8(
-                    "OPLL音色ライブラリ"),
-                juce::String::fromUTF8(
-                    "総合音色ライブラリを読み込めないため、"
-                    "安全に上書き更新できません"));
-            return;
-        }
-        const auto original_library = library_;
-        std::size_t updated_composite_references{};
         if (save_as || !selected_library_id_) {
             entry.name = library_.uniqueName(
                 mgstc::engine::TimbreCategory::Opll,
@@ -16469,35 +16458,7 @@ private:
             refreshLibraryList();
             return;
         }
-        if (!save_as && selected_library_id_
-            && composite_library) {
-            const auto* updated_entry =
-                library_.find(*selected_library_id_);
-            if (updated_entry) {
-                updated_composite_references =
-                    composite_library->updateTimbreReferences(
-                        *updated_entry, unixTimeNow());
-            }
-        }
         const bool saved = persistLibrary();
-        if (saved && updated_composite_references != 0
-            && !persistCompositeTimbreLibrary(
-                *composite_library)) {
-            library_ = original_library;
-            const bool rolled_back = persistLibrary();
-            refreshLibraryList();
-            showError(
-                juce::String::fromUTF8(
-                    "OPLL音色ライブラリ"),
-                rolled_back
-                    ? juce::String::fromUTF8(
-                          "総合音色を更新できなかったため、"
-                          "音色の上書きを取り消しました")
-                    : juce::String::fromUTF8(
-                          "総合音色の更新と音色の復元に失敗しました。"
-                          "ライブラリファイルを確認してください"));
-            return;
-        }
         if (!saved) {
             showError(
                 juce::String::fromUTF8(
@@ -16515,11 +16476,7 @@ private:
                 ? juce::String::fromUTF8(
                     "新しいOPLL音色として保存しました")
                 : juce::String::fromUTF8(
-                    "OPLL音色を保存しました")
-                    + (updated_composite_references == 0
-                           ? juce::String{}
-                           : juce::String::fromUTF8(
-                                 "（総合音色の参照も更新）")));
+                    "OPLL音色を保存しました"));
     }
 
     void notifyLibraryContentsChanged() {
@@ -16594,19 +16551,6 @@ private:
             return;
         }
         const auto id = entry->id;
-        const auto impact = inspectCompositeTimbreImpact(id);
-        if (!impact.readable || !impact.uses.empty()) {
-            showError(
-                juce::String::fromUTF8("OPLL音色ライブラリ"),
-                !impact.readable
-                    ? juce::String::fromUTF8(
-                          "総合音色ライブラリを確認できないため、"
-                          "安全に削除できません")
-                    : juce::String::fromUTF8(
-                          "総合音色から参照中のため削除できません。\n\n")
-                        + describeCompositeTimbreImpact(impact));
-            return;
-        }
         const auto entry_name =
             juce::String::fromUTF8(entry->name.c_str());
         juce::Component::SafePointer<
@@ -16820,6 +16764,7 @@ private:
             recordHistory();
         }
         auditionAfterEdit();
+        publishOwnedSnapshot();
     }
 
     void restoreHistory() {
@@ -17110,6 +17055,7 @@ private:
     juce::TooltipWindow tooltip_window_;
     SwitchLookAndFeel switch_look_and_feel_;
     bool envelope_context_{};
+    std::optional<std::uint64_t> owned_edit_id_;
     mgstc::engine::OpllPatchParameters patch_;
     std::optional<int> ui_scale_session_override_;
     std::vector<mgstc::engine::OpllPatchParameters> history_;

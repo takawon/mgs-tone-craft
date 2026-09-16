@@ -566,6 +566,13 @@ bool parseSequence(
     std::vector<EnvelopeEvent> volume;
     std::vector<EnvelopeEvent> pitch;
     std::vector<EnvelopeEvent> timbre;
+    const auto skip_space = [&] {
+        while (position < body.size()
+               && std::isspace(static_cast<unsigned char>(
+                   body[position]))) {
+            ++position;
+        }
+    };
     const auto skip = [&] {
         while (position < body.size()
                && (std::isspace(static_cast<unsigned char>(
@@ -575,6 +582,62 @@ bool parseSequence(
             ++position;
         }
     };
+    const auto parse_header_number = [&](int minimum, int maximum, int& value) {
+        skip_space();
+        if (position >= body.size()
+            || !std::isdigit(static_cast<unsigned char>(body[position]))) {
+            return false;
+        }
+        const auto begin = position;
+        while (position < body.size()
+               && std::isdigit(static_cast<unsigned char>(body[position]))) {
+            ++position;
+        }
+        return decimal(
+            std::string_view(body).substr(begin, position - begin),
+            minimum,
+            maximum,
+            value);
+    };
+    {
+        // MGSC 1.11: optional `{ Mode,Noise, data }`. Mode 0–3 (default 1),
+        // Noise 0–31 (default 0). `{ 0.f }` is volume, not a header.
+        const auto saved = position;
+        skip_space();
+        bool have_header = false;
+        int mode = static_cast<int>(kMgscSequenceToneModeDefault);
+        int noise = static_cast<int>(kMgscSequenceNoiseDefault);
+        if (position < body.size() && body[position] == ',') {
+            ++position;
+            have_header = true;
+        } else if (parse_header_number(0, 3, mode)) {
+            skip_space();
+            if (position < body.size() && body[position] == ',') {
+                ++position;
+                have_header = true;
+            } else {
+                position = saved;
+            }
+        } else {
+            position = saved;
+        }
+        if (have_header) {
+            skip_space();
+            if (position < body.size() && body[position] == ',') {
+                ++position;
+            } else {
+                static_cast<void>(parse_header_number(0, 31, noise));
+                skip_space();
+                if (position < body.size() && body[position] == ',') {
+                    ++position;
+                }
+            }
+            assignSequenceEnvelopeMixer(
+                layer.volume_envelope.rate,
+                static_cast<std::uint8_t>(mode),
+                static_cast<std::uint8_t>(noise));
+        }
+    }
     while (position < body.size()) {
         skip();
         if (position >= body.size()) {

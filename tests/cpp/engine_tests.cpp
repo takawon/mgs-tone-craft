@@ -22,6 +22,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "mgstc/engine/envelope_rate.hpp"
@@ -562,6 +563,50 @@ void testNoWaitLoopHitsInstructionBudget() {
     REQUIRE_EQ(
         runtime.processTick(buffer, 32),
         SequenceError::InstructionBudgetExceeded);
+}
+
+void testOneCountVolumeLoopHoldsWithoutBudgetFault() {
+    SequenceEnvelopeRuntime runtime({0x40, 0x0F, 0x60});
+    EventBuffer buffer(16);
+    for (int tick = 0; tick < 8; ++tick) {
+        buffer.clear();
+        REQUIRE_EQ(runtime.processTick(buffer), SequenceError::None);
+        REQUIRE_EQ(runtime.volume(), static_cast<std::uint8_t>(15));
+    }
+}
+
+void testEmptyEnvelopeLoopMutesTrackVolume() {
+    RuntimeSession session(16, 32);
+    REQUIRE_EQ(session.setSequenceEnvelope(0, {0x40, 0x60}), true);
+    REQUIRE_EQ(session.setPsgToneNoise(0, 1, 0), true);
+    REQUIRE_EQ(session.queueNoteOn(0, 60), true);
+    REQUIRE_EQ(session.processTick().ok(), true);
+    std::optional<int> last_volume;
+    for (const auto& write : session.writes()) {
+        if (write.chip == ChipId::Psg && write.address == 8) {
+            last_volume = write.value;
+        }
+    }
+    REQUIRE_EQ(last_volume, std::optional<int>{0});
+}
+
+void testOneCountSustainLoopFormatsHoldInsideBrackets() {
+    using namespace mgstc::engine;
+    auto layer = defaultCompositeTimbre().layers.front();
+    layer.volume = 15;
+    layer.envelope_timeline = {
+        .length_counts = 2,
+        .loop_start_count = 1,
+        .loop_end_count = 2,
+    };
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {EnvelopeEventKind::Volume, 15, 0, 2},
+    };
+    const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(formatted.valid(), true);
+    REQUIRE_EQ(formatted.body.find("[]") == std::string::npos, true);
+    REQUIRE_EQ(formatted.body.find("[.f.]") != std::string::npos, true);
 }
 
 void testCompositeSequenceLanesLoopIndependently() {
@@ -1105,10 +1150,13 @@ void testRuntimePsgNoteOnOrderMatchesObservedBoundary() {
 }
 
 void testRuntimeTrackMicroDetuneMatchesObservedVgm() {
-    const auto pitch_registers = [](std::uint8_t track, std::int32_t micro) {
+    const auto pitch_registers = [](
+        std::uint8_t track,
+        std::uint8_t midi_note,
+        std::int32_t micro) {
         RuntimeSession session(32, 64);
         REQUIRE_EQ(session.setTrackDetune(track, 0, micro), true);
-        REQUIRE_EQ(session.queueNoteOn(track, 60), true);
+        REQUIRE_EQ(session.queueNoteOn(track, midi_note), true);
         REQUIRE_EQ(session.processTick().ok(), true);
 
         int low = -1;
@@ -1147,10 +1195,33 @@ void testRuntimeTrackMicroDetuneMatchesObservedVgm() {
     for (const auto track : {std::uint8_t{0}, std::uint8_t{3}}) {
         for (std::size_t i = 0; i < psg_scc_values.size(); ++i) {
             REQUIRE_EQ(
-                pitch_registers(track, psg_scc_values[i]),
+                pitch_registers(track, 60, psg_scc_values[i]),
                 psg_scc_expected[i]);
         }
     }
+
+    // blank(2).vgm: o4c on PSG/SCC. `@\-5`/`@\-60`/`@\-100` are the values
+    // the former 1/8 rounding got wrong even at C4.
+    constexpr std::array<std::int32_t, 28> psg_scc_blank_values{
+        0, 1, 2, 5, 10, 30, 60, 90, 100, 150, 175, 200, 222, 255,
+        0, -1, -2, -5, -10, -30, -60, -90, -100, -150, -175, -200, -222,
+        -255};
+    constexpr std::array<int, 28> psg_scc_blank_expected{
+        0x01AB, 0x01AB, 0x01AB, 0x01AC, 0x01AC, 0x01AF, 0x01B3,
+        0x01B6, 0x01B8, 0x01BE, 0x01C1, 0x01C4, 0x01C7, 0x01CB,
+        0x01AB, 0x01AB, 0x01AB, 0x01AB, 0x01AA, 0x01A7, 0x01A4,
+        0x01A0, 0x019F, 0x0198, 0x0195, 0x0192, 0x018F, 0x018B};
+    for (const auto track : {std::uint8_t{0}, std::uint8_t{3}}) {
+        for (std::size_t i = 0; i < psg_scc_blank_values.size(); ++i) {
+            REQUIRE_EQ(
+                pitch_registers(track, 60, psg_scc_blank_values[i]),
+                psg_scc_blank_expected[i]);
+        }
+    }
+
+    // Same `@\30` is not a constant period offset across octaves.
+    REQUIRE_EQ(pitch_registers(0, 48, 30), 0x035E);
+    REQUIRE_EQ(pitch_registers(0, 72, 30), 0x00D7);
 
     constexpr std::array<std::int32_t, 8> opll_values{
         10, 40, 70, 90, 130, 160, 200, 255};
@@ -1159,9 +1230,25 @@ void testRuntimeTrackMicroDetuneMatchesObservedVgm() {
         0x16B1, 0x16B2, 0x16B3, 0x16B6};
     for (std::size_t i = 0; i < opll_values.size(); ++i) {
         REQUIRE_EQ(
-            pitch_registers(8, opll_values[i]),
+            pitch_registers(8, 60, opll_values[i]),
             opll_expected[i]);
     }
+
+    constexpr std::array<std::int32_t, 14> opll_blank_values{
+        0, 1, 2, 5, 10, 30, 60, 90, 100, 150, 175, 200, 222, 255};
+    constexpr std::array<int, 14> opll_blank_expected{
+        0x16AC, 0x16AC, 0x16AC, 0x16AC, 0x16AC, 0x16AD, 0x16AE,
+        0x16AF, 0x16AF, 0x16B1, 0x16B2, 0x16B3, 0x16B4, 0x16B6};
+    for (std::size_t i = 0; i < opll_blank_values.size(); ++i) {
+        REQUIRE_EQ(
+            pitch_registers(8, 60, opll_blank_values[i]),
+            opll_blank_expected[i]);
+    }
+
+    // floor(d*(n+1)/256) vs floor(n*d/255) differs at n=25 on C.
+    REQUIRE_EQ(pitch_registers(8, 60, 25), 0x16AD);
+    // B uses span 17, not the doubled-C step of 19.
+    REQUIRE_EQ(pitch_registers(8, 71, 255), 0x1756);
 }
 
 #if MGSTC_HAS_PRIVATE_MGSDRV_FIXTURE
@@ -1206,9 +1293,14 @@ void testRuntimeSccKeyMaskPreservesOtherChannels() {
 
     REQUIRE_EQ(session.queueKeyOff(3), true);
     REQUIRE_EQ(session.processTick().ok(), true);
-    REQUIRE_EQ(session.writes()[0].port, static_cast<std::uint8_t>(3));
-    REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0x02));
-    REQUIRE_EQ(session.writes()[0].reason, WriteReason::KeyOff);
+    // MGSDRV `k` decays software volume; SCC key bits stay on so the other
+    // channel keeps sounding.
+    REQUIRE_EQ(session.writes().size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(session.writes()[0].chip, ChipId::Scc);
+    REQUIRE_EQ(session.writes()[0].port, static_cast<std::uint8_t>(2));
+    REQUIRE_EQ(session.writes()[0].address, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(session.writes()[0].reason, WriteReason::Volume);
 }
 
 void testRuntimeSccRateEnvelopeKeepsGateDuringRelease() {
@@ -3224,6 +3316,13 @@ void testTimbreLibraryCrudAndVersionedRoundTrip() {
     REQUIRE_EQ(
         restored->find(opll_id)->revision,
         static_cast<std::uint32_t>(2));
+    auto favorite_only = *library.find(opll_id);
+    favorite_only.favorite = false;
+    REQUIRE_EQ(library.update(opll_id, favorite_only, 201), true);
+    REQUIRE_EQ(library.find(opll_id)->favorite, false);
+    REQUIRE_EQ(
+        library.find(opll_id)->revision,
+        static_cast<std::uint32_t>(2));
     REQUIRE_EQ(
         restored->find(opll_id)->opll_registers,
         opll.opll_registers);
@@ -5158,6 +5257,46 @@ void testCompositeAutomaticVolumeRejectsMgscCount240() {
     REQUIRE_EQ(parsed.valid(), false);
 }
 
+void testCompositeSequenceEnvelopeHeaderModeNoise() {
+    using namespace mgstc::engine;
+
+    auto layer = defaultCompositeTimbre().layers.front();
+    REQUIRE_EQ(layer.source, TimbreSource::Psg);
+    layer.volume = 15;
+    layer.envelope_timeline = {.length_counts = 4};
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+    };
+
+    auto omitted = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(omitted.valid(), true);
+    REQUIRE_EQ(omitted.body.substr(0, 2), std::string(",,"));
+
+    layer.volume_envelope.rate.tone_mode = 2;
+    layer.volume_envelope.rate.noise = 9;
+    auto explicit_header = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(explicit_header.valid(), true);
+    REQUIRE_EQ(explicit_header.body.substr(0, 4), std::string("2,9,"));
+    REQUIRE_EQ(
+        explicit_header.definition.find("@e0 = { 2,9,") == 0, true);
+
+    CompositeLayer parsed;
+    parsed.source = TimbreSource::Psg;
+    std::vector<std::string> issues;
+    REQUIRE_EQ(parseMgsSequenceBody("2,9,f", parsed, issues), true);
+    REQUIRE_EQ(parsed.volume_envelope.rate.tone_mode, static_cast<std::uint8_t>(2));
+    REQUIRE_EQ(parsed.volume_envelope.rate.noise, static_cast<std::uint8_t>(9));
+    REQUIRE_EQ(parsed.volume_envelope.events.empty(), false);
+    REQUIRE_EQ(parsed.volume_envelope.events.front().value, 15);
+
+    CompositeLayer volume_zero;
+    volume_zero.source = TimbreSource::Psg;
+    issues.clear();
+    REQUIRE_EQ(parseMgsSequenceBody("0.f", volume_zero, issues), true);
+    REQUIRE_EQ(rateEnvelopeIsUnset(volume_zero.volume_envelope.rate), true);
+    REQUIRE_EQ(volume_zero.volume_envelope.events.size() >= 2, true);
+}
+
 void testCompositeSoloPitchAndChannelValidation() {
     auto timbre = mgstc::engine::defaultCompositeTimbre();
     timbre.layers[1].solo = true;
@@ -5539,6 +5678,55 @@ void testRuntimePitchSweepAndKeyOffHangAndOpllSustain() {
     REQUIRE_EQ(second_period.has_value(), true);
     REQUIRE_EQ(*second_period != *first_period, true);
 
+    auto last_psg_volume = [](const auto& writes) -> std::optional<int> {
+        std::optional<int> value;
+        for (const auto& write : writes) {
+            if (write.chip == ChipId::Psg && write.address == 8) {
+                value = write.value & 0x0F;
+            }
+        }
+        return value;
+    };
+
+    std::uint8_t progress = 0;
+    std::uint8_t volume = 15;
+    REQUIRE_EQ(
+        stepSequenceKeyOffDecay(0, progress, volume),
+        KeyOffDecayWrite::Volume);
+    REQUIRE_EQ(volume, static_cast<std::uint8_t>(0));
+    progress = 0;
+    volume = 15;
+    REQUIRE_EQ(
+        stepSequenceKeyOffDecay(1, progress, volume),
+        KeyOffDecayWrite::Volume);
+    REQUIRE_EQ(volume, static_cast<std::uint8_t>(14));
+    progress = 0;
+    volume = 15;
+    REQUIRE_EQ(
+        stepSequenceKeyOffDecay(2, progress, volume),
+        KeyOffDecayWrite::None);
+    REQUIRE_EQ(progress, static_cast<std::uint8_t>(1));
+    REQUIRE_EQ(volume, static_cast<std::uint8_t>(15));
+    REQUIRE_EQ(
+        stepSequenceKeyOffDecay(2, progress, volume),
+        KeyOffDecayWrite::Volume);
+    REQUIRE_EQ(volume, static_cast<std::uint8_t>(14));
+    REQUIRE_EQ(progress, static_cast<std::uint8_t>(0));
+
+    RuntimeSession immediate(64, 256);
+    REQUIRE_EQ(immediate.setSequenceEnvelope(0, {0xEF, 200}), true);
+    REQUIRE_EQ(immediate.setPsgToneNoise(0, 1, 0), true);
+    REQUIRE_EQ(immediate.setPsgFixedVolume(0, 15), true);
+    REQUIRE_EQ(immediate.setTrackKeyOffHang(0, 0), true);
+    REQUIRE_EQ(immediate.queueNoteOn(0, 60), true);
+    REQUIRE_EQ(immediate.processTick().ok(), true);
+    REQUIRE_EQ(last_psg_volume(immediate.writes()), std::optional<int>{15});
+    REQUIRE_EQ(immediate.queueKeyOff(0), true);
+    REQUIRE_EQ(immediate.processTick().ok(), true);
+    REQUIRE_EQ(last_psg_volume(immediate.writes()), std::optional<int>{0});
+    REQUIRE_EQ(immediate.processTick().ok(), true);
+    REQUIRE_EQ(last_psg_volume(immediate.writes()), std::nullopt);
+
     RuntimeSession hang(64, 256);
     REQUIRE_EQ(hang.setSequenceEnvelope(0, {0xEF, 200}), true);
     REQUIRE_EQ(hang.setPsgToneNoise(0, 1, 0), true);
@@ -5548,21 +5736,13 @@ void testRuntimePitchSweepAndKeyOffHangAndOpllSustain() {
     REQUIRE_EQ(hang.processTick().ok(), true);
     REQUIRE_EQ(hang.queueKeyOff(0), true);
     REQUIRE_EQ(hang.processTick().ok(), true);
-    auto has_volume_zero = [](const auto& writes) {
-        for (const auto& write : writes) {
-            if (write.chip == ChipId::Psg
-                && write.address == 8
-                && write.value == 0) {
-                return true;
-            }
-        }
-        return false;
-    };
-    REQUIRE_EQ(has_volume_zero(hang.writes()), false);
+    REQUIRE_EQ(last_psg_volume(hang.writes()), std::nullopt);
     REQUIRE_EQ(hang.processTick().ok(), true);
-    REQUIRE_EQ(has_volume_zero(hang.writes()), false);
+    REQUIRE_EQ(last_psg_volume(hang.writes()), std::optional<int>{14});
     REQUIRE_EQ(hang.processTick().ok(), true);
-    REQUIRE_EQ(has_volume_zero(hang.writes()), true);
+    REQUIRE_EQ(last_psg_volume(hang.writes()), std::nullopt);
+    REQUIRE_EQ(hang.processTick().ok(), true);
+    REQUIRE_EQ(last_psg_volume(hang.writes()), std::optional<int>{13});
 
     RuntimeSession opll(64, 256);
     REQUIRE_EQ(opll.setTrackOpllSustain(8, true), true);
@@ -5672,6 +5852,14 @@ void testCompositeTimbreLibraryRoundTripAndRevision() {
         loaded->find(id)->updated_unix_seconds,
         static_cast<std::int64_t>(120));
 
+    auto favorite_only = loaded->find(id)->timbre;
+    favorite_only.favorite = true;
+    REQUIRE_EQ(loaded->update(id, favorite_only, 121), true);
+    REQUIRE_EQ(loaded->find(id)->timbre.favorite, true);
+    REQUIRE_EQ(
+        loaded->find(id)->revision,
+        static_cast<std::uint32_t>(2));
+
     REQUIRE_EQ(
         CompositeTimbreLibrary::deserialize(
             "MGSTC_COMPOSITE_TIMBRE_LIBRARY\t3\r\n",
@@ -5742,6 +5930,46 @@ void testCompositeLibraryDependencyIndexAndPropagation() {
             .base_timbre
             ->scc_waveform[0],
         static_cast<std::uint8_t>(0x7F));
+}
+
+void testAdoptLibraryTimbreCopiesAndBreaksLink() {
+    using namespace mgstc::engine;
+
+    TimbreLibrary timbres;
+    TimbreLibraryEntry scc;
+    scc.category = TimbreCategory::Scc;
+    scc.name = "Library SCC";
+    scc.scc_waveform[0] = 0x11;
+    scc.scc_waveform[31] = 0x22;
+    const auto library_id = timbres.add(scc, 10);
+    REQUIRE_EQ(isStandaloneLibraryTimbreId(library_id), true);
+
+    auto composite = defaultCompositeTimbre();
+    CompositeLayer seeded;
+    seeded.source = TimbreSource::Scc;
+    seedDefaultLayerTimbre(composite, seeded);
+    REQUIRE_EQ(seeded.base_timbre.has_value(), true);
+    REQUIRE_EQ(
+        isStandaloneLibraryTimbreId(seeded.base_timbre->library_id), false);
+    composite.layers[1] = std::move(seeded);
+
+    auto adopted = adoptLibraryTimbre(composite, *timbres.find(library_id));
+    REQUIRE_EQ(adopted.name, std::string("Library SCC"));
+    REQUIRE_EQ(adopted.scc_waveform[0], static_cast<std::uint8_t>(0x11));
+    REQUIRE_EQ(isStandaloneLibraryTimbreId(adopted.library_id), false);
+    REQUIRE_EQ(adopted.library_id == library_id, false);
+    REQUIRE_EQ(
+        adopted.library_id == composite.layers[1].base_timbre->library_id,
+        false);
+
+    composite.layers[1].base_timbre = adopted;
+    auto edited = adopted;
+    edited.scc_waveform[0] = 0x7F;
+    REQUIRE_EQ(replaceOwnedTimbreSnapshot(composite, edited), true);
+    REQUIRE_EQ(
+        composite.layers[1].base_timbre->scc_waveform[0],
+        static_cast<std::uint8_t>(0x7F));
+    REQUIRE_EQ(timbres.find(library_id)->scc_waveform[0], static_cast<std::uint8_t>(0x11));
 }
 
 void testPcKeyboardPhysicalLayoutAndOctaveSlide() {
@@ -5834,10 +6062,18 @@ int main(int argc, char** argv) {
         {"RampStepWidthsFollowEightBitRemainderPattern", testRampStepWidthsFollowEightBitRemainderPattern},
         {"FrequencyDeltasAreSignedAndCumulativeEvents", testFrequencyDeltasAreSignedAndCumulativeEvents},
         {"NoWaitLoopHitsInstructionBudget", testNoWaitLoopHitsInstructionBudget},
+        {"OneCountVolumeLoopHoldsWithoutBudgetFault",
+         testOneCountVolumeLoopHoldsWithoutBudgetFault},
+        {"EmptyEnvelopeLoopMutesTrackVolume",
+         testEmptyEnvelopeLoopMutesTrackVolume},
+        {"OneCountSustainLoopFormatsHoldInsideBrackets",
+         testOneCountSustainLoopFormatsHoldInsideBrackets},
         {"CompositeSequenceLanesLoopIndependently", testCompositeSequenceLanesLoopIndependently},
         {"CompositeAutomaticVolumeRoundTripsThroughMgsc", testCompositeAutomaticVolumeRoundTripsThroughMgsc},
         {"PreciseAutomaticKeepsUnsplitRampVolumes", testPreciseAutomaticKeepsUnsplitRampVolumes},
         {"CompositeAutomaticVolumeRejectsMgscCount240", testCompositeAutomaticVolumeRejectsMgscCount240},
+        {"CompositeSequenceEnvelopeHeaderModeNoise",
+         testCompositeSequenceEnvelopeHeaderModeNoise},
         {"RateEnvelopeNativePhases", testRateEnvelopeNativePhases},
         {"RateEnvelopeTestRateQuantizedKeyOff", testRateEnvelopeTestRateQuantizedKeyOff},
         {"TraceRateEnvelopePreviewKeyOff", testTraceRateEnvelopePreviewKeyOff},
@@ -5952,6 +6188,7 @@ int main(int argc, char** argv) {
          testRuntimePitchSweepAndKeyOffHangAndOpllSustain},
         {"CompositeTimbreLibraryRoundTripAndRevision", testCompositeTimbreLibraryRoundTripAndRevision},
         {"CompositeLibraryDependencyIndexAndPropagation", testCompositeLibraryDependencyIndexAndPropagation},
+        {"AdoptLibraryTimbreCopiesAndBreaksLink", testAdoptLibraryTimbreCopiesAndBreaksLink},
         {"PcKeyboardPhysicalLayoutAndOctaveSlide", testPcKeyboardPhysicalLayoutAndOctaveSlide},
         {"SequentialVoiceAllocatorPolyMonoAndStealing", testSequentialVoiceAllocatorPolyMonoAndStealing},
         {"GzipStoredRoundTrip", testGzipStoredRoundTrip},
@@ -5986,7 +6223,7 @@ int main(int argc, char** argv) {
         {"ToneImportMusicaVcdNamesAndSccEnvelope",
          testToneImportMusicaVcdNamesAndSccEnvelope},
         {"ToneImportSngWaveAndName", testToneImportSngWaveAndName},
-        {"ToneImportSkipsUnusedEnvelope", testToneImportSkipsUnusedEnvelope},
+        {"ToneImportUnusedEnvelopeAsPsg", testToneImportUnusedEnvelopeAsPsg},
         {"ToneImportSkipsOpllRhythmChannelEnvelope",
          testToneImportSkipsOpllRhythmChannelEnvelope},
         {"ToneImportRhythmHeaderAndMelodyTrack",
@@ -5995,6 +6232,12 @@ int main(int argc, char** argv) {
          testToneImportUsedEnvelopeWithoutPatchUsesDefault},
         {"ToneImportDefaultCandidateNames",
          testToneImportDefaultCandidateNames},
+        {"ToneImportWidensHalfwidthKanaAndCircledNumbers",
+         testToneImportWidensHalfwidthKanaAndCircledNumbers},
+        {"ToneImportMmlSequenceHeaderMixer",
+         testToneImportMmlSequenceHeaderMixer},
+        {"ToneImportMgsBytecodeLoopAfterStart",
+         testToneImportMgsBytecodeLoopAfterStart},
         {"ImportedLibraryEntryKeepsEmptyName",
          testImportedLibraryEntryKeepsEmptyName},
 #ifdef _WIN32

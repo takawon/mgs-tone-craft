@@ -25,4 +25,17 @@ struct NotePitch {
     std::uint8_t midi_note,
     NotePitch& output) noexcept;
 
+// Track MML `@\`: add the 16-bit value to the unshifted PSG/SCC table word,
+// then logical-shift by the internal octave (o1=0 … o8=7).
+[[nodiscard]] bool psgSccPeriodWithMicroDetune(
+    std::uint8_t midi_note,
+    std::int32_t micro,
+    std::uint16_t& period) noexcept;
+
+// Track MML `@\` on OPLL: 0 skips; otherwise floor(d*(n+1)/256) using the
+// per-note F-number span table. n is clamped to 0..255.
+[[nodiscard]] std::int32_t opllMicroDetuneDelta(
+    std::uint8_t midi_note,
+    std::int32_t micro) noexcept;
+
 }  // namespace mgstc::engine

@@ -320,6 +320,22 @@ void collapseTrailingHold(std::vector<std::string>& tokens) {
     return comment;
 }
 
+[[nodiscard]] std::string_view envelopeHeaderPrefix(
+    std::string_view body) noexcept {
+    if (body.size() >= 2 && body[0] == ',' && body[1] == ',') {
+        return body.substr(0, 2);
+    }
+    const auto comma = body.find(',');
+    if (comma == std::string_view::npos) {
+        return {};
+    }
+    const auto second = body.find(',', comma + 1);
+    if (second == std::string_view::npos) {
+        return {};
+    }
+    return body.substr(0, second + 1);
+}
+
 [[nodiscard]] std::string wrapEnvelopeDefinition(
     std::uint8_t definition_number,
     const std::string& body,
@@ -333,7 +349,8 @@ void collapseTrailingHold(std::vector<std::string>& tokens) {
         return single + "\r\n";
     }
 
-    std::string first = prefix + ",,";
+    const auto header = envelopeHeaderPrefix(body);
+    std::string first = prefix + std::string(header);
     if (!comment.empty()) {
         first += " ; " + comment;
     }
@@ -341,8 +358,8 @@ void collapseTrailingHold(std::vector<std::string>& tokens) {
     result += "\r\n";
 
     std::string commands = body;
-    if (commands.size() >= 2 && commands[0] == ',' && commands[1] == ',') {
-        commands.erase(0, 2);
+    if (!header.empty()) {
+        commands.erase(0, header.size());
     }
     std::vector<std::string> pieces;
     std::size_t cursor = 0;
@@ -731,7 +748,9 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
 
     coalesceAdjacentHolds(tokens);
     collapseTrailingHold(tokens);
-    result.body = ",," + joinTokens(tokens);
+    result.body = formatSequenceEnvelopeHeader(
+                      layer.source, layer.volume_envelope.rate)
+        + joinTokens(tokens);
     result.compiled_bytes = compiledEnvelopeBytes(tokens);
     if (result.compiled_bytes > compiled_byte_limit) {
         result.issues.push_back(MgsEnvelopeIssue::DefinitionLengthExceeded);

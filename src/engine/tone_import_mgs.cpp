@@ -325,6 +325,7 @@ void applyMusicEnvelopeEvents(
         }
         if (isOpllRhythmMusicTrack(static_cast<unsigned>(event.track))
             && rhythm_on) {
+            static_cast<void>(usage[event.number]);
             continue;
         }
         const std::optional<unsigned> patch =
@@ -757,6 +758,22 @@ void collectMmlEnvelopeUse(
     applyMusicEnvelopeEvents(events, mmlHeaderRhythmMode(text), usage);
 }
 
+[[nodiscard]] std::optional<tone_import_detail::EnvelopeChipUse>
+usageOrUnusedPsg(
+    const std::map<unsigned, tone_import_detail::EnvelopeChipUse>& usage,
+    unsigned number) {
+    const auto found = usage.find(number);
+    if (found != usage.end() && found->second.anyChip()) {
+        return found->second;
+    }
+    if (found == usage.end()) {
+        tone_import_detail::EnvelopeChipUse unused;
+        unused.psg = true;
+        return unused;
+    }
+    return std::nullopt;
+}
+
 void addEnvelopeCandidate(
     ToneImportResult& result,
     EnvelopeDef envelope,
@@ -781,11 +798,8 @@ void addEnvelopeCandidate(
             warnings.push_back(
                 {"PSG noise and tone/noise mode commands were skipped"});
         }
-        if (envelope.mode != 0 || envelope.noise != 0) {
-            warnings.push_back(
-                {"PSG mode/noise from the envelope header is not stored "
-                 "on sequence envelopes"});
-        }
+        assignSequenceEnvelopeMixer(
+            layer.volume_envelope.rate, envelope.mode, envelope.noise);
         for (const auto& issue : issues) {
             warnings.push_back({issue});
         }
@@ -1015,11 +1029,12 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
                 "MGS"));
     }
     for (const auto& envelope : envelopes) {
-        const auto found = usage_by_envelope.find(envelope.number);
-        if (found == usage_by_envelope.end() || !found->second.anyChip()) {
+        const auto usage = usageOrUnusedPsg(
+            usage_by_envelope, envelope.number);
+        if (!usage) {
             continue;
         }
-        addEnvelopeCandidate(result, envelope, tones, "MGS", found->second);
+        addEnvelopeCandidate(result, envelope, tones, "MGS", *usage);
     }
     return result;
 }
@@ -1075,8 +1090,9 @@ ToneImportResult importMgsMml(std::string_view text) {
             warnings.push_back(
                 {"PSG noise and tone/noise mode commands were skipped"});
         }
-        const auto found = usage_by_envelope.find(definition.number);
-        if (found == usage_by_envelope.end() || !found->second.anyChip()) {
+        const auto usage = usageOrUnusedPsg(
+            usage_by_envelope, definition.number);
+        if (!usage) {
             continue;
         }
         auto timbre = tone_import_detail::makeSelfContainedComposite(
@@ -1084,7 +1100,7 @@ ToneImportResult importMgsMml(std::string_view text) {
             tones,
             tone_import_detail::paddedImportNumber(definition.number),
             warnings,
-            found->second);
+            *usage);
         auto candidate = tone_import_detail::makeCompositeCandidate(
             std::move(timbre), "MML");
         candidate.warnings = std::move(warnings);
@@ -1101,8 +1117,9 @@ ToneImportResult importMgsMml(std::string_view text) {
         layer.volume_envelope.kind = EnvelopeKind::Rate;
         layer.volume_envelope.rate = rate;
         std::vector<ImportWarning> warnings;
-        const auto found = usage_by_envelope.find(definition.number);
-        if (found == usage_by_envelope.end() || !found->second.anyChip()) {
+        const auto usage = usageOrUnusedPsg(
+            usage_by_envelope, definition.number);
+        if (!usage) {
             continue;
         }
         auto timbre = tone_import_detail::makeSelfContainedComposite(
@@ -1110,7 +1127,7 @@ ToneImportResult importMgsMml(std::string_view text) {
             tones,
             tone_import_detail::paddedImportNumber(definition.number),
             warnings,
-            found->second);
+            *usage);
         tone_import_detail::addCandidate(
             result.candidates,
             tone_import_detail::makeCompositeCandidate(std::move(timbre), "MML"));

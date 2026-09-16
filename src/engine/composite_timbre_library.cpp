@@ -810,10 +810,16 @@ bool CompositeTimbreLibrary::update(
     if (!current) {
         return false;
     }
+    auto previous = current->timbre;
+    previous.favorite = false;
+    auto incoming = replacement;
+    incoming.favorite = false;
+    const bool data_changed = previous != incoming;
     current->timbre = replacement;
     current->updated_unix_seconds = now_unix_seconds;
-    if (current->revision
-        != std::numeric_limits<std::uint32_t>::max()) {
+    if (data_changed
+        && current->revision
+            != std::numeric_limits<std::uint32_t>::max()) {
         ++current->revision;
     }
     return true;

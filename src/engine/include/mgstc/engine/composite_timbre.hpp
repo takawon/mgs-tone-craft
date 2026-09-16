@@ -113,7 +113,15 @@ struct RateEnvelope {
 inline void seedDefaultRateEnvelope(
     RateEnvelope& rate,
     TimbreSource source) noexcept {
-    if (!rateEnvelopeIsUnset(rate)) {
+    const bool mixer_set = rate.tone_mode != 0 || rate.noise != 0;
+    const auto keep_mode = rate.tone_mode;
+    const auto keep_noise = rate.noise;
+    if (rate.attack_level != 0
+        || rate.attack_rate != 0
+        || rate.decay_rate != 0
+        || rate.sustain_level != 0
+        || rate.sustain_rate != 0
+        || rate.release_rate != 0) {
         return;
     }
     rate.attack_level = 0;
@@ -122,9 +130,14 @@ inline void seedDefaultRateEnvelope(
     rate.sustain_level = 128;
     rate.sustain_rate = 8;
     rate.release_rate = 16;
-    rate.tone_mode =
-        source == TimbreSource::Psg ? std::uint8_t{1} : std::uint8_t{0};
-    rate.noise = 0;
+    if (mixer_set) {
+        rate.tone_mode = keep_mode;
+        rate.noise = keep_noise;
+    } else {
+        rate.tone_mode =
+            source == TimbreSource::Psg ? std::uint8_t{1} : std::uint8_t{0};
+        rate.noise = 0;
+    }
 }
 
 [[nodiscard]] inline RateEnvelope clampRateEnvelope(
@@ -132,6 +145,56 @@ inline void seedDefaultRateEnvelope(
     rate.tone_mode = std::min<std::uint8_t>(rate.tone_mode, 3);
     rate.noise = std::min<std::uint8_t>(rate.noise, 31);
     return rate;
+}
+
+// MGSC 1.11 `@e = { Mode,Noise,data }`. Omitted header is Mode=1, Noise=0.
+inline constexpr std::uint8_t kMgscSequenceToneModeDefault = 1;
+inline constexpr std::uint8_t kMgscSequenceNoiseDefault = 0;
+
+[[nodiscard]] inline RateEnvelope sequenceEnvelopeMixer(
+    const RateEnvelope& rate) noexcept {
+    if (rateEnvelopeIsUnset(rate)) {
+        RateEnvelope mixer{};
+        mixer.tone_mode = kMgscSequenceToneModeDefault;
+        mixer.noise = kMgscSequenceNoiseDefault;
+        return mixer;
+    }
+    auto mixer = clampRateEnvelope(rate);
+    mixer.attack_level = 0;
+    mixer.attack_rate = 0;
+    mixer.decay_rate = 0;
+    mixer.sustain_level = 0;
+    mixer.sustain_rate = 0;
+    mixer.release_rate = 0;
+    return mixer;
+}
+
+[[nodiscard]] inline std::string formatSequenceEnvelopeHeader(
+    TimbreSource source,
+    const RateEnvelope& rate) {
+    if (source != TimbreSource::Psg) {
+        return ",,";
+    }
+    if (rateEnvelopeIsUnset(rate)) {
+        return ",,";
+    }
+    const auto mixer = sequenceEnvelopeMixer(rate);
+    return std::to_string(static_cast<unsigned>(mixer.tone_mode)) + ","
+        + std::to_string(static_cast<unsigned>(mixer.noise)) + ",";
+}
+
+inline void assignSequenceEnvelopeMixer(
+    RateEnvelope& rate,
+    std::uint8_t mode,
+    std::uint8_t noise) noexcept {
+    mode = std::min<std::uint8_t>(mode, 3);
+    noise = std::min<std::uint8_t>(noise, 31);
+    if (mode == kMgscSequenceToneModeDefault
+        && noise == kMgscSequenceNoiseDefault) {
+        return;
+    }
+    rate.tone_mode = mode;
+    rate.noise = noise;
 }
 
 struct EnvelopeTimeline {
@@ -280,7 +343,7 @@ struct CompositeLayer {
     std::uint8_t volume{15};
     // `@e` / `@r` definition number (0–31). New layers start at 00 sequential.
     std::uint8_t envelope_number{};
-    // Track MML `k` (PSG/SCC). 0 = immediate key-off. Ignored with `@r` / HW EG.
+    // Track MML `k` (PSG/SCC). Ticks per 1-volume `@e` decay after key-off.
     std::uint8_t key_off_hang{};
     // Track MML `p` (PSG/SCC). Mutually exclusive with `software_lfo`.
     PitchSweepSettings pitch_sweep{};
@@ -369,7 +432,36 @@ struct TimbreUse {
 inline constexpr std::uint64_t kSccTrianglePresetLibraryId =
     0x4D47534300010001ULL;
 
+// Composite-owned original IDs. Standalone library IDs are small counters
+// starting at 1; these high ids never collide, so assigning a library timbre
+// copies waveform/registers into the composite and breaks the live link.
+inline constexpr std::uint64_t kSpecialTimbreIdMin =
+    0x4D47530000000000ULL;
+inline constexpr std::uint64_t kCompositeOwnedTimbreIdBase =
+    0x4D47535400030001ULL;
+
+[[nodiscard]] inline bool isStandaloneLibraryTimbreId(
+    std::uint64_t id) noexcept {
+    return id != 0 && id < kSpecialTimbreIdMin;
+}
+
+[[nodiscard]] std::uint64_t allocateCompositeOwnedTimbreId(
+    const CompositeTimbre& timbre) noexcept;
+
+// Copy a standalone library entry into a composite-local snapshot (new id).
+[[nodiscard]] SavedTimbreReference adoptLibraryTimbre(
+    const CompositeTimbre& dest,
+    const TimbreLibraryEntry& entry);
+
 void seedDefaultLayerTimbre(CompositeLayer& layer) noexcept;
+
+// Same as above, then give SCC Triangle a composite-owned id so it is editable.
+void seedDefaultLayerTimbre(
+    CompositeTimbre& dest, CompositeLayer& layer) noexcept;
+
+// Replace every owned snapshot with this id. Preserves MGSC number assignment.
+bool replaceOwnedTimbreSnapshot(
+    CompositeTimbre& dest, const SavedTimbreReference& snapshot);
 
 [[nodiscard]] bool layerIsAudible(
     const CompositeTimbre& timbre,

@@ -97,6 +97,43 @@ void seedDefaultLayerTimbre(CompositeLayer& layer) noexcept {
     layer.base_timbre = std::move(reference);
 }
 
+void seedDefaultLayerTimbre(
+    CompositeTimbre& dest, CompositeLayer& layer) noexcept {
+    seedDefaultLayerTimbre(layer);
+    if (layer.source == TimbreSource::Scc && layer.base_timbre) {
+        layer.base_timbre->library_id =
+            allocateCompositeOwnedTimbreId(dest);
+    }
+}
+
+bool replaceOwnedTimbreSnapshot(
+    CompositeTimbre& dest, const SavedTimbreReference& snapshot) {
+    if (snapshot.library_id == 0) {
+        return false;
+    }
+    bool found = false;
+    const auto apply = [&](SavedTimbreReference& current) {
+        if (current.library_id != snapshot.library_id) {
+            return;
+        }
+        const auto number_mode = current.number_mode;
+        const auto manual_number = current.manual_number;
+        current = snapshot;
+        current.number_mode = number_mode;
+        current.manual_number = manual_number;
+        found = true;
+    };
+    for (auto& layer : dest.layers) {
+        if (layer.base_timbre) {
+            apply(*layer.base_timbre);
+        }
+    }
+    for (auto& reference : dest.embedded_timbres) {
+        apply(reference);
+    }
+    return found;
+}
+
 bool layerIsAudible(
     const CompositeTimbre& timbre,
     std::size_t layer_index) noexcept {
@@ -297,6 +334,37 @@ SavedTimbreReference makeSavedTimbreReference(
         : TimbreSource::Opll;
     reference.opll_registers = entry.opll_registers;
     reference.scc_waveform = entry.scc_waveform;
+    return reference;
+}
+
+std::uint64_t allocateCompositeOwnedTimbreId(
+    const CompositeTimbre& timbre) noexcept {
+    std::uint64_t next = kCompositeOwnedTimbreIdBase;
+    const auto consider = [&](std::uint64_t id) {
+        if (id >= kCompositeOwnedTimbreIdBase && id >= next) {
+            next = id + 1;
+        }
+    };
+    for (const auto& layer : timbre.layers) {
+        if (layer.base_timbre) {
+            consider(layer.base_timbre->library_id);
+        }
+        for (const auto& event : layer.timbre_automation) {
+            consider(event.target_library_id);
+        }
+    }
+    for (const auto& reference : timbre.embedded_timbres) {
+        consider(reference.library_id);
+    }
+    return next;
+}
+
+SavedTimbreReference adoptLibraryTimbre(
+    const CompositeTimbre& dest,
+    const TimbreLibraryEntry& entry) {
+    auto reference = makeSavedTimbreReference(entry);
+    reference.library_id = allocateCompositeOwnedTimbreId(dest);
+    reference.revision = 1;
     return reference;
 }
 

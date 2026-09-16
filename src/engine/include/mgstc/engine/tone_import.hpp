@@ -97,6 +97,12 @@ inline constexpr std::uint32_t kVgmCandidateMaxCommands = 48;
     const ImportedToneCandidate& candidate,
     ImportRegisterAs register_as);
 
+[[nodiscard]] inline bool importedCandidateDisplaysAsComposite(
+    const ImportedToneCandidate& candidate) noexcept {
+    return candidate.type == ImportedToneType::Composite
+        || candidate.default_register_as == ImportRegisterAs::Composite;
+}
+
 [[nodiscard]] SccWaveform sccWaveformFromBytes(
     const std::array<std::uint8_t, 32>& bytes) noexcept;
 
