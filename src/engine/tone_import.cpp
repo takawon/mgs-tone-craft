@@ -4,6 +4,7 @@
 #include "tone_import_internal.hpp"
 
 #include "mgstc/engine/opll_patch.hpp"
+#include "mgstc/engine/opll_register_auto.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -376,6 +377,8 @@ bool envelopeBytecodeToLayer(
         }
         if (opcode == 0x60) {
             loop_end = count;
+            // L<: commands after `]` use after_loop_start=false (§6.2.3).
+            after_loop_start = false;
             continue;
         }
         if (opcode >= 0x80 && opcode <= 0xA3) {
@@ -689,9 +692,110 @@ CompositeTimbre makeSelfContainedComposite(
     return timbre;
 }
 
+[[nodiscard]] const CompositeTimbre* compositeOf(
+    const ImportedToneCandidate& candidate) {
+    if (const auto* timbre =
+            std::get_if<CompositeTimbre>(&candidate.data)) {
+        return timbre;
+    }
+    if (candidate.composite_alternative) {
+        return &*candidate.composite_alternative;
+    }
+    return nullptr;
+}
+
+std::optional<SccWaveform> extractImportedScc(
+    const ImportedToneCandidate& candidate) {
+    if (const auto* wave = std::get_if<SccWaveform>(&candidate.data)) {
+        return *wave;
+    }
+    const auto* timbre = compositeOf(candidate);
+    if (timbre == nullptr) {
+        return std::nullopt;
+    }
+    const auto from_reference =
+        [](const SavedTimbreReference& reference)
+            -> std::optional<SccWaveform> {
+        if (reference.source != TimbreSource::Scc
+            || allZero(reference.scc_waveform)) {
+            return std::nullopt;
+        }
+        return sccWaveformFromBytes(reference.scc_waveform);
+    };
+    for (const auto& layer : timbre->layers) {
+        if (layer.base_timbre) {
+            if (auto wave = from_reference(*layer.base_timbre)) {
+                return wave;
+            }
+        }
+    }
+    for (const auto& embedded : timbre->embedded_timbres) {
+        if (auto wave = from_reference(embedded)) {
+            return wave;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<OpllPatchParameters> extractImportedOpll(
+    const ImportedToneCandidate& candidate) {
+    if (const auto* patch =
+            std::get_if<OpllPatchParameters>(&candidate.data)) {
+        return *patch;
+    }
+    const auto* timbre = compositeOf(candidate);
+    if (timbre == nullptr) {
+        return std::nullopt;
+    }
+    const auto from_reference =
+        [](const SavedTimbreReference& reference)
+            -> std::optional<OpllPatchParameters> {
+        if (reference.source != TimbreSource::Opll
+            || allZero(reference.opll_registers)) {
+            return std::nullopt;
+        }
+        return decodeOpllPatch(reference.opll_registers);
+    };
+    for (const auto& layer : timbre->layers) {
+        if (layer.base_timbre) {
+            if (auto patch = from_reference(*layer.base_timbre)) {
+                return patch;
+            }
+        }
+    }
+    for (const auto& embedded : timbre->embedded_timbres) {
+        if (auto patch = from_reference(embedded)) {
+            return patch;
+        }
+    }
+    return std::nullopt;
+}
+
+void decorateRegisterChoices(ImportedToneCandidate& candidate) {
+    const auto add = [&](ImportRegisterAs choice) {
+        if (std::find(
+                candidate.register_choices.begin(),
+                candidate.register_choices.end(),
+                choice)
+            == candidate.register_choices.end()) {
+            candidate.register_choices.push_back(choice);
+        }
+    };
+    if (candidate.register_choices.empty()) {
+        candidate.register_choices.push_back(candidate.default_register_as);
+    }
+    if (extractImportedScc(candidate)) {
+        add(ImportRegisterAs::Scc);
+    }
+    if (extractImportedOpll(candidate)) {
+        add(ImportRegisterAs::Opll);
+    }
+}
+
 void addCandidate(
     std::vector<ImportedToneCandidate>& candidates,
     ImportedToneCandidate candidate) {
+    decorateRegisterChoices(candidate);
     candidates.push_back(std::move(candidate));
 }
 
@@ -909,14 +1013,62 @@ TimbreLibraryEntry makeImportedLibraryEntry(
         if (const auto* patch =
                 std::get_if<OpllPatchParameters>(&candidate.data)) {
             entry.opll_registers = encodeOpllPatch(*patch);
+        } else if (
+            const auto extracted =
+                tone_import_detail::extractImportedOpll(candidate)) {
+            entry.opll_registers = encodeOpllPatch(*extracted);
         }
     } else {
         entry.category = TimbreCategory::Scc;
         if (const auto* wave = std::get_if<SccWaveform>(&candidate.data)) {
             entry.scc_waveform = sccWaveformToBytes(*wave);
+        } else if (
+            const auto extracted =
+                tone_import_detail::extractImportedScc(candidate)) {
+            entry.scc_waveform = sccWaveformToBytes(*extracted);
         }
     }
     return entry;
+}
+
+void finalizeImportedComposite(CompositeTimbre& timbre) {
+    const auto ensureSnapshot = [&](std::uint64_t library_id,
+                                    TimbreSource source) {
+        if (library_id == 0
+            || findEmbeddedTimbreSnapshot(timbre, library_id) != nullptr) {
+            return;
+        }
+        for (const auto& layer : timbre.layers) {
+            if (layer.base_timbre
+                && layer.base_timbre->library_id == library_id
+                && layer.base_timbre->source == source) {
+                timbre.embedded_timbres.push_back(*layer.base_timbre);
+                return;
+            }
+        }
+        for (const auto& embedded : timbre.embedded_timbres) {
+            if (embedded.library_id == library_id
+                && embedded.source == source) {
+                return;
+            }
+        }
+    };
+
+    for (const auto& layer : timbre.layers) {
+        if (layer.base_timbre) {
+            ensureSnapshot(
+                layer.base_timbre->library_id, layer.base_timbre->source);
+        }
+        for (const auto& event : layer.timbre_automation) {
+            if (event.kind != EnvelopeEventKind::Timbre
+                || event.timbre_pick != TimbrePick::Library
+                || event.target_library_id == 0) {
+                continue;
+            }
+            ensureSnapshot(event.target_library_id, layer.source);
+        }
+    }
+    static_cast<void>(enforceOpllRegisterAutoExclusivity(timbre));
 }
 
 std::optional<CompositeTimbre> makeImportedComposite(
@@ -929,12 +1081,14 @@ std::optional<CompositeTimbre> makeImportedComposite(
         auto copy = *timbre;
         copy.name = candidate.name;
         copy.favorite = candidate.favorite;
+        finalizeImportedComposite(copy);
         return copy;
     }
     if (candidate.composite_alternative) {
         auto copy = *candidate.composite_alternative;
         copy.name = candidate.name;
         copy.favorite = candidate.favorite;
+        finalizeImportedComposite(copy);
         return copy;
     }
     return std::nullopt;

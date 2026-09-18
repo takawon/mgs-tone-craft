@@ -6495,7 +6495,13 @@ private:
         }
         const auto push_label =
             [&](const juce::String& label, bool after_loop) {
-                if (loop_start && after_loop) {
+                if (loop_end) {
+                    if (after_loop) {
+                        after.push_back(label);
+                    } else {
+                        after_end.push_back(label);
+                    }
+                } else if (loop_start && after_loop) {
                     after.push_back(label);
                 } else {
                     before.push_back(label);

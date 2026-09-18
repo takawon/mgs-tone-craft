@@ -93,6 +93,10 @@ inline constexpr std::uint32_t kVgmCandidateMaxCommands = 48;
     const ImportedToneCandidate& candidate,
     ImportRegisterAs register_as);
 
+// Ensures automation library references have embedded snapshots so import
+// preview and configureEngine do not depend on the SQLite timbre library.
+void finalizeImportedComposite(CompositeTimbre& timbre);
+
 [[nodiscard]] std::optional<CompositeTimbre> makeImportedComposite(
     const ImportedToneCandidate& candidate,
     ImportRegisterAs register_as);

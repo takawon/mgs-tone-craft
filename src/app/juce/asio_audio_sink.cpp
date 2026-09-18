@@ -181,8 +181,11 @@ struct AsioAudioSink::Impl final : juce::AudioIODeviceCallback {
                 });
         }
         if (!rendered) {
-            if (!render_failed.exchange(true, std::memory_order_relaxed)) {
-                push(AudioSinkStatusType::DeviceError, -1);
+            for (std::size_t frame = 0; frame < frames; ++frame) {
+                output_channel_data[0][frame] = 0.0F;
+                if (right != nullptr) {
+                    right[frame] = 0.0F;
+                }
             }
             return;
         }

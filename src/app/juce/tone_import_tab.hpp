@@ -51,7 +51,8 @@ public:
           persist_(std::move(persist)),
           timbres_(std::move(timbres)),
           composites_(std::move(composites)),
-          libraries_changed_(std::move(libraries_changed)) {
+          libraries_changed_(std::move(libraries_changed)),
+          tooltip_window_(this, 450) {
         setWantsKeyboardFocus(true);
         open_file_.setButtonText(juce::String::fromUTF8("ファイルを開く"));
         open_file_.setTooltip(
@@ -408,6 +409,13 @@ private:
             registered_.setFont(UiFonts::body());
             addAndMakeVisible(registered_);
             refreshFromModel();
+            name_.addMouseListener(this, false);
+        }
+
+        void mouseMove(const juce::MouseEvent& event) override {
+            if (event.eventComponent == &name_) {
+                refreshNameTooltip();
+            }
         }
 
         void mouseDown(const juce::MouseEvent& event) override {
@@ -438,6 +446,17 @@ private:
                 std::max(libraryButtonMinW, UiScale::sx(72))));
             area.removeFromRight(controlGap);
             name_.setBounds(area);
+            refreshNameTooltip();
+        }
+
+        void refreshNameTooltip() {
+            const auto text = name_.getText();
+            if (UiLayout::isTextTruncated(
+                    name_.getFont(), text, name_.getWidth())) {
+                name_.setTooltip(text);
+            } else {
+                name_.setTooltip({});
+            }
         }
 
         void paint(juce::Graphics& graphics) override {
@@ -459,6 +478,7 @@ private:
             name_.setText(
                 juce::String::fromUTF8(item.name.c_str()),
                 juce::dontSendNotification);
+            refreshNameTooltip();
             preview_.setCandidate(item);
             favorite_.setText(
                 juce::String::fromUTF8(item.favorite ? "★" : "☆"),
@@ -1012,6 +1032,7 @@ private:
     std::function<mgstc::engine::TimbreLibrary*()> timbres_;
     std::function<mgstc::engine::CompositeTimbreLibrary*()> composites_;
     LibrariesChangedCallback libraries_changed_;
+    juce::TooltipWindow tooltip_window_;
     juce::TextButton open_file_;
     juce::Label status_;
     juce::Viewport viewport_;

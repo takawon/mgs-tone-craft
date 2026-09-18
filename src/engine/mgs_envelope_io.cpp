@@ -449,7 +449,8 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
     const auto add_volume = [&](const EnvelopeEvent& event) {
         if (event.kind != EnvelopeEventKind::Volume
             || event.count > effective_end
-            || (looping && event.count == effective_end)) {
+            || (looping && event.count == effective_end
+                && event.after_loop_start)) {
             return;
         }
         if (event.value < 0 || event.value > 15) {
@@ -465,8 +466,7 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
 
     for (const auto& event : layer.pitch_envelope.events) {
         if (event.kind != EnvelopeEventKind::Pitch
-            || event.count > effective_end
-            || (looping && event.count == effective_end)) {
+            || event.count > effective_end) {
             continue;
         }
         if (event.value < -127 || event.value > 127) {
@@ -480,8 +480,7 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
     }
 
     for (const auto& event : layer.timbre_automation) {
-        if (event.count > effective_end
-            || (looping && event.count == effective_end)) {
+        if (event.count > effective_end) {
             continue;
         }
         auto& tokens = event.after_loop_start
@@ -726,6 +725,13 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
     }
 
     if (looping) {
+        // L<: only `[`内（`]`直前）の after_* を `]` の前へ。`]以降`は §6.2.3 で出力しない。
+        for (const auto& token : states[effective_end].after_timbre_tokens) {
+            appendToken(tokens, token);
+        }
+        for (const auto& token : states[effective_end].after_pitch_tokens) {
+            appendToken(tokens, token);
+        }
         appendToken(tokens, "]");
     } else {
         for (const auto& token : states[effective_end].before_timbre_tokens) {

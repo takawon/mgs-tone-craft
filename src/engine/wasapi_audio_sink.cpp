@@ -300,11 +300,15 @@ struct WasapiAudioSink::Impl {
             const auto rendered = engine->render(samples);
             applyMasterVolume(samples);
             result = render_client->ReleaseBuffer(available, 0);
-            if (FAILED(result) || !rendered.ok()) {
-                push(
-                    AudioSinkStatusType::DeviceError,
-                    FAILED(result) ? result : E_FAIL);
+            if (FAILED(result)) {
+                push(AudioSinkStatusType::DeviceError, result);
                 break;
+            }
+            if (!rendered.ok()) {
+                // Tick-level faults already muted the tail of this buffer.
+                // Keep the stream alive so one bad program cannot silence
+                // the rest of the session.
+                continue;
             }
         }
 

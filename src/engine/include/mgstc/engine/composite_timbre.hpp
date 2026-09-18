@@ -68,9 +68,10 @@ struct EnvelopeEvent {
     std::uint32_t count{};
     std::uint64_t target_library_id{};
     TimbrePick timbre_pick{TimbrePick::Library};
-    // §6.2.3: at the loop-start count, false = before `[` (first pass only),
-    // true = after `[` (re-run on each `]` return). Ignored when the event's
-    // count is not the layer's loop_start_count.
+    // §6.2.3 bracket zone at the event's count:
+    // L> — false = before `[` (first pass only), true = after `[` (each loop).
+    // L< — true = before `]` (inside loop), false = after `]` (unreachable in
+    // sustain loop; edit/save only, omitted from audition and MGSC output).
     bool after_loop_start{};
     // Volume-only authoring flag. When set, the sequence compiler emits a
     // 2n cc ramp command using the interval from the preceding volume spec.

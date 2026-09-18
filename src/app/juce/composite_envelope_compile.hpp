@@ -234,10 +234,12 @@ enum class CompositeEnvelopeLane : std::uint8_t {
                 // Match formatMgsCompositeEnvelope: loop_end is the `]`
                 // marker only. A volume at that count must not sit after
                 // `[` with no wait (1-step `[f]` would compile to `[]`).
+                // Pitch/timbre at loop_end (e.g. `[\-1f\1]`) stay inside `[]`.
                 return valid_loop
                     && event.count == *timeline->loop_end_count
                     && event.kind
-                        != mgstc::engine::EnvelopeEventKind::LoopEnd;
+                        == mgstc::engine::EnvelopeEventKind::Volume
+                    && event.after_loop_start;
             }),
         events.end());
 
@@ -382,7 +384,9 @@ enum class CompositeEnvelopeLane : std::uint8_t {
             count -= chunk;
         }
     };
-    const auto append_zero_time_at = [&](std::uint32_t count) {
+    const auto append_zero_time_at = [&](
+        std::uint32_t count,
+        std::optional<bool> after_loop_start = std::nullopt) {
         if (lane != CompositeEnvelopeLane::Volume) {
             return;
         }
@@ -390,6 +394,10 @@ enum class CompositeEnvelopeLane : std::uint8_t {
             if (timbre.count != count
                 || timbre.kind
                     != mgstc::engine::EnvelopeEventKind::Timbre) {
+                continue;
+            }
+            if (after_loop_start
+                && timbre.after_loop_start != *after_loop_start) {
                 continue;
             }
             mgstc::engine::EnvelopeEvent resolved{
@@ -411,10 +419,14 @@ enum class CompositeEnvelopeLane : std::uint8_t {
                     != mgstc::engine::EnvelopeEventKind::Pitch) {
                 continue;
             }
-            bytecode.insert(
-                bytecode.end(),
-                {0x12, static_cast<std::uint8_t>(
-                    juce::jlimit(-127, 127, pitch.value))});
+            if (after_loop_start
+                && pitch.after_loop_start != *after_loop_start) {
+                continue;
+            }
+            const auto clamped = juce::jlimit(-127, 127, pitch.value);
+            const auto encoded = static_cast<std::uint8_t>(
+                clamped < 0 ? static_cast<int>(clamped + 256) : clamped);
+            bytecode.insert(bytecode.end(), {0x12, encoded});
         }
     };
     const auto catch_up_zero_time = [&](std::uint32_t until_exclusive) {
@@ -451,7 +463,13 @@ enum class CompositeEnvelopeLane : std::uint8_t {
                 append_wait(*next - cursor);
                 cursor = *next;
             }
-            append_zero_time_at(*next);
+            // LoopStart / LoopEnd emit bracket-scoped zero-time at their
+            // counts; catch_up must not duplicate (e.g. `[\-1f\1]`).
+            if (!valid_loop
+                || (*next != *timeline->loop_start_count
+                    && *next != *timeline->loop_end_count)) {
+                append_zero_time_at(*next);
+            }
             remaining = *next + 1;
         }
     };
@@ -465,7 +483,18 @@ enum class CompositeEnvelopeLane : std::uint8_t {
         // (`e:7.\-127.d:4`). Do not inject on `[` / `]` or other kinds
         // (that would duplicate opcodes).
         if (event.kind == mgstc::engine::EnvelopeEventKind::Volume) {
-            append_zero_time_at(event.count);
+            const bool loop_start_volume =
+                valid_loop
+                && event.count == *timeline->loop_start_count;
+            if (!loop_start_volume) {
+                const std::optional<bool> bracket_side =
+                    valid_loop
+                    && event.count > *timeline->loop_start_count
+                    && event.count <= *timeline->loop_end_count
+                        ? std::optional<bool>{true}
+                        : std::optional<bool>{false};
+                append_zero_time_at(event.count, bracket_side);
+            }
         }
         switch (event.kind) {
         case mgstc::engine::EnvelopeEventKind::Volume:
@@ -530,9 +559,12 @@ enum class CompositeEnvelopeLane : std::uint8_t {
                      juce::jlimit(0, 255, event.secondary))});
             break;
         case mgstc::engine::EnvelopeEventKind::LoopStart:
+            append_zero_time_at(event.count, false);
             bytecode.push_back(0x40);
+            append_zero_time_at(event.count, true);
             break;
         case mgstc::engine::EnvelopeEventKind::LoopEnd:
+            append_zero_time_at(event.count, true);
             bytecode.push_back(0x60);
             break;
         default:

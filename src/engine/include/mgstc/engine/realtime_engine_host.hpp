@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -112,7 +113,26 @@ public:
         return commands_.approximateSize();
     }
 
+    // UI / test thread only. When `process_on_caller_thread` is true (no live
+    // audio consumer), applies queued commands synchronously. When false, only
+    // waits for the audio thread to activate Pending programs — never calls
+    // render() here (SPSC command queue has a single consumer).
+    void drainPendingCommands(
+        std::span<float> interleaved_stereo,
+        std::size_t max_waits = 250,
+        bool process_on_caller_thread = true) noexcept;
+
+    // UI thread only. Drop orphaned Editing slots (never Active/Pending).
+    void discardStuckProgramEdits() noexcept;
+
+    // UI thread only. Block until the audio thread activates a Pending
+    // program or the timeout elapses. Never calls render().
+    [[nodiscard]] bool waitForPendingProgramActivation(
+        std::chrono::milliseconds timeout
+            = std::chrono::milliseconds(500)) noexcept;
+
 private:
+    [[nodiscard]] bool hasPendingProgramLoad() const noexcept;
     enum class ProgramSlotState : std::uint8_t {
         Free,
         Editing,

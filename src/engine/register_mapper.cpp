@@ -306,7 +306,10 @@ MapError RegisterMapper::mapScc(
         }
         const auto patch = static_cast<std::uint8_t>(event.arg0);
         if (!scc_patch_defined_[patch]) {
-            return MapError::PatchNotFound;
+            // Keep the current wave. A missing @s must not abort the
+            // realtime stream (import preview can reference 0–14 while
+            // composite numbers start at 15).
+            return MapError::None;
         }
         return writeSccWave(
             track,
@@ -394,7 +397,8 @@ MapError RegisterMapper::mapOpll(
             return writeOpllRomPatch(track, patch, tick, output);
         }
         if (!opll_patch_defined_[patch]) {
-            return MapError::PatchNotFound;
+            // Keep the current original patch. Same reason as SCC.
+            return MapError::None;
         }
         return writeOpllOriginalPatch(
             track,
@@ -770,11 +774,38 @@ MapError RegisterMapper::writeOpllPitch(
     const auto channel = static_cast<std::uint8_t>(track - 8);
     const auto low_address = static_cast<std::uint8_t>(0x10 + channel);
     const auto high_address = static_cast<std::uint8_t>(0x20 + channel);
+    if (!key_on) {
+        // Key-off clears only the key gate. Keep the packed F-number so `\`
+        // / `@\` detune and @e pitch survive through release.
+        auto value = static_cast<std::uint8_t>(
+            opll_mirror_[high_address] & ~0x10U);
+        if (sustain) {
+            value |= 0x20U;
+        } else {
+            value &= ~0x20U;
+        }
+        const auto error = emit(
+            output,
+            tick,
+            ChipId::Opll,
+            0,
+            high_address,
+            value,
+            track,
+            WriteReason::KeyOff);
+        if (error == MapError::None) {
+            opll_mirror_[high_address] = value;
+        }
+        return error;
+    }
+
+    opll_packed_[channel] = packOpllPitch(pitch);
+    const auto packed = opll_packed_[channel];
     const auto high = static_cast<std::uint8_t>(
-        ((pitch.f_number >> 8) & 0x01)
-        | static_cast<std::uint8_t>(pitch.block << 1)
-        | (key_on ? 0x10 : 0x00)
-        | (sustain ? 0x20 : 0x00));
+        (opll_mirror_[high_address] & 0x30U)
+        | static_cast<std::uint8_t>(packed >> 8)
+        | 0x10U
+        | (sustain ? 0x20U : 0x00U));
 
     // MGSDRV writes the key/block register before the F-number low byte.
     auto error = emit(
@@ -785,27 +816,23 @@ MapError RegisterMapper::writeOpllPitch(
         high_address,
         high,
         track,
-        key_on ? WriteReason::KeyOn : WriteReason::KeyOff);
+        WriteReason::KeyOn);
     if (error != MapError::None) {
         return error;
     }
     opll_mirror_[high_address] = high;
-    opll_packed_[channel] = packOpllPitch(pitch);
-    if (!key_on) {
-        return MapError::None;
-    }
     error = emit(
         output,
         tick,
         ChipId::Opll,
         0,
         low_address,
-        static_cast<std::uint8_t>(pitch.f_number & 0xFF),
+        static_cast<std::uint8_t>(packed & 0xFF),
         track,
         WriteReason::Frequency);
     if (error == MapError::None) {
         opll_mirror_[low_address] =
-            static_cast<std::uint8_t>(pitch.f_number & 0xFF);
+            static_cast<std::uint8_t>(packed & 0xFF);
     }
     return error;
 }

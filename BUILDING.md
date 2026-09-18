@@ -29,6 +29,13 @@
 .\tools\build.cmd
 ```
 
+ルートの `build.cmd` も同じスクリプトへ委譲する。
+
+> **注意:** 通常の PowerShell から `cmake --build build` だけを実行しない。
+> Visual Studio の Developer 環境（`INCLUDE` 等）が無いと、標準ヘッダ未検出の C1083 になる。
+> CMake 構成時と、Ninja がソースをコンパイルする前に環境チェックがあり、未設定なら上記の正しい手順を案内して停止する。
+> 同時に `.\tools\build.cmd` を二重起動しない（走行中のテスト exe を `ninja clean` が消す）。
+
 このスクリプトはVisual Studio C++環境を自動検出し、通常のPowerShellへ
 MSVC／Windows SDK／Ninjaの環境を読み込んでから、CMake構成、ビルド、テストを
 順に実行する。実行環境に`Path`と`PATH`が重複している場合も、MSBuildが失敗

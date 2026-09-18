@@ -71,6 +71,14 @@ void addCandidate(
     std::vector<ImportedToneCandidate>& candidates,
     ImportedToneCandidate candidate);
 
+[[nodiscard]] std::optional<SccWaveform> extractImportedScc(
+    const ImportedToneCandidate& candidate);
+
+[[nodiscard]] std::optional<OpllPatchParameters> extractImportedOpll(
+    const ImportedToneCandidate& candidate);
+
+void decorateRegisterChoices(ImportedToneCandidate& candidate);
+
 }  // namespace tone_import_detail
 
 [[nodiscard]] ToneImportResult importMgsBinary(

@@ -763,15 +763,16 @@ usageOrUnusedPsg(
     const std::map<unsigned, tone_import_detail::EnvelopeChipUse>& usage,
     unsigned number) {
     const auto found = usage.find(number);
-    if (found != usage.end() && found->second.anyChip()) {
-        return found->second;
+    if (found != usage.end()) {
+        if (found->second.anyChip()) {
+            return found->second;
+        }
+        // Present but empty: used only while OPLL rhythm mode was on.
+        return std::nullopt;
     }
-    if (found == usage.end()) {
-        tone_import_detail::EnvelopeChipUse unused;
-        unused.psg = true;
-        return unused;
-    }
-    return std::nullopt;
+    tone_import_detail::EnvelopeChipUse psg;
+    psg.psg = true;
+    return psg;
 }
 
 void addEnvelopeCandidate(
