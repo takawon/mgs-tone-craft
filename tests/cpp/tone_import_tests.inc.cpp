@@ -241,6 +241,20 @@ void testToneImportMmlTonesAndSelfContainedEnvelope() {
     REQUIRE_EQ(opll_count, 2);
     REQUIRE_EQ(composite_count, 1);
     REQUIRE_EQ(composite != nullptr, true);
+    REQUIRE_EQ(
+        composite->register_choices.size() >= static_cast<std::size_t>(2),
+        true);
+    bool has_opll_choice = false;
+    for (const auto choice : composite->register_choices) {
+        if (choice == mgstc::engine::ImportRegisterAs::Opll) {
+            has_opll_choice = true;
+        }
+    }
+    REQUIRE_EQ(has_opll_choice, true);
+    const auto extracted = mgstc::engine::makeImportedLibraryEntry(
+        *composite, mgstc::engine::ImportRegisterAs::Opll);
+    REQUIRE_EQ(extracted.category, mgstc::engine::TimbreCategory::Opll);
+    REQUIRE_EQ(extracted.opll_registers[0] != 0, true);
     const auto* timbre = std::get_if<mgstc::engine::CompositeTimbre>(
         &composite->data);
     REQUIRE_EQ(timbre != nullptr, true);
@@ -403,6 +417,25 @@ void testToneImportMmlSccTrackEmbedsWaveWithoutEnvelopePatch() {
     REQUIRE_EQ(
         timbre->embedded_timbres.front().scc_waveform,
         mgstc::engine::sccWaveformToBytes(wave));
+    const mgstc::engine::ImportedToneCandidate* composite = nullptr;
+    for (const auto& candidate : result.candidates) {
+        if (candidate.type == mgstc::engine::ImportedToneType::Composite) {
+            composite = &candidate;
+            break;
+        }
+    }
+    REQUIRE_EQ(composite != nullptr, true);
+    bool has_scc_choice = false;
+    for (const auto choice : composite->register_choices) {
+        if (choice == mgstc::engine::ImportRegisterAs::Scc) {
+            has_scc_choice = true;
+        }
+    }
+    REQUIRE_EQ(has_scc_choice, true);
+    const auto extracted = mgstc::engine::makeImportedLibraryEntry(
+        *composite, mgstc::engine::ImportRegisterAs::Scc);
+    REQUIRE_EQ(extracted.category, mgstc::engine::TimbreCategory::Scc);
+    REQUIRE_EQ(extracted.scc_waveform, mgstc::engine::sccWaveformToBytes(wave));
 }
 
 void testToneImportMmlSccTrackEmbedsEveryTrackPatch() {
@@ -599,6 +632,10 @@ void testToneImportMusicaVcdNamesAndSccEnvelope() {
         mgstc::engine::ImportRegisterAs::Composite);
     REQUIRE_EQ(result.candidates[2].composite_alternative.has_value(), true);
     REQUIRE_EQ(
+        result.candidates[2].register_choices.size()
+            >= static_cast<std::size_t>(2),
+        true);
+    REQUIRE_EQ(
         mgstc::engine::importedCandidateDisplaysAsComposite(
             result.candidates[2]),
         true);
@@ -675,11 +712,14 @@ void testToneImportUnusedEnvelopeAsPsg() {
     const auto binary = mgstc::engine::importTones(
         makeMgsEnvelopeOnlyVoice(), "mgs");
     REQUIRE_EQ(binary.valid(), true);
+    REQUIRE_EQ(binary.candidates.size(), static_cast<std::size_t>(1));
     REQUIRE_EQ(
-        countImportedType(binary, mgstc::engine::ImportedToneType::Composite),
-        1);
-    const auto* binary_timbre = firstCompositeTimbre(binary);
+        binary.candidates.front().type,
+        mgstc::engine::ImportedToneType::Composite);
+    const auto* binary_timbre = std::get_if<mgstc::engine::CompositeTimbre>(
+        &binary.candidates.front().data);
     REQUIRE_EQ(binary_timbre != nullptr, true);
+    REQUIRE_EQ(binary_timbre->layers.empty(), false);
     REQUIRE_EQ(
         binary_timbre->layers.front().source, mgstc::engine::TimbreSource::Psg);
 
@@ -687,13 +727,254 @@ void testToneImportUnusedEnvelopeAsPsg() {
     const std::vector<std::uint8_t> mml(source.begin(), source.end());
     const auto text = mgstc::engine::importTones(mml, "mus");
     REQUIRE_EQ(text.valid(), true);
+    REQUIRE_EQ(text.candidates.size(), static_cast<std::size_t>(1));
     REQUIRE_EQ(
-        countImportedType(text, mgstc::engine::ImportedToneType::Composite),
-        1);
-    const auto* text_timbre = firstCompositeTimbre(text);
+        text.candidates.front().type,
+        mgstc::engine::ImportedToneType::Composite);
+    const auto* text_timbre = std::get_if<mgstc::engine::CompositeTimbre>(
+        &text.candidates.front().data);
     REQUIRE_EQ(text_timbre != nullptr, true);
+    REQUIRE_EQ(text_timbre->layers.empty(), false);
     REQUIRE_EQ(
         text_timbre->layers.front().source, mgstc::engine::TimbreSource::Psg);
+
+    const std::string rate = "@r0 = { 1, 0, 0, 0, 255, 0, 0, 255 }\n";
+    const std::vector<std::uint8_t> rate_bytes(rate.begin(), rate.end());
+    const auto rate_result = mgstc::engine::importTones(rate_bytes, "mus");
+    REQUIRE_EQ(rate_result.valid(), true);
+    REQUIRE_EQ(rate_result.candidates.size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(
+        rate_result.candidates.front().type,
+        mgstc::engine::ImportedToneType::Composite);
+    const auto* rate_timbre = std::get_if<mgstc::engine::CompositeTimbre>(
+        &rate_result.candidates.front().data);
+    REQUIRE_EQ(rate_timbre != nullptr, true);
+    REQUIRE_EQ(rate_timbre->layers.empty(), false);
+    REQUIRE_EQ(
+        rate_timbre->layers.front().source, mgstc::engine::TimbreSource::Psg);
+    REQUIRE_EQ(
+        rate_timbre->layers.front().volume_envelope.kind,
+        mgstc::engine::EnvelopeKind::Rate);
+}
+
+std::vector<std::uint8_t> makeLooptestMgsBytes() {
+    // looptest.mgs: @v15, @e00 = {,,ff[\-1f\1] }, unused @e01, track 9 uses @e0.
+    std::vector<std::uint8_t> bytes{
+        'M', 'G', 'S', '3', '1', '3', '\r', '\n',
+        'N', 'o', ' ', 'T', 'i', 't', 'l', 'e', '\r', '\n', 0x1A};
+    const auto header = bytes.size();
+    bytes.resize(header + 0x28, 0);
+    bytes[header] = 0x00;
+    bytes[header + 1] = 0x01;
+    bytes[header + 4] = 0x28;
+    bytes[header + 5] = 0x00;
+    bytes.push_back(0x00);
+    bytes.push_back(0x0F);
+    bytes.insert(
+        bytes.end(),
+        {0x21, 0x41, 0x18, 0x07, 0x70, 0xA7, 0x00, 0x11});
+    bytes.push_back(0x02);
+    bytes.push_back(0x00);
+    bytes.push_back(0x20);
+    const std::vector<std::uint8_t> env00{
+        0x0F, 0x0F, 0x40, 0x12, 0xFF, 0x0F, 0x12, 0x01, 0x60};
+    bytes.push_back(static_cast<std::uint8_t>(env00.size()));
+    bytes.insert(bytes.end(), env00.begin(), env00.end());
+    bytes.push_back(0x02);
+    bytes.push_back(0x01);
+    bytes.push_back(0x20);
+    const std::vector<std::uint8_t> env01{
+        0x0F, 0x0F, 0x12, 0xFF, 0x40, 0x0F, 0x12, 0x01, 0x60};
+    bytes.push_back(static_cast<std::uint8_t>(env01.size()));
+    bytes.insert(bytes.end(), env01.begin(), env01.end());
+    bytes.push_back(0xFF);
+    appendMgsMusicTrack(
+        bytes,
+        header,
+        9,
+        {0xCF, 0x80, 0x49, 0x00, 0xD3, 0x20, 0xC0, 0xFF});
+    return bytes;
+}
+
+std::vector<std::uint8_t> makeLooptest1MgsBytes() {
+    // looptest1.mgs: @e00 = {,,ff \-1 [ f ] \1 fdae }
+    std::vector<std::uint8_t> bytes{
+        'M', 'G', 'S', '3', '1', '3', '\r', '\n',
+        'N', 'o', ' ', 'T', 'i', 't', 'l', 'e', '\r', '\n', 0x1A};
+    const auto header = bytes.size();
+    bytes.resize(header + 0x28, 0);
+    bytes[header] = 0x00;
+    bytes[header + 1] = 0x01;
+    bytes[header + 4] = 0x28;
+    bytes[header + 5] = 0x00;
+    bytes.push_back(0x00);
+    bytes.push_back(0x0F);
+    bytes.insert(
+        bytes.end(),
+        {0x21, 0x41, 0x18, 0x07, 0x70, 0xA7, 0x00, 0x11});
+    bytes.push_back(0x02);
+    bytes.push_back(0x00);
+    bytes.push_back(0x20);
+    const std::vector<std::uint8_t> env00{
+        0x0F, 0x0F, 0x12, 0xFF, 0x40, 0x0F, 0x60, 0x12, 0x01, 0x0F};
+    bytes.push_back(static_cast<std::uint8_t>(env00.size()));
+    bytes.insert(bytes.end(), env00.begin(), env00.end());
+    bytes.push_back(0xFF);
+    appendMgsMusicTrack(
+        bytes,
+        header,
+        9,
+        {0xCF, 0x80, 0x49, 0x00, 0xD3, 0x20, 0xC0, 0xFF});
+    return bytes;
+}
+
+void testToneImportLooptest1MgsEnvelope() {
+    const auto result =
+        mgstc::engine::importTones(makeLooptest1MgsBytes(), "mgs");
+    REQUIRE_EQ(result.valid(), true);
+    const auto* timbre = firstCompositeTimbre(result);
+    REQUIRE_EQ(timbre != nullptr, true);
+    REQUIRE_EQ(timbre->layers.size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(
+        *timbre->layers.front().envelope_timeline.loop_start_count,
+        static_cast<std::uint32_t>(2));
+    REQUIRE_EQ(
+        *timbre->layers.front().envelope_timeline.loop_end_count,
+        static_cast<std::uint32_t>(3));
+    bool minus_before_bracket = false;
+    bool plus_after_bracket = false;
+    for (const auto& event : timbre->layers.front().pitch_envelope.events) {
+        if (event.value == -1
+            && event.count == 2
+            && !event.after_loop_start) {
+            minus_before_bracket = true;
+        }
+        if (event.value == 1
+            && event.count == 3
+            && !event.after_loop_start) {
+            plus_after_bracket = true;
+        }
+    }
+    REQUIRE_EQ(minus_before_bracket, true);
+    REQUIRE_EQ(plus_after_bracket, true);
+    const auto formatted = mgstc::engine::formatMgsCompositeEnvelope(
+        timbre->layers.front(), 0);
+    REQUIRE_EQ(formatted.valid(), true);
+    const auto open = formatted.body.find('[');
+    const auto close = formatted.body.find(']');
+    const auto minus_one = formatted.body.find("\\-1");
+    REQUIRE_EQ(open != std::string::npos, true);
+    REQUIRE_EQ(close != std::string::npos, true);
+    REQUIRE_EQ(minus_one != std::string::npos, true);
+    REQUIRE_EQ(minus_one < open, true);
+    REQUIRE_EQ(formatted.body.find("\\1") == std::string::npos, true);
+}
+
+void testToneImportLoopEndPitchBeforeBracket() {
+    std::vector<std::uint8_t> bytes{
+        'M', 'G', 'S', '3', '\r', '\n', 0x1A};
+    const auto header = bytes.size();
+    bytes.resize(header + 0x28, 0);
+    bytes[header] = 0x00;
+    bytes[header + 4] = 0x28;
+    bytes[header + 5] = 0x00;
+    bytes.push_back(0x02);
+    bytes.push_back(0x00);
+    bytes.push_back(0x49);
+    const std::vector<std::uint8_t> env{
+        0x0F, 0x0F, 0x40, 0x0F, 0x12, 0x01, 0x60};
+    bytes.push_back(static_cast<std::uint8_t>(env.size()));
+    bytes.insert(bytes.end(), env.begin(), env.end());
+    bytes.push_back(0xFF);
+    appendMgsMusicTrack(bytes, header, 1, {0x49, 0x00, 0xFF});
+    const auto result = mgstc::engine::importTones(bytes, "mgs");
+    REQUIRE_EQ(result.valid(), true);
+    const auto* timbre = firstCompositeTimbre(result);
+    REQUIRE_EQ(timbre != nullptr, true);
+    bool plus_before_close = false;
+    for (const auto& event : timbre->layers.front().pitch_envelope.events) {
+        if (event.value == 1
+            && event.count == 3
+            && event.after_loop_start) {
+            plus_before_close = true;
+        }
+    }
+    REQUIRE_EQ(plus_before_close, true);
+    const auto formatted = mgstc::engine::formatMgsCompositeEnvelope(
+        timbre->layers.front(), 0);
+    REQUIRE_EQ(formatted.valid(), true);
+    const auto open = formatted.body.find('[');
+    const auto close = formatted.body.find(']');
+    const auto plus_one = formatted.body.find("\\1");
+    REQUIRE_EQ(open != std::string::npos, true);
+    REQUIRE_EQ(close != std::string::npos, true);
+    REQUIRE_EQ(plus_one != std::string::npos, true);
+    REQUIRE_EQ(plus_one > open && plus_one < close, true);
+}
+
+void testToneImportLooptestMgsEnvelope() {
+    const auto result = mgstc::engine::importTones(makeLooptestMgsBytes(), "mgs");
+    REQUIRE_EQ(result.valid(), true);
+    REQUIRE_EQ(
+        countImportedType(result, mgstc::engine::ImportedToneType::Composite),
+        2);
+    REQUIRE_EQ(
+        countImportedType(result, mgstc::engine::ImportedToneType::Opll),
+        1);
+    int unused_psg = 0;
+    for (const auto& candidate : result.candidates) {
+        const auto* composite = std::get_if<mgstc::engine::CompositeTimbre>(
+            &candidate.data);
+        if (composite == nullptr || composite->layers.empty()) {
+            continue;
+        }
+        if (composite->layers.front().source
+            == mgstc::engine::TimbreSource::Psg) {
+            ++unused_psg;
+        }
+    }
+    REQUIRE_EQ(unused_psg, 1);
+    const auto* timbre = firstCompositeTimbre(result);
+    REQUIRE_EQ(timbre != nullptr, true);
+    REQUIRE_EQ(timbre->layers.size(), static_cast<std::size_t>(1));
+    REQUIRE_EQ(timbre->layers.front().source, mgstc::engine::TimbreSource::Opll);
+    REQUIRE_EQ(
+        timbre->layers.front().envelope_timeline.loop_start_count.has_value(),
+        true);
+    REQUIRE_EQ(
+        *timbre->layers.front().envelope_timeline.loop_start_count,
+        static_cast<std::uint32_t>(2));
+    REQUIRE_EQ(
+        timbre->layers.front().envelope_timeline.loop_end_count.has_value(),
+        true);
+    REQUIRE_EQ(
+        *timbre->layers.front().envelope_timeline.loop_end_count,
+        static_cast<std::uint32_t>(3));
+    bool found_minus_one = false;
+    bool found_plus_one = false;
+    for (const auto& event : timbre->layers.front().pitch_envelope.events) {
+        if (event.value == -1 && event.after_loop_start) {
+            found_minus_one = true;
+        }
+        if (event.value == 1 && event.after_loop_start) {
+            found_plus_one = true;
+        }
+    }
+    REQUIRE_EQ(found_minus_one, true);
+    REQUIRE_EQ(found_plus_one, true);
+    const auto formatted = mgstc::engine::formatMgsCompositeEnvelope(
+        timbre->layers.front(), 0);
+    REQUIRE_EQ(formatted.valid(), true);
+    const auto open = formatted.body.find('[');
+    const auto close = formatted.body.find(']');
+    REQUIRE_EQ(open != std::string::npos, true);
+    REQUIRE_EQ(close != std::string::npos, true);
+    const auto minus_one = formatted.body.find("\\-1");
+    const auto plus_one = formatted.body.find("\\1");
+    REQUIRE_EQ(minus_one != std::string::npos, true);
+    REQUIRE_EQ(plus_one != std::string::npos, true);
+    REQUIRE_EQ(minus_one > open && minus_one < close, true);
+    REQUIRE_EQ(plus_one > open && plus_one < close, true);
 }
 
 void testToneImportSkipsOpllRhythmChannelEnvelope() {

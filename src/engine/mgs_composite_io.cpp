@@ -660,6 +660,8 @@ bool parseSequence(
             } else {
                 loop_end = count;
             }
+            // L<: commands after `]` use after_loop_start=false (§6.2.3).
+            after_loop_start = false;
             ++position;
             continue;
         }

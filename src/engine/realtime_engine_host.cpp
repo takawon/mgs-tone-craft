@@ -2,7 +2,9 @@
 
 #include <type_traits>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <thread>
 #include <utility>
 
 namespace mgstc::engine {
@@ -366,6 +368,12 @@ void RealtimeEngineHost::loadProgram(
             != command.generation
         || incoming.state.load(std::memory_order_acquire)
             != ProgramSlotState::Pending) {
+        if (incoming.state.load(std::memory_order_acquire)
+            == ProgramSlotState::Pending) {
+            incoming.state.store(
+                ProgramSlotState::Free,
+                std::memory_order_release);
+        }
         reject(command.type);
         return;
     }
@@ -396,6 +404,72 @@ void RealtimeEngineHost::loadProgram(
         .command = command.type,
         .generation = command.generation,
     });
+}
+
+bool RealtimeEngineHost::hasPendingProgramLoad() const noexcept {
+    for (std::uint8_t index = 0; index < kProgramSlotCount; ++index) {
+        if (programs_[index].state.load(std::memory_order_acquire)
+            == ProgramSlotState::Pending) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void RealtimeEngineHost::drainPendingCommands(
+    std::span<float> /*interleaved_stereo*/,
+    std::size_t max_waits,
+    bool process_on_caller_thread) noexcept {
+    if (process_on_caller_thread) {
+        while (pendingCommandCount() > 0 || hasPendingProgramLoad()) {
+            applyPendingCommands();
+        }
+        return;
+    }
+    for (std::size_t pass = 0;
+         pass < max_waits && hasPendingProgramLoad();
+         ++pass) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+bool RealtimeEngineHost::waitForPendingProgramActivation(
+    std::chrono::milliseconds timeout) noexcept {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool load_rejected = false;
+    for (;;) {
+        EngineNotice notice{};
+        while (pollNotice(notice)) {
+            if (notice.type == EngineNoticeType::CommandRejected
+                && notice.command == EngineCommandType::LoadProgram) {
+                load_rejected = true;
+            }
+        }
+        const bool pending = hasPendingProgramLoad();
+        if (load_rejected || !pending
+            || std::chrono::steady_clock::now() >= deadline) {
+            if (load_rejected) {
+                return false;
+            }
+            return !pending;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void RealtimeEngineHost::discardStuckProgramEdits() noexcept {
+    for (std::uint8_t index = 0; index < kProgramSlotCount; ++index) {
+        if (index == active_program_) {
+            continue;
+        }
+        auto& slot = programs_[index];
+        if (slot.state.load(std::memory_order_acquire)
+            == ProgramSlotState::Editing) {
+            slot.state.store(
+                ProgramSlotState::Free,
+                std::memory_order_release);
+        }
+    }
 }
 
 void RealtimeEngineHost::applyPendingCommands() noexcept {

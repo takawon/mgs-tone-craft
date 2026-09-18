@@ -33,4 +33,6 @@ public:
 
     [[nodiscard]] virtual const mgstc::engine::OpllPatchParameters&
     sharedOpllPatch() const noexcept = 0;
+
+    virtual void invalidateSharedEditorProgram() noexcept = 0;
 };

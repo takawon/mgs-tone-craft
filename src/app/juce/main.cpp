@@ -60,6 +60,7 @@
 #include "library_browser_chrome.hpp"
 #include "tone_library_session.hpp"
 #include "tone_import_tab.hpp"
+#include "import_preview_engine.hpp"
 #include "composite_envelope_compile.hpp"
 #include "switch_look_and_feel.hpp"
 #include "mgstc_look_and_feel.hpp"
@@ -2271,6 +2272,32 @@ public:
         ++composite_owned_timbre_revision_;
     }
 
+    struct CompositeOwnedAuditionCallbacks {
+        std::function<void()> sync_program;
+        std::function<void()> one_second;
+        std::function<void(std::uint8_t)> note_on;
+        std::function<void(std::uint8_t)> note_off;
+        std::function<void()> stop_preview;
+    };
+
+    void setCompositeOwnedAuditionCallbacks(
+        CompositeOwnedAuditionCallbacks callbacks) {
+        composite_owned_audition_ = std::move(callbacks);
+    }
+
+    [[nodiscard]] const CompositeOwnedAuditionCallbacks&
+    compositeOwnedAuditionCallbacks() const noexcept {
+        return composite_owned_audition_;
+    }
+
+    [[nodiscard]] bool compositeOwnedAuditionReady() const noexcept {
+        return composite_owned_audition_.sync_program
+            && composite_owned_audition_.one_second
+            && composite_owned_audition_.note_on
+            && composite_owned_audition_.note_off
+            && composite_owned_audition_.stop_preview;
+    }
+
     [[nodiscard]] std::uint64_t compositeOwnedTimbreRevision() const noexcept {
         return composite_owned_timbre_revision_;
     }
@@ -2284,7 +2311,7 @@ public:
         return shared_editor_program_active_;
     }
 
-    void invalidateSharedEditorProgram() noexcept {
+    void invalidateSharedEditorProgram() noexcept override {
         shared_editor_program_active_ = false;
     }
 
@@ -2357,6 +2384,10 @@ public:
         }
         if (submitted) {
             shared_editor_program_active_ = true;
+            if (running()) {
+                static_cast<void>(
+                    engine_.waitForPendingProgramActivation());
+            }
         }
         return submitted;
     }
@@ -2818,6 +2849,7 @@ private:
         composite_owned_edit_target_;
     std::optional<mgstc::engine::SavedTimbreReference>
         published_composite_owned_;
+    CompositeOwnedAuditionCallbacks composite_owned_audition_;
     std::uint64_t composite_owned_timbre_revision_{1};
     bool shared_editor_program_active_{};
     PcAudioBackend pc_audio_backend_{PcAudioBackend::Wasapi};
@@ -3047,7 +3079,11 @@ private:
             return false;
         }
 
-        return engine_.submitProgram(edit);
+        if (!engine_.submitProgram(edit)) {
+            static_cast<void>(engine_.discardProgramEdit(edit));
+            return false;
+        }
+        return true;
     }
 
     void startNote() {
@@ -5949,7 +5985,8 @@ public:
                 }
             });
         }
-        engine_ready_ = audio_service.running() && configureEngine();
+        engine_ready_ = audio_service.running();
+        composite_program_stale_ = true;
         startTimerHz(60);
         updateStatus(
             engine_ready_
@@ -6091,8 +6128,68 @@ public:
         if (!timbre) {
             return;
         }
+        static_cast<void>(reloadCompositeLibraryFromDisk());
         last_audition_note_ = loadLastAuditionNoteSetting();
-        auditionCompositeModel(*timbre);
+        if (!import_preview_saved_ && !library_manager_imported_) {
+            import_preview_saved_ = timbre_;
+        }
+        timbre_ = std::move(*timbre);
+        composite_program_stale_ = true;
+        if (!audio_service_.running()) {
+            engine_ready_ = false;
+            restoreImportPreviewTimbre();
+            return;
+        }
+        if (!configureEngine()) {
+            restoreImportPreviewTimbre();
+            return;
+        }
+        prepareEngineForProgramEdit();
+        if (immediate_audition_.getToggleState()) {
+            startCompositeNote(last_audition_note_, true, true, false);
+        }
+    }
+
+    bool applyPublishedOwnedSnapshot() {
+        const auto& snap =
+            audio_service_.publishedCompositeOwnedTimbre();
+        if (!snap) {
+            return false;
+        }
+        if (!mgstc::engine::replaceOwnedTimbreSnapshot(timbre_, *snap)) {
+            return false;
+        }
+        timeline_.setTimbre(timbre_);
+        syncControlsFromModel();
+        composite_program_stale_ = true;
+        applied_owned_revision_ =
+            audio_service_.compositeOwnedTimbreRevision();
+        return true;
+    }
+
+    void syncOwnedEditProgram() {
+        if (!applyPublishedOwnedSnapshot()) {
+            return;
+        }
+        static_cast<void>(configureEngine());
+    }
+
+    void auditionOwnedEditOneSecond() {
+        if (!applyPublishedOwnedSnapshot()) {
+            return;
+        }
+        startAudition();
+    }
+
+    void ownedEditNoteOn(std::uint8_t note) {
+        if (!applyPublishedOwnedSnapshot()) {
+            return;
+        }
+        startCompositeNote(note, false);
+    }
+
+    void ownedEditNoteOff(std::uint8_t note) {
+        stopCompositeNote(note);
     }
 
     void stopImportedPreview() {
@@ -7014,13 +7111,23 @@ private:
 
     void auditionCompositeModel(
         const mgstc::engine::CompositeTimbre& model) {
-        stopAudition();
-        auto editing = timbre_;
+        silenceAuditionNotes();
+        if (!import_preview_saved_ && !library_manager_imported_) {
+            import_preview_saved_ = timbre_;
+        }
         timbre_ = model;
         composite_program_stale_ = true;
-        startAudition();
-        timbre_ = std::move(editing);
-        composite_program_stale_ = true;
+        if (!audio_service_.running()) {
+            engine_ready_ = false;
+            restoreImportPreviewTimbre();
+            return;
+        }
+        if (!configureEngine()) {
+            restoreImportPreviewTimbre();
+            return;
+        }
+        prepareEngineForProgramEdit();
+        startCompositeNote(last_audition_note_, true, true, false);
     }
 
     void auditionCompositeAb() {
@@ -7940,11 +8047,12 @@ private:
     [[nodiscard]] std::array<std::uint8_t, 3>
     audibleLayerCounts() const {
         std::array<std::uint8_t, 3> counts{};
-        for (std::size_t index = 0; index < timbre_.layers.size(); ++index) {
-            if (!mgstc::engine::layerIsAudible(timbre_, index)) {
+        const auto& timbre = timbre_;
+        for (std::size_t index = 0; index < timbre.layers.size(); ++index) {
+            if (!mgstc::engine::layerIsAudible(timbre, index)) {
                 continue;
             }
-            ++counts[static_cast<std::size_t>(timbre_.layers[index].source)];
+            ++counts[static_cast<std::size_t>(timbre.layers[index].source)];
         }
         return counts;
     }
@@ -7985,10 +8093,23 @@ private:
             bases[source] + voice * counts[source] + ordinal);
     }
 
+    void prepareEngineForProgramEdit() {
+        std::array<float, 256> drain{};
+        engine_.drainPendingCommands(
+            drain,
+            250,
+            !audio_service_.running());
+    }
+
     bool configureEngine() {
         MGSTC_UI_ACTIVITY("composite: configureEngine (compile + submit)");
         audio_service_.clearOpllKeyOffForceSilence();
+        prepareEngineForProgramEdit();
         auto edit = engine_.beginProgramEdit();
+        if (!edit.valid()) {
+            engine_.discardStuckProgramEdits();
+            edit = engine_.beginProgramEdit();
+        }
         if (!edit.valid()) {
             return false;
         }
@@ -8005,7 +8126,8 @@ private:
             });
         auto opll = mgstc::engine::encodeOpllPatch(
             mgstc::engine::defaultOpllPatch());
-        for (const auto& layer : timbre_.layers) {
+        const auto& program_timbre = timbre_;
+        for (const auto& layer : program_timbre.layers) {
             if (!layer.base_timbre
                 || layer.base_timbre->source != layer.source) {
                 continue;
@@ -8018,7 +8140,8 @@ private:
                 opll = layer.base_timbre->opll_registers;
             }
         }
-        const auto numbers = mgstc::engine::resolveTimbreNumbers(timbre_);
+        const auto numbers =
+            mgstc::engine::resolveTimbreNumbers(program_timbre);
         bool configured =
             edit.engine->session().mapper().defineSccPatch(0, raw_scc)
                 == mgstc::engine::MapError::None
@@ -8028,7 +8151,7 @@ private:
         for (const auto& assignment : numbers.assignments) {
             const mgstc::engine::SavedTimbreReference* snap =
                 mgstc::engine::findEmbeddedTimbreSnapshot(
-                    timbre_, assignment.library_id);
+                    program_timbre, assignment.library_id);
             mgstc::engine::SavedTimbreReference live_ref;
             if (snap == nullptr) {
                 if (const auto* live =
@@ -8038,13 +8161,21 @@ private:
                 }
             }
             if (snap == nullptr) {
-                continue;
+                configured = false;
+                break;
             }
             if (snap->source == mgstc::engine::TimbreSource::Scc) {
                 configured = configured
                     && edit.engine->session().mapper().defineSccPatch(
                            assignment.number, snap->scc_waveform)
                         == mgstc::engine::MapError::None;
+                if (snap->manual_number
+                    && *snap->manual_number != assignment.number) {
+                    configured = configured
+                        && edit.engine->session().mapper().defineSccPatch(
+                               *snap->manual_number, snap->scc_waveform)
+                            == mgstc::engine::MapError::None;
+                }
             } else if (snap->source
                        == mgstc::engine::TimbreSource::Opll) {
                 configured = configured
@@ -8052,15 +8183,25 @@ private:
                            .defineOpllOriginalPatch(
                                assignment.number, snap->opll_registers)
                         == mgstc::engine::MapError::None;
+                if (snap->manual_number
+                    && *snap->manual_number != assignment.number
+                    && *snap->manual_number > 14) {
+                    configured = configured
+                        && edit.engine->session().mapper()
+                               .defineOpllOriginalPatch(
+                                   *snap->manual_number,
+                                   snap->opll_registers)
+                            == mgstc::engine::MapError::None;
+                }
             }
         }
         const auto counts = audibleLayerCounts();
         const auto voice_capacity = compositeVoiceCapacity(counts);
         auto spectrum_map = mgstc::engine::identitySpectrumChannelMap();
         for (std::uint8_t voice = 0; voice < voice_capacity; ++voice)
-            for (std::size_t index = 0; index < timbre_.layers.size(); ++index)
-                if (mgstc::engine::layerIsAudible(timbre_, index))
-                    spectrum_map[trackForVoice(index, voice, counts)] = trackFor(timbre_.layers[index]);
+            for (std::size_t index = 0; index < program_timbre.layers.size(); ++index)
+                if (mgstc::engine::layerIsAudible(program_timbre, index))
+                    spectrum_map[trackForVoice(index, voice, counts)] = trackFor(program_timbre.layers[index]);
         edit.engine->setSpectrumChannelMap(spectrum_map);
         voice_allocator_.setChannelCount(voice_capacity);
         voice_allocator_.setPolyphonic(performance_keyboard_.polyphonic());
@@ -8072,20 +8213,20 @@ private:
           // Later poly voices omit shared original-tone y (regs 0–7).
           const bool include_original_tone_y =
               !polyphonic || voice == 0;
-          for (std::size_t index = 0; index < timbre_.layers.size(); ++index) {
-            const auto& layer = timbre_.layers[index];
-            if (!mgstc::engine::layerIsAudible(timbre_, index)) {
+          for (std::size_t index = 0; index < program_timbre.layers.size(); ++index) {
+            const auto& layer = program_timbre.layers[index];
+            if (!mgstc::engine::layerIsAudible(program_timbre, index)) {
                 continue;
             }
             const auto track = trackForVoice(index, voice, counts);
             const bool expand_tl = include_original_tone_y
                 && mgstc::engine::opllRegisterAutoOwnedByLayer(
-                       timbre_,
+                       program_timbre,
                        index,
                        mgstc::engine::OpllRegisterAutoTarget::TotalLevel);
             const bool expand_fb = include_original_tone_y
                 && mgstc::engine::opllRegisterAutoOwnedByLayer(
-                       timbre_,
+                       program_timbre,
                        index,
                        mgstc::engine::OpllRegisterAutoTarget::Feedback);
             const bool rate_kind =
@@ -8152,11 +8293,54 @@ private:
             return false;
         }
         if (!engine_.submitProgram(edit)) {
+            static_cast<void>(engine_.discardProgramEdit(edit));
             return false;
         }
         composite_program_stale_ = false;
         audio_service_.invalidateSharedEditorProgram();
+        if (audio_service_.running()) {
+            static_cast<void>(engine_.waitForPendingProgramActivation());
+        } else {
+            prepareEngineForProgramEdit();
+        }
         return true;
+    }
+
+    [[nodiscard]] bool ensureEngineReady() {
+        if (!audio_service_.running()) {
+            engine_ready_ = false;
+            return false;
+        }
+        if (!engine_ready_) {
+            engine_ready_ = configureEngine();
+        }
+        return engine_ready_;
+    }
+
+    void restoreImportPreviewTimbre() {
+        if (!import_preview_saved_ || library_manager_imported_) {
+            return;
+        }
+        timbre_ = std::move(*import_preview_saved_);
+        import_preview_saved_.reset();
+        composite_program_stale_ = true;
+    }
+
+    void silenceAuditionNotes() {
+        timeline_preview_pending_ = false;
+        audition_stop_time_ms_.reset();
+        for (const auto track : sounding_tracks_) {
+            static_cast<void>(
+                engine_.submit(
+                    mgstc::engine::EngineCommand::noteOff(track)));
+            if (track >= kOpllTrack) {
+                audio_service_.armOpllKeyOffForceSilence(track);
+            }
+        }
+        sounding_tracks_.clear();
+        pending_notes_.clear();
+        static_cast<void>(voice_allocator_.allNotesOff());
+        performance_keyboard_.clearPreviewNote();
     }
 
     void startAudition() {
@@ -8172,11 +8356,14 @@ private:
     void startCompositeNote(
         std::uint8_t base_note,
         bool stop_after_one_second,
-        bool already_configured = false) {
-        if (stop_after_one_second || !performance_keyboard_.polyphonic()) {
-            stopAudition();
+        bool already_configured = false,
+        bool silence_notes_first = true) {
+        if (silence_notes_first
+            && (stop_after_one_second
+                || !performance_keyboard_.polyphonic())) {
+            silenceAuditionNotes();
         }
-            if (!engine_ready_
+        if (!ensureEngineReady()
             || (!already_configured
                 && voice_allocator_.activeVoiceCount() == 0
                 && composite_program_stale_
@@ -8189,15 +8376,16 @@ private:
         if (assignment.stolen_note) {
             stopCompositeVoice(assignment.channel);
         }
+        const auto& note_timbre = timbre_;
         const auto counts = audibleLayerCounts();
         double maximum_delay_ms = 0.0;
-        for (std::size_t index = 0; index < timbre_.layers.size(); ++index) {
+        for (std::size_t index = 0; index < note_timbre.layers.size(); ++index) {
             if (audition_layer_filter_
                 && index != *audition_layer_filter_) {
                 continue;
             }
-            const auto& layer = timbre_.layers[index];
-            if (!mgstc::engine::layerIsAudible(timbre_, index)) {
+            const auto& layer = note_timbre.layers[index];
+            if (!mgstc::engine::layerIsAudible(note_timbre, index)) {
                 continue;
             }
             const auto note = mgstc::engine::layerMidiNote(
@@ -8210,7 +8398,7 @@ private:
             const double delay_ms = mgstc::engine::startDelayMilliseconds(
                 layer.start_delay_form,
                 layer.start_delay_value,
-                timbre_.playback_tempo);
+                note_timbre.playback_tempo);
             maximum_delay_ms =
                 juce::jmax(maximum_delay_ms, delay_ms);
             if (delay_ms <= 0.0) {
@@ -8249,20 +8437,8 @@ private:
     }
 
     void stopAudition() {
-        timeline_preview_pending_ = false;
-        audition_stop_time_ms_.reset();
-        for (const auto track : sounding_tracks_) {
-            static_cast<void>(
-                engine_.submit(
-                    mgstc::engine::EngineCommand::noteOff(track)));
-            if (track >= kOpllTrack) {
-                audio_service_.armOpllKeyOffForceSilence(track);
-            }
-        }
-        sounding_tracks_.clear();
-        pending_notes_.clear();
-        static_cast<void>(voice_allocator_.allNotesOff());
-        performance_keyboard_.clearPreviewNote();
+        silenceAuditionNotes();
+        restoreImportPreviewTimbre();
     }
 
     void stopCompositeVoice(std::uint8_t voice) {
@@ -8508,6 +8684,7 @@ private:
     std::optional<std::uint64_t> library_manager_performance_id_;
     std::optional<mgstc::engine::CompositeTimbre>
         library_manager_saved_timbre_;
+    std::optional<mgstc::engine::CompositeTimbre> import_preview_saved_;
     bool library_manager_imported_{};
     bool composite_ab_next_b_{true};
     std::vector<std::string> composite_filter_tags_;
@@ -9796,7 +9973,7 @@ public:
             return;
         }
         last_audition_note_ = loadLastAuditionNoteSetting();
-        static_cast<void>(auditionOneSecond(wave));
+        static_cast<void>(auditionAfterEdit(wave));
     }
 
     void stopImportedPreview() {
@@ -12054,12 +12231,26 @@ private:
     void silenceAllVoices() {
         audition_stop_time_ms_.reset();
         performance_keyboard_.clearPreviewNote();
+        if (usesCompositeAudition()) {
+            audio_service_.compositeOwnedAuditionCallbacks().stop_preview();
+        }
         clearEngineVoices();
+    }
+
+    [[nodiscard]] bool usesCompositeAudition() const noexcept {
+        return owned_edit_id_.has_value()
+            && audio_service_.compositeOwnedAuditionReady();
     }
 
     bool configureEngine(
         bool retrigger,
         const SccWaveform* preview = nullptr) {
+        if (usesCompositeAudition()) {
+            juce::ignoreUnused(retrigger, preview);
+            publishOwnedSnapshot();
+            audio_service_.compositeOwnedAuditionCallbacks().sync_program();
+            return true;
+        }
         MGSTC_UI_ACTIVITY("scc: configureEngine (shared program)");
         // hardReset前にアロケータと実発音を揃え、Poly残留を防ぐ。
         clearEngineVoices();
@@ -12088,6 +12279,11 @@ private:
         performance_keyboard_.clearPreviewNote();
         last_audition_note_ = note;
         saveLastAuditionNoteSetting(last_audition_note_);
+        if (usesCompositeAudition()) {
+            publishOwnedSnapshot();
+            audio_service_.compositeOwnedAuditionCallbacks().note_on(note);
+            return;
+        }
         if (!engine_ready_) {
             return;
         }
@@ -12124,6 +12320,10 @@ private:
 
     void stopPerformanceNote(std::uint8_t note) {
         audition_stop_time_ms_.reset();
+        if (usesCompositeAudition()) {
+            audio_service_.compositeOwnedAuditionCallbacks().note_off(note);
+            return;
+        }
         const auto channel = voice_allocator_.noteOff(note);
         if (!channel) {
             return;
@@ -12147,6 +12347,12 @@ private:
 
     [[nodiscard]] bool auditionOneSecond(
         const SccWaveform* preview = nullptr) {
+        if (usesCompositeAudition()) {
+            publishOwnedSnapshot();
+            audio_service_.compositeOwnedAuditionCallbacks().one_second();
+            armOneSecondPreview();
+            return true;
+        }
         if (!engine_ready_ || !configureEngine(true, preview)) {
             return false;
         }
@@ -12156,6 +12362,16 @@ private:
 
     [[nodiscard]] bool auditionAfterEdit(
         const SccWaveform* preview = nullptr) {
+        if (usesCompositeAudition()) {
+            publishOwnedSnapshot();
+            if (immediate_audition_.getToggleState()) {
+                audio_service_.compositeOwnedAuditionCallbacks().one_second();
+                armOneSecondPreview();
+            } else {
+                audio_service_.compositeOwnedAuditionCallbacks().sync_program();
+            }
+            return true;
+        }
         if (immediate_audition_.getToggleState()) {
             return auditionOneSecond(preview);
         }
@@ -13389,7 +13605,7 @@ public:
             return;
         }
         last_audition_note_ = loadLastAuditionNoteSetting();
-        static_cast<void>(auditionOneSecond(patch));
+        auditionAfterEdit(patch);
     }
 
     void stopImportedPreview() {
@@ -15023,6 +15239,18 @@ private:
     void auditionAfterEdit(
         const mgstc::engine::OpllPatchParameters*
             preview = nullptr) {
+        if (usesCompositeAudition()) {
+            publishOwnedSnapshot();
+            if (immediate_audition_.getToggleState()) {
+                audio_service_.compositeOwnedAuditionCallbacks().one_second();
+                performance_keyboard_.showPreviewNote(last_audition_note_);
+                audition_stop_time_ms_ =
+                    juce::Time::getMillisecondCounterHiRes() + 1000.0;
+            } else {
+                audio_service_.compositeOwnedAuditionCallbacks().sync_program();
+            }
+            return;
+        }
         if (immediate_audition_.getToggleState()) {
             static_cast<void>(auditionOneSecond(preview));
             return;
@@ -15109,13 +15337,27 @@ private:
     void silenceAllVoices() {
         audition_stop_time_ms_.reset();
         performance_keyboard_.clearPreviewNote();
+        if (usesCompositeAudition()) {
+            audio_service_.compositeOwnedAuditionCallbacks().stop_preview();
+        }
         clearEngineVoices(true);
+    }
+
+    [[nodiscard]] bool usesCompositeAudition() const noexcept {
+        return owned_edit_id_.has_value()
+            && audio_service_.compositeOwnedAuditionReady();
     }
 
     bool configureEngine(
         bool retrigger,
         const mgstc::engine::OpllPatchParameters*
             preview = nullptr) {
+        if (usesCompositeAudition()) {
+            juce::ignoreUnused(retrigger, preview);
+            publishOwnedSnapshot();
+            audio_service_.compositeOwnedAuditionCallbacks().sync_program();
+            return true;
+        }
         MGSTC_UI_ACTIVITY("opll: configureEngine (shared program)");
         // hardReset前にアロケータと実発音を揃え、Poly残留を防ぐ。
         clearEngineVoices(false);
@@ -15147,6 +15389,11 @@ private:
         saveLastAuditionNoteSetting(last_audition_note_);
         updateAuditionNoteLabels();
         pending_envelope_trace_refresh_ = true;
+        if (usesCompositeAudition()) {
+            publishOwnedSnapshot();
+            audio_service_.compositeOwnedAuditionCallbacks().note_on(note);
+            return;
+        }
         if (!engine_ready_) {
             return;
         }
@@ -15173,6 +15420,10 @@ private:
 
     void stopPerformanceNote(std::uint8_t note) {
         audition_stop_time_ms_.reset();
+        if (usesCompositeAudition()) {
+            audio_service_.compositeOwnedAuditionCallbacks().note_off(note);
+            return;
+        }
         const auto channel = voice_allocator_.noteOff(note);
         if (!channel) {
             return;
@@ -15187,6 +15438,14 @@ private:
     [[nodiscard]] bool auditionOneSecond(
         const mgstc::engine::OpllPatchParameters*
             preview = nullptr) {
+        if (usesCompositeAudition()) {
+            publishOwnedSnapshot();
+            audio_service_.compositeOwnedAuditionCallbacks().one_second();
+            performance_keyboard_.showPreviewNote(last_audition_note_);
+            audition_stop_time_ms_ =
+                juce::Time::getMillisecondCounterHiRes() + 1000.0;
+            return true;
+        }
         if (!engine_ready_
             || !configureEngine(true, preview)) {
             return false;
@@ -15368,7 +15627,8 @@ public:
                 .getDefaultLookAndFeel()
                 .findColour(
                     juce::ResizableWindow::backgroundColourId),
-            DocumentWindow::allButtons),
+            DocumentWindow::allButtons,
+            false),
           editor_(editor),
           close_editor_(std::move(close_editor)),
           activate_editor_(std::move(activate_editor)) {
@@ -15848,7 +16108,7 @@ public:
 
     void activeWindowStatusChanged() override {
         DocumentWindow::activeWindowStatusChanged();
-        if (!isActiveWindow()) {
+        if (!isActiveWindow() || !isShowing()) {
             return;
         }
         // Belt-and-suspenders for non-caption activation paths (client /
@@ -15860,7 +16120,15 @@ public:
         onWindowRaisedForEditing();
     }
 
-    void restoreClientKeyboardFocus() {
+    void restoreClientKeyboardFocus(bool only_if_still_active = false) {
+        // grabKeyboardFocus on a showing-but-inactive DocumentWindow makes
+        // that window the OS foreground. A 1ms delayed restore queued while
+        // 総合 was active (modal 音色設定 closing) must not run after
+        // 総合音色編集 has already taken the foreground, or the two windows
+        // bounce forever via activateEditor / toFront.
+        if (only_if_still_active && !isActiveWindow()) {
+            return;
+        }
         auto* content = getContentComponent();
         if (content == nullptr) {
             return;
@@ -15879,6 +16147,11 @@ private:
     static constexpr UINT_PTR kCaptionZOrderSubclassId = 0x4d475354u; // MGST
 
     void onWindowRaisedForEditing() {
+        // Background import preview builds editors with addToDesktop deferred.
+        // A hidden peer must not call activateEditor and deactivate 総合.
+        if (!isShowing()) {
+            return;
+        }
         MGSTC_UI_ACTIVITY("window: raise + activate (caption/border)");
         if (activate_editor_) {
             activate_editor_(editor_);
@@ -15889,7 +16162,7 @@ private:
             if (safe_this == nullptr || !safe_this->isShowing()) {
                 return;
             }
-            safe_this->restoreClientKeyboardFocus();
+            safe_this->restoreClientKeyboardFocus(true);
         });
     }
 
@@ -16025,6 +16298,7 @@ public:
         audio_service_ = std::make_unique<SharedAudioService>(
             offline_spectrogram_capture_);
         midi_service_ = std::make_unique<SharedMidiInputService>();
+        wireCompositeOwnedAuditionCallbacks();
         auto requested_editor =
             arguments.getValueForOption("--editor");
         if (requested_editor.isEmpty()) {
@@ -16239,8 +16513,13 @@ private:
                 });
         }
         if (!show) {
+            // addToDesktop on a visible peer can synchronously activate the
+            // window and deactivate the current editor before audition runs.
             if (created) {
                 window->setVisible(false);
+            }
+            if (!window->isOnDesktop()) {
+                window->addToDesktop();
             }
             return window.get();
         }
@@ -16255,6 +16534,9 @@ private:
             // Already active + not bringing to front (library preview /
             // manager note-on): keep a light/heavy-smart refresh only.
             window->refreshExternalState();
+        }
+        if (!window->isOnDesktop()) {
+            window->addToDesktop();
         }
         // Re-show (e.g. SCC/OPLL from Composite) also clamps — monitor
         // layout or DPI may have changed while the window was hidden.
@@ -16415,6 +16697,17 @@ private:
         }
     }
 
+    void stopAllImportPreviews() {
+        const auto stop = [](const std::unique_ptr<MainWindow>& window) {
+            if (window != nullptr) {
+                window->silenceImportedPreview();
+            }
+        };
+        stop(main_window_);
+        stop(scc_window_);
+        stop(opll_window_);
+    }
+
     void previewImportedCandidate(
         const mgstc::engine::ImportedToneCandidate& candidate) {
         const juce::String editor =
@@ -16425,9 +16718,48 @@ private:
                     == mgstc::engine::ImportRegisterAs::Scc
                 ? "scc"
                 : "opll";
+        stopAllImportPreviews();
         if (auto* window = ensureEditor(editor, false, false)) {
             window->auditionImportedCandidate(candidate);
         }
+    }
+
+    [[nodiscard]] CompositeEditorComponent* compositeEditor() const {
+        if (main_window_ == nullptr) {
+            return nullptr;
+        }
+        return dynamic_cast<CompositeEditorComponent*>(
+            main_window_->getContentComponent());
+    }
+
+    void wireCompositeOwnedAuditionCallbacks() {
+        audio_service_->setCompositeOwnedAuditionCallbacks({
+            [this] {
+                if (auto* editor = compositeEditor()) {
+                    editor->syncOwnedEditProgram();
+                }
+            },
+            [this] {
+                if (auto* editor = compositeEditor()) {
+                    editor->auditionOwnedEditOneSecond();
+                }
+            },
+            [this](std::uint8_t note) {
+                if (auto* editor = compositeEditor()) {
+                    editor->ownedEditNoteOn(note);
+                }
+            },
+            [this](std::uint8_t note) {
+                if (auto* editor = compositeEditor()) {
+                    editor->ownedEditNoteOff(note);
+                }
+            },
+            [this] {
+                if (auto* editor = compositeEditor()) {
+                    editor->stopImportedPreview();
+                }
+            },
+        });
     }
 
     void editImportedCandidate(
@@ -16458,6 +16790,7 @@ private:
                     == mgstc::engine::ImportRegisterAs::Scc
                 ? "scc"
                 : "opll";
+        stopAllImportPreviews();
         if (auto* window = ensureEditor(editor, false, false)) {
             window->libraryManagerImportedNoteOn(candidate, note);
         }
@@ -16470,6 +16803,7 @@ private:
             kind == LibraryManagerKind::Composite
                 ? "main"
             : kind == LibraryManagerKind::Scc ? "scc" : "opll";
+        stopAllImportPreviews();
         if (auto* window = ensureEditor(editor, false, false)) {
             window->auditionLibraryPreview(kind, id);
         }
@@ -16483,6 +16817,7 @@ private:
             kind == LibraryManagerKind::Composite
                 ? "main"
             : kind == LibraryManagerKind::Scc ? "scc" : "opll";
+        stopAllImportPreviews();
         if (auto* window = ensureEditor(editor, false, false)) {
             window->libraryManagerNoteOn(kind, id, note);
         }

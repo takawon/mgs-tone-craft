@@ -134,6 +134,7 @@ function Resolve-Git([string]$VsRoot) {
 }
 
 Push-Location $projectRoot
+$buildLockPath = $null
 try {
     $vsDevCmd = Find-VsDevCmd
     Import-VsEnvironment $vsDevCmd
@@ -194,6 +195,27 @@ try {
     Write-Host "Build tree: $resolvedBuildDirectory"
     Write-Host "Executables: $runtimeOutputDirectory"
 
+    $buildLockPath = Join-Path $resolvedBuildDirectory ".mgstc-build.lock"
+    if (-not (Test-Path -LiteralPath $resolvedBuildDirectory)) {
+        New-Item -ItemType Directory -Path $resolvedBuildDirectory | Out-Null
+    }
+    if (Test-Path -LiteralPath $buildLockPath -PathType Leaf) {
+        $lockPid = 0
+        $lockLine = Get-Content -LiteralPath $buildLockPath -TotalCount 1
+        [void][int]::TryParse($lockLine, [ref]$lockPid)
+        if (
+            $lockPid -gt 0 -and
+            (Get-Process -Id $lockPid -ErrorAction SilentlyContinue)
+        ) {
+            throw (
+                "Another MGSTC build is already running (PID $lockPid). " +
+                "A second build would ninja-clean test executables out from " +
+                "under ctest. Wait for the first build to finish."
+            )
+        }
+    }
+    [IO.File]::WriteAllText($buildLockPath, "$PID")
+
     # CMake can misdecode localized MSVC /showIncludes output, leaving Ninja
     # unaware that a public header changed.  Detect project-header updates
     # independently and clean only in that case so stale ABI layouts can
@@ -230,30 +252,31 @@ try {
         throw "CMake configuration failed with exit code $LASTEXITCODE."
     }
 
-    $targetExecutables = @("mgstc.exe") | ForEach-Object {
-        [System.IO.Path]::GetFullPath(
-            (Join-Path $runtimeOutputDirectory $_))
+    $outputRoot = [System.IO.Path]::GetFullPath($runtimeOutputDirectory)
+    if (-not $outputRoot.EndsWith([IO.Path]::DirectorySeparatorChar)) {
+        $outputRoot += [IO.Path]::DirectorySeparatorChar
     }
     $runningTargets = @(
-        Get-Process -Name "mgstc" `
-            -ErrorAction SilentlyContinue |
+        Get-Process -ErrorAction SilentlyContinue |
             Where-Object {
-                $processPath = if ($_.Path) {
-                    [System.IO.Path]::GetFullPath($_.Path)
+                if (-not $_.Path) {
+                    return $false
                 }
-                $_.Path -and @(
-                    $targetExecutables |
-                        Where-Object {
-                            [string]::Equals(
-                                $processPath,
-                                $_,
-                                [System.StringComparison]::OrdinalIgnoreCase)
-                        }
-                ).Count -gt 0
+                if ($_.ProcessName -notlike "mgstc*") {
+                    return $false
+                }
+                try {
+                    $processPath = [System.IO.Path]::GetFullPath($_.Path)
+                } catch {
+                    return $false
+                }
+                return $processPath.StartsWith(
+                    $outputRoot,
+                    [System.StringComparison]::OrdinalIgnoreCase)
             }
     )
     if ($runningTargets.Count -gt 0) {
-        Write-Host "Stopping the running build target before relinking:"
+        Write-Host "Stopping running MGSTC binaries before relinking:"
         foreach ($process in $runningTargets) {
             Write-Host "  PID $($process.Id): $($process.Path)"
             Stop-Process -Id $process.Id -Force
@@ -279,7 +302,35 @@ try {
         throw "Build failed with exit code $LASTEXITCODE."
     }
 
+    # Stamp after a successful compile, not after tests. A test failure
+    # must not force a full ninja clean on the next build.
+    [IO.File]::WriteAllText(
+        $headerDependencyStamp,
+        [DateTime]::UtcNow.ToString("O"))
+
     if (-not $SkipTests) {
+        $testfile = Join-Path $resolvedBuildDirectory "CTestTestfile.cmake"
+        if (-not (Test-Path -LiteralPath $testfile -PathType Leaf)) {
+            throw "CTest test file was not generated: $testfile"
+        }
+        $testExecutables = @(
+            Select-String `
+                -LiteralPath $testfile `
+                -Pattern '"([^"]+\.exe)"' |
+                ForEach-Object { $_.Matches.Groups[1].Value } |
+                Sort-Object -Unique
+        )
+        $missingTests = @(
+            $testExecutables |
+                Where-Object { -not (Test-Path -LiteralPath $_) }
+        )
+        if ($missingTests.Count -gt 0) {
+            throw (
+                "CTest executables missing after build:`n  " +
+                ($missingTests -join "`n  ")
+            )
+        }
+
         & $ctestExecutable `
             --test-dir $resolvedBuildDirectory `
             --output-on-failure
@@ -287,10 +338,15 @@ try {
             throw "Tests failed with exit code $LASTEXITCODE."
         }
     }
-
-    [IO.File]::WriteAllText(
-        $headerDependencyStamp,
-        [DateTime]::UtcNow.ToString("O"))
 } finally {
+    if (
+        $buildLockPath -and
+        (Test-Path -LiteralPath $buildLockPath -PathType Leaf)
+    ) {
+        $lockLine = Get-Content -LiteralPath $buildLockPath -TotalCount 1
+        if ($lockLine -eq "$PID") {
+            Remove-Item -LiteralPath $buildLockPath -Force
+        }
+    }
     Pop-Location
 }

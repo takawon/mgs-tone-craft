@@ -1389,6 +1389,42 @@ void testRuntimeOpllKeyOnAndOffRegisters() {
     REQUIRE_EQ(session.writes()[0].reason, WriteReason::KeyOff);
 }
 
+void testRuntimeOpllKeyOffKeepsFrequencyDetune() {
+    RuntimeSession session(16, 32);
+    REQUIRE_EQ(session.setTrackDetune(8, 40, 0), true);
+    REQUIRE_EQ(session.queueNoteOn(8, 60), true);
+    REQUIRE_EQ(session.processTick().ok(), true);
+    std::optional<std::uint8_t> key_on_low;
+    for (const auto& write : session.writes()) {
+        if (write.chip == ChipId::Opll && write.address == 0x10) {
+            key_on_low = write.value;
+        }
+    }
+    REQUIRE_EQ(key_on_low.has_value(), true);
+    REQUIRE_EQ(key_on_low != static_cast<std::uint8_t>(0xAC), true);
+
+    REQUIRE_EQ(session.queueKeyOff(8), true);
+    REQUIRE_EQ(session.processTick().ok(), true);
+    bool wrote_low_on_key_off = false;
+    for (const auto& write : session.writes()) {
+        if (write.chip == ChipId::Opll && write.address == 0x10) {
+            wrote_low_on_key_off = true;
+        }
+    }
+    REQUIRE_EQ(wrote_low_on_key_off, false);
+
+    REQUIRE_EQ(session.queueNoteOn(8, 60), true);
+    REQUIRE_EQ(session.processTick().ok(), true);
+    std::optional<std::uint8_t> next_key_on_low;
+    for (const auto& write : session.writes()) {
+        if (write.chip == ChipId::Opll && write.address == 0x10) {
+            next_key_on_low = write.value;
+        }
+    }
+    REQUIRE_EQ(next_key_on_low.has_value(), true);
+    REQUIRE_EQ(next_key_on_low, *key_on_low);
+}
+
 void testChipRackRendersAllThreeChips() {
     ChipRack rack;
     REQUIRE_EQ(rack.valid(), true);
@@ -2877,6 +2913,33 @@ void testRealtimeHostCommandQueueHasFixedCapacity() {
     REQUIRE_EQ(host.render(output).ok(), true);
     REQUIRE_EQ(host.pendingCommandCount(), static_cast<std::size_t>(0));
     REQUIRE_EQ(host.submit(EngineCommand::stop()), true);
+}
+
+void testRealtimeHostDrainsPendingProgramLoads() {
+    RealtimeEngineHost host;
+    auto first = host.beginProgramEdit();
+    auto second = host.beginProgramEdit();
+    REQUIRE_EQ(first.valid(), true);
+    REQUIRE_EQ(second.valid(), true);
+    REQUIRE_EQ(
+        first.engine->session().setSequenceEnvelope(3, {0x0F}),
+        true);
+    REQUIRE_EQ(
+        second.engine->session().setSequenceEnvelope(3, {0x0E}),
+        true);
+    REQUIRE_EQ(host.submitProgram(first), true);
+    REQUIRE_EQ(host.submitProgram(second), true);
+    REQUIRE_EQ(host.beginProgramEdit().valid(), false);
+
+    std::array<float, 256> output{};
+    host.drainPendingCommands(output);
+    REQUIRE_EQ(host.waitForPendingProgramActivation(
+                   std::chrono::milliseconds(0)),
+               true);
+    REQUIRE_EQ(host.beginProgramEdit().valid(), true);
+    auto spare = host.beginProgramEdit();
+    REQUIRE_EQ(spare.valid(), true);
+    REQUIRE_EQ(host.discardProgramEdit(spare), true);
 }
 
 void testProgramPoolLimitsEditingAndReusesReleasedSlot() {
@@ -6455,6 +6518,8 @@ int main(int argc, char** argv) {
         {"RuntimePsgSequenceKeyOffStaysSilent", testRuntimePsgSequenceKeyOffStaysSilent},
         {"AuditionGateSuppressesEnvelopeUntilNoteOn", testAuditionGateSuppressesEnvelopeUntilNoteOn},
         {"RuntimeOpllKeyOnAndOffRegisters", testRuntimeOpllKeyOnAndOffRegisters},
+        {"RuntimeOpllKeyOffKeepsFrequencyDetune",
+         testRuntimeOpllKeyOffKeepsFrequencyDetune},
         {"ChipRackRendersAllThreeChips", testChipRackRendersAllThreeChips},
         {"EmulatorSoundOutputMirrorsChipRack", testEmulatorSoundOutputMirrorsChipRack},
         {"MAmidiChipRegisterMap", testMAmidiChipRegisterMap},
@@ -6490,6 +6555,8 @@ int main(int argc, char** argv) {
         {"SpscQueueTransfersConcurrently", testSpscQueueTransfersConcurrently},
         {"RealtimeHostDrainsCommandsAndReportsRejections", testRealtimeHostDrainsCommandsAndReportsRejections},
         {"RealtimeHostCommandQueueHasFixedCapacity", testRealtimeHostCommandQueueHasFixedCapacity},
+        {"RealtimeHostDrainsPendingProgramLoads",
+         testRealtimeHostDrainsPendingProgramLoads},
         {"ProgramPoolLimitsEditingAndReusesReleasedSlot", testProgramPoolLimitsEditingAndReusesReleasedSlot},
         {"ProgramSnapshotActivatesAndRetriggersWithoutAudioAllocation", testProgramSnapshotActivatesAndRetriggersWithoutAudioAllocation},
         {"RealtimeHostPublishesOpllScopeToUiQueue", testRealtimeHostPublishesOpllScopeToUiQueue},
@@ -6583,6 +6650,10 @@ int main(int argc, char** argv) {
          testToneImportMusicaVcdNamesAndSccEnvelope},
         {"ToneImportSngWaveAndName", testToneImportSngWaveAndName},
         {"ToneImportUnusedEnvelopeAsPsg", testToneImportUnusedEnvelopeAsPsg},
+        {"ToneImportLooptestMgsEnvelope", testToneImportLooptestMgsEnvelope},
+        {"ToneImportLooptest1MgsEnvelope", testToneImportLooptest1MgsEnvelope},
+        {"ToneImportLoopEndPitchBeforeBracket",
+         testToneImportLoopEndPitchBeforeBracket},
         {"ToneImportSkipsOpllRhythmChannelEnvelope",
          testToneImportSkipsOpllRhythmChannelEnvelope},
         {"ToneImportRhythmHeaderAndMelodyTrack",

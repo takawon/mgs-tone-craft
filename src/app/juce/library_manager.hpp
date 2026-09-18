@@ -125,6 +125,39 @@ public:
         return &rows_[static_cast<std::size_t>(index)];
     }
 
+    [[nodiscard]] static juce::String cellText(
+        const LibraryManagerRow& row,
+        int column_id) {
+        if (column_id == kName) {
+            auto text = juce::String::fromUTF8(row.name.c_str());
+            if (row.kind != LibraryManagerKind::Composite) {
+                text += " (r"
+                    + juce::String(static_cast<int>(row.revision))
+                    + ")";
+            }
+            return text;
+        }
+        if (column_id == kTags) {
+            if (row.tags.empty()) {
+                return juce::String::fromUTF8("（タグなし）");
+            }
+            juce::StringArray parts;
+            for (const auto& tag : row.tags) {
+                parts.add(juce::String::fromUTF8(tag.c_str()));
+            }
+            return parts.joinIntoString(" ");
+        }
+        if (column_id == kUpdated) {
+            return formatLibraryManagerTime(row.updated_unix_seconds);
+        }
+        return {};
+    }
+
+    [[nodiscard]] static bool isTooltipColumn(int column_id) {
+        return column_id == kName || column_id == kTags
+            || column_id == kUpdated;
+    }
+
     int getNumRows() override {
         return static_cast<int>(rows_.size());
     }
@@ -194,27 +227,7 @@ public:
                 false);
             return;
         }
-        juce::String text;
-        if (column_id == kName) {
-            text = juce::String::fromUTF8(row->name.c_str());
-            if (row->kind != LibraryManagerKind::Composite) {
-                text += " (r"
-                    + juce::String(static_cast<int>(row->revision))
-                    + ")";
-            }
-        } else if (column_id == kTags) {
-            if (row->tags.empty()) {
-                text = juce::String::fromUTF8("（タグなし）");
-            } else {
-                juce::StringArray parts;
-                for (const auto& tag : row->tags) {
-                    parts.add(juce::String::fromUTF8(tag.c_str()));
-                }
-                text = parts.joinIntoString(" ");
-            }
-        } else if (column_id == kUpdated) {
-            text = formatLibraryManagerTime(row->updated_unix_seconds);
-        }
+        const auto text = cellText(*row, column_id);
         graphics.drawText(
             text,
             UiLayout::xs,
@@ -269,6 +282,28 @@ public:
         if (selection_handler_) {
             selection_handler_();
         }
+    }
+
+    juce::String getCellTooltip(
+        int row_number,
+        int column_id) override {
+        if (!isTooltipColumn(column_id)) {
+            return {};
+        }
+        const auto* row = rowAt(row_number);
+        if (row == nullptr || table_ == nullptr) {
+            return {};
+        }
+        const auto text = cellText(*row, column_id);
+        const int column_width =
+            table_->getHeader().getColumnWidth(column_id);
+        const int available_width =
+            column_width - UiLayout::xs * 2;
+        if (UiLayout::isTextTruncated(
+                UiFonts::body(), text, available_width)) {
+            return text;
+        }
+        return {};
     }
 
 private:
@@ -352,7 +387,8 @@ public:
           composites_(std::move(composites)),
           performance_target_changed_(
               std::move(performance_target_changed)),
-          libraries_changed_(std::move(libraries_changed)) {
+          libraries_changed_(std::move(libraries_changed)),
+          tooltip_window_(this, 450) {
         category_.addItem(juce::String::fromUTF8("SCC"), 1);
         category_.addItem(juce::String::fromUTF8("OPLL"), 2);
         category_.addItem(juce::String::fromUTF8("複合"), 3);
@@ -1608,6 +1644,7 @@ private:
         composites_;
     PerformanceTargetChangedCallback performance_target_changed_;
     LibrariesChangedCallback libraries_changed_;
+    juce::TooltipWindow tooltip_window_;
     SwitchLookAndFeel switch_look_and_feel_;
     juce::ComboBox category_;
     juce::TextEditor filter_;

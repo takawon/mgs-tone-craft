@@ -2,6 +2,18 @@ cmake_minimum_required(VERSION 3.25)
 
 include(FetchContent)
 
+# MSVC needs VsDevCmd (INCLUDE/LIB/PATH). Plain PowerShell + cmake --build
+# otherwise fails with misleading C1083 on <array>. Check before project() so
+# configure fails fast; build.ps1 imports VsDevCmd first.
+if(WIN32)
+    if(NOT DEFINED ENV{INCLUDE} OR "$ENV{INCLUDE}" STREQUAL "")
+        message(FATAL_ERROR
+            "Visual Studio C++ environment is not active (INCLUDE is unset).\n"
+            "Run: .\\tools\\build.cmd\n"
+            "Or open Developer PowerShell for VS before running CMake.")
+    endif()
+endif()
+
 project(
     MgsToneCraft
     VERSION 0.1.0
@@ -523,5 +535,93 @@ if(MGSTC_BUILD_BENCHMARKS)
         target_compile_options(
             mgstc_wave_import_benchmark PRIVATE -Wall -Wextra -Wpedantic
         )
+    endif()
+endif()
+
+# CMAKE_*_COMPILER_LAUNCHER as a CMake list breaks JUCE juceaide
+# sub-configure. A custom target plus add_dependencies serializes the
+# INCLUDE check before any compile, including third_party / JUCE objects
+# that would otherwise race and fail with C1083.
+if(WIN32 AND MSVC)
+    set(_MGSTC_CHECK_MSVC_ENV_PS1
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/check-msvc-env.ps1")
+    set(_MGSTC_POWERSHELL
+        "$ENV{WINDIR}/System32/WindowsPowerShell/v1.0/powershell.exe")
+
+    add_custom_target(
+        mgstc_msvc_env_check
+        COMMAND
+            "${_MGSTC_POWERSHELL}"
+            -NoProfile
+            -ExecutionPolicy
+            Bypass
+            -File
+            "${_MGSTC_CHECK_MSVC_ENV_PS1}"
+        VERBATIM
+        COMMENT "Checking Visual Studio C++ environment (INCLUDE)"
+    )
+
+    function(mgstc_attach_msvc_env_check directory)
+        get_property(_mgstc_targets DIRECTORY "${directory}"
+            PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(_mgstc_target IN LISTS _mgstc_targets)
+            if(_mgstc_target STREQUAL "mgstc_msvc_env_check")
+                continue()
+            endif()
+            if(NOT TARGET "${_mgstc_target}")
+                continue()
+            endif()
+            get_target_property(
+                _mgstc_aliased "${_mgstc_target}" ALIASED_TARGET)
+            if(_mgstc_aliased)
+                continue()
+            endif()
+            get_target_property(_mgstc_imported "${_mgstc_target}" IMPORTED)
+            if(_mgstc_imported)
+                continue()
+            endif()
+            get_target_property(_mgstc_type "${_mgstc_target}" TYPE)
+            if(_mgstc_type STREQUAL "INTERFACE_LIBRARY")
+                continue()
+            endif()
+            add_dependencies("${_mgstc_target}" mgstc_msvc_env_check)
+        endforeach()
+        get_property(_mgstc_subdirs DIRECTORY "${directory}"
+            PROPERTY SUBDIRECTORIES)
+        foreach(_mgstc_subdir IN LISTS _mgstc_subdirs)
+            mgstc_attach_msvc_env_check("${_mgstc_subdir}")
+        endforeach()
+    endfunction()
+
+    mgstc_attach_msvc_env_check("${CMAKE_CURRENT_SOURCE_DIR}")
+
+    # CTest records absolute exe paths at generate time. Keep every
+    # executable next to mgstc.exe when build.ps1 sets this directory.
+    if(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+        get_property(_mgstc_exe_targets DIRECTORY
+            PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(_mgstc_target IN LISTS _mgstc_exe_targets)
+            if(NOT TARGET "${_mgstc_target}")
+                continue()
+            endif()
+            get_target_property(_mgstc_type "${_mgstc_target}" TYPE)
+            if(NOT _mgstc_type STREQUAL "EXECUTABLE")
+                continue()
+            endif()
+            set_target_properties(
+                "${_mgstc_target}"
+                PROPERTIES
+                    RUNTIME_OUTPUT_DIRECTORY
+                        "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
+                    RUNTIME_OUTPUT_DIRECTORY_DEBUG
+                        "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
+                    RUNTIME_OUTPUT_DIRECTORY_RELEASE
+                        "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
+                    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO
+                        "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
+                    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL
+                        "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
+            )
+        endforeach()
     endif()
 endif()

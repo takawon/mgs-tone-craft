@@ -442,4 +442,15 @@ inline void applyScale(float factor) {
         text_w + control_height + xs);
 }
 
+[[nodiscard]] inline bool isTextTruncated(
+    const juce::Font& font,
+    const juce::String& text,
+    int available_width) {
+    if (text.isEmpty() || available_width <= 0) {
+        return false;
+    }
+    return juce::GlyphArrangement::getStringWidthInt(font, text)
+        > available_width;
+}
+
 } // namespace UiLayout

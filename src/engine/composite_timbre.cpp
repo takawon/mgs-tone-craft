@@ -516,9 +516,6 @@ TimbreNumberResolution resolveTimbreNumbers(
             }
             continue;
         }
-        if (reference.number_mode == TimbreNumberMode::Manual) {
-            continue;
-        }
         const auto source = sourceIndex(reference.source);
         std::optional<std::uint8_t> available;
         for (unsigned int candidate = minimum_number;
