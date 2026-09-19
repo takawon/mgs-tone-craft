@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-#pragma once
+#include "mgstc/engine/composite_envelope_compile.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -8,27 +8,13 @@
 #include <optional>
 #include <vector>
 
-#include <juce_core/juce_core.h>
-
-#include "mgstc/engine/composite_timbre.hpp"
 #include "mgstc/engine/envelope_sequence.hpp"
-#include "mgstc/engine/mgs_envelope_io.hpp"
 #include "mgstc/engine/opll_register_auto.hpp"
-#include "mgstc/engine/timbre_library.hpp"
 
-struct CompositeEnvelopePrograms {
-    std::vector<std::uint8_t> volume;
-    std::vector<std::uint8_t> pitch;
-    std::vector<std::uint8_t> timbre;
-};
+namespace mgstc::engine {
+namespace {
 
-enum class CompositeEnvelopeLane : std::uint8_t {
-    Volume,
-    Pitch,
-    Timbre,
-};
-
-[[nodiscard]] inline std::int32_t interpolatedLaneVolume(
+[[nodiscard]] std::int32_t interpolatedLaneVolume(
     std::int32_t start_value,
     std::uint32_t start_count,
     std::int32_t end_value,
@@ -49,15 +35,17 @@ enum class CompositeEnvelopeLane : std::uint8_t {
     return (num - span / 2) / span;
 }
 
-[[nodiscard]] inline std::vector<std::uint8_t> compileCompositeEnvelopeLane(
-    const mgstc::engine::CompositeLayer& layer,
+}  // namespace
+
+[[nodiscard]] std::vector<std::uint8_t> compileCompositeEnvelopeLane(
+    const CompositeLayer& layer,
     CompositeEnvelopeLane lane,
-    const mgstc::engine::TimbreNumberResolution& numbers,
-    const mgstc::engine::TimbreLibrary* library = nullptr,
-    bool include_original_tone_y = true,
-    bool expand_tl_auto = true,
-    bool expand_fb_auto = true,
-    bool include_loop = true) {
+    const TimbreNumberResolution& numbers,
+    const TimbreLibrary* library,
+    bool include_original_tone_y,
+    bool expand_tl_auto,
+    bool expand_fb_auto,
+    bool include_loop) {
     struct TimedEvent {
         std::uint32_t count{};
         mgstc::engine::EnvelopeEventKind kind{};
@@ -306,10 +294,14 @@ enum class CompositeEnvelopeLane : std::uint8_t {
                             });
                         const auto vols =
                             mgstc::engine::sampleAutomaticRampVolumes(
-                                static_cast<std::uint8_t>(juce::jlimit(
-                                    0, 15, origin_value)),
-                                static_cast<std::uint8_t>(juce::jlimit(
-                                    0, 15, event.value)),
+                                static_cast<std::uint8_t>(std::clamp(
+                                    origin_value,
+                                    std::int32_t{0},
+                                    std::int32_t{15})),
+                                static_cast<std::uint8_t>(std::clamp(
+                                    event.value,
+                                    std::int32_t{0},
+                                    std::int32_t{15})),
                                 duration,
                                 origin_scheduled);
                         const auto start = origin_scheduled ? 1u : 0u;
@@ -369,12 +361,12 @@ enum class CompositeEnvelopeLane : std::uint8_t {
     std::uint32_t cursor{};
     std::uint32_t previous_volume_count{};
     auto volume = static_cast<std::uint8_t>(
-        juce::jlimit(0, 15, static_cast<int>(layer.volume)));
+        std::min<std::uint8_t>(layer.volume, 15));
     const auto append_wait = [&bytecode, &volume, lane](
                                  std::uint32_t count) {
         while (count != 0) {
             const auto chunk = static_cast<std::uint8_t>(
-                juce::jmin<std::uint32_t>(255, count));
+                std::min<std::uint32_t>(255, count));
             const auto held_volume = lane == CompositeEnvelopeLane::Volume
                 ? volume
                 : std::uint8_t{0};
@@ -423,7 +415,8 @@ enum class CompositeEnvelopeLane : std::uint8_t {
                 && pitch.after_loop_start != *after_loop_start) {
                 continue;
             }
-            const auto clamped = juce::jlimit(-127, 127, pitch.value);
+            const auto clamped = std::clamp(
+                pitch.value, std::int32_t{-127}, std::int32_t{127});
             const auto encoded = static_cast<std::uint8_t>(
                 clamped < 0 ? static_cast<int>(clamped + 256) : clamped);
             bytecode.insert(bytecode.end(), {0x12, encoded});
@@ -500,7 +493,8 @@ enum class CompositeEnvelopeLane : std::uint8_t {
         case mgstc::engine::EnvelopeEventKind::Volume:
             {
                 const auto target = static_cast<std::uint8_t>(
-                    juce::jlimit(0, 15, event.value));
+                    std::clamp(
+                        event.value, std::int32_t{0}, std::int32_t{15}));
                 const auto interval = event.automatic_duration != 0
                     ? event.automatic_duration
                     : event.count - previous_volume_count;
@@ -508,22 +502,25 @@ enum class CompositeEnvelopeLane : std::uint8_t {
                     if (interval == 1) {
                         volume = target;
                         bytecode.push_back(volume);
-                        cursor = juce::jmax(cursor, event.count + 1);
+                        cursor = std::max(cursor, event.count + 1);
                     } else {
                         const auto duration = static_cast<std::uint8_t>(
-                            juce::jlimit<std::uint32_t>(1, 255, interval));
+                            std::clamp(
+                                interval,
+                                std::uint32_t{1},
+                                std::uint32_t{255}));
                         bytecode.push_back(
                             static_cast<std::uint8_t>(0x20 | target));
                         bytecode.push_back(duration);
                         volume = target;
-                        cursor = juce::jmax(
+                        cursor = std::max(
                             cursor,
                             event.count + static_cast<std::uint32_t>(duration));
                     }
                 } else {
                     volume = target;
                     bytecode.push_back(volume);
-                    cursor = juce::jmax(cursor, event.count + 1);
+                    cursor = std::max(cursor, event.count + 1);
                 }
                 previous_volume_count = event.count;
             }
@@ -532,7 +529,10 @@ enum class CompositeEnvelopeLane : std::uint8_t {
             bytecode.insert(
                 bytecode.end(),
                 {0x12, static_cast<std::uint8_t>(
-                    juce::jlimit(-127, 127, event.value))});
+                    std::clamp(
+                        event.value,
+                        std::int32_t{-127},
+                        std::int32_t{127}))});
             break;
         case mgstc::engine::EnvelopeEventKind::Timbre: {
             mgstc::engine::EnvelopeEvent resolved{
@@ -554,9 +554,13 @@ enum class CompositeEnvelopeLane : std::uint8_t {
                 bytecode.end(),
                 {0x11,
                  static_cast<std::uint8_t>(
-                     juce::jlimit(0, 255, event.value)),
+                     std::clamp(
+                     event.value, std::int32_t{0}, std::int32_t{255})),
                  static_cast<std::uint8_t>(
-                     juce::jlimit(0, 255, event.secondary))});
+                     std::clamp(
+                         event.secondary,
+                         std::int32_t{0},
+                         std::int32_t{255}))});
             break;
         case mgstc::engine::EnvelopeEventKind::LoopStart:
             append_zero_time_at(event.count, false);
@@ -578,13 +582,13 @@ enum class CompositeEnvelopeLane : std::uint8_t {
     return bytecode;
 }
 
-[[nodiscard]] inline CompositeEnvelopePrograms compileCompositeEnvelopes(
-    const mgstc::engine::CompositeLayer& layer,
-    const mgstc::engine::TimbreNumberResolution& numbers,
-    const mgstc::engine::TimbreLibrary* library = nullptr,
-    bool include_original_tone_y = true,
-    bool expand_tl_auto = true,
-    bool expand_fb_auto = true) {
+[[nodiscard]] CompositeEnvelopePrograms compileCompositeEnvelopes(
+    const CompositeLayer& layer,
+    const TimbreNumberResolution& numbers,
+    const TimbreLibrary* library,
+    bool include_original_tone_y,
+    bool expand_tl_auto,
+    bool expand_fb_auto) {
     return {
         .volume = compileCompositeEnvelopeLane(
             layer,
@@ -607,11 +611,11 @@ enum class CompositeEnvelopeLane : std::uint8_t {
     };
 }
 
-[[nodiscard]] inline std::vector<std::uint8_t> sampleCompositeVolumeLane(
-    const mgstc::engine::CompositeLayer& layer,
+[[nodiscard]] std::vector<std::uint8_t> sampleCompositeVolumeLane(
+    const CompositeLayer& layer,
     int ticks) {
     std::vector<std::uint8_t> volumes(
-        static_cast<std::size_t>(juce::jmax(0, ticks)), 0);
+        static_cast<std::size_t>(std::max(0, ticks)), 0);
     if (ticks <= 0) {
         return volumes;
     }
@@ -635,3 +639,5 @@ enum class CompositeEnvelopeLane : std::uint8_t {
     }
     return volumes;
 }
+
+}  // namespace mgstc::engine

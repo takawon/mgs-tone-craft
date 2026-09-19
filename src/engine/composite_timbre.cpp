@@ -154,12 +154,7 @@ bool layerIsAudible(
 std::optional<std::uint8_t> layerMidiNote(
     const CompositeLayer& layer,
     std::uint8_t root_midi_note) noexcept {
-    const int note = static_cast<int>(root_midi_note)
-        + static_cast<int>(layer.relative_semitones);
-    if (note < 24 || note > 119) {
-        return std::nullopt;
-    }
-    return static_cast<std::uint8_t>(note);
+    return transposedMidiNote(root_midi_note, layer.relative_semitones);
 }
 
 std::optional<std::uint8_t> firstAvailableChannel(

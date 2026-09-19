@@ -149,6 +149,8 @@ endif()
 
 add_library(mgstc_engine STATIC
     src/engine/chip_rack.cpp
+    src/engine/composite_envelope_compile.cpp
+    src/engine/composite_program_compiler.cpp
     src/engine/composite_timbre.cpp
     src/engine/composite_timbre_library.cpp
     src/engine/emulator_sound_output.cpp
@@ -341,6 +343,58 @@ if(WIN32)
                 mgstc PRIVATE /W4 /permissive- /EHsc /utf-8
             )
         endif()
+
+        # Stage B: 48kHz VST3 Instrument. Do not link WASAPI/ASIO/WinMM hosts.
+        juce_add_plugin(
+            mgstc_vst3
+            COMPANY_NAME "MGS Tone Craft"
+            BUNDLE_ID "com.mgstonecraft.mgstc.instrument"
+            IS_SYNTH TRUE
+            NEEDS_MIDI_INPUT TRUE
+            NEEDS_MIDI_OUTPUT FALSE
+            IS_MIDI_EFFECT FALSE
+            EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+            COPY_PLUGIN_AFTER_BUILD FALSE
+            PLUGIN_MANUFACTURER_CODE Mgsc
+            PLUGIN_CODE Mgti
+            FORMATS VST3
+            PRODUCT_NAME "MGS Tone Craft"
+            PLUGIN_NAME "MGS Tone Craft"
+            DESCRIPTION "MGSDRV compound timbre instrument"
+            VST3_CATEGORIES "Instrument Synth"
+            PLUGIN_CHANNEL_CONFIGURATIONS "{0, 2}"
+        )
+        target_sources(
+            mgstc_vst3 PRIVATE
+                src/plugin/vst3/plugin_processor.hpp
+                src/plugin/vst3/plugin_processor.cpp
+        )
+        target_include_directories(
+            mgstc_vst3 PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3
+        )
+        target_link_libraries(
+            mgstc_vst3
+            PRIVATE
+                mgstc_engine
+                juce::juce_audio_processors
+        )
+        target_compile_features(mgstc_vst3 PRIVATE cxx_std_20)
+        target_compile_definitions(
+            mgstc_vst3
+            PUBLIC
+                JUCE_WEB_BROWSER=0
+                JUCE_USE_CURL=0
+                JUCE_VST3_CAN_REPLACE_VST2=0
+                JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
+            PRIVATE
+                MGSTC_DOC_VERSION="${MGSTC_DOC_VERSION}"
+        )
+        if(MSVC)
+            target_compile_options(
+                mgstc_vst3 PRIVATE /W4 /permissive- /EHsc /utf-8
+            )
+        endif()
     endif()
 endif()
 
@@ -446,26 +500,80 @@ if(MGSTC_BUILD_TESTS)
             target_compile_options(mgstc_opll_envelope_graph_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
         endif()
         add_test(NAME mgstc_opll_envelope_graph_tests COMMAND mgstc_opll_envelope_graph_tests)
+    endif()
 
+    add_executable(
+        mgstc_composite_envelope_compile_tests
+        tests/cpp/composite_envelope_compile_tests.cpp)
+    target_link_libraries(
+        mgstc_composite_envelope_compile_tests
+        PRIVATE mgstc_engine)
+    target_compile_features(
+        mgstc_composite_envelope_compile_tests PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(
+            mgstc_composite_envelope_compile_tests PRIVATE
+                /W4 /permissive- /EHsc /utf-8)
+    else()
+        target_compile_options(
+            mgstc_composite_envelope_compile_tests PRIVATE
+                -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(
+        NAME mgstc_composite_envelope_compile_tests
+        COMMAND mgstc_composite_envelope_compile_tests)
+
+    add_executable(
+        mgstc_realtime_engine_host_tests
+        tests/cpp/realtime_engine_host_tests.cpp)
+    target_link_libraries(
+        mgstc_realtime_engine_host_tests
+        PRIVATE mgstc_engine)
+    target_compile_features(
+        mgstc_realtime_engine_host_tests PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(
+            mgstc_realtime_engine_host_tests PRIVATE
+                /W4 /permissive- /EHsc /utf-8)
+    else()
+        target_compile_options(
+            mgstc_realtime_engine_host_tests PRIVATE
+                -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(
+        NAME mgstc_realtime_engine_host_tests
+        COMMAND mgstc_realtime_engine_host_tests)
+
+    if(WIN32 AND TARGET juce::juce_audio_processors)
         add_executable(
-            mgstc_composite_envelope_compile_tests
-            tests/cpp/composite_envelope_compile_tests.cpp)
+            mgstc_vst3_processor_tests
+            tests/cpp/vst3_processor_tests.cpp
+            src/plugin/vst3/plugin_processor.cpp)
+        target_include_directories(
+            mgstc_vst3_processor_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3)
         target_link_libraries(
-            mgstc_composite_envelope_compile_tests
-            PRIVATE mgstc_engine juce::juce_core)
+            mgstc_vst3_processor_tests
+            PRIVATE
+                mgstc_engine
+                juce::juce_audio_processors)
         target_compile_features(
-            mgstc_composite_envelope_compile_tests PRIVATE cxx_std_20)
+            mgstc_vst3_processor_tests PRIVATE cxx_std_20)
         target_compile_definitions(
-            mgstc_composite_envelope_compile_tests
-            PRIVATE JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
+            mgstc_vst3_processor_tests
+            PRIVATE
+                JUCE_WEB_BROWSER=0
+                JUCE_USE_CURL=0
+                JUCE_VST3_CAN_REPLACE_VST2=0
+                JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0)
         if(MSVC)
             target_compile_options(
-                mgstc_composite_envelope_compile_tests PRIVATE
+                mgstc_vst3_processor_tests PRIVATE
                     /W4 /permissive- /EHsc /utf-8)
         endif()
         add_test(
-            NAME mgstc_composite_envelope_compile_tests
-            COMMAND mgstc_composite_envelope_compile_tests)
+            NAME mgstc_vst3_processor_tests
+            COMMAND mgstc_vst3_processor_tests)
     endif()
 
     add_executable(

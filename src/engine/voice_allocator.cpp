@@ -1,6 +1,7 @@
 #include "mgstc/engine/voice_allocator.hpp"
 
 #include <algorithm>
+#include <array>
 
 namespace mgstc::engine {
 
@@ -8,7 +9,7 @@ SequentialVoiceAllocator::SequentialVoiceAllocator(
     std::uint8_t channel_count)
     : voices_(std::max<std::uint8_t>(channel_count, 1)) {}
 
-VoiceAssignment SequentialVoiceAllocator::noteOn(std::uint8_t note) {
+VoiceAssignment SequentialVoiceAllocator::noteOn(std::uint8_t note) noexcept {
     for (std::size_t index = 0; index < voices_.size(); ++index) {
         if (voices_[index].note == note) {
             voices_[index].age = next_age_++;
@@ -55,26 +56,43 @@ std::optional<std::uint8_t> SequentialVoiceAllocator::noteOff(
     return std::nullopt;
 }
 
-std::vector<std::uint8_t> SequentialVoiceAllocator::allNotesOff() {
-    std::vector<std::uint8_t> channels;
+std::size_t SequentialVoiceAllocator::allNotesOff(
+    std::span<std::uint8_t> channels_out) noexcept {
+    std::size_t written = 0;
     for (std::size_t index = 0; index < voices_.size(); ++index) {
         if (!voices_[index].note) {
             continue;
         }
-        channels.push_back(static_cast<std::uint8_t>(index));
+        if (written < channels_out.size()) {
+            channels_out[written] = static_cast<std::uint8_t>(index);
+        }
+        ++written;
         voices_[index] = {};
     }
-    return channels;
+    return written;
+}
+
+std::vector<std::uint8_t> SequentialVoiceAllocator::allNotesOff() {
+    std::array<std::uint8_t, 16> channels{};
+    const auto count = allNotesOff(channels);
+    return {
+        channels.begin(),
+        channels.begin()
+            + static_cast<std::ptrdiff_t>(
+                std::min(count, channels.size())),
+    };
 }
 
 void SequentialVoiceAllocator::setChannelCount(
     std::uint8_t channel_count) {
-    static_cast<void>(allNotesOff());
+    std::array<std::uint8_t, 16> ignored{};
+    static_cast<void>(allNotesOff(ignored));
     voices_.assign(std::max<std::uint8_t>(channel_count, 1), {});
 }
 
 void SequentialVoiceAllocator::setPolyphonic(bool polyphonic) {
-    static_cast<void>(allNotesOff());
+    std::array<std::uint8_t, 16> ignored{};
+    static_cast<void>(allNotesOff(ignored));
     polyphonic_ = polyphonic;
 }
 

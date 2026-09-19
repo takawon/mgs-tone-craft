@@ -522,9 +522,51 @@ void RealtimeEngineHost::applyPendingCommands() noexcept {
     }
 }
 
+void RealtimeEngineHost::servicePendingControlCommands() noexcept {
+    applyPendingCommands();
+}
+
+bool RealtimeEngineHost::realtimeNoteOn(
+    std::uint8_t track,
+    std::uint8_t midi_note) noexcept {
+    if (!programs_[active_program_].engine.session().queueNoteOn(
+            track, midi_note)) {
+        return false;
+    }
+    noteStarted(track, midi_note);
+    return true;
+}
+
+bool RealtimeEngineHost::realtimeNoteOff(std::uint8_t track) noexcept {
+    if (!programs_[active_program_].engine.session().queueKeyOff(track)) {
+        return false;
+    }
+    noteStopped(track);
+    return true;
+}
+
+bool RealtimeEngineHost::realtimeSilenceTrack(std::uint8_t track) noexcept {
+    if (!programs_[active_program_].engine.session().forceMuteTrack(track)) {
+        return false;
+    }
+    noteStopped(track);
+    return true;
+}
+
+void RealtimeEngineHost::realtimeStop() noexcept {
+    programs_[active_program_].engine.hardReset();
+    ++spectrum_pcm_epoch_;
+    allNotesStopped();
+}
+
 RenderResult RealtimeEngineHost::render(
     std::span<float> interleaved_stereo) noexcept {
-    applyPendingCommands();
+    servicePendingControlCommands();
+    return renderAudio(interleaved_stereo);
+}
+
+RenderResult RealtimeEngineHost::renderAudio(
+    std::span<float> interleaved_stereo) noexcept {
     auto& core = programs_[active_program_].engine;
     SpectrumCapture* capture = nullptr;
     if (spectrum_enabled_.load(std::memory_order_acquire)) {

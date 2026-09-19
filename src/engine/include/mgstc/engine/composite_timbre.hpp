@@ -470,6 +470,17 @@ bool replaceOwnedTimbreSnapshot(
     const CompositeTimbre& timbre,
     std::size_t layer_index) noexcept;
 
+[[nodiscard]] inline std::optional<std::uint8_t> transposedMidiNote(
+    std::uint8_t root_midi_note,
+    std::int8_t relative_semitones) noexcept {
+    const int note = static_cast<int>(root_midi_note)
+        + static_cast<int>(relative_semitones);
+    if (note < 24 || note > 119) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint8_t>(note);
+}
+
 [[nodiscard]] std::optional<std::uint8_t> layerMidiNote(
     const CompositeLayer& layer,
     std::uint8_t root_midi_note) noexcept;

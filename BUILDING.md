@@ -194,6 +194,10 @@ ctest --test-dir build --output-on-failure
   - Windows共有モード・イベント駆動WASAPI出力
 - `mgstc`
   - 1組の共有エンジン・WASAPI／ASIO選択出力・MIDI入力を使用するアプリ本体
+- `mgstc_vst3`
+  - 48kHz 最小 VST3 Instrument。`mgstc_engine` と `juce_audio_processors` のみ。WASAPI／ASIO／Windows MIDI は開かない。ビルド後にシステムへ自動コピーしない（`COPY_PLUGIN_AFTER_BUILD` は FALSE）
+- `mgstc_realtime_engine_host_tests` / `mgstc_vst3_processor_tests`
+  - Audio Thread 直接 Note API、MIDI sample offset、複数 instance、非48kHz 無音化
 - `mgstc_stereo_sample_rate_converter_tests`
   - ASIO向け48kHz→44.1／48／96kHzステレオ変換の連続性・左右同期テスト
 
@@ -202,6 +206,14 @@ ctest --test-dir build --output-on-failure
 ```powershell
 .\build\mgstc.exe
 ```
+
+VST3 bundle は JUCE artefacts 配下に生成される（構成ディレクトリは `tools\build.cmd` が選ぶ中間 Build tree）。典型例:
+
+```text
+<build-tree>\mgstc_vst3_artefacts\<Config>\VST3\MGS Tone Craft.vst3
+```
+
+DAW のプラグインパスへこの bundle を追加するか、ホストのスキャン対象に含める。Stage B は 48,000 Hz のみ発音する。
 
 音源エミュレータの固定コミットとライセンスは
 [THIRD_PARTY.md](THIRD_PARTY.md)を参照する。
