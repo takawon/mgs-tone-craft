@@ -45,7 +45,6 @@
 #include "ui_fonts.hpp"
 #include "ui_layout.hpp"
 #include "ui_paint.hpp"
-#include "rate_envelope_trace.hpp"
 #include "ui_focus.hpp"
 #include "ui_modal_dialog.hpp"
 #include "juce_chip_tracks.hpp"
@@ -61,7 +60,7 @@
 #include "tone_library_session.hpp"
 #include "tone_import_tab.hpp"
 #include "import_preview_engine.hpp"
-#include "composite_envelope_compile.hpp"
+
 #include "switch_look_and_feel.hpp"
 #include "mgstc_look_and_feel.hpp"
 #include "about_panel.hpp"
@@ -71,6 +70,7 @@
 #include "mgstc/engine/chip_rack.hpp"
 #include "mgstc/engine/chip_volume_curve.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
+#include "mgstc/engine/composite_program_compiler.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/volume.hpp"
 #include "mgstc/engine/envelope_sequence.hpp"
@@ -8010,19 +8010,6 @@ private:
             juce::dontSendNotification);
     }
 
-    [[nodiscard]] static std::uint8_t trackFor(
-        const mgstc::engine::CompositeLayer& layer) {
-        switch (layer.source) {
-        case mgstc::engine::TimbreSource::Psg:
-            return layer.channel;
-        case mgstc::engine::TimbreSource::Scc:
-            return static_cast<std::uint8_t>(3 + layer.channel);
-        case mgstc::engine::TimbreSource::Opll:
-            return static_cast<std::uint8_t>(8 + layer.channel);
-        }
-        return 0;
-    }
-
     void publishSpectrogramSourceMask() const {
         if (!spectrogram_source_mask_changed_) {
             return;
@@ -8042,55 +8029,6 @@ private:
             }
         }
         spectrogram_source_mask_changed_(mask);
-    }
-
-    [[nodiscard]] std::array<std::uint8_t, 3>
-    audibleLayerCounts() const {
-        std::array<std::uint8_t, 3> counts{};
-        const auto& timbre = timbre_;
-        for (std::size_t index = 0; index < timbre.layers.size(); ++index) {
-            if (!mgstc::engine::layerIsAudible(timbre, index)) {
-                continue;
-            }
-            ++counts[static_cast<std::size_t>(timbre.layers[index].source)];
-        }
-        return counts;
-    }
-
-    [[nodiscard]] std::uint8_t compositeVoiceCapacity(
-        const std::array<std::uint8_t, 3>& counts) const {
-        constexpr std::array<std::uint8_t, 3> capacities{3, 5, 9};
-        std::uint8_t result = 9;
-        bool has_source = false;
-        for (std::size_t source = 0; source < counts.size(); ++source) {
-            if (counts[source] == 0) {
-                continue;
-            }
-            has_source = true;
-            result = std::min<std::uint8_t>(
-                result,
-                static_cast<std::uint8_t>(
-                    capacities[source] / counts[source]));
-        }
-        return has_source ? std::max<std::uint8_t>(result, 1) : 1;
-    }
-
-    [[nodiscard]] std::uint8_t trackForVoice(
-        std::size_t layer_index,
-        std::uint8_t voice,
-        const std::array<std::uint8_t, 3>& counts) const {
-        const auto& layer = timbre_.layers[layer_index];
-        const auto source = static_cast<std::size_t>(layer.source);
-        std::uint8_t ordinal = 0;
-        for (std::size_t index = 0; index < layer_index; ++index) {
-            if (mgstc::engine::layerIsAudible(timbre_, index)
-                && timbre_.layers[index].source == layer.source) {
-                ++ordinal;
-            }
-        }
-        constexpr std::array<std::uint8_t, 3> bases{0, 3, 8};
-        return static_cast<std::uint8_t>(
-            bases[source] + voice * counts[source] + ordinal);
     }
 
     void prepareEngineForProgramEdit() {
@@ -8113,181 +8051,19 @@ private:
         if (!edit.valid()) {
             return false;
         }
-        const auto scc = mgstc::engine::generateSccPreset(
-            mgstc::engine::SccWavePreset::Sine,
-            mgstc::engine::SccHarmonic::One);
-        std::array<std::uint8_t, 32> raw_scc{};
-        std::transform(
-            scc.begin(),
-            scc.end(),
-            raw_scc.begin(),
-            [](std::int8_t sample) {
-                return static_cast<std::uint8_t>(sample);
-            });
-        auto opll = mgstc::engine::encodeOpllPatch(
-            mgstc::engine::defaultOpllPatch());
-        const auto& program_timbre = timbre_;
-        for (const auto& layer : program_timbre.layers) {
-            if (!layer.base_timbre
-                || layer.base_timbre->source != layer.source) {
-                continue;
-            }
-            if (layer.source
-                == mgstc::engine::TimbreSource::Scc) {
-                raw_scc = layer.base_timbre->scc_waveform;
-            } else if (layer.source
-                       == mgstc::engine::TimbreSource::Opll) {
-                opll = layer.base_timbre->opll_registers;
-            }
-        }
-        const auto numbers =
-            mgstc::engine::resolveTimbreNumbers(program_timbre);
-        bool configured =
-            edit.engine->session().mapper().defineSccPatch(0, raw_scc)
-                == mgstc::engine::MapError::None
-            && edit.engine->session().mapper()
-                   .defineOpllOriginalPatch(16, opll)
-                == mgstc::engine::MapError::None;
-        for (const auto& assignment : numbers.assignments) {
-            const mgstc::engine::SavedTimbreReference* snap =
-                mgstc::engine::findEmbeddedTimbreSnapshot(
-                    program_timbre, assignment.library_id);
-            mgstc::engine::SavedTimbreReference live_ref;
-            if (snap == nullptr) {
-                if (const auto* live =
-                        timbre_library_.find(assignment.library_id)) {
-                    live_ref = mgstc::engine::makeSavedTimbreReference(*live);
-                    snap = &live_ref;
-                }
-            }
-            if (snap == nullptr) {
-                configured = false;
-                break;
-            }
-            if (snap->source == mgstc::engine::TimbreSource::Scc) {
-                configured = configured
-                    && edit.engine->session().mapper().defineSccPatch(
-                           assignment.number, snap->scc_waveform)
-                        == mgstc::engine::MapError::None;
-                if (snap->manual_number
-                    && *snap->manual_number != assignment.number) {
-                    configured = configured
-                        && edit.engine->session().mapper().defineSccPatch(
-                               *snap->manual_number, snap->scc_waveform)
-                            == mgstc::engine::MapError::None;
-                }
-            } else if (snap->source
-                       == mgstc::engine::TimbreSource::Opll) {
-                configured = configured
-                    && edit.engine->session().mapper()
-                           .defineOpllOriginalPatch(
-                               assignment.number, snap->opll_registers)
-                        == mgstc::engine::MapError::None;
-                if (snap->manual_number
-                    && *snap->manual_number != assignment.number
-                    && *snap->manual_number > 14) {
-                    configured = configured
-                        && edit.engine->session().mapper()
-                               .defineOpllOriginalPatch(
-                                   *snap->manual_number,
-                                   snap->opll_registers)
-                            == mgstc::engine::MapError::None;
-                }
-            }
-        }
-        const auto counts = audibleLayerCounts();
-        const auto voice_capacity = compositeVoiceCapacity(counts);
-        auto spectrum_map = mgstc::engine::identitySpectrumChannelMap();
-        for (std::uint8_t voice = 0; voice < voice_capacity; ++voice)
-            for (std::size_t index = 0; index < program_timbre.layers.size(); ++index)
-                if (mgstc::engine::layerIsAudible(program_timbre, index))
-                    spectrum_map[trackForVoice(index, voice, counts)] = trackFor(program_timbre.layers[index]);
-        edit.engine->setSpectrumChannelMap(spectrum_map);
-        voice_allocator_.setChannelCount(voice_capacity);
-        voice_allocator_.setPolyphonic(performance_keyboard_.polyphonic());
         static_cast<void>(
             mgstc::engine::enforceOpllRegisterAutoExclusivity(timbre_));
-        const bool polyphonic = performance_keyboard_.polyphonic();
-        for (std::uint8_t voice = 0; voice < voice_capacity; ++voice) {
-          // First composite voice keeps per-OPLL-layer y / TL/FB auto.
-          // Later poly voices omit shared original-tone y (regs 0–7).
-          const bool include_original_tone_y =
-              !polyphonic || voice == 0;
-          for (std::size_t index = 0; index < program_timbre.layers.size(); ++index) {
-            const auto& layer = program_timbre.layers[index];
-            if (!mgstc::engine::layerIsAudible(program_timbre, index)) {
-                continue;
-            }
-            const auto track = trackForVoice(index, voice, counts);
-            const bool expand_tl = include_original_tone_y
-                && mgstc::engine::opllRegisterAutoOwnedByLayer(
-                       program_timbre,
-                       index,
-                       mgstc::engine::OpllRegisterAutoTarget::TotalLevel);
-            const bool expand_fb = include_original_tone_y
-                && mgstc::engine::opllRegisterAutoOwnedByLayer(
-                       program_timbre,
-                       index,
-                       mgstc::engine::OpllRegisterAutoTarget::Feedback);
-            const bool rate_kind =
-                layer.volume_envelope.kind
-                == mgstc::engine::EnvelopeKind::Rate;
-            if (rate_kind) {
-                const auto rate = mgstc::engine::clampRateEnvelope(
-                    layer.volume_envelope.rate);
-                configured = configured
-                    && edit.engine->session().setRateEnvelope(
-                        track,
-                        mgstc::app::rateDefinitionFrom(rate),
-                        layer.volume);
-            } else {
-                auto envelopes = compileCompositeEnvelopes(
-                    layer,
-                    numbers,
-                    &timbre_library_,
-                    include_original_tone_y,
-                    expand_tl,
-                    expand_fb);
-                configured = configured
-                    && edit.engine->session().setCompositeSequenceEnvelopes(
-                        track,
-                        std::move(envelopes.volume),
-                        std::move(envelopes.pitch),
-                        std::move(envelopes.timbre));
-            }
-            configured = configured
-                && edit.engine->session().setTrackVolume(
-                    track, layer.volume)
-                && edit.engine->session().setTrackDetune(
-                    track, layer.detune, layer.micro_detune)
-                && edit.engine->session().setTrackPatch(
-                    track,
-                    mgstc::engine::layerBasePatchNumber(layer, &numbers))
-                && edit.engine->session().setTrackSoftwareLfo(
-                    track, layer.software_lfo)
-                && edit.engine->session().setTrackPitchSweep(
-                    track, layer.pitch_sweep)
-                && edit.engine->session().setTrackKeyOffHang(
-                    track, layer.key_off_hang)
-                && edit.engine->session().setTrackOpllSustain(
-                    track,
-                    layer.source == mgstc::engine::TimbreSource::Opll
-                        && layer.opll_sustain);
-            if (layer.source == mgstc::engine::TimbreSource::Psg) {
-                const auto rate = mgstc::engine::clampRateEnvelope(
-                    layer.volume_envelope.rate);
-                const auto mixer = rate_kind
-                    ? rate
-                    : mgstc::engine::sequenceEnvelopeMixer(
-                          layer.volume_envelope.rate);
-                configured = configured
-                    && edit.engine->session().setPsgToneNoise(
-                        track, mixer.tone_mode, mixer.noise)
-                    && edit.engine->session().setPsgFixedVolume(
-                        track, layer.volume);
-            }
-          }
-        }
+        mgstc::engine::CompositePlaybackPlan plan;
+        const bool configured = mgstc::engine::compileCompositeProgram(
+            *edit.engine,
+            timbre_,
+            {
+                .polyphonic = performance_keyboard_.polyphonic(),
+                .library = &timbre_library_,
+            },
+            &plan);
+        voice_allocator_.setChannelCount(plan.voice_capacity);
+        voice_allocator_.setPolyphonic(performance_keyboard_.polyphonic());
         if (!configured) {
             static_cast<void>(engine_.discardProgramEdit(edit));
             return false;
@@ -8377,28 +8153,23 @@ private:
             stopCompositeVoice(assignment.channel);
         }
         const auto& note_timbre = timbre_;
-        const auto counts = audibleLayerCounts();
+        const auto plan =
+            mgstc::engine::buildCompositePlaybackPlan(note_timbre);
         double maximum_delay_ms = 0.0;
-        for (std::size_t index = 0; index < note_timbre.layers.size(); ++index) {
+        for (const auto& binding : plan.audible_layers) {
             if (audition_layer_filter_
-                && index != *audition_layer_filter_) {
+                && binding.layer_index != *audition_layer_filter_) {
                 continue;
             }
-            const auto& layer = note_timbre.layers[index];
-            if (!mgstc::engine::layerIsAudible(note_timbre, index)) {
-                continue;
-            }
+            const auto& layer = note_timbre.layers[binding.layer_index];
             const auto note = mgstc::engine::layerMidiNote(
                 layer, base_note);
             if (!note) {
                 continue;
             }
-            const auto track = trackForVoice(
-                index, assignment.channel, counts);
-            const double delay_ms = mgstc::engine::startDelayMilliseconds(
-                layer.start_delay_form,
-                layer.start_delay_value,
-                note_timbre.playback_tempo);
+            const auto track =
+                plan.physicalTrack(binding, assignment.channel);
+            const double delay_ms = binding.start_delay_ms;
             maximum_delay_ms =
                 juce::jmax(maximum_delay_ms, delay_ms);
             if (delay_ms <= 0.0) {
@@ -8442,12 +8213,9 @@ private:
     }
 
     void stopCompositeVoice(std::uint8_t voice) {
-        const auto counts = audibleLayerCounts();
-        for (std::size_t index = 0; index < timbre_.layers.size(); ++index) {
-            if (!mgstc::engine::layerIsAudible(timbre_, index)) {
-                continue;
-            }
-            const auto track = trackForVoice(index, voice, counts);
+        const auto plan = mgstc::engine::buildCompositePlaybackPlan(timbre_);
+        for (const auto& binding : plan.audible_layers) {
+            const auto track = plan.physicalTrack(binding, voice);
             static_cast<void>(engine_.submit(
                 mgstc::engine::EngineCommand::noteOff(track)));
             if (track >= kOpllTrack) {

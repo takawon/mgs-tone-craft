@@ -105,7 +105,27 @@ public:
         return spectrum_context_.load(std::memory_order_acquire);
     }
 
+    // Audio thread only. Drains the control SPSC (program load, mixer, …).
+    // DAW MIDI must not be pushed into that queue; use the realtime note
+    // APIs below and then renderAudio().
+    void servicePendingControlCommands() noexcept;
+
+    // Audio thread only. Renders the active program. Does not touch the
+    // control SPSC.
+    [[nodiscard]] RenderResult renderAudio(
+        std::span<float> interleaved_stereo) noexcept;
+
+    // Audio thread only. Direct RuntimeSession note ops on the active
+    // program. Not routed through EngineCommand SPSC.
+    [[nodiscard]] bool realtimeNoteOn(
+        std::uint8_t track,
+        std::uint8_t midi_note) noexcept;
+    [[nodiscard]] bool realtimeNoteOff(std::uint8_t track) noexcept;
+    [[nodiscard]] bool realtimeSilenceTrack(std::uint8_t track) noexcept;
+    void realtimeStop() noexcept;
+
     // Audio thread only. Commands are drained before the first sample.
+    // Compatible facade: servicePendingControlCommands() then renderAudio().
     [[nodiscard]] RenderResult render(
         std::span<float> interleaved_stereo) noexcept;
 

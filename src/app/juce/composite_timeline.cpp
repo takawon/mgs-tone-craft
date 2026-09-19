@@ -16,7 +16,8 @@
 
 #include <juce_gui_extra/juce_gui_extra.h>
 
-#include "composite_envelope_compile.hpp"
+#include "mgstc/engine/composite_envelope_compile.hpp"
+#include "mgstc/engine/composite_program_compiler.hpp"
 #include "juce_chip_tracks.hpp"
 #include "juce_utf8.hpp"
 #include "last_audition_note.hpp"
@@ -1621,7 +1622,7 @@ void paintRateEnvelopeHandles(
 [[nodiscard]] mgstc::engine::RateEnvelopeHandleLayout
 rateEnvelopeHandlesForLayer(const mgstc::engine::CompositeLayer& layer) {
     return mgstc::engine::rateEnvelopeHandleLayout(
-        mgstc::app::rateDefinitionFrom(
+        mgstc::engine::rateEnvelopeDefinitionFrom(
             mgstc::engine::clampRateEnvelope(layer.volume_envelope.rate)),
         layer.source != mgstc::engine::TimbreSource::Opll);
 }
@@ -2172,7 +2173,7 @@ private:
         }
         auto rate = readRate();
         const auto next = mgstc::engine::applyRateEnvelopeHandleDrag(
-            mgstc::app::rateDefinitionFrom(rate),
+            mgstc::engine::rateEnvelopeDefinitionFrom(rate),
             kind,
             seconds,
             level,
@@ -2196,7 +2197,7 @@ private:
             colourForTimbreSource(source_),
             source_,
             mgstc::engine::rateEnvelopeHandleLayout(
-                mgstc::app::rateDefinitionFrom(rate),
+                mgstc::engine::rateEnvelopeDefinitionFrom(rate),
                 softwareRelease()),
             true);
     }
@@ -6205,7 +6206,7 @@ private:
         }
         const int end_count = static_cast<int>(
             layer.envelope_timeline.length_counts);
-        const auto sampled = sampleCompositeVolumeLane(layer, end_count);
+        const auto sampled = mgstc::engine::sampleCompositeVolumeLane(layer, end_count);
         const auto draw_output_span = [&](int start, int stop) {
             const int last = juce::jmin(stop, end_count);
             for (int count = start; count < last; ++count) {

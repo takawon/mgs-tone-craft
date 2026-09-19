@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace mgstc::engine {
@@ -16,10 +17,15 @@ class SequentialVoiceAllocator {
 public:
     explicit SequentialVoiceAllocator(std::uint8_t channel_count);
 
-    [[nodiscard]] VoiceAssignment noteOn(std::uint8_t note);
+    [[nodiscard]] VoiceAssignment noteOn(std::uint8_t note) noexcept;
     [[nodiscard]] std::optional<std::uint8_t>
     noteOff(std::uint8_t note) noexcept;
     [[nodiscard]] std::vector<std::uint8_t> allNotesOff();
+    // Audio-thread safe: writes cleared voice indices into `channels_out`
+    // (truncated if the span is short) and returns the number of voices
+    // that were active.
+    [[nodiscard]] std::size_t allNotesOff(
+        std::span<std::uint8_t> channels_out) noexcept;
 
     void setChannelCount(std::uint8_t channel_count);
     void setPolyphonic(bool polyphonic);

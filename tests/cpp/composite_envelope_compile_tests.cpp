@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-#include "../../src/app/juce/composite_envelope_compile.hpp"
-
+#include "mgstc/engine/composite_envelope_compile.hpp"
+#include "mgstc/engine/composite_program_compiler.hpp"
+#include "mgstc/engine/composite_timbre.hpp"
 #include "mgstc/engine/engine_command.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/realtime_engine_host.hpp"
 #include "mgstc/engine/tone_import.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -15,6 +17,10 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+using mgstc::engine::compileCompositeEnvelopeLane;
+using mgstc::engine::compileCompositeEnvelopes;
+using mgstc::engine::CompositeEnvelopeLane;
 
 namespace {
 
@@ -436,6 +442,189 @@ void testEayzs004Envelope26RealtimeHostPreview() {
     require(peak > 0.001, "EAYZS004 @e26 host preview rendered silence");
 }
 
+void testTrackMappingMatchesLegacyLayout() {
+    using namespace mgstc::engine;
+    auto timbre = defaultCompositeTimbre();
+    const auto plan = buildCompositePlaybackPlan(timbre);
+    require(plan.voice_capacity == 3, "PSG+SCC+OPLL capacity should be 3");
+    require(plan.audible_counts[0] == 1, "one audible PSG layer");
+    require(plan.audible_counts[1] == 1, "one audible SCC layer");
+    require(plan.audible_counts[2] == 1, "one audible OPLL layer");
+    require(plan.audible_layers.size() == 3, "three audible layers");
+    require(
+        plan.physicalTrack(plan.audible_layers[0], 0) == 0,
+        "PSG voice0 -> track 0");
+    require(
+        plan.physicalTrack(plan.audible_layers[1], 0) == 3,
+        "SCC voice0 -> track 3");
+    require(
+        plan.physicalTrack(plan.audible_layers[2], 0) == 8,
+        "OPLL voice0 -> track 8");
+    require(
+        plan.physicalTrack(plan.audible_layers[0], 1) == 1,
+        "PSG voice1 -> track 1");
+    require(
+        plan.physicalTrack(plan.audible_layers[1], 2) == 5,
+        "SCC voice2 -> track 5");
+    require(
+        plan.physicalTrack(plan.audible_layers[2], 2) == 10,
+        "OPLL voice2 -> track 10");
+    require(
+        authoringTrackForLayer(timbre.layers[0]) == 0,
+        "PSG authoring track");
+    require(
+        authoringTrackForLayer(timbre.layers[1]) == 3,
+        "SCC authoring track");
+    require(
+        authoringTrackForLayer(timbre.layers[2]) == 8,
+        "OPLL authoring track");
+
+    CompositeTimbre two_scc;
+    two_scc.layers = {
+        defaultCompositeTimbre().layers[1],
+        defaultCompositeTimbre().layers[1],
+    };
+    two_scc.layers[0].channel = 0;
+    two_scc.layers[1].channel = 1;
+    const auto scc_plan = buildCompositePlaybackPlan(two_scc);
+    require(scc_plan.voice_capacity == 2, "two SCC layers -> capacity 2");
+    require(
+        scc_plan.physicalTrack(scc_plan.audible_layers[0], 0) == 3,
+        "SCC layer0 voice0 -> 3");
+    require(
+        scc_plan.physicalTrack(scc_plan.audible_layers[1], 0) == 4,
+        "SCC layer1 voice0 -> 4");
+    require(
+        scc_plan.physicalTrack(scc_plan.audible_layers[0], 1) == 5,
+        "SCC layer0 voice1 -> 5");
+    require(
+        scc_plan.physicalTrack(scc_plan.audible_layers[1], 1) == 6,
+        "SCC layer1 voice1 -> 6");
+    require(
+        physicalTrackForVoice(two_scc, 1, 1, scc_plan.audible_counts) == 6,
+        "legacy physicalTrackForVoice mismatch");
+}
+
+void testVoiceCapacityMatchesLegacyFormula() {
+    using namespace mgstc::engine;
+    require(compositeVoiceCapacity({0, 0, 0}) == 1, "empty capacity");
+    require(compositeVoiceCapacity({1, 0, 0}) == 3, "one PSG -> 3");
+    require(compositeVoiceCapacity({0, 1, 0}) == 5, "one SCC -> 5");
+    require(compositeVoiceCapacity({0, 0, 1}) == 9, "one OPLL -> 9");
+    require(compositeVoiceCapacity({1, 1, 1}) == 3, "one of each -> 3");
+    require(compositeVoiceCapacity({2, 0, 0}) == 1, "two PSG -> 1");
+    require(compositeVoiceCapacity({3, 0, 0}) == 1, "three PSG -> 1");
+    require(compositeVoiceCapacity({0, 2, 0}) == 2, "two SCC -> 2");
+    require(compositeVoiceCapacity({0, 3, 0}) == 1, "three SCC -> 1");
+    require(compositeVoiceCapacity({1, 0, 5}) == 1, "PSG+5 OPLL -> 1");
+
+    auto timbre = defaultCompositeTimbre();
+    timbre.layers[0].muted = true;
+    const auto counts = audibleLayerCounts(timbre);
+    require(counts[0] == 0, "muted PSG is not audible");
+    require(compositeVoiceCapacity(counts) == 5, "muted PSG leaves SCC cap 5");
+}
+
+void testRateEnvelopeDefinitionFromCopiesRuntimeFields() {
+    using namespace mgstc::engine;
+    RateEnvelope rate{};
+    rate.tone_mode = 2;
+    rate.noise = 7;
+    rate.attack_level = 10;
+    rate.attack_rate = 20;
+    rate.decay_rate = 30;
+    rate.sustain_level = 40;
+    rate.sustain_rate = 50;
+    rate.release_rate = 60;
+    const auto definition = rateEnvelopeDefinitionFrom(rate);
+    require(definition.attack_level == 10, "AL");
+    require(definition.attack_rate == 20, "AR");
+    require(definition.decay_rate == 30, "DR");
+    require(definition.sustain_level == 40, "SL");
+    require(definition.sustain_rate == 50, "SR");
+    require(definition.release_rate == 60, "RR");
+}
+
+void testCompileCompositeProgramConfiguresMappedTracks() {
+    using namespace mgstc::engine;
+    auto timbre = defaultCompositeTimbre();
+    timbre.layers[0].volume = 12;
+    timbre.layers[0].detune = 3;
+    timbre.layers[1].volume = 11;
+    timbre.layers[2].volume = 10;
+    timbre.layers[2].relative_semitones = 12;
+    timbre.layers[2].start_delay_form = StartDelayForm::AbsoluteTicks;
+    timbre.layers[2].start_delay_value = 6;
+
+    EngineCore engine;
+    CompositePlaybackPlan plan;
+    require(
+        compileCompositeProgram(
+            engine,
+            timbre,
+            {.polyphonic = false},
+            &plan),
+        "compileCompositeProgram failed");
+    require(plan.voice_capacity == 3, "default capacity");
+    require(
+        plan.audible_layers[2].start_delay_ms == 100.0,
+        "r%6 should be 100ms");
+    require(
+        plan.audible_layers[2].relative_semitones == 12,
+        "relative semitone dropped");
+
+    require(engine.session().queueNoteOn(0, 60), "PSG noteOn");
+    require(engine.session().queueNoteOn(3, 60), "SCC noteOn");
+    require(engine.session().queueNoteOn(8, 72), "OPLL noteOn");
+    const auto tick = engine.session().processTick();
+    require(tick.ok(), "first tick after compile");
+    require(!engine.session().writes().empty(), "compiled program wrote nothing");
+
+    std::array<float, 800> pcm{};
+    double peak = 0.0;
+    for (int frame = 0; frame < 60; ++frame) {
+        const auto render_result = engine.render(pcm);
+        require(render_result.ok(), "render after compileCompositeProgram");
+        for (const auto sample : pcm) {
+            peak = std::max(peak, static_cast<double>(std::fabs(sample)));
+        }
+    }
+    require(peak > 0.001, "compiled default composite rendered silence");
+}
+
+void testCompileCompositeProgramRateEnvelopeRenders() {
+    using namespace mgstc::engine;
+    CompositeTimbre timbre;
+    CompositeLayer layer;
+    layer.source = TimbreSource::Psg;
+    layer.enabled = true;
+    layer.volume = 15;
+    layer.volume_envelope.kind = EnvelopeKind::Rate;
+    seedDefaultRateEnvelope(layer.volume_envelope.rate, TimbreSource::Psg);
+    timbre.layers.push_back(layer);
+
+    EngineCore engine;
+    CompositePlaybackPlan plan;
+    require(
+        compileCompositeProgram(engine, timbre, {}, &plan),
+        "rate program compile failed");
+    require(plan.voice_capacity == 3, "single PSG rate capacity");
+    require(plan.physicalTrack(0, 0) == 0, "rate PSG track 0");
+    require(engine.session().queueNoteOn(0, 60), "rate noteOn");
+    require(engine.session().processTick().ok(), "rate first tick");
+
+    std::array<float, 800> pcm{};
+    double peak = 0.0;
+    for (int frame = 0; frame < 60; ++frame) {
+        const auto render_result = engine.render(pcm);
+        require(render_result.ok(), "rate render fault");
+        for (const auto sample : pcm) {
+            peak = std::max(peak, static_cast<double>(std::fabs(sample)));
+        }
+    }
+    require(peak > 0.001, "compiled rate envelope rendered silence");
+}
+
 int main() {
     try {
         testLoopEndPitchBeforeCloseBracket();
@@ -444,6 +633,11 @@ int main() {
         testEayzs004Envelope26Renders();
         testEayzs004AllCompositeImportsConfigure();
         testEayzs004Envelope26RealtimeHostPreview();
+        testTrackMappingMatchesLegacyLayout();
+        testVoiceCapacityMatchesLegacyFormula();
+        testRateEnvelopeDefinitionFromCopiesRuntimeFields();
+        testCompileCompositeProgramConfiguresMappedTracks();
+        testCompileCompositeProgramRateEnvelopeRenders();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
