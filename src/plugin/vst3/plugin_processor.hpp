@@ -5,16 +5,20 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <span>
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "host_engine_timeline.hpp"
 #include "layer_delay_scheduler.hpp"
+#include "plugin_state.hpp"
 #include "vst3_diagnostic.hpp"
 #include "mgstc/audio/stereo_sample_rate_converter.hpp"
 #include "mgstc/engine/composite_program_compiler.hpp"
+#include "mgstc/engine/opll_patch.hpp"
 #include "mgstc/engine/realtime_engine_host.hpp"
+#include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/voice_allocator.hpp"
 
 namespace mgstc::plugin {
@@ -22,6 +26,7 @@ namespace mgstc::plugin {
 class MgstcAudioProcessor final : public juce::AudioProcessor {
 public:
     static constexpr double kEngineSampleRate = 48'000.0;
+    static constexpr std::uint8_t kMaxVoices = 16;
     static constexpr int kScratchFrames = 2048;
     static constexpr std::size_t kSrcChunkMaxFrames = 2048;
     static constexpr std::size_t kMappedEventCapacity = 1024;
@@ -58,6 +63,49 @@ public:
 
     void getStateInformation(juce::MemoryBlock& destData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
+
+    // Message thread. The editor is not the state authority.
+    [[nodiscard]] PluginStateDocument copyPluginState() const;
+    [[nodiscard]] bool replacePluginState(PluginStateDocument document);
+
+    // Message-thread editor delegation. Does not open OS audio, MIDI,
+    // MAmidi, or the tone library. Shared-wave audition is runtime only
+    // and is not written into Plugin State.
+    [[nodiscard]] bool replaceEditorComposite(
+        mgstc::engine::CompositeTimbre sound,
+        bool polyphonic,
+        std::uint8_t& voice_capacity);
+    [[nodiscard]] bool editorNoteOn(
+        std::uint8_t track,
+        std::uint8_t note);
+    [[nodiscard]] bool editorNoteOff(std::uint8_t track);
+    void editorSilenceTrack(std::uint8_t track);
+    void editorFlushPending();
+    void editorSetMasterVolumePercent(int percent);
+    [[nodiscard]] int editorMasterVolumePercent() const noexcept;
+    [[nodiscard]] std::uint64_t editorMasterVolumeRevision() const noexcept;
+    void editorPublishSharedScc(const mgstc::engine::SccWaveform& waveform);
+    void editorPublishSharedOpll(
+        const mgstc::engine::OpllPatchParameters& patch);
+    [[nodiscard]] bool editorAuditionShared(
+        const mgstc::engine::SccWaveform& waveform,
+        const mgstc::engine::OpllPatchParameters& patch,
+        bool retrigger,
+        std::uint8_t track,
+        std::uint8_t note,
+        bool commit_scc,
+        bool commit_opll);
+    [[nodiscard]] bool editorRestoreCommittedProgram();
+    [[nodiscard]] const mgstc::engine::SccWaveform&
+    editorSharedScc() const noexcept;
+    [[nodiscard]] std::uint64_t editorSharedSccRevision() const noexcept;
+    [[nodiscard]] const mgstc::engine::OpllPatchParameters&
+    editorSharedOpll() const noexcept;
+    [[nodiscard]] std::uint64_t editorSharedOpllRevision() const noexcept;
+    [[nodiscard]] bool editorSharedProgramActive() const noexcept;
+    [[nodiscard]] bool editorProgramReady() const noexcept;
+    void editorNoteBlockedBackendCall() noexcept;
+    [[nodiscard]] std::uint64_t editorBlockedBackendCalls() const noexcept;
 
 private:
     friend struct MgstcAudioProcessorTestAccess;
@@ -153,11 +201,42 @@ private:
     void processSrcZeroBlock(
         juce::AudioBuffer<float>& buffer,
         int num_samples) noexcept;
+    enum class CommitMode : std::uint8_t {
+        Initial,
+        Offline,
+        Live,
+    };
+
+    [[nodiscard]] bool onAudioThread() const noexcept;
+    [[nodiscard]] bool commitPluginState(
+        PluginStateDocument document,
+        CommitMode mode,
+        bool polyphonic = true,
+        std::uint8_t* voice_capacity = nullptr);
+    [[nodiscard]] bool editorSubmitEngine(
+        const mgstc::engine::EngineCommand& command);
+    void applyCommittedPlaybackPlan() noexcept;
+    [[nodiscard]] const mgstc::engine::CompositePlaybackPlan&
+    activePlan() const noexcept;
+    [[nodiscard]] std::uint8_t pickPlanSlot() const noexcept;
+    void poseAsAudioThreadForTest() noexcept;
+    void clearAudioThreadForTest() noexcept;
     [[nodiscard]] bool hostIsEngineRate() const noexcept;
 
     mgstc::engine::RealtimeEngineHost engine_{};
-    mgstc::engine::SequentialVoiceAllocator voices_{1};
-    mgstc::engine::CompositePlaybackPlan plan_{};
+    mgstc::engine::SequentialVoiceAllocator voices_{kMaxVoices};
+    std::array<mgstc::engine::CompositePlaybackPlan, 3> plan_slots_{};
+    std::atomic<std::uint8_t> published_plan_{0};
+    std::atomic<std::uint8_t> acknowledged_plan_{0};
+    std::uint8_t applied_plan_{0};
+    mutable std::mutex state_mu_{};
+    mgstc::engine::CompositeTimbre sound_{};
+    PluginEditorState editor_{};
+    std::uint64_t library_id_{0};
+    std::atomic<std::uint64_t> audio_thread_token_{0};
+    std::atomic<std::uint64_t> state_compile_count_{0};
+    std::atomic<std::uint64_t> state_audio_reject_count_{0};
+    std::atomic<bool> host_prepared_{false};
     LayerDelayScheduler scheduler_{};
     mgstc::audio::StereoSampleRateConverter src_{};
     std::array<TrackLayerState, LayerDelayScheduler::kPhysicalTrackCount>
@@ -170,7 +249,7 @@ private:
     std::array<float, static_cast<std::size_t>(kScratchFrames) * 2>
         scratch_{};
     bool sample_rate_ok_{false};
-    bool program_ready_{false};
+    std::atomic<bool> program_ready_{false};
     bool use_src_{false};
 
     std::array<MappedMidiEvent, kMappedEventCapacity> mapped_events_{};
@@ -194,6 +273,16 @@ private:
     std::uint64_t src_fill_ns_{};
     std::uint64_t src_render_ns_{};
     std::uint64_t copy_ns_{};
+
+    bool editor_shared_program_active_{false};
+    bool editor_runtime_program_temporary_{false};
+    int editor_master_volume_percent_{100};
+    std::uint64_t editor_master_volume_revision_{1};
+    mgstc::engine::SccWaveform editor_shared_scc_{};
+    std::uint64_t editor_shared_scc_revision_{1};
+    mgstc::engine::OpllPatchParameters editor_shared_opll_{};
+    std::uint64_t editor_shared_opll_revision_{1};
+    std::uint64_t editor_blocked_backend_calls_{0};
 
     bool in_process_block_{false};
     std::atomic<std::uint64_t> diag_process_block_{};

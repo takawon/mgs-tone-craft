@@ -10,11 +10,30 @@
 #include <span>
 
 #include "mgstc/engine/composite_timbre.hpp"
+#include "mgstc/engine/engine_command.hpp"
+#include "mgstc/engine/opll_patch.hpp"
+#include "mgstc/engine/opll_register_auto.hpp"
 
 namespace mgstc::plugin {
 namespace {
 
-constexpr std::uint8_t kMaxVoices = 16;
+[[nodiscard]] std::uint64_t currentThreadToken() noexcept {
+    static std::atomic<std::uint64_t> next{1};
+    thread_local const std::uint64_t token =
+        next.fetch_add(1, std::memory_order_relaxed);
+    return token;
+}
+
+struct AudioThreadBinding {
+    std::atomic<std::uint64_t>& token;
+    explicit AudioThreadBinding(std::atomic<std::uint64_t>& token) noexcept
+        : token(token) {
+        token.store(currentThreadToken(), std::memory_order_relaxed);
+    }
+    ~AudioThreadBinding() {
+        token.store(0, std::memory_order_relaxed);
+    }
+};
 
 [[nodiscard]] int clampedMidiSample(int sample_position, int num_samples) noexcept {
     if (sample_position < 0) {
@@ -69,26 +88,11 @@ MgstcAudioProcessor::MgstcAudioProcessor()
           BusesProperties().withOutput(
               "Output", juce::AudioChannelSet::stereo(), true)) {
     engine_.setOpllScopeEnabled(false);
-    auto timbre = stageCSmokeTimbre();
-    auto edit = engine_.beginProgramEdit();
-    if (!edit.valid()) {
-        engine_.discardStuckProgramEdits();
-        edit = engine_.beginProgramEdit();
-    }
-    if (!edit.valid()) {
-        return;
-    }
-    if (!mgstc::engine::compileCompositeProgram(
-            *edit.engine,
-            timbre,
-            {.polyphonic = true},
-            &plan_)) {
-        static_cast<void>(engine_.discardProgramEdit(edit));
-        return;
-    }
-    voices_.setChannelCount(plan_.voice_capacity);
-    voices_.setPolyphonic(true);
-    program_ready_ = engine_.submitProgram(edit);
+    engine_.setSpectrumCaptureEnabled(false);
+    engine_.setSpectrogramCaptureEnabled(false);
+    PluginStateDocument document;
+    document.sound = stageCSmokeTimbre();
+    static_cast<void>(commitPluginState(std::move(document), CommitMode::Initial));
 }
 
 MgstcAudioProcessor::~MgstcAudioProcessor() {
@@ -294,8 +298,11 @@ void MgstcAudioProcessor::prepareToPlay(
     use_src_ = false;
     sample_rate_ok_ = false;
     host_rate_hz_ = 0;
-    if (program_ready_) {
-        voices_.setChannelCount(plan_.voice_capacity);
+    host_prepared_.store(true, std::memory_order_release);
+    if (program_ready_.load(std::memory_order_acquire)) {
+        const auto index = published_plan_.load(std::memory_order_acquire);
+        const auto capacity = plan_slots_[index].voice_capacity;
+        voices_.setActiveChannelCount(capacity == 0 ? 1 : capacity);
         voices_.setPolyphonic(true);
     }
 
@@ -345,6 +352,7 @@ void MgstcAudioProcessor::releaseResources() {
     host_rate_hz_ = 0;
     // Do not report latency 0 here. 7↔0 on deactivate/activate is the
     // Cubase restartComponent loop isolated in Stage D.2.
+    host_prepared_.store(false, std::memory_order_release);
 }
 
 void MgstcAudioProcessor::reset() {
@@ -380,6 +388,7 @@ void MgstcAudioProcessor::processBlock(
     juce::AudioBuffer<float>& buffer,
     juce::MidiBuffer& midi) {
     in_process_block_ = true;
+    AudioThreadBinding audio_thread_binding(audio_thread_token_);
     diag_process_block_.fetch_add(1, std::memory_order_relaxed);
     recordProcessBlockContract(buffer, midi);
     struct ProcessFlag {
@@ -395,7 +404,7 @@ void MgstcAudioProcessor::processBlock(
         }
     }
 
-    if (!sample_rate_ok_ || !program_ready_) {
+    if (!sample_rate_ok_ || !program_ready_.load(std::memory_order_acquire)) {
         buffer.clear();
         midi.clear();
         return;
@@ -409,7 +418,7 @@ void MgstcAudioProcessor::processBlock(
 
     if constexpr (vst3DiagEngineOnlyNon48()) {
         if (!hostIsEngineRate()) {
-            engine_.servicePendingControlCommands();
+            applyCommittedPlaybackPlan();
             processEngineOnlyBlock(buffer, midi, num_samples);
             host_frame_position_ += static_cast<std::uint64_t>(num_samples);
             midi_it_ = {};
@@ -430,7 +439,7 @@ void MgstcAudioProcessor::processBlock(
         }
     }
 
-    engine_.servicePendingControlCommands();
+    applyCommittedPlaybackPlan();
 
     if (use_src_) {
         processResampledBlock(buffer, midi, num_samples);
@@ -928,8 +937,8 @@ void MgstcAudioProcessor::stopTrack(std::uint8_t track, bool hard) noexcept {
 }
 
 void MgstcAudioProcessor::stopVoice(std::uint8_t voice, bool hard) noexcept {
-    for (const auto& binding : plan_.audible_layers) {
-        stopTrack(plan_.physicalTrack(binding, voice), hard);
+    for (const auto& binding : activePlan().audible_layers) {
+        stopTrack(activePlan().physicalTrack(binding, voice), hard);
     }
     scheduler_.cancelVoice(voice);
 }
@@ -937,13 +946,13 @@ void MgstcAudioProcessor::stopVoice(std::uint8_t voice, bool hard) noexcept {
 void MgstcAudioProcessor::startVoice(
     std::uint8_t voice,
     std::uint8_t midi_note) noexcept {
-    for (const auto& binding : plan_.audible_layers) {
+    for (const auto& binding : activePlan().audible_layers) {
         const auto note = mgstc::engine::transposedMidiNote(
             midi_note, binding.relative_semitones);
         if (!note) {
             continue;
         }
-        const auto track = plan_.physicalTrack(binding, voice);
+        const auto track = activePlan().physicalTrack(binding, voice);
         if (!validPhysicalTrack(track)) {
             continue;
         }
@@ -1078,12 +1087,8 @@ void MgstcAudioProcessor::silenceFrom(
     }
 }
 
-juce::AudioProcessorEditor* MgstcAudioProcessor::createEditor() {
-    return nullptr;
-}
-
 bool MgstcAudioProcessor::hasEditor() const {
-    return false;
+    return true;
 }
 
 const juce::String MgstcAudioProcessor::getName() const {
@@ -1133,12 +1138,403 @@ void MgstcAudioProcessor::changeProgramName(
     const juce::String& /*newName*/) {}
 
 void MgstcAudioProcessor::getStateInformation(juce::MemoryBlock& destData) {
-    destData.reset();
+    if (onAudioThread()) {
+        return;
+    }
+    const auto bytes = serializePluginState(copyPluginState());
+    if (bytes.empty()) {
+        destData.reset();
+        return;
+    }
+    destData.replaceAll(bytes.data(), bytes.size());
 }
 
 void MgstcAudioProcessor::setStateInformation(
-    const void* /*data*/,
-    int /*sizeInBytes*/) {}
+    const void* data,
+    int sizeInBytes) {
+    if (onAudioThread()) {
+        state_audio_reject_count_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto parsed = parsePluginState(
+        data,
+        sizeInBytes > 0 ? static_cast<std::size_t>(sizeInBytes) : 0);
+    if (parsed.status != PluginStateStatus::Ok) {
+        return;
+    }
+    const auto mode = host_prepared_.load(std::memory_order_acquire)
+        ? CommitMode::Live
+        : CommitMode::Offline;
+    static_cast<void>(commitPluginState(parsed.document, mode));
+}
+
+PluginStateDocument MgstcAudioProcessor::copyPluginState() const {
+    if (onAudioThread()) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(state_mu_);
+    PluginStateDocument document;
+    document.editor = editor_;
+    document.library_id = library_id_;
+    document.sound = sound_;
+    return document;
+}
+
+bool MgstcAudioProcessor::replacePluginState(PluginStateDocument document) {
+    if (onAudioThread()) {
+        state_audio_reject_count_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto mode = host_prepared_.load(std::memory_order_acquire)
+        ? CommitMode::Live
+        : CommitMode::Offline;
+    return commitPluginState(std::move(document), mode);
+}
+
+bool MgstcAudioProcessor::onAudioThread() const noexcept {
+    const auto key = audio_thread_token_.load(std::memory_order_relaxed);
+    return key != 0 && key == currentThreadToken();
+}
+
+void MgstcAudioProcessor::poseAsAudioThreadForTest() noexcept {
+    audio_thread_token_.store(currentThreadToken(), std::memory_order_relaxed);
+}
+
+void MgstcAudioProcessor::clearAudioThreadForTest() noexcept {
+    audio_thread_token_.store(0, std::memory_order_relaxed);
+}
+
+std::uint8_t MgstcAudioProcessor::pickPlanSlot() const noexcept {
+    const auto published = published_plan_.load(std::memory_order_acquire);
+    const auto acknowledged =
+        acknowledged_plan_.load(std::memory_order_acquire);
+    for (std::uint8_t index = 0; index < plan_slots_.size(); ++index) {
+        if (index != published && index != acknowledged) {
+            return index;
+        }
+    }
+    return static_cast<std::uint8_t>(
+        (published + 1U) % plan_slots_.size());
+}
+
+const mgstc::engine::CompositePlaybackPlan&
+MgstcAudioProcessor::activePlan() const noexcept {
+    return plan_slots_[applied_plan_];
+}
+
+void MgstcAudioProcessor::applyCommittedPlaybackPlan() noexcept {
+    const auto index = published_plan_.load(std::memory_order_acquire);
+    acknowledged_plan_.store(index, std::memory_order_release);
+    engine_.servicePendingControlCommands();
+    if (index == applied_plan_) {
+        return;
+    }
+    resetPlaybackState(true);
+    applied_plan_ = index;
+    const auto capacity = plan_slots_[index].voice_capacity;
+    voices_.setActiveChannelCount(capacity == 0 ? 1 : capacity);
+}
+
+bool MgstcAudioProcessor::commitPluginState(
+    PluginStateDocument document,
+    CommitMode mode,
+    bool polyphonic,
+    std::uint8_t* voice_capacity) {
+    if (onAudioThread()) {
+        state_audio_reject_count_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    static_cast<void>(mgstc::engine::enforceOpllRegisterAutoExclusivity(
+        document.sound));
+    document.sound.playback_tempo = std::clamp(
+        document.sound.playback_tempo,
+        mgstc::engine::kMgscTempoMin,
+        mgstc::engine::kMgscTempoMax);
+    if (!validatePluginSoundSnapshot(document.sound)) {
+        return false;
+    }
+
+    auto edit = engine_.beginProgramEdit();
+    if (!edit.valid()) {
+        engine_.discardStuckProgramEdits();
+        edit = engine_.beginProgramEdit();
+    }
+    if (!edit.valid()) {
+        return false;
+    }
+
+    mgstc::engine::CompositePlaybackPlan plan;
+    state_compile_count_.fetch_add(1, std::memory_order_relaxed);
+    const bool compiled = mgstc::engine::compileCompositeProgram(
+        *edit.engine,
+        document.sound,
+        {.polyphonic = polyphonic},
+        &plan);
+    if (voice_capacity != nullptr) {
+        *voice_capacity = plan.voice_capacity;
+    }
+    if (!compiled) {
+        static_cast<void>(engine_.discardProgramEdit(edit));
+        return false;
+    }
+
+    const auto slot = pickPlanSlot();
+    plan_slots_[slot] = plan;
+
+    PluginStateDocument previous = copyPluginState();
+    {
+        std::lock_guard<std::mutex> lock(state_mu_);
+        sound_ = document.sound;
+        editor_ = document.editor;
+        library_id_ = document.library_id;
+    }
+    if (!engine_.submitProgram(edit)) {
+        static_cast<void>(engine_.discardProgramEdit(edit));
+        std::lock_guard<std::mutex> lock(state_mu_);
+        sound_ = std::move(previous.sound);
+        editor_ = previous.editor;
+        library_id_ = previous.library_id;
+        return false;
+    }
+
+    if (mode == CommitMode::Offline) {
+        std::array<float, 64> drain{};
+        engine_.drainPendingCommands(drain, 32, true);
+    }
+
+    published_plan_.store(slot, std::memory_order_release);
+    program_ready_.store(true, std::memory_order_release);
+    editor_runtime_program_temporary_ = false;
+    if (mode != CommitMode::Live) {
+        applied_plan_ = slot;
+        acknowledged_plan_.store(slot, std::memory_order_release);
+        const auto capacity = plan_slots_[slot].voice_capacity;
+        voices_.setActiveChannelCount(capacity == 0 ? 1 : capacity);
+        voices_.setPolyphonic(true);
+    }
+    return true;
+}
+
+bool MgstcAudioProcessor::replaceEditorComposite(
+    mgstc::engine::CompositeTimbre sound,
+    bool polyphonic,
+    std::uint8_t& voice_capacity) {
+    voice_capacity = 1;
+    if (onAudioThread()) {
+        state_audio_reject_count_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    auto document = copyPluginState();
+    document.sound = std::move(sound);
+    const auto mode = host_prepared_.load(std::memory_order_acquire)
+        ? CommitMode::Live
+        : CommitMode::Offline;
+    return commitPluginState(
+        std::move(document), mode, polyphonic, &voice_capacity);
+}
+
+bool MgstcAudioProcessor::editorSubmitEngine(
+    const mgstc::engine::EngineCommand& command) {
+    if (onAudioThread()) {
+        return false;
+    }
+    if (!engine_.submit(command)) {
+        return false;
+    }
+    if (!host_prepared_.load(std::memory_order_acquire)) {
+        std::array<float, 64> drain{};
+        engine_.drainPendingCommands(drain, 32, true);
+    }
+    return true;
+}
+
+bool MgstcAudioProcessor::editorNoteOn(
+    std::uint8_t track,
+    std::uint8_t note) {
+    return editorSubmitEngine(
+        mgstc::engine::EngineCommand::noteOn(track, note));
+}
+
+bool MgstcAudioProcessor::editorNoteOff(std::uint8_t track) {
+    return editorSubmitEngine(
+        mgstc::engine::EngineCommand::noteOff(track));
+}
+
+void MgstcAudioProcessor::editorSilenceTrack(std::uint8_t track) {
+    static_cast<void>(editorSubmitEngine(
+        mgstc::engine::EngineCommand::silenceTrack(track)));
+}
+
+void MgstcAudioProcessor::editorFlushPending() {
+    if (onAudioThread()
+        || host_prepared_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::array<float, 256> drain{};
+    engine_.drainPendingCommands(drain, 250, true);
+}
+
+void MgstcAudioProcessor::editorSetMasterVolumePercent(int percent) {
+    if (onAudioThread()) {
+        return;
+    }
+    editor_master_volume_percent_ = std::clamp(percent, 0, 100);
+    ++editor_master_volume_revision_;
+}
+
+int MgstcAudioProcessor::editorMasterVolumePercent() const noexcept {
+    return editor_master_volume_percent_;
+}
+
+std::uint64_t MgstcAudioProcessor::editorMasterVolumeRevision()
+    const noexcept {
+    return editor_master_volume_revision_;
+}
+
+void MgstcAudioProcessor::editorPublishSharedScc(
+    const mgstc::engine::SccWaveform& waveform) {
+    if (onAudioThread()) {
+        return;
+    }
+    editor_shared_scc_ = waveform;
+    ++editor_shared_scc_revision_;
+}
+
+void MgstcAudioProcessor::editorPublishSharedOpll(
+    const mgstc::engine::OpllPatchParameters& patch) {
+    if (onAudioThread()) {
+        return;
+    }
+    editor_shared_opll_ = patch;
+    ++editor_shared_opll_revision_;
+}
+
+bool MgstcAudioProcessor::editorAuditionShared(
+    const mgstc::engine::SccWaveform& waveform,
+    const mgstc::engine::OpllPatchParameters& patch,
+    bool retrigger,
+    std::uint8_t track,
+    std::uint8_t note,
+    bool commit_scc,
+    bool commit_opll) {
+    if (onAudioThread()) {
+        return false;
+    }
+    if (commit_scc) {
+        editorPublishSharedScc(waveform);
+    }
+    if (commit_opll) {
+        editorPublishSharedOpll(patch);
+    }
+    auto edit = engine_.beginProgramEdit();
+    if (!edit.valid()) {
+        engine_.discardStuckProgramEdits();
+        edit = engine_.beginProgramEdit();
+    }
+    if (!edit.valid()) {
+        return false;
+    }
+    constexpr std::uint8_t kPsgTrack = mgstc::engine::kCompositePsgTrackBase;
+    constexpr std::uint8_t kSccTrack = mgstc::engine::kCompositeSccTrackBase;
+    constexpr std::uint8_t kOpllTrack = mgstc::engine::kCompositeOpllTrackBase;
+    std::array<std::uint8_t, 32> raw_wave{};
+    std::transform(
+        waveform.begin(),
+        waveform.end(),
+        raw_wave.begin(),
+        [](std::int8_t sample) {
+            return static_cast<std::uint8_t>(sample);
+        });
+    const auto opll_registers = mgstc::engine::encodeOpllPatch(patch);
+    bool configured =
+        edit.engine->session().setSequenceEnvelope(
+            kPsgTrack, {0x40, 0xEF, 0x01, 0x60})
+        && edit.engine->session().setPsgToneNoise(kPsgTrack, 1, 0)
+        && edit.engine->session().setPsgFixedVolume(kPsgTrack, 15)
+        && edit.engine->session().mapper().defineSccPatch(0, raw_wave)
+            == mgstc::engine::MapError::None
+        && edit.engine->session().mapper().defineOpllOriginalPatch(
+               16, opll_registers)
+            == mgstc::engine::MapError::None;
+    for (std::uint8_t scc = kSccTrack; scc < kSccTrack + 5; ++scc) {
+        configured = configured
+            && edit.engine->session().setSequenceEnvelope(
+                scc, {0x10, 0x00, 0x40, 0xEF, 0x01, 0x60})
+            && edit.engine->session().setTrackVolume(scc, 15);
+    }
+    for (std::uint8_t opll = kOpllTrack; opll < kOpllTrack + 9; ++opll) {
+        configured = configured
+            && edit.engine->session().setSequenceEnvelope(
+                opll, {0x10, 0x10, 0x40, 0xEF, 0x01, 0x60});
+    }
+    if (!configured) {
+        static_cast<void>(engine_.discardProgramEdit(edit));
+        return false;
+    }
+    const auto submitted = engine_.submitProgram(
+        edit,
+        {
+            .retrigger = retrigger,
+            .track = track,
+            .midi_note = note,
+        });
+    if (!submitted && edit.valid()) {
+        static_cast<void>(engine_.discardProgramEdit(edit));
+        return false;
+    }
+    if (!host_prepared_.load(std::memory_order_acquire)) {
+        std::array<float, 64> drain{};
+        engine_.drainPendingCommands(drain, 32, true);
+    }
+    editor_shared_program_active_ = true;
+    editor_runtime_program_temporary_ = true;
+    return true;
+}
+
+bool MgstcAudioProcessor::editorRestoreCommittedProgram() {
+    if (!editor_runtime_program_temporary_ || onAudioThread()) {
+        return !editor_runtime_program_temporary_;
+    }
+    auto document = copyPluginState();
+    const auto mode = host_prepared_.load(std::memory_order_acquire)
+        ? CommitMode::Live
+        : CommitMode::Offline;
+    return commitPluginState(std::move(document), mode);
+}
+
+const mgstc::engine::SccWaveform&
+MgstcAudioProcessor::editorSharedScc() const noexcept {
+    return editor_shared_scc_;
+}
+
+std::uint64_t MgstcAudioProcessor::editorSharedSccRevision() const noexcept {
+    return editor_shared_scc_revision_;
+}
+
+const mgstc::engine::OpllPatchParameters&
+MgstcAudioProcessor::editorSharedOpll() const noexcept {
+    return editor_shared_opll_;
+}
+
+std::uint64_t MgstcAudioProcessor::editorSharedOpllRevision() const noexcept {
+    return editor_shared_opll_revision_;
+}
+
+bool MgstcAudioProcessor::editorSharedProgramActive() const noexcept {
+    return editor_shared_program_active_;
+}
+
+bool MgstcAudioProcessor::editorProgramReady() const noexcept {
+    return program_ready_.load(std::memory_order_acquire);
+}
+
+void MgstcAudioProcessor::editorNoteBlockedBackendCall() noexcept {
+    ++editor_blocked_backend_calls_;
+}
+
+std::uint64_t MgstcAudioProcessor::editorBlockedBackendCalls() const noexcept {
+    return editor_blocked_backend_calls_;
+}
 
 }  // namespace mgstc::plugin
 

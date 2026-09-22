@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <vector>
@@ -29,7 +30,13 @@ inline int global_percent = kDefaultPercent;
 inline int active_percent = kDefaultPercent;
 inline float active_factor = 1.0F;
 
-inline std::vector<std::function<void()>> global_listeners;
+struct GlobalListener {
+    std::uint64_t id{};
+    std::function<void()> callback;
+};
+
+inline std::vector<GlobalListener> global_listeners;
+inline std::uint64_t next_listener_id{1};
 
 [[nodiscard]] inline juce::File settingsIniFile() {
     return mgstcApplicationDataDirectory().getChildFile("settings-v1.ini");
@@ -131,14 +138,24 @@ inline void saveGlobalToIni() {
         nullptr, nullptr, nullptr, path.toWideCharPointer()));
 }
 
-inline void addGlobalListener(std::function<void()> listener) {
-    global_listeners.push_back(std::move(listener));
+[[nodiscard]] inline std::uint64_t addGlobalListener(
+    std::function<void()> listener) {
+    const auto id = next_listener_id++;
+    global_listeners.push_back(
+        GlobalListener{id, std::move(listener)});
+    return id;
+}
+
+inline void removeGlobalListener(std::uint64_t id) {
+    std::erase_if(
+        global_listeners,
+        [id](const GlobalListener& item) { return item.id == id; });
 }
 
 inline void notifyGlobalListeners() {
     for (auto& listener : global_listeners) {
-        if (listener) {
-            listener();
+        if (listener.callback) {
+            listener.callback();
         }
     }
 }

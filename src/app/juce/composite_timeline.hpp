@@ -18,9 +18,9 @@ namespace mgstc::engine {
 struct OpllScopeFrame;
 }
 
-class SharedAudioHost;
-
 namespace mgstc::app {
+
+class EditorSession;
 
 struct EnvelopeTimbreCatalogItem {
     std::uint64_t library_id{};
@@ -109,7 +109,7 @@ public:
     void setMutateTimbreMemoCallback(MutateTimbreMemoCallback callback);
     void setLfoSessionCallback(LfoSessionCallback callback);
     void setLfoPollKeysCallback(LfoPollKeysCallback callback);
-    void setAudioService(SharedAudioHost* audio_service) noexcept;
+    void setEditorSession(EditorSession* session) noexcept;
     void setPlaybackTempo(int tempo_bpm);
     void setTimbre(
         const engine::CompositeTimbre& timbre,

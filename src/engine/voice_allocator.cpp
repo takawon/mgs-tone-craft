@@ -7,10 +7,12 @@ namespace mgstc::engine {
 
 SequentialVoiceAllocator::SequentialVoiceAllocator(
     std::uint8_t channel_count)
-    : voices_(std::max<std::uint8_t>(channel_count, 1)) {}
+    : voices_(std::max<std::uint8_t>(channel_count, 1)),
+      active_count_(std::max<std::uint8_t>(channel_count, 1)) {}
 
 VoiceAssignment SequentialVoiceAllocator::noteOn(std::uint8_t note) noexcept {
-    for (std::size_t index = 0; index < voices_.size(); ++index) {
+    const auto usable = static_cast<std::size_t>(active_count_);
+    for (std::size_t index = 0; index < usable; ++index) {
         if (voices_[index].note == note) {
             voices_[index].age = next_age_++;
             return {static_cast<std::uint8_t>(index), note};
@@ -18,19 +20,18 @@ VoiceAssignment SequentialVoiceAllocator::noteOn(std::uint8_t note) noexcept {
     }
 
     std::size_t selected = 0;
+    const auto begin = voices_.begin();
+    const auto end = begin + static_cast<std::ptrdiff_t>(usable);
     if (polyphonic_) {
         const auto free = std::find_if(
-            voices_.begin(), voices_.end(),
-            [](const Voice& voice) { return !voice.note; });
-        if (free != voices_.end()) {
-            selected = static_cast<std::size_t>(
-                std::distance(voices_.begin(), free));
+            begin, end, [](const Voice& voice) { return !voice.note; });
+        if (free != end) {
+            selected = static_cast<std::size_t>(std::distance(begin, free));
         } else {
             selected = static_cast<std::size_t>(std::distance(
-                voices_.begin(),
+                begin,
                 std::min_element(
-                    voices_.begin(), voices_.end(),
-                    [](const Voice& left, const Voice& right) {
+                    begin, end, [](const Voice& left, const Voice& right) {
                         return left.age < right.age;
                     })));
         }
@@ -46,7 +47,8 @@ VoiceAssignment SequentialVoiceAllocator::noteOn(std::uint8_t note) noexcept {
 
 std::optional<std::uint8_t> SequentialVoiceAllocator::noteOff(
     std::uint8_t note) noexcept {
-    for (std::size_t index = 0; index < voices_.size(); ++index) {
+    const auto usable = static_cast<std::size_t>(active_count_);
+    for (std::size_t index = 0; index < usable; ++index) {
         if (voices_[index].note != note) {
             continue;
         }
@@ -59,7 +61,8 @@ std::optional<std::uint8_t> SequentialVoiceAllocator::noteOff(
 std::size_t SequentialVoiceAllocator::allNotesOff(
     std::span<std::uint8_t> channels_out) noexcept {
     std::size_t written = 0;
-    for (std::size_t index = 0; index < voices_.size(); ++index) {
+    const auto usable = static_cast<std::size_t>(active_count_);
+    for (std::size_t index = 0; index < usable; ++index) {
         if (!voices_[index].note) {
             continue;
         }
@@ -88,6 +91,19 @@ void SequentialVoiceAllocator::setChannelCount(
     std::array<std::uint8_t, 16> ignored{};
     static_cast<void>(allNotesOff(ignored));
     voices_.assign(std::max<std::uint8_t>(channel_count, 1), {});
+    active_count_ = static_cast<std::uint8_t>(voices_.size());
+}
+
+void SequentialVoiceAllocator::setActiveChannelCount(
+    std::uint8_t channel_count) noexcept {
+    const auto next = std::max<std::uint8_t>(channel_count, 1);
+    if (static_cast<std::size_t>(next) > voices_.size()) {
+        return;
+    }
+    for (std::size_t index = next; index < active_count_; ++index) {
+        voices_[index] = {};
+    }
+    active_count_ = next;
 }
 
 void SequentialVoiceAllocator::setPolyphonic(bool polyphonic) {
@@ -97,8 +113,11 @@ void SequentialVoiceAllocator::setPolyphonic(bool polyphonic) {
 }
 
 std::size_t SequentialVoiceAllocator::activeVoiceCount() const noexcept {
+    const auto end = voices_.begin()
+        + static_cast<std::ptrdiff_t>(active_count_);
     return static_cast<std::size_t>(std::count_if(
-        voices_.begin(), voices_.end(),
+        voices_.begin(),
+        end,
         [](const Voice& voice) { return voice.note.has_value(); }));
 }
 

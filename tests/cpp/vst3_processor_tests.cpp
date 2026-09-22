@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 #include "plugin_processor.hpp"
+#include "plugin_editor_context.hpp"
 
 #include <algorithm>
 #include <array>
@@ -14,10 +15,13 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "mgstc/engine/chip_rack.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
+#include "mgstc/engine/composite_timbre_library.hpp"
+#include "plugin_state.hpp"
 #include "mgstc/engine/dc_blocker.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/register_write.hpp"
@@ -37,7 +41,7 @@ struct MgstcAudioProcessorTestAccess {
 
     static const mgstc::engine::CompositePlaybackPlan& plan(
         const MgstcAudioProcessor& processor) {
-        return processor.plan_;
+        return processor.activePlan();
     }
 
     static std::size_t noteOnCount(const MgstcAudioProcessor& processor) {
@@ -366,6 +370,34 @@ struct MgstcAudioProcessorTestAccess {
         std::size_t index) {
         return processor.note_on_log_[index].midi_note;
     }
+
+    static std::uint64_t blockedBackendCalls(
+        const MgstcAudioProcessor& processor) {
+        return processor.editor_blocked_backend_calls_;
+    }
+
+    static bool scopeEnabled(const MgstcAudioProcessor& processor) {
+        return processor.engine_.opllScopeEnabled();
+    }
+
+    static std::uint64_t stateCompileCount(
+        const MgstcAudioProcessor& processor) {
+        return processor.state_compile_count_.load(std::memory_order_relaxed);
+    }
+
+    static std::uint64_t stateAudioRejectCount(
+        const MgstcAudioProcessor& processor) {
+        return processor.state_audio_reject_count_.load(
+            std::memory_order_relaxed);
+    }
+
+    static void poseAsAudioThread(MgstcAudioProcessor& processor) {
+        processor.poseAsAudioThreadForTest();
+    }
+
+    static void clearAudioThread(MgstcAudioProcessor& processor) {
+        processor.clearAudioThreadForTest();
+    }
 };
 
 }  // namespace mgstc::plugin
@@ -377,6 +409,7 @@ using mgstc::plugin::delayMillisecondsToEngineFrames;
 using mgstc::plugin::hostFrameToEngineFrame;
 using mgstc::plugin::kVst3DiagOff;
 using mgstc::plugin::MgstcAudioProcessor;
+using mgstc::plugin::PluginEditorContext;
 
 void require(bool value, const char* message) {
     if (!value) {
@@ -2812,6 +2845,590 @@ void testHostRateOverdueNoteIsAppliedNow() {
     }
 }
 
+juce::MemoryBlock stateBytes(MgstcAudioProcessor& processor) {
+    juce::MemoryBlock block;
+    processor.getStateInformation(block);
+    return block;
+}
+
+bool sameBlock(const juce::MemoryBlock& left, const juce::MemoryBlock& right) {
+    if (left.getSize() != right.getSize()) {
+        return false;
+    }
+    const auto* a = static_cast<const std::uint8_t*>(left.getData());
+    const auto* b = static_cast<const std::uint8_t*>(right.getData());
+    return std::equal(a, a + left.getSize(), b);
+}
+
+bool sameBuffer(
+    const juce::AudioBuffer<float>& left,
+    const juce::AudioBuffer<float>& right) {
+    if (left.getNumChannels() != right.getNumChannels()
+        || left.getNumSamples() != right.getNumSamples()) {
+        return false;
+    }
+    for (int channel = 0; channel < left.getNumChannels(); ++channel) {
+        const auto* a = left.getReadPointer(channel);
+        const auto* b = right.getReadPointer(channel);
+        if (!std::equal(a, a + left.getNumSamples(), b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void renderMidiNote(
+    MgstcAudioProcessor& processor,
+    juce::AudioBuffer<float>& out) {
+    processor.prepareToPlay(48'000.0, 256);
+    juce::AudioBuffer<float> warm(2, 256);
+    juce::MidiBuffer empty;
+    processor.processBlock(warm, empty);
+    juce::MidiBuffer on;
+    on.addEvent(
+        juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)),
+        0);
+    out.setSize(2, 256);
+    processor.processBlock(out, on);
+}
+
+std::string soundBytes(const mgstc::engine::CompositeTimbre& timbre) {
+    return mgstc::engine::serializeCompositeSoundPayload(timbre);
+}
+
+mgstc::engine::CompositeTimbre psgOnlyTimbre() {
+    auto timbre = mgstc::engine::defaultCompositeTimbre();
+    timbre.name = "PSG only";
+    timbre.memo = "psg";
+    timbre.tags = {"psg"};
+    timbre.favorite = false;
+    timbre.layers = {timbre.layers[0]};
+    timbre.layers[0].volume = 11;
+    timbre.layers[0].relative_semitones = -2;
+    mgstc::engine::EnvelopeEvent pitch;
+    pitch.kind = mgstc::engine::EnvelopeEventKind::Pitch;
+    pitch.value = -3;
+    pitch.count = 4;
+    timbre.layers[0].pitch_envelope.events.push_back(pitch);
+    return timbre;
+}
+
+mgstc::engine::CompositeTimbre sccOnlyTimbre() {
+    auto timbre = mgstc::engine::defaultCompositeTimbre();
+    auto layer = timbre.layers[1];
+    mgstc::engine::seedDefaultLayerTimbre(timbre, layer);
+    for (std::size_t index = 0; index < layer.base_timbre->scc_waveform.size();
+         ++index) {
+        layer.base_timbre->scc_waveform[index] =
+            static_cast<std::uint8_t>(index * 3U + 1U);
+    }
+    layer.relative_semitones = 3;
+    layer.volume = 12;
+    layer.start_delay_form = mgstc::engine::StartDelayForm::AbsoluteTicks;
+    layer.start_delay_value = 6;
+    layer.software_lfo.enabled = true;
+    layer.software_lfo.delay = 1;
+    layer.software_lfo.depth = 4;
+    layer.software_lfo.speed = 2;
+    timbre.name = "SCC only";
+    timbre.layers = {std::move(layer)};
+    return timbre;
+}
+
+mgstc::engine::CompositeTimbre opllOnlyTimbre() {
+    auto timbre = mgstc::engine::defaultCompositeTimbre();
+    auto layer = timbre.layers[2];
+    layer.base_opll_rom = std::uint8_t{4};
+    layer.volume = 10;
+    layer.relative_semitones = -5;
+    layer.opll_sustain = true;
+    layer.start_delay_form = mgstc::engine::StartDelayForm::AbsoluteTicks;
+    layer.start_delay_value = 12;
+    mgstc::engine::EnvelopeEvent slide;
+    slide.kind = mgstc::engine::EnvelopeEventKind::Timbre;
+    slide.timbre_pick = mgstc::engine::TimbrePick::OpllRom;
+    slide.value = 8;
+    slide.count = 24;
+    layer.timbre_automation.push_back(slide);
+    timbre.name = "OPLL only";
+    timbre.favorite = true;
+    timbre.layers = {std::move(layer)};
+    return timbre;
+}
+
+mgstc::engine::CompositeTimbre compositeTimbre() {
+    auto timbre = mgstc::engine::defaultCompositeTimbre();
+    timbre.name = "Stage E Snapshot";
+    timbre.memo = "self-contained";
+    timbre.tags = {"lead", "stage-e"};
+    timbre.favorite = true;
+    auto scc = sccOnlyTimbre().layers[0];
+    auto opll = opllOnlyTimbre().layers[0];
+    timbre.layers[0] = psgOnlyTimbre().layers[0];
+    timbre.layers[1] = std::move(scc);
+    timbre.layers[2] = std::move(opll);
+    return timbre;
+}
+
+mgstc::plugin::PluginStateDocument documentFrom(
+    mgstc::engine::CompositeTimbre timbre,
+    std::uint64_t library_id,
+    mgstc::plugin::PluginEditorState editor) {
+    mgstc::plugin::PluginStateDocument document;
+    document.sound = std::move(timbre);
+    document.library_id = library_id;
+    document.editor = editor;
+    return document;
+}
+
+void requireSoundRoundTrip(const mgstc::plugin::PluginStateDocument& document) {
+    const auto bytes = mgstc::plugin::serializePluginState(document);
+    require(!bytes.empty(), "plugin state serializes");
+    const auto parsed = mgstc::plugin::parsePluginState(
+        bytes.data(), bytes.size());
+    require(
+        parsed.status == mgstc::plugin::PluginStateStatus::Ok,
+        "plugin state parses");
+    require(
+        soundBytes(parsed.document.sound) == soundBytes(document.sound),
+        "sound payload round-trip");
+    require(parsed.document.sound.name == document.sound.name, "name");
+    require(parsed.document.sound.memo == document.sound.memo, "memo");
+    require(parsed.document.sound.tags == document.sound.tags, "tags");
+    require(
+        parsed.document.sound.favorite == document.sound.favorite,
+        "favorite");
+    require(parsed.document.library_id == document.library_id, "library id");
+    require(parsed.document.editor == document.editor, "editor state");
+}
+
+std::size_t sourceByteIndex(const mgstc::engine::CompositeTimbre& timbre) {
+    return 2U + 4U + 4U + timbre.layers[0].name.size();
+}
+
+std::vector<std::uint8_t> toBytes(std::string_view text) {
+    std::vector<std::uint8_t> out(text.size());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        out[index] = static_cast<std::uint8_t>(
+            static_cast<unsigned char>(text[index]));
+    }
+    return out;
+}
+
+std::vector<std::uint8_t> replacePayload(
+    std::vector<std::uint8_t> blob,
+    const std::vector<std::uint8_t>& original,
+    const std::vector<std::uint8_t>& replacement) {
+    const auto found = std::search(
+        blob.begin(), blob.end(), original.begin(), original.end());
+    require(found != blob.end(), "sound payload is inside the plugin state");
+    const auto at = static_cast<std::size_t>(std::distance(blob.begin(), found));
+    require(at >= 4, "payload size prefix");
+    const auto new_size = static_cast<std::uint32_t>(replacement.size());
+    blob[at - 4] = static_cast<std::uint8_t>(new_size & 0xFFU);
+    blob[at - 3] = static_cast<std::uint8_t>((new_size >> 8U) & 0xFFU);
+    blob[at - 2] = static_cast<std::uint8_t>((new_size >> 16U) & 0xFFU);
+    blob[at - 1] = static_cast<std::uint8_t>((new_size >> 24U) & 0xFFU);
+    blob.erase(
+        blob.begin() + static_cast<std::ptrdiff_t>(at),
+        blob.begin() + static_cast<std::ptrdiff_t>(at + original.size()));
+    blob.insert(
+        blob.begin() + static_cast<std::ptrdiff_t>(at),
+        replacement.begin(),
+        replacement.end());
+    return blob;
+}
+
+void requireRejected(
+    MgstcAudioProcessor& processor,
+    const std::vector<std::uint8_t>& bytes) {
+    const auto before = stateBytes(processor);
+    const auto compiles = Access::stateCompileCount(processor);
+    processor.setStateInformation(
+        bytes.empty() ? nullptr : bytes.data(),
+        static_cast<int>(bytes.size()));
+    require(
+        Access::stateCompileCount(processor) == compiles,
+        "rejected state does not compile");
+    require(sameBlock(before, stateBytes(processor)), "rejected state keeps the previous snapshot");
+}
+
+void testPluginStateFoundation() {
+    require(MgstcAudioProcessor{}.hasEditor(), "plugin exposes the shared editor");
+
+    MgstcAudioProcessor original;
+    const auto original_bytes = stateBytes(original);
+    require(!original_bytes.isEmpty(), "default state is not empty");
+    MgstcAudioProcessor restored;
+    restored.setStateInformation(
+        original_bytes.getData(),
+        static_cast<int>(original_bytes.getSize()));
+    require(sameBlock(original_bytes, stateBytes(restored)), "default round-trip");
+    const auto smoke = restored.copyPluginState().sound;
+    require(smoke.layers.size() == 3, "default composite has three layers");
+    require(smoke.layers[1].start_delay_value == 12, "SCC delay snapshot");
+    require(smoke.layers[2].start_delay_value == 24, "OPLL delay snapshot");
+
+    const mgstc::plugin::PluginEditorState editor{
+        .has_selected_layer = true,
+        .selected_layer = 1,
+        .editor_tab = 3,
+    };
+    const auto psg = documentFrom(psgOnlyTimbre(), 0, {});
+    const auto scc = documentFrom(sccOnlyTimbre(), 0, editor);
+    const auto opll = documentFrom(opllOnlyTimbre(), 382, editor);
+    auto composite = documentFrom(compositeTimbre(), 382, editor);
+    requireSoundRoundTrip(psg);
+    requireSoundRoundTrip(scc);
+    requireSoundRoundTrip(opll);
+    requireSoundRoundTrip(composite);
+
+    const auto scc_parsed = mgstc::plugin::parsePluginState(
+        mgstc::plugin::serializePluginState(scc).data(),
+        mgstc::plugin::serializePluginState(scc).size());
+    require(
+        scc_parsed.document.sound.layers[0].base_timbre->scc_waveform
+            == scc.sound.layers[0].base_timbre->scc_waveform,
+        "SCC waveform snapshot");
+    require(
+        scc_parsed.document.sound.layers[0].software_lfo.enabled
+            && scc_parsed.document.sound.layers[0].software_lfo.depth == 4,
+        "LFO snapshot");
+    require(
+        scc_parsed.document.sound.layers[0].start_delay_value == 6,
+        "layer delay snapshot");
+    const auto opll_parsed = mgstc::plugin::parsePluginState(
+        mgstc::plugin::serializePluginState(opll).data(),
+        mgstc::plugin::serializePluginState(opll).size());
+    require(
+        mgstc::engine::layerEnvelopeHasPatchSlide(
+            opll_parsed.document.sound.layers[0], nullptr),
+        "patch slide snapshot");
+    require(
+        !opll_parsed.document.sound.layers[0].pitch_envelope.events.empty()
+            || opll_parsed.document.sound.layers[0].volume_envelope.events.size()
+                > 0,
+        "envelope snapshot");
+    require(
+        psg.sound.layers[0].pitch_envelope.events.back().value == -3,
+        "pitch envelope value");
+
+    MgstcAudioProcessor player_a;
+    require(player_a.replacePluginState(composite), "commit composite");
+    const auto committed = stateBytes(player_a);
+    MgstcAudioProcessor player_b;
+    player_b.setStateInformation(
+        committed.getData(), static_cast<int>(committed.getSize()));
+    juce::AudioBuffer<float> pcm_a;
+    juce::AudioBuffer<float> pcm_b;
+    renderMidiNote(player_a, pcm_a);
+    renderMidiNote(player_b, pcm_b);
+    require(sameBuffer(pcm_a, pcm_b), "restored program matches PCM");
+    require(bufferAllFinite(pcm_a), "restored PCM is finite");
+
+    auto library_a = composite;
+    library_a.library_id = 0;
+    auto library_b = composite;
+    library_b.library_id = 382;
+    require(
+        soundBytes(library_a.sound) == soundBytes(library_b.sound),
+        "library id is not part of the sound payload");
+    MgstcAudioProcessor lib_left;
+    MgstcAudioProcessor lib_right;
+    require(lib_left.replacePluginState(library_a), "library 0");
+    require(lib_right.replacePluginState(library_b), "library 382");
+    require(lib_right.copyPluginState().library_id == 382, "library metadata");
+    juce::AudioBuffer<float> lib_pcm_a;
+    juce::AudioBuffer<float> lib_pcm_b;
+    renderMidiNote(lib_left, lib_pcm_a);
+    renderMidiNote(lib_right, lib_pcm_b);
+    require(sameBuffer(lib_pcm_a, lib_pcm_b), "library id does not change PCM");
+
+    MgstcAudioProcessor instance_a;
+    MgstcAudioProcessor instance_b;
+    require(instance_a.replacePluginState(psg), "instance A");
+    require(instance_b.replacePluginState(opll), "instance B");
+    const auto instance_b_bytes = stateBytes(instance_b);
+    require(instance_a.replacePluginState(scc), "instance A changes");
+    require(
+        sameBlock(instance_b_bytes, stateBytes(instance_b)),
+        "instance B is unchanged");
+    require(
+        instance_a.copyPluginState().sound.name
+            != instance_b.copyPluginState().sound.name,
+        "instances keep different programs");
+
+    const auto valid = mgstc::plugin::serializePluginState(psg);
+    require(
+        mgstc::plugin::parsePluginState(nullptr, 0).status
+            == mgstc::plugin::PluginStateStatus::Empty,
+        "empty");
+    require(
+        mgstc::plugin::parsePluginState(valid.data(), 4).status
+            == mgstc::plugin::PluginStateStatus::Truncated,
+        "truncated header");
+    std::vector<std::uint8_t> bad_magic(8, static_cast<std::uint8_t>('X'));
+    require(
+        mgstc::plugin::parsePluginState(bad_magic.data(), bad_magic.size()).status
+            == mgstc::plugin::PluginStateStatus::BadMagic,
+        "bad magic");
+    auto unknown = valid;
+    unknown[8] = 2;
+    require(
+        mgstc::plugin::parsePluginState(unknown.data(), unknown.size()).status
+            == mgstc::plugin::PluginStateStatus::UnsupportedVersion,
+        "unknown version");
+    auto trailing = valid;
+    trailing.push_back(0);
+    require(
+        mgstc::plugin::parsePluginState(trailing.data(), trailing.size()).status
+            == mgstc::plugin::PluginStateStatus::BrokenPayload,
+        "trailing bytes");
+
+    auto payload = toBytes(soundBytes(psg.sound));
+    const auto source_at = sourceByteIndex(psg.sound);
+    require(payload.size() > source_at + 1, "payload has a source byte");
+    require(
+        payload[source_at]
+            == static_cast<std::uint8_t>(psg.sound.layers[0].source),
+        "source byte layout");
+    auto invalid_enum = payload;
+    invalid_enum[source_at] = 9;
+    auto oversized = payload;
+    oversized[2] = 0xFF;
+    oversized[3] = 0xFF;
+    auto bad_channel = payload;
+    bad_channel[source_at + 1] = 255;
+    auto short_wave = payload;
+    short_wave.resize(short_wave.size() - 8);
+
+    MgstcAudioProcessor guard;
+    requireRejected(guard, {});
+    requireRejected(guard, std::vector<std::uint8_t>(valid.begin(), valid.begin() + 12));
+    requireRejected(guard, bad_magic);
+    requireRejected(guard, unknown);
+    requireRejected(guard, trailing);
+    requireRejected(guard, replacePayload(valid, payload, invalid_enum));
+    requireRejected(guard, replacePayload(valid, payload, oversized));
+    requireRejected(guard, replacePayload(valid, payload, bad_channel));
+    requireRejected(guard, replacePayload(valid, payload, short_wave));
+
+    auto corrupt = guard.copyPluginState();
+    corrupt.sound.layers[0].channel = 255;
+    const auto compiles = Access::stateCompileCount(guard);
+    const auto before_direct = stateBytes(guard);
+    require(!guard.replacePluginState(corrupt), "invalid channel is rejected");
+    require(Access::stateCompileCount(guard) == compiles, "invalid channel does not compile");
+    require(sameBlock(before_direct, stateBytes(guard)), "direct reject keeps state");
+
+    MgstcAudioProcessor audio_guard;
+    const auto audio_before = stateBytes(audio_guard);
+    const auto audio_compiles = Access::stateCompileCount(audio_guard);
+    Access::poseAsAudioThread(audio_guard);
+    audio_guard.setStateInformation(valid.data(), static_cast<int>(valid.size()));
+    require(
+        Access::stateAudioRejectCount(audio_guard) == 1,
+        "audio thread rejects state");
+    require(
+        Access::stateCompileCount(audio_guard) == audio_compiles,
+        "audio thread does not compile");
+    Access::clearAudioThread(audio_guard);
+    require(sameBlock(audio_before, stateBytes(audio_guard)), "audio-thread reject keeps state");
+
+    MgstcAudioProcessor timed;
+    timed.prepareToPlay(44'100.0, 128);
+    juce::AudioBuffer<float> attack(2, 128);
+    juce::MidiBuffer note;
+    note.addEvent(
+        juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)),
+        0);
+    timed.processBlock(attack, note);
+    require(Access::noteOnCount(timed) > 0, "note is sounding");
+    require(Access::scheduler(timed).pendingCount() > 0, "delayed layer is pending");
+    require(timed.replacePluginState(psg), "replace while prepared");
+    processEmpty(timed, 48'000);
+    require(layerOf(Access::plan(timed), mgstc::engine::TimbreSource::Psg) != nullptr, "PSG remains");
+    require(layerOf(Access::plan(timed), mgstc::engine::TimbreSource::Scc) == nullptr, "old SCC delay is gone");
+    require(layerOf(Access::plan(timed), mgstc::engine::TimbreSource::Opll) == nullptr, "old OPLL delay is gone");
+    require(Access::scheduler(timed).pendingCount() == 0, "old pending layers are dropped");
+
+    MgstcAudioProcessor rates;
+    require(rates.replacePluginState(psg), "program before rate changes");
+    rates.prepareToPlay(44'100.0, 512);
+    const auto latency_calls = Access::latencyCalls(rates);
+    const auto latency = rates.getLatencySamples();
+    require(latency == 7, "44.1 kHz latency stays 7");
+    require(rates.replacePluginState(scc), "restore does not touch latency");
+    processEmpty(rates, 512);
+    require(Access::latencyCalls(rates) == latency_calls, "setState does not report latency");
+    require(rates.getLatencySamples() == latency, "latency value unchanged by setState");
+    const auto at_441 = stateBytes(rates);
+    rates.prepareToPlay(48'000.0, 512);
+    require(rates.getLatencySamples() == 0, "48 kHz latency is still 0");
+    require(sameBlock(at_441, stateBytes(rates)), "48 kHz keeps the sound snapshot");
+    rates.prepareToPlay(96'000.0, 256);
+    require(sameBlock(at_441, stateBytes(rates)), "96 kHz keeps the sound snapshot");
+    rates.prepareToPlay(88'200.0, 256);
+    require(sameBlock(at_441, stateBytes(rates)), "88.2 kHz keeps the sound snapshot");
+    require(rates.getLatencySamples() == 15, "88.2 kHz latency is unchanged by state");
+
+    MgstcAudioProcessor audible;
+    audible.setStateInformation(valid.data(), static_cast<int>(valid.size()));
+    audible.prepareToPlay(48'000.0, 512);
+    juce::AudioBuffer<float> heard(2, 512);
+    juce::MidiBuffer heard_midi;
+    heard_midi.addEvent(
+        juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)),
+        0);
+    audible.processBlock(heard, heard_midi);
+    double peak = channelPeak(heard, 0, 512);
+    if (peak <= 0.001) {
+        juce::AudioBuffer<float> more(2, 512);
+        juce::MidiBuffer empty;
+        audible.processBlock(more, empty);
+        peak = channelPeak(more, 0, 512);
+    }
+    require(peak > 0.001, "restored PSG is audible at 48 kHz");
+    audible.prepareToPlay(44'100.0, 512);
+    juce::AudioBuffer<float> heard_44(2, 512);
+    juce::MidiBuffer midi_44;
+    midi_44.addEvent(
+        juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)),
+        0);
+    audible.processBlock(heard_44, midi_44);
+    peak = channelPeak(heard_44, 0, 512);
+    if (peak <= 0.001) {
+        juce::AudioBuffer<float> more(2, 512);
+        juce::MidiBuffer empty;
+        audible.processBlock(more, empty);
+        peak = channelPeak(more, 0, 512);
+    }
+    require(peak > 0.001, "restored PSG is audible at 44.1 kHz");
+}
+
+void testPluginEditor() {
+    MgstcAudioProcessor processor;
+    const auto before = stateBytes(processor);
+    const auto compiles = Access::stateCompileCount(processor);
+    const auto latency = processor.getLatencySamples();
+    require(!processor.producesMidi(), "plugin does not produce MIDI");
+
+    auto* editor = processor.createEditor();
+    require(editor != nullptr, "createEditor");
+    require(
+        Access::stateCompileCount(processor) == compiles,
+        "opening the editor does not compile");
+    require(sameBlock(before, stateBytes(processor)), "opening the editor keeps state");
+    require(
+        processor.getLatencySamples() == latency,
+        "opening the editor keeps latency");
+    require(
+        Access::blockedBackendCalls(processor) == 0,
+        "opening the editor does not enumerate devices");
+    require(!Access::scopeEnabled(processor), "waveform scope stays off");
+
+    bool spectrum_disabled = false;
+    bool library_disabled = false;
+    const auto walk = [&](auto&& self, juce::Component* component) -> void {
+        if (auto* button = dynamic_cast<juce::Button*>(component)) {
+            const auto text = button->getButtonText();
+            if (text == juce::String::fromUTF8("スペアナ")) {
+                require(!button->isEnabled(), "spectrum control stays in place and is grey");
+                spectrum_disabled = true;
+            }
+            if (text == juce::String::fromUTF8("ライブラリ管理")) {
+                require(!button->isEnabled(), "tone library control stays in place and is grey");
+                library_disabled = true;
+            }
+        }
+        for (int index = 0; index < component->getNumChildComponents(); ++index) {
+            self(self, component->getChildComponent(index));
+        }
+    };
+    walk(walk, editor);
+    require(spectrum_disabled, "spectrum button is present");
+    require(library_disabled, "library button is present");
+    delete editor;
+    require(sameBlock(before, stateBytes(processor)), "closing the editor keeps state");
+    require(
+        Access::stateCompileCount(processor) == compiles,
+        "closing the editor does not recompile");
+    require(
+        Access::blockedBackendCalls(processor) == 0,
+        "closing the editor does not enumerate devices");
+
+    MgstcAudioProcessor other;
+    const auto other_before = stateBytes(other);
+    {
+        PluginEditorContext context(processor);
+        auto timbre = processor.copyPluginState().sound;
+        timbre.name = "instance-a";
+        mgstc::app::CompositeAuditionRequest request;
+        request.timbre = &timbre;
+        request.polyphonic = true;
+        const auto applied = context.audition().submitComposite(request);
+        require(applied.ok, "composite edit reaches this instance");
+        require(
+            processor.copyPluginState().sound.name == "instance-a",
+            "edited name is stored on this instance");
+        require(
+            sameBlock(other_before, stateBytes(other)),
+            "another instance is unchanged");
+        require(
+            context.snapshot().capabilities.spectrum_analyzer == false
+                && context.snapshot().capabilities.tone_library == false
+                && context.snapshot().capabilities.on_screen_keyboard,
+            "plugin capabilities stay off except the keyboard");
+        require(
+            context.output().availableAsioDrivers().empty(),
+            "plugin does not list ASIO drivers");
+    }
+    require(
+        Access::blockedBackendCalls(processor) == 1,
+        "ASIO enumeration is the rejected backend call");
+
+    const auto edited = stateBytes(processor);
+    editor = processor.createEditor();
+    require(sameBlock(edited, stateBytes(processor)), "reopen does not revert the edit");
+    delete editor;
+
+    processor.prepareToPlay(48'000.0, 512);
+    const auto daw_notes = Access::noteOnCount(processor);
+    {
+        PluginEditorContext context(processor);
+        require(context.audition().noteOn(0, 60), "editor keyboard note");
+        double peak = 0.0;
+        for (int block = 0; block < 8 && peak <= 0.001; ++block) {
+            juce::AudioBuffer<float> buffer(2, 512);
+            juce::MidiBuffer midi;
+            processor.processBlock(buffer, midi);
+            require(midi.isEmpty(), "editor keyboard does not write host MIDI");
+            peak = std::max(peak, channelPeak(buffer, 0, 512));
+        }
+        require(peak > 0.001, "editor keyboard is audible");
+        require(
+            Access::noteOnCount(processor) == daw_notes,
+            "editor keyboard does not use the DAW note path");
+    }
+
+    MgstcAudioProcessor headless;
+    headless.prepareToPlay(48'000.0, 512);
+    juce::AudioBuffer<float> heard(2, 512);
+    juce::MidiBuffer host_midi;
+    host_midi.addEvent(
+        juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)),
+        0);
+    headless.processBlock(heard, host_midi);
+    double headless_peak = channelPeak(heard, 0, 512);
+    if (headless_peak <= 0.001) {
+        juce::AudioBuffer<float> more(2, 2048);
+        juce::MidiBuffer empty;
+        headless.processBlock(more, empty);
+        headless_peak = channelPeak(more, 0, 2048);
+    }
+    require(headless_peak > 0.001, "audio works with no editor");
+}
+
 }  // namespace
 
 int main() {
@@ -2867,6 +3484,8 @@ int main() {
         testIteratorOverdueIsConsumedInOrder();
         testBlockBoundaryMidiStaysOnItsFrame();
         testHostRateOverdueNoteIsAppliedNow();
+        testPluginStateFoundation();
+        testPluginEditor();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
