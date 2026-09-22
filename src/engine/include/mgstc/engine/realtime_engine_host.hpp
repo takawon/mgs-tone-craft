@@ -105,6 +105,16 @@ public:
         return spectrum_context_.load(std::memory_order_acquire);
     }
 
+    // VST has no waveform UI. Skip the 800-sample scope ring; chip mix is unchanged.
+    void setOpllScopeEnabled(bool enabled) noexcept;
+    [[nodiscard]] bool opllScopeEnabled() const noexcept {
+        return opll_scope_enabled_;
+    }
+
+    // Software envelope / pending key work on the active program. Does not
+    // include chip-hardware release tails after key-off.
+    [[nodiscard]] bool hasRealtimeWork() const noexcept;
+
     // Audio thread only. Drains the control SPSC (program load, mixer, …).
     // DAW MIDI must not be pushed into that queue; use the realtime note
     // APIs below and then renderAudio().
@@ -213,6 +223,7 @@ private:
     std::uint64_t spectrum_sample_clock_{};
     std::uint64_t spectrum_pcm_epoch_{};
     bool clipping_{};
+    bool opll_scope_enabled_{true};
 };
 
 }  // namespace mgstc::engine

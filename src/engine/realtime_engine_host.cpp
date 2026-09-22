@@ -27,6 +27,17 @@ RealtimeEngineHost::RealtimeEngineHost()
     applyOutputRouting(programs_[0].engine);
 }
 
+void RealtimeEngineHost::setOpllScopeEnabled(bool enabled) noexcept {
+    opll_scope_enabled_ = enabled;
+    for (std::size_t index = 0; index < kProgramSlotCount; ++index) {
+        programs_[index].engine.setOpllScopeEnabled(enabled);
+    }
+}
+
+bool RealtimeEngineHost::hasRealtimeWork() const noexcept {
+    return programs_[active_program_].engine.session().hasRealtimeWork();
+}
+
 RealtimeEngineHost::~RealtimeEngineHost() {
     output_kind_ = SoundOutputKind::Emulator;
     applyOutputRouting();
@@ -379,6 +390,7 @@ void RealtimeEngineHost::loadProgram(
     }
 
     static_cast<void>(incoming.engine.setGains(current_gains_));
+    incoming.engine.setOpllScopeEnabled(opll_scope_enabled_);
     applyOutputRouting(incoming.engine);
     incoming.engine.hardReset();
     ++spectrum_pcm_epoch_;
@@ -581,12 +593,14 @@ RenderResult RealtimeEngineHost::renderAudio(
     }
     const auto result = core.render(interleaved_stereo, capture);
     spectrum_sample_clock_ += result.frames;
-    OpllScopeFrame scope{};
-    if (programs_[active_program_].engine.takeOpllScopeFrame(scope)) {
-        annotateGuideNote(scope);
-        static_cast<void>(opll_scope_frames_->tryPush(scope));
-        if (spectrogram_capture_enabled_.load(std::memory_order_acquire)) {
-            static_cast<void>(spectrogram_scope_frames_->tryPush(scope));
+    if (opll_scope_enabled_) {
+        OpllScopeFrame scope{};
+        if (programs_[active_program_].engine.takeOpllScopeFrame(scope)) {
+            annotateGuideNote(scope);
+            static_cast<void>(opll_scope_frames_->tryPush(scope));
+            if (spectrogram_capture_enabled_.load(std::memory_order_acquire)) {
+                static_cast<void>(spectrogram_scope_frames_->tryPush(scope));
+            }
         }
     }
     if (!result.ok()) {

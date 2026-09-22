@@ -111,6 +111,14 @@ public:
 
     // Interleaved stereo: L, R, L, R... Audible mix is silent while a
     // remote backend is selected; scope can still track the simulator.
+    void setOpllScopeEnabled(bool enabled) noexcept {
+        opll_scope_enabled_ = enabled;
+    }
+
+    [[nodiscard]] bool opllScopeEnabled() const noexcept {
+        return opll_scope_enabled_;
+    }
+
     [[nodiscard]] RenderResult render(
         std::span<float> interleaved_stereo, SpectrumCapture* capture = nullptr) noexcept;
 
@@ -145,6 +153,7 @@ private:
     std::size_t opll_scope_position_{};
     std::uint64_t opll_scope_sequence_{};
     bool opll_scope_ready_{};
+    bool opll_scope_enabled_{true};
 };
 
 }  // namespace mgstc::engine

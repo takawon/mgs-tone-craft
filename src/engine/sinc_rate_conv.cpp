@@ -1,6 +1,5 @@
 #include "mgstc/engine/sinc_rate_conv.hpp"
 
-#include <algorithm>
 #include <cmath>
 #include <numbers>
 
@@ -50,23 +49,22 @@ void SincRateConv::reset() noexcept {
     history_.fill(0.0F);
     channel_history_ = {};
     tracking_channels_ = false;
+    history_pos_ = 0;
     time_ = 0.0;
     frac_ = 0.0;
 }
 
 void SincRateConv::push(float sample) noexcept {
-    for (std::size_t i = 0; i + 1 < history_.size(); ++i) {
-        history_[i] = history_[i + 1];
-    }
-    history_.back() = sample;
+    history_[history_pos_] = sample;
+    history_pos_ = (history_pos_ + 1) & kTapMask;
 }
 
 float SincRateConv::lookup(double x) const noexcept {
+    const double absolute = x < 0.0 ? -x : x;
     const auto index = static_cast<int>(
-        std::abs(x) * static_cast<double>(kTableReso));
-    const auto clamped = std::min(
-        static_cast<int>(sinc_table_.size()) - 1,
-        index);
+        absolute * static_cast<double>(kTableReso));
+    const auto limit = static_cast<int>(sinc_table_.size()) - 1;
+    const auto clamped = index < limit ? index : limit;
     return sinc_table_[static_cast<std::size_t>(clamped)];
 }
 
@@ -76,10 +74,11 @@ float SincRateConv::interpolate() noexcept {
 
     double sum = 0.0;
     constexpr double center = static_cast<double>(kTapCount) / 2.0 - 1.0;
-    for (std::size_t k = 0; k < history_.size(); ++k) {
+    const auto pos = history_pos_;
+    for (std::size_t k = 0; k < kTapCount; ++k) {
         const double x = static_cast<double>(k) - center - frac_;
-        sum += static_cast<double>(history_[k])
-            * static_cast<double>(lookup(x));
+        const float sample = history_[(pos + k) & kTapMask];
+        sum += static_cast<double>(sample) * static_cast<double>(lookup(x));
     }
     return static_cast<float>(sum);
 }

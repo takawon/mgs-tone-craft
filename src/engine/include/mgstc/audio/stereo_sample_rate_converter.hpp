@@ -12,6 +12,11 @@ struct StereoRenderCallback {
     bool (*render)(
         void* context,
         std::span<float> interleaved_stereo) noexcept {};
+    // Optional. When set, process() prefers this over `render` and may
+    // receive fewer frames than the prepared chunk. 0 means failure.
+    std::size_t (*render_frames)(
+        void* context,
+        std::span<float> interleaved_stereo) noexcept {};
 };
 
 // Streaming stereo sinc converter for realtime sinks. prepare() may allocate;
@@ -21,11 +26,17 @@ public:
     static constexpr double kSourceSampleRate = 48'000.0;
     static constexpr std::size_t kTapCount = 16;
     static constexpr std::size_t kTableResolution = 256;
+    // 16-tap interpolator center is tap 7; newest sample is tap 15.
+    static constexpr std::size_t kGroupDelaySourceFrames = kTapCount / 2;
 
     [[nodiscard]] bool prepare(
         double target_sample_rate,
         std::size_t source_chunk_frames = 256);
     void reset() noexcept;
+    // Marks the FIR primed with the existing zero history so the first
+    // process() does not pull a source frame before any output. ASIO does
+    // not call this; VST3 uses it so Engine is not advanced for SRC priming.
+    void primeWithSilence() noexcept;
 
     [[nodiscard]] bool process(
         float* output_left,
@@ -35,6 +46,10 @@ public:
 
     [[nodiscard]] double targetSampleRate() const noexcept {
         return target_sample_rate_;
+    }
+
+    [[nodiscard]] std::size_t sourceChunkFrames() const noexcept {
+        return source_buffer_.size() / 2;
     }
 
 private:

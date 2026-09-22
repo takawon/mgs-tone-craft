@@ -195,9 +195,11 @@ ctest --test-dir build --output-on-failure
 - `mgstc`
   - 1組の共有エンジン・WASAPI／ASIO選択出力・MIDI入力を使用するアプリ本体
 - `mgstc_vst3`
-  - 48kHz 最小 VST3 Instrument。`mgstc_engine` と `juce_audio_processors` のみ。WASAPI／ASIO／Windows MIDI は開かない。ビルド後にシステムへ自動コピーしない（`COPY_PLUGIN_AFTER_BUILD` は FALSE）
-- `mgstc_realtime_engine_host_tests` / `mgstc_vst3_processor_tests`
-  - Audio Thread 直接 Note API、MIDI sample offset、複数 instance、非48kHz 無音化
+  - 48kHz VST3 Instrument（Layer Start Delay 含む）。`mgstc_engine` と `juce_audio_processors` のみ。WASAPI／ASIO／Windows MIDI は開かない。ビルド後にシステムへ自動コピーしない（`COPY_PLUGIN_AFTER_BUILD` は FALSE）
+- `mgstc_vst3_diag`
+  - Stage D.2 診断 VST3。製品 `mgstc_vst3` とは別成果物。`MGSTC_VST3_DIAG_MODE` で経路だけを切り替える（既定 `OFF`）。製品機能ではない
+- `mgstc_realtime_engine_host_tests` / `mgstc_layer_delay_scheduler_tests` / `mgstc_vst3_processor_tests` / `mgstc_vst3_diag_null_tests` / `mgstc_vst3_diag_lat0_tests`
+  - Audio Thread 直接 Note API、遅延 frame 変換と cancel、MIDI sample offset、block 跨ぎ、複数 instance、非48kHz 無音化
 - `mgstc_stereo_sample_rate_converter_tests`
   - ASIO向け48kHz→44.1／48／96kHzステレオ変換の連続性・左右同期テスト
 
@@ -213,7 +215,15 @@ VST3 bundle は JUCE artefacts 配下に生成される（構成ディレクト�
 <build-tree>\mgstc_vst3_artefacts\<Config>\VST3\MGS Tone Craft.vst3
 ```
 
-DAW のプラグインパスへこの bundle を追加するか、ホストのスキャン対象に含める。Stage B は 48,000 Hz のみ発音する。
+DAW のプラグインパスへこの bundle を追加するか、ホストのスキャン対象に含める。Stage C は 48,000 Hz のみ発音する。
+
+Cubase 非48 kHz フリーズ隔離（Stage D.2）の診断 VST3 は通常の `mgstc_vst3` とは別ターゲット `mgstc_vst3_diag` である。既定は `OFF`（診断ターゲットを作らない）。CMake キャッシュ `MGSTC_VST3_DIAG_MODE` で `OFF` / `NON48_NULL` / `NON48_NULL_LAT0` / `NON48_ENGINE_ONLY` / `NON48_SRC_ZERO` / `NORMAL_NO_LATENCY_NOTIFY` を選ぶ。通常 Release の `mgstc_vst3` は常に診断 OFF のまま。診断 bundle の典型パス:
+
+```text
+<build-tree>\mgstc_vst3_diag_artefacts\<Config>\VST3\MGS Tone Craft.vst3
+```
+
+Plugin Code は製品と同じ `Mgti` なので、Cubase には診断 bundle だけを追加する。プラグイン破棄時に `%LOCALAPPDATA%\MgsToneCraft\vst3-d2-diag.txt` へカウンタを書く。Audio Thread ではログしない。
 
 音源エミュレータの固定コミットとライセンスは
 [THIRD_PARTY.md](THIRD_PARTY.md)を参照する。

@@ -12,7 +12,9 @@ namespace mgstc::engine {
 class SincRateConv {
 public:
     static constexpr std::size_t kTapCount = 16;
+    static constexpr std::size_t kTapMask = kTapCount - 1;
     static constexpr std::size_t kTableReso = 256;
+    static_assert((kTapCount & kTapMask) == 0, "tap count is a power of two");
 
     SincRateConv(double input_hz, double output_hz);
 
@@ -28,29 +30,30 @@ public:
         tracking_channels_ = !channels.empty();
         while (input_hz_ > time_) {
             time_ += output_hz_;
+            const auto slot = history_pos_;
             push(static_cast<float>(generate()));
-            for (std::size_t ch = 0; ch < channels.size(); ++ch) {
-                auto& history = channel_history_[ch];
-                for (std::size_t k = 1; k < kTapCount; ++k)
-                    history[k - 1] = history[k];
-                history.back() = channels[ch];
-            }
+            for (std::size_t ch = 0; ch < channels.size(); ++ch)
+                channel_history_[ch][slot] = channels[ch];
         }
         time_ -= input_hz_;
         const float mixed = interpolate();
         // Read the same native instants with the mono converter's phase.
         // The generator is never called again for individual channels.
-        constexpr double center = static_cast<double>(kTapCount) / 2.0 - 1.0;
-        std::array<float, kTapCount> coefficients{};
-        if (!channels.empty())
+        if (!channels.empty()) {
+            constexpr double center = static_cast<double>(kTapCount) / 2.0 - 1.0;
+            std::array<float, kTapCount> coefficients{};
             for (std::size_t k = 0; k < kTapCount; ++k)
                 coefficients[k] = lookup(static_cast<double>(k) - center - frac_);
-        for (std::size_t ch = 0; ch < channels.size(); ++ch) {
-            double sum = 0.0;
-            for (std::size_t k = 0; k < kTapCount; ++k)
-                sum += static_cast<double>(channel_history_[ch][k])
-                    * static_cast<double>(coefficients[k]);
-            channels[ch] = static_cast<float>(sum);
+            const auto pos = history_pos_;
+            for (std::size_t ch = 0; ch < channels.size(); ++ch) {
+                double sum = 0.0;
+                const auto& history = channel_history_[ch];
+                for (std::size_t k = 0; k < kTapCount; ++k) {
+                    sum += static_cast<double>(history[(pos + k) & kTapMask])
+                        * static_cast<double>(coefficients[k]);
+                }
+                channels[ch] = static_cast<float>(sum);
+            }
         }
         return mixed;
     }
@@ -65,6 +68,7 @@ private:
     double ratio_{};
     double time_{};
     double frac_{};
+    std::size_t history_pos_{};
     std::array<float, kTapCount> history_{};
     std::array<std::array<float, kTapCount>, 14> channel_history_{};
     bool tracking_channels_{};

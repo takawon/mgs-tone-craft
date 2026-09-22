@@ -77,17 +77,32 @@ void StereoSampleRateConverter::reset() noexcept {
     source_valid_frames_ = 0;
 }
 
+void StereoSampleRateConverter::primeWithSilence() noexcept {
+    primed_ = true;
+}
+
 bool StereoSampleRateConverter::refill(
     StereoRenderCallback render) noexcept {
-    if (source_buffer_.empty()
-        || render.render == nullptr
-        || !render.render(render.context, source_buffer_)) {
-        source_cursor_frames_ = 0;
-        source_valid_frames_ = 0;
+    source_cursor_frames_ = 0;
+    source_valid_frames_ = 0;
+    if (source_buffer_.empty()) {
         return false;
     }
-    source_cursor_frames_ = 0;
-    source_valid_frames_ = source_buffer_.size() / 2;
+    const auto max_frames = source_buffer_.size() / 2;
+    if (render.render_frames != nullptr) {
+        const auto frames = render.render_frames(
+            render.context, source_buffer_);
+        if (frames == 0) {
+            return false;
+        }
+        source_valid_frames_ = std::min(frames, max_frames);
+        return true;
+    }
+    if (render.render == nullptr
+        || !render.render(render.context, source_buffer_)) {
+        return false;
+    }
+    source_valid_frames_ = max_frames;
     return true;
 }
 
