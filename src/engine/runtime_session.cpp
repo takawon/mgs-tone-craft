@@ -285,6 +285,18 @@ void RuntimeSession::gateUntilNoteOn() noexcept {
     sequence_faulted_.fill(false);
 }
 
+bool RuntimeSession::hasRealtimeWork() const noexcept {
+    for (std::uint8_t track = 0; track < kTrackCount; ++track) {
+        if (pending_keys_[track] != PendingKey::None
+            || audition_track_running_[track]
+            || key_off_decay_active_[track]
+            || force_mute_pending_[track]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void RuntimeSession::resetForKeyOn() noexcept {
     tick_ = 0;
     mapper_.reset();

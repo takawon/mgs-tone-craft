@@ -918,6 +918,14 @@ static INLINE int16_t to_linear(uint16_t h, OPLL_SLOT *slot, int16_t am) {
 static INLINE int16_t calc_slot_car(OPLL *opll, int ch, int16_t fm) {
   OPLL_SLOT *slot = CAR(opll, ch);
 
+  /* to_linear returns 0 when the envelope is muted, before it reads the
+   * waveform. Skip that lookup. output[] still advances so feedback matches. */
+  if (slot->eg_out > EG_MAX) {
+    slot->output[1] = slot->output[0];
+    slot->output[0] = 0;
+    return 0;
+  }
+
   uint8_t am = slot->patch->AM ? opll->lfo_am : 0;
 
   slot->output[1] = slot->output[0];
@@ -928,6 +936,12 @@ static INLINE int16_t calc_slot_car(OPLL *opll, int ch, int16_t fm) {
 
 static INLINE int16_t calc_slot_mod(OPLL *opll, int ch) {
   OPLL_SLOT *slot = MOD(opll, ch);
+
+  if (slot->eg_out > EG_MAX) {
+    slot->output[1] = slot->output[0];
+    slot->output[0] = 0;
+    return 0;
+  }
 
   int16_t fm = slot->patch->FB > 0 ? (slot->output[1] + slot->output[0]) >> (9 - slot->patch->FB) : 0;
   uint8_t am = slot->patch->AM ? opll->lfo_am : 0;
@@ -941,6 +955,8 @@ static INLINE int16_t calc_slot_mod(OPLL *opll, int ch) {
 static INLINE int16_t calc_slot_tom(OPLL *opll) {
   OPLL_SLOT *slot = MOD(opll, 8);
 
+  if (slot->eg_out > EG_MAX)
+    return 0;
   return to_linear(slot->wave_table[slot->pg_out], slot, 0);
 }
 
@@ -949,6 +965,9 @@ static INLINE int16_t calc_slot_tom(OPLL *opll) {
 
 static INLINE int16_t calc_slot_snare(OPLL *opll) {
   OPLL_SLOT *slot = CAR(opll, 7);
+
+  if (slot->eg_out > EG_MAX)
+    return 0;
 
   uint32_t phase;
 
@@ -963,6 +982,9 @@ static INLINE int16_t calc_slot_snare(OPLL *opll) {
 static INLINE int16_t calc_slot_cym(OPLL *opll) {
   OPLL_SLOT *slot = CAR(opll, 8);
 
+  if (slot->eg_out > EG_MAX)
+    return 0;
+
   uint32_t phase = opll->short_noise ? _PD(0x300) : _PD(0x100);
 
   return to_linear(slot->wave_table[phase], slot, 0);
@@ -970,6 +992,9 @@ static INLINE int16_t calc_slot_cym(OPLL *opll) {
 
 static INLINE int16_t calc_slot_hat(OPLL *opll) {
   OPLL_SLOT *slot = MOD(opll, 7);
+
+  if (slot->eg_out > EG_MAX)
+    return 0;
 
   uint32_t phase;
 

@@ -114,6 +114,10 @@ public:
     void resetForKeyOn() noexcept;
     [[nodiscard]] TickResult processTick();
 
+    // Software envelopes, pending keys, and key-off decay. Does not include
+    // chip-hardware release tails after the session has already keyed off.
+    [[nodiscard]] bool hasRealtimeWork() const noexcept;
+
     [[nodiscard]] Tick tick() const noexcept {
         return tick_;
     }

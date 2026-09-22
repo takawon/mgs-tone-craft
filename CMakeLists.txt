@@ -344,7 +344,75 @@ if(WIN32)
             )
         endif()
 
-        # Stage B: 48kHz VST3 Instrument. Do not link WASAPI/ASIO/WinMM hosts.
+        # VST3 Instrument. Do not link WASAPI/ASIO/WinMM hosts.
+        set(MGSTC_VST3_DIAG_MODE "OFF" CACHE STRING
+            "VST3 Stage D.2 diagnostic: OFF, NON48_NULL, NON48_NULL_LAT0, NON48_ENGINE_ONLY, NON48_SRC_ZERO, NORMAL_NO_LATENCY_NOTIFY"
+            FORCE)
+        set_property(
+            CACHE MGSTC_VST3_DIAG_MODE
+            PROPERTY STRINGS
+                OFF
+                NON48_NULL
+                NON48_NULL_LAT0
+                NON48_ENGINE_ONLY
+                NON48_SRC_ZERO
+                NORMAL_NO_LATENCY_NOTIFY)
+
+        function(mgstc_vst3_diag_mode_id out_var mode)
+            if(mode STREQUAL "NON48_NULL")
+                set(${out_var} 1 PARENT_SCOPE)
+            elseif(mode STREQUAL "NON48_NULL_LAT0")
+                set(${out_var} 2 PARENT_SCOPE)
+            elseif(mode STREQUAL "NON48_ENGINE_ONLY")
+                set(${out_var} 3 PARENT_SCOPE)
+            elseif(mode STREQUAL "NON48_SRC_ZERO")
+                set(${out_var} 4 PARENT_SCOPE)
+            elseif(mode STREQUAL "NORMAL_NO_LATENCY_NOTIFY")
+                set(${out_var} 5 PARENT_SCOPE)
+            else()
+                set(${out_var} 0 PARENT_SCOPE)
+            endif()
+        endfunction()
+
+        function(mgstc_configure_vst3_target target_name diag_mode_id)
+            target_sources(
+                ${target_name} PRIVATE
+                    src/plugin/vst3/host_engine_timeline.hpp
+                    src/plugin/vst3/layer_delay_scheduler.hpp
+                    src/plugin/vst3/layer_delay_scheduler.cpp
+                    src/plugin/vst3/plugin_processor.hpp
+                    src/plugin/vst3/plugin_processor.cpp
+                    src/plugin/vst3/vst3_diagnostic.hpp
+            )
+            target_include_directories(
+                ${target_name} PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3
+            )
+            target_link_libraries(
+                ${target_name}
+                PRIVATE
+                    mgstc_engine
+                    juce::juce_audio_processors
+            )
+            target_compile_features(${target_name} PRIVATE cxx_std_20)
+            target_compile_definitions(
+                ${target_name}
+                PUBLIC
+                    JUCE_WEB_BROWSER=0
+                    JUCE_USE_CURL=0
+                    JUCE_VST3_CAN_REPLACE_VST2=0
+                    JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
+                PRIVATE
+                    MGSTC_DOC_VERSION="${MGSTC_DOC_VERSION}"
+                    MGSTC_VST3_DIAG_MODE=${diag_mode_id}
+            )
+            if(MSVC)
+                target_compile_options(
+                    ${target_name} PRIVATE /W4 /permissive- /EHsc /utf-8
+                )
+            endif()
+        endfunction()
+
         juce_add_plugin(
             mgstc_vst3
             COMPANY_NAME "MGS Tone Craft"
@@ -364,35 +432,31 @@ if(WIN32)
             VST3_CATEGORIES "Instrument Synth"
             PLUGIN_CHANNEL_CONFIGURATIONS "{0, 2}"
         )
-        target_sources(
-            mgstc_vst3 PRIVATE
-                src/plugin/vst3/plugin_processor.hpp
-                src/plugin/vst3/plugin_processor.cpp
-        )
-        target_include_directories(
-            mgstc_vst3 PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3
-        )
-        target_link_libraries(
-            mgstc_vst3
-            PRIVATE
-                mgstc_engine
-                juce::juce_audio_processors
-        )
-        target_compile_features(mgstc_vst3 PRIVATE cxx_std_20)
-        target_compile_definitions(
-            mgstc_vst3
-            PUBLIC
-                JUCE_WEB_BROWSER=0
-                JUCE_USE_CURL=0
-                JUCE_VST3_CAN_REPLACE_VST2=0
-                JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
-            PRIVATE
-                MGSTC_DOC_VERSION="${MGSTC_DOC_VERSION}"
-        )
-        if(MSVC)
-            target_compile_options(
-                mgstc_vst3 PRIVATE /W4 /permissive- /EHsc /utf-8
+        mgstc_configure_vst3_target(mgstc_vst3 0)
+
+        mgstc_vst3_diag_mode_id(_mgstc_vst3_diag_id "${MGSTC_VST3_DIAG_MODE}")
+        if(_mgstc_vst3_diag_id GREATER 0)
+            juce_add_plugin(
+                mgstc_vst3_diag
+                COMPANY_NAME "MGS Tone Craft"
+                BUNDLE_ID "com.mgstonecraft.mgstc.instrument"
+                IS_SYNTH TRUE
+                NEEDS_MIDI_INPUT TRUE
+                NEEDS_MIDI_OUTPUT FALSE
+                IS_MIDI_EFFECT FALSE
+                EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+                COPY_PLUGIN_AFTER_BUILD FALSE
+                PLUGIN_MANUFACTURER_CODE Mgsc
+                PLUGIN_CODE Mgti
+                FORMATS VST3
+                PRODUCT_NAME "MGS Tone Craft"
+                PLUGIN_NAME "MGS Tone Craft"
+                DESCRIPTION "MGSTC Stage D.2 diagnostic instrument"
+                VST3_CATEGORIES "Instrument Synth"
+                PLUGIN_CHANNEL_CONFIGURATIONS "{0, 2}"
+            )
+            mgstc_configure_vst3_target(
+                mgstc_vst3_diag ${_mgstc_vst3_diag_id}
             )
         endif()
     endif()
@@ -544,10 +608,33 @@ if(MGSTC_BUILD_TESTS)
         NAME mgstc_realtime_engine_host_tests
         COMMAND mgstc_realtime_engine_host_tests)
 
+    add_executable(
+        mgstc_layer_delay_scheduler_tests
+        tests/cpp/layer_delay_scheduler_tests.cpp
+        src/plugin/vst3/layer_delay_scheduler.cpp)
+    target_include_directories(
+        mgstc_layer_delay_scheduler_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3)
+    target_compile_features(
+        mgstc_layer_delay_scheduler_tests PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(
+            mgstc_layer_delay_scheduler_tests PRIVATE
+                /W4 /permissive- /EHsc /utf-8)
+    else()
+        target_compile_options(
+            mgstc_layer_delay_scheduler_tests PRIVATE
+                -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(
+        NAME mgstc_layer_delay_scheduler_tests
+        COMMAND mgstc_layer_delay_scheduler_tests)
+
     if(WIN32 AND TARGET juce::juce_audio_processors)
         add_executable(
             mgstc_vst3_processor_tests
             tests/cpp/vst3_processor_tests.cpp
+            src/plugin/vst3/layer_delay_scheduler.cpp
             src/plugin/vst3/plugin_processor.cpp)
         target_include_directories(
             mgstc_vst3_processor_tests PRIVATE
@@ -565,7 +652,8 @@ if(MGSTC_BUILD_TESTS)
                 JUCE_WEB_BROWSER=0
                 JUCE_USE_CURL=0
                 JUCE_VST3_CAN_REPLACE_VST2=0
-                JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0)
+                JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
+                MGSTC_VST3_DIAG_MODE=0)
         if(MSVC)
             target_compile_options(
                 mgstc_vst3_processor_tests PRIVATE
@@ -574,6 +662,70 @@ if(MGSTC_BUILD_TESTS)
         add_test(
             NAME mgstc_vst3_processor_tests
             COMMAND mgstc_vst3_processor_tests)
+
+        add_executable(
+            mgstc_vst3_diag_null_tests
+            tests/cpp/vst3_diag_null_tests.cpp
+            src/plugin/vst3/layer_delay_scheduler.cpp
+            src/plugin/vst3/plugin_processor.cpp)
+        target_include_directories(
+            mgstc_vst3_diag_null_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3)
+        target_link_libraries(
+            mgstc_vst3_diag_null_tests
+            PRIVATE
+                mgstc_engine
+                juce::juce_audio_processors)
+        target_compile_features(
+            mgstc_vst3_diag_null_tests PRIVATE cxx_std_20)
+        target_compile_definitions(
+            mgstc_vst3_diag_null_tests
+            PRIVATE
+                JUCE_WEB_BROWSER=0
+                JUCE_USE_CURL=0
+                JUCE_VST3_CAN_REPLACE_VST2=0
+                JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
+                MGSTC_VST3_DIAG_MODE=1)
+        if(MSVC)
+            target_compile_options(
+                mgstc_vst3_diag_null_tests PRIVATE
+                    /W4 /permissive- /EHsc /utf-8)
+        endif()
+        add_test(
+            NAME mgstc_vst3_diag_null_tests
+            COMMAND mgstc_vst3_diag_null_tests)
+
+        add_executable(
+            mgstc_vst3_diag_lat0_tests
+            tests/cpp/vst3_diag_lat0_tests.cpp
+            src/plugin/vst3/layer_delay_scheduler.cpp
+            src/plugin/vst3/plugin_processor.cpp)
+        target_include_directories(
+            mgstc_vst3_diag_lat0_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3)
+        target_link_libraries(
+            mgstc_vst3_diag_lat0_tests
+            PRIVATE
+                mgstc_engine
+                juce::juce_audio_processors)
+        target_compile_features(
+            mgstc_vst3_diag_lat0_tests PRIVATE cxx_std_20)
+        target_compile_definitions(
+            mgstc_vst3_diag_lat0_tests
+            PRIVATE
+                JUCE_WEB_BROWSER=0
+                JUCE_USE_CURL=0
+                JUCE_VST3_CAN_REPLACE_VST2=0
+                JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
+                MGSTC_VST3_DIAG_MODE=2)
+        if(MSVC)
+            target_compile_options(
+                mgstc_vst3_diag_lat0_tests PRIVATE
+                    /W4 /permissive- /EHsc /utf-8)
+        endif()
+        add_test(
+            NAME mgstc_vst3_diag_lat0_tests
+            COMMAND mgstc_vst3_diag_lat0_tests)
     endif()
 
     add_executable(

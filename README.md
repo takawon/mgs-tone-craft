@@ -68,7 +68,7 @@ MGSCで使える定義テキストの作成を支援します。
 - **インポート**: 非圧縮MGS、MML／MUS、MuSICA VCD、SCC-Musixx SNG、VGM／VGZの完成したOPLL／SCC／総合音色を候補化し、既存ライブラリへ登録（圧縮MGSは拒否。`.mgstc`取込は別操作のまま）
 - **複合音色との連携**: 割当済みSCC／OPLL音色を対応エディタで開き、総合出音を聴きながら編集・保存反映
 - **試聴**: 画面鍵盤、PCキーボード、MIDI入力、内蔵エミュレータ。1秒プレビューON／OFF。スペアナ操作中も直前エディタへ鍵盤入力を委譲
-- **VST3 Instrument**（Stage B）: DAW から 48 kHz で Note On／Off を受け、既定の総合音色を stereo で返す。エディタ・プリセット・任意サンプルレートは未対応。ビルド成果物の置き場は [BUILDING.md](BUILDING.md) を参照
+- **VST3 Instrument**（Stage C）: DAW から 48 kHz で Note On／Off を受け、総合音色を stereo で返す。レイヤー開始遅延は Engine frame で sample-accurate。エディタ・プリセット・任意サンプルレートは未対応。ビルド成果物の置き場は [BUILDING.md](BUILDING.md) を参照
 - **実機演奏**: MAmi-VSIF dongle／MAmidiMEmo 経由で MSX 実機へ出力して発音できる
 - **変換**: WAV／Audacityからの近似変換、SCC↔OPLLの相互近似変換
 

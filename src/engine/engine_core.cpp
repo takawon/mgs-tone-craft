@@ -90,8 +90,9 @@ RenderResult EngineCore::render(
     }
 
     const bool remote_output = output_backend_ != nullptr;
+    const bool fill_scope = opll_scope_enabled_;
     const auto frame_count = interleaved_stereo.size() / 2;
-    for (std::size_t frame = 0; frame < frame_count; ++frame) {
+    for (std::size_t frame = 0; frame < frame_count; ) {
         if (clock_.tickDue()) {
             result.tick_result = session_.processTick();
             if (!result.tick_result.ok()) {
@@ -117,53 +118,83 @@ RenderResult EngineCore::render(
             static_cast<void>(clock_.beginTick());
         }
 
-        const auto scope_chips = renderScopeSample(capture != nullptr && capture->channelsEnabled());
-        const auto scope_raw = gains_.master * (
-            scope_chips.psg * gains_.psg
-            + scope_chips.scc * gains_.scc
-            + scope_chips.opll * gains_.opll);
-        // Mild DC block on the mixed float bus (MSXplay/libkss-like output
-        // stage with MML lpf=0: RCF off, DC filter still active).
-        const auto scope_filtered = mix_dc_blocker_.process(scope_raw);
-        const auto scope_mixed = std::clamp(scope_filtered, -1.0F, 1.0F);
-        if (capture != nullptr) {
-            if (analysis_context_ != capture->context()) {
-                analysis_mix_dc_blocker_.reset();
-                analysis_context_ = capture->context();
+        const auto until_tick = clock_.framesUntilNextTick();
+        if (until_tick == 0) {
+            std::fill(
+                interleaved_stereo.begin()
+                    + static_cast<std::ptrdiff_t>(frame * 2),
+                interleaved_stereo.end(),
+                0.0F);
+            result.error = RenderError::Runtime;
+            result.frames = frame;
+            return result;
+        }
+        const auto run = std::min(
+            frame_count - frame,
+            static_cast<std::size_t>(until_tick));
+        for (std::size_t index = 0; index < run; ++index) {
+            const auto out_frame = frame + index;
+            const auto scope_chips = renderScopeSample(
+                capture != nullptr && capture->channelsEnabled());
+            const auto scope_raw = gains_.master * (
+                scope_chips.psg * gains_.psg
+                + scope_chips.scc * gains_.scc
+                + scope_chips.opll * gains_.opll);
+            // Mild DC block on the mixed float bus (MSXplay/libkss-like output
+            // stage with MML lpf=0: RCF off, DC filter still active).
+            const auto scope_filtered = mix_dc_blocker_.process(scope_raw);
+            const auto scope_mixed = std::clamp(scope_filtered, -1.0F, 1.0F);
+            if (capture != nullptr) {
+                if (analysis_context_ != capture->context()) {
+                    analysis_mix_dc_blocker_.reset();
+                    analysis_context_ = capture->context();
+                }
+                const auto mask = capture->sourceMask();
+                const auto selected_raw = gains_.master * (
+                    ((mask & 1) ? scope_chips.psg * gains_.psg : 0.0F)
+                    + ((mask & 2) ? scope_chips.scc * gains_.scc : 0.0F)
+                    + ((mask & 4) ? scope_chips.opll * gains_.opll : 0.0F));
+                const auto selected = std::clamp(
+                    analysis_mix_dc_blocker_.process(selected_raw),
+                    -1.0F,
+                    1.0F);
+                // Full context taps the audible bus exactly. A restricted editor
+                // uses the same mixer stages on its selected source PCM.
+                capture->append(
+                    scope_chips,
+                    mask == 7 ? scope_mixed : selected,
+                    gains_.master,
+                    gains_.psg,
+                    gains_.scc,
+                    gains_.opll);
             }
-            const auto mask = capture->sourceMask();
-            const auto selected_raw = gains_.master * (
-                ((mask & 1) ? scope_chips.psg * gains_.psg : 0.0F)
-                + ((mask & 2) ? scope_chips.scc * gains_.scc : 0.0F)
-                + ((mask & 4) ? scope_chips.opll * gains_.opll : 0.0F));
-            const auto selected = std::clamp(analysis_mix_dc_blocker_.process(selected_raw), -1.0F, 1.0F);
-            // Full context taps the audible bus exactly. A restricted editor
-            // uses the same mixer stages on its selected source PCM.
-            capture->append(scope_chips, mask == 7 ? scope_mixed : selected,
-                            gains_.master, gains_.psg, gains_.scc, gains_.opll);
-        }
-        const auto scope_index = opll_scope_position_++;
-        psg_scope_work_[scope_index] = scope_chips.psg;
-        scc_scope_work_[scope_index] = scope_chips.scc;
-        opll_scope_work_[scope_index] = scope_chips.opll;
-        mixed_scope_work_[scope_index] = scope_mixed;
-        if (opll_scope_position_ == opll_scope_work_.size()) {
-            opll_scope_completed_.psg_samples = psg_scope_work_;
-            opll_scope_completed_.scc_samples = scc_scope_work_;
-            opll_scope_completed_.samples = opll_scope_work_;
-            opll_scope_completed_.mixed_samples = mixed_scope_work_;
-            opll_scope_completed_.sequence = ++opll_scope_sequence_;
-            opll_scope_position_ = 0;
-            opll_scope_ready_ = true;
-        }
+            if (fill_scope) {
+                const auto scope_index = opll_scope_position_++;
+                psg_scope_work_[scope_index] = scope_chips.psg;
+                scc_scope_work_[scope_index] = scope_chips.scc;
+                opll_scope_work_[scope_index] = scope_chips.opll;
+                mixed_scope_work_[scope_index] = scope_mixed;
+                if (opll_scope_position_ == opll_scope_work_.size()) {
+                    opll_scope_completed_.psg_samples = psg_scope_work_;
+                    opll_scope_completed_.scc_samples = scc_scope_work_;
+                    opll_scope_completed_.samples = opll_scope_work_;
+                    opll_scope_completed_.mixed_samples = mixed_scope_work_;
+                    opll_scope_completed_.sequence = ++opll_scope_sequence_;
+                    opll_scope_position_ = 0;
+                    opll_scope_ready_ = true;
+                }
+            }
 
-        // Audible destination is the remote chip; keep PC mix silent.
-        const auto mixed = remote_output ? 0.0F : scope_mixed;
-        result.clipped = result.clipped
-            || (!remote_output && scope_mixed != scope_filtered);
-        interleaved_stereo[frame * 2] = mixed;
-        interleaved_stereo[frame * 2 + 1] = mixed;
-        static_cast<void>(clock_.consumeFrames(1));
+            // Audible destination is the remote chip; keep PC mix silent.
+            const auto mixed = remote_output ? 0.0F : scope_mixed;
+            result.clipped = result.clipped
+                || (!remote_output && scope_mixed != scope_filtered);
+            interleaved_stereo[out_frame * 2] = mixed;
+            interleaved_stereo[out_frame * 2 + 1] = mixed;
+        }
+        static_cast<void>(
+            clock_.consumeFrames(static_cast<std::uint32_t>(run)));
+        frame += run;
     }
     result.frames = frame_count;
     return result;
