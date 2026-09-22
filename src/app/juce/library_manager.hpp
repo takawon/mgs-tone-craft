@@ -11,6 +11,7 @@
 
 #include <juce_gui_extra/juce_gui_extra.h>
 
+#include "editor_icons.hpp"
 #include "juce_utf8.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/timbre_library.hpp"
@@ -42,7 +43,7 @@ struct LibraryManagerRow {
     std::int64_t last_used_unix_seconds{};
 };
 
-[[nodiscard]] juce::String formatLibraryManagerTime(
+[[nodiscard]] inline juce::String formatLibraryManagerTime(
     std::int64_t unix_seconds) {
     if (unix_seconds <= 0) {
         return juce::String::fromUTF8("—");
@@ -196,8 +197,8 @@ public:
         graphics.setFont(UiFonts::body());
         graphics.setColour(juce::Colour(0xFFE6EDF3));
         if (column_id == kPreview) {
-            if (auto icon = makeEditorIcon(
-                    EditorIcon::Audition,
+            if (auto icon = mgstc::app::makeEditorIcon(
+                    mgstc::app::EditorIcon::Audition,
                     juce::Colour(0xFF9AA8B5))) {
                 const int icon_size =
                     juce::jmin(width, height) - UiLayout::xs * 2;

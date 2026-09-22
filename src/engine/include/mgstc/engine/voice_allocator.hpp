@@ -28,6 +28,9 @@ public:
         std::span<std::uint8_t> channels_out) noexcept;
 
     void setChannelCount(std::uint8_t channel_count);
+    // Limits note allocation without resizing. `channel_count` must already
+    // fit in the vector allocated by the constructor or setChannelCount.
+    void setActiveChannelCount(std::uint8_t channel_count) noexcept;
     void setPolyphonic(bool polyphonic);
     [[nodiscard]] bool polyphonic() const noexcept {
         return polyphonic_;
@@ -41,6 +44,7 @@ private:
     };
 
     std::vector<Voice> voices_;
+    std::uint8_t active_count_{1};
     std::uint64_t next_age_{1};
     bool polyphonic_{true};
 };

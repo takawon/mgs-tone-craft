@@ -25,7 +25,7 @@
 #include "opll_patch_ui.hpp"
 #include "pitch_command_labels.hpp"
 #include "rate_envelope_trace.hpp"
-#include "shared_audio_host.hpp"
+#include "editor_session.hpp"
 #include "switch_look_and_feel.hpp"
 #include "tag_ui.hpp"
 #include "ui_chrome_constants.hpp"
@@ -38,7 +38,6 @@
 
 #include "mgstc/engine/chip_volume_curve.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
-#include "mgstc/engine/engine_command.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/envelope_rate.hpp"
 #include "mgstc/engine/envelope_sequence.hpp"
@@ -815,9 +814,9 @@ public:
         const mgstc::engine::OpllPatchParameters& initial,
         bool editing_existing,
         std::function<void(mgstc::engine::OpllPatchParameters)> on_apply,
-        SharedAudioHost* audio_service = nullptr)
+        mgstc::app::EditorSession* session = nullptr)
         : on_apply_(std::move(on_apply)),
-          audio_service_(audio_service),
+          session_(session),
           panel_(switch_look_and_feel_) {
         title_.setText(
             juce::String::fromUTF8(
@@ -904,20 +903,18 @@ private:
     }
 
     void silencePreviewTracks() {
-        if (audio_service_ == nullptr) {
+        if (session_ == nullptr) {
             return;
         }
-        auto& engine = audio_service_->engine();
         for (std::uint8_t channel = 0; channel < 9; ++channel) {
             const auto track = static_cast<std::uint8_t>(kOpllTrack + channel);
-            static_cast<void>(engine.submit(
-                mgstc::engine::EngineCommand::noteOff(track)));
-            audio_service_->armOpllKeyOffForceSilence(track);
+            static_cast<void>(session_->audition().noteOff(track));
+            session_->audition().armOpllKeyOffSilence(track);
         }
     }
 
     void auditionPreview() {
-        if (audio_service_ == nullptr || !audio_service_->running()) {
+        if (session_ == nullptr || !session_->snapshot().audio_running) {
             return;
         }
         const auto note = static_cast<std::uint8_t>(
@@ -925,13 +922,15 @@ private:
         panel_.setAuditionNote(note);
         const auto patch = panel_.parameters();
         silencePreviewTracks();
-        audio_service_->clearOpllKeyOffForceSilence();
-        temporary_program_ = audio_service_->submitSharedEditorProgram(
-            audio_service_->sharedSccWaveform(),
-            patch,
-            true,
-            kOpllTrack,
-            note);
+        session_->audition().clearOpllKeyOffSilence();
+        const auto shared = session_->snapshot();
+        mgstc::app::SharedAuditionRequest request;
+        request.scc = &shared.shared_scc_waveform;
+        request.opll = &patch;
+        request.retrigger = true;
+        request.track = kOpllTrack;
+        request.note = note;
+        temporary_program_ = session_->audition().submitShared(request);
         if (temporary_program_) {
             startTimer(1000);
         }
@@ -939,18 +938,20 @@ private:
 
     void stopPreviewAndRestore() {
         stopTimer();
-        if (audio_service_ == nullptr || !temporary_program_) {
+        if (session_ == nullptr || !temporary_program_) {
             temporary_program_ = false;
             return;
         }
         silencePreviewTracks();
-        static_cast<void>(audio_service_->submitSharedEditorProgram(
-            audio_service_->sharedSccWaveform(),
-            audio_service_->sharedOpllPatch(),
-            false,
-            kOpllTrack,
-            static_cast<std::uint8_t>(
-                LastAuditionNoteStore::instance().get())));
+        const auto shared = session_->snapshot();
+        mgstc::app::SharedAuditionRequest request;
+        request.scc = &shared.shared_scc_waveform;
+        request.opll = &shared.shared_opll_patch;
+        request.retrigger = false;
+        request.track = kOpllTrack;
+        request.note = static_cast<std::uint8_t>(
+            LastAuditionNoteStore::instance().get());
+        static_cast<void>(session_->audition().submitShared(request));
         temporary_program_ = false;
     }
 
@@ -959,7 +960,7 @@ private:
     }
 
     std::function<void(mgstc::engine::OpllPatchParameters)> on_apply_;
-    SharedAudioHost* audio_service_{};
+    mgstc::app::EditorSession* session_{};
     bool temporary_program_{};
     SwitchLookAndFeel switch_look_and_feel_;
     juce::Label title_;
@@ -3965,8 +3966,8 @@ public:
             true);
     }
 
-    void setAudioService(SharedAudioHost* audio_service) noexcept {
-        audio_service_ = audio_service;
+    void setEditorSession(mgstc::app::EditorSession* session) noexcept {
+        session_ = session;
     }
 
     void setPlaybackTempo(int tempo_bpm) {
@@ -8048,7 +8049,7 @@ private:
                 mgstc::engine::OpllPatchParameters patch) {
                 applyOpllManualYPatch(count, baseline, patch);
             },
-            audio_service_);
+            session_);
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         dialog->setContentOwned(content, true);
@@ -8806,7 +8807,7 @@ private:
     MutateTimbreMemoCallback mutate_memo_callback_;
     LfoSessionCallback lfo_session_callback_;
     LfoPollKeysCallback lfo_poll_keys_callback_;
-    SharedAudioHost* audio_service_{};
+    mgstc::app::EditorSession* session_{};
     std::unique_ptr<RateEnvelopeEditorWindow> rate_window_;
     std::optional<std::size_t> rate_editor_layer_;
     juce::OwnedArray<CompositeLayerSetupView> layer_setups_;
@@ -8947,8 +8948,9 @@ void CompositeTimeline::setLfoPollKeysCallback(LfoPollKeysCallback callback) {
     impl_->setLfoPollKeysCallback(std::move(callback));
 }
 
-void CompositeTimeline::setAudioService(SharedAudioHost* audio_service) noexcept {
-    impl_->setAudioService(audio_service);
+void CompositeTimeline::setEditorSession(
+    EditorSession* session) noexcept {
+    impl_->setEditorSession(session);
 }
 
 void CompositeTimeline::setPlaybackTempo(int tempo_bpm) {

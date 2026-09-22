@@ -316,6 +316,7 @@ if(WIN32)
                 src/app/juce/tone_library_session.cpp
                 src/app/juce/tone_library_session.hpp
                 src/app/juce/main.cpp
+                src/app/juce/mgstc_editor_view.cpp
         )
         target_link_libraries(
             mgstc
@@ -382,17 +383,37 @@ if(WIN32)
                     src/plugin/vst3/layer_delay_scheduler.cpp
                     src/plugin/vst3/plugin_processor.hpp
                     src/plugin/vst3/plugin_processor.cpp
+                    src/plugin/vst3/plugin_state.hpp
+                    src/plugin/vst3/plugin_state.cpp
+                    src/plugin/vst3/plugin_editor_context.hpp
+                    src/plugin/vst3/plugin_editor.hpp
+                    src/plugin/vst3/plugin_editor.cpp
                     src/plugin/vst3/vst3_diagnostic.hpp
+                    src/app/juce/mgstc_editor_view.cpp
+                    src/app/juce/composite_timeline.cpp
+                    src/app/juce/tone_library_session.cpp
+                    src/app/juce/ui_hang_watchdog.cpp
+                    src/app/juce/ui_layout.cpp
+                    src/app/juce/ui_paint.cpp
+                    src/app/juce/rate_envelope_trace.cpp
+                    src/app/windows/audio_import_bridge.cpp
             )
             target_include_directories(
                 ${target_name} PRIVATE
                     ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src/app/juce
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src/app/windows
             )
             target_link_libraries(
                 ${target_name}
                 PRIVATE
                     mgstc_engine
+                    mgstc_binary_data
                     juce::juce_audio_processors
+                    juce::juce_audio_utils
+                    juce::juce_gui_extra
+                    gdiplus
+                    windowscodecs
             )
             target_compile_features(${target_name} PRIVATE cxx_std_20)
             target_compile_definitions(
@@ -402,6 +423,7 @@ if(WIN32)
                     JUCE_USE_CURL=0
                     JUCE_VST3_CAN_REPLACE_VST2=0
                     JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
+                    JUCE_MODAL_LOOPS_PERMITTED=1
                 PRIVATE
                     MGSTC_DOC_VERSION="${MGSTC_DOC_VERSION}"
                     MGSTC_VST3_DIAG_MODE=${diag_mode_id}
@@ -635,15 +657,32 @@ if(MGSTC_BUILD_TESTS)
             mgstc_vst3_processor_tests
             tests/cpp/vst3_processor_tests.cpp
             src/plugin/vst3/layer_delay_scheduler.cpp
-            src/plugin/vst3/plugin_processor.cpp)
+            src/plugin/vst3/plugin_processor.cpp
+            src/plugin/vst3/plugin_state.cpp
+            src/plugin/vst3/plugin_editor.cpp
+            src/app/juce/mgstc_editor_view.cpp
+            src/app/juce/composite_timeline.cpp
+            src/app/juce/tone_library_session.cpp
+            src/app/juce/ui_hang_watchdog.cpp
+            src/app/juce/ui_layout.cpp
+            src/app/juce/ui_paint.cpp
+            src/app/juce/rate_envelope_trace.cpp
+            src/app/windows/audio_import_bridge.cpp)
         target_include_directories(
             mgstc_vst3_processor_tests PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3)
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/app/juce
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/app/windows)
         target_link_libraries(
             mgstc_vst3_processor_tests
             PRIVATE
                 mgstc_engine
-                juce::juce_audio_processors)
+                mgstc_binary_data
+                juce::juce_audio_processors
+                juce::juce_audio_utils
+                juce::juce_gui_extra
+                gdiplus
+                windowscodecs)
         target_compile_features(
             mgstc_vst3_processor_tests PRIVATE cxx_std_20)
         target_compile_definitions(
@@ -653,6 +692,7 @@ if(MGSTC_BUILD_TESTS)
                 JUCE_USE_CURL=0
                 JUCE_VST3_CAN_REPLACE_VST2=0
                 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
+                JUCE_MODAL_LOOPS_PERMITTED=1
                 MGSTC_VST3_DIAG_MODE=0)
         if(MSVC)
             target_compile_options(
@@ -667,15 +707,32 @@ if(MGSTC_BUILD_TESTS)
             mgstc_vst3_diag_null_tests
             tests/cpp/vst3_diag_null_tests.cpp
             src/plugin/vst3/layer_delay_scheduler.cpp
-            src/plugin/vst3/plugin_processor.cpp)
+            src/plugin/vst3/plugin_processor.cpp
+            src/plugin/vst3/plugin_state.cpp
+            src/plugin/vst3/plugin_editor.cpp
+            src/app/juce/mgstc_editor_view.cpp
+            src/app/juce/composite_timeline.cpp
+            src/app/juce/tone_library_session.cpp
+            src/app/juce/ui_hang_watchdog.cpp
+            src/app/juce/ui_layout.cpp
+            src/app/juce/ui_paint.cpp
+            src/app/juce/rate_envelope_trace.cpp
+            src/app/windows/audio_import_bridge.cpp)
         target_include_directories(
             mgstc_vst3_diag_null_tests PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3)
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/app/juce
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/app/windows)
         target_link_libraries(
             mgstc_vst3_diag_null_tests
             PRIVATE
                 mgstc_engine
-                juce::juce_audio_processors)
+                mgstc_binary_data
+                juce::juce_audio_processors
+                juce::juce_audio_utils
+                juce::juce_gui_extra
+                gdiplus
+                windowscodecs)
         target_compile_features(
             mgstc_vst3_diag_null_tests PRIVATE cxx_std_20)
         target_compile_definitions(
@@ -685,6 +742,7 @@ if(MGSTC_BUILD_TESTS)
                 JUCE_USE_CURL=0
                 JUCE_VST3_CAN_REPLACE_VST2=0
                 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
+                JUCE_MODAL_LOOPS_PERMITTED=1
                 MGSTC_VST3_DIAG_MODE=1)
         if(MSVC)
             target_compile_options(
@@ -699,15 +757,32 @@ if(MGSTC_BUILD_TESTS)
             mgstc_vst3_diag_lat0_tests
             tests/cpp/vst3_diag_lat0_tests.cpp
             src/plugin/vst3/layer_delay_scheduler.cpp
-            src/plugin/vst3/plugin_processor.cpp)
+            src/plugin/vst3/plugin_processor.cpp
+            src/plugin/vst3/plugin_state.cpp
+            src/plugin/vst3/plugin_editor.cpp
+            src/app/juce/mgstc_editor_view.cpp
+            src/app/juce/composite_timeline.cpp
+            src/app/juce/tone_library_session.cpp
+            src/app/juce/ui_hang_watchdog.cpp
+            src/app/juce/ui_layout.cpp
+            src/app/juce/ui_paint.cpp
+            src/app/juce/rate_envelope_trace.cpp
+            src/app/windows/audio_import_bridge.cpp)
         target_include_directories(
             mgstc_vst3_diag_lat0_tests PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3)
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/vst3
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/app/juce
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/app/windows)
         target_link_libraries(
             mgstc_vst3_diag_lat0_tests
             PRIVATE
                 mgstc_engine
-                juce::juce_audio_processors)
+                mgstc_binary_data
+                juce::juce_audio_processors
+                juce::juce_audio_utils
+                juce::juce_gui_extra
+                gdiplus
+                windowscodecs)
         target_compile_features(
             mgstc_vst3_diag_lat0_tests PRIVATE cxx_std_20)
         target_compile_definitions(
@@ -717,6 +792,7 @@ if(MGSTC_BUILD_TESTS)
                 JUCE_USE_CURL=0
                 JUCE_VST3_CAN_REPLACE_VST2=0
                 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
+                JUCE_MODAL_LOOPS_PERMITTED=1
                 MGSTC_VST3_DIAG_MODE=2)
         if(MSVC)
             target_compile_options(
