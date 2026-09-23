@@ -6746,7 +6746,7 @@ private:
     }
 
     void updateEnvelopeMmlPreview() {
-        if (selected_layer_ < 0)
+        if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
             if (last_envelope_mml_preview_.isNotEmpty()) {
                 last_envelope_mml_preview_.clear();
