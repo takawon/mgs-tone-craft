@@ -15,6 +15,10 @@
 - 本体をAGPL-3.0-onlyとすることでJUCEのAGPLv3条件を満たす。商用ライセンスは購入しない。
 - JUCE 8.0.15はスプラッシュ画面を使用しない版であり、`JUCE_DISPLAY_SPLASH_SCREEN`は
   指定しても無視される。表示義務のための追加実装は行わない。
+- Windows Direct2D の `Present1()` Message Thread blocking 対策として、JUCE Forum で
+  reuk が 2026-07-17 に提示した `direct2d.patch` を
+  `third_party/patches/juce/direct2d.patch` から FetchContent `PATCH_COMMAND` で適用する。
+  上流 JUCE に同等修正が取り込まれたら local patch を削除し、二重適用しない。
 - JUCEモジュールが同梱するzlib、pnglib、jpeglib、HarfBuzzなどの各依存は、
   JUCEソース内の`LICENSE.md`および各ディレクトリのライセンス表示に従う。
 

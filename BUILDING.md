@@ -60,7 +60,10 @@ JUCEのWindowsリソース生成ツールは日本語を含む出力パスを処
 通常のBuildでは現行UIを正式な`build\mgstc.exe`として生成する。従来の
 旧Win32 GUI版はソースを含めて削除済みであり、JUCE版だけをビルドする。JUCEは8.0.15の公式コミット
 `91ad83ae34a81e0833b1a2b0866f54846370ae53`へ固定し、初回構成時に
-公式GitHubリポジトリから取得する。
+公式GitHubリポジトリから取得する。初回構成時に
+`third_party/patches/juce/direct2d.patch`（JUCE Forum / reuk、Direct2D
+`Present1` の Message Thread blocking 対策）を JUCE ソースへ適用する。
+上流に同等修正が入ったらこの patch を削除する。
 ASIO対応もJUCE 8.0.15同梱のASIO SDKヘッダーを`JUCE_ASIO=1`で使用するため、
 別途ASIO SDKをダウンロードする必要はない。本体はAGPL-3.0-only、同梱ASIO SDKは
 GPLv3側の条件で使用し、配布ZIPにはSteinbergのASIO SDKライセンス全文を含める。
