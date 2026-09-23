@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 #include "plugin_processor.hpp"
+#include "plugin_editor.hpp"
 #include "plugin_editor_context.hpp"
 
 #include <algorithm>
@@ -2999,6 +3000,10 @@ void requireSoundRoundTrip(const mgstc::plugin::PluginStateDocument& document) {
         parsed.document.sound.favorite == document.sound.favorite,
         "favorite");
     require(parsed.document.library_id == document.library_id, "library id");
+    require(
+        parsed.document.master_volume_percent
+            == document.master_volume_percent,
+        "master volume");
     require(parsed.document.editor == document.editor, "editor state");
 }
 
@@ -3173,7 +3178,7 @@ void testPluginStateFoundation() {
             == mgstc::plugin::PluginStateStatus::BadMagic,
         "bad magic");
     auto unknown = valid;
-    unknown[8] = 2;
+    unknown[8] = 3;
     require(
         mgstc::plugin::parsePluginState(unknown.data(), unknown.size()).status
             == mgstc::plugin::PluginStateStatus::UnsupportedVersion,
@@ -3304,6 +3309,198 @@ void testPluginStateFoundation() {
         peak = channelPeak(more, 0, 512);
     }
     require(peak > 0.001, "restored PSG is audible at 44.1 kHz");
+}
+
+std::vector<float> captureHostNotePcm(
+    MgstcAudioProcessor& processor,
+    int frames = 2048) {
+    juce::AudioBuffer<float> buffer(2, frames);
+    juce::MidiBuffer midi;
+    midi.addEvent(
+        juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)),
+        0);
+    processor.processBlock(buffer, midi);
+    std::vector<float> pcm(static_cast<std::size_t>(frames));
+    const auto* left = buffer.getReadPointer(0);
+    for (int index = 0; index < frames; ++index) {
+        pcm[static_cast<std::size_t>(index)] = left[index];
+    }
+    return pcm;
+}
+
+double peakOf(const std::vector<float>& pcm) {
+    double peak = 0.0;
+    for (const auto sample : pcm) {
+        peak = std::max(peak, static_cast<double>(std::fabs(sample)));
+    }
+    return peak;
+}
+
+void requireWorkingCompositeMatchesProcessor(
+    juce::AudioProcessorEditor* editor,
+    MgstcAudioProcessor& processor,
+    const char* message) {
+    auto* plugin_editor =
+        dynamic_cast<mgstc::plugin::MgstcAudioProcessorEditor*>(editor);
+    require(plugin_editor != nullptr, "plugin editor type");
+    require(
+        soundBytes(plugin_editor->copyWorkingComposite())
+            == soundBytes(processor.copyPluginState().sound),
+        message);
+}
+
+std::vector<std::uint8_t> asLegacyV1(std::vector<std::uint8_t> v2) {
+    require(v2.size() > 36, "v2 blob has master volume field");
+    require(v2[8] == 2, "current serializer writes schema v2");
+    v2[8] = 1;
+    v2.erase(v2.begin() + 32, v2.begin() + 36);
+    return v2;
+}
+
+void testPluginProjectRestore() {
+    auto composite = documentFrom(compositeTimbre(), 7, {});
+    composite.master_volume_percent = 40;
+    composite.sound.layers[1].enabled = false;
+    requireSoundRoundTrip(composite);
+
+    MgstcAudioProcessor saved;
+    require(saved.replacePluginState(composite), "commit E4 composite");
+    require(saved.editorMasterVolumePercent() == 40, "processor stores master 40");
+    const auto blob = stateBytes(saved);
+
+    MgstcAudioProcessor before_prepare;
+    before_prepare.setStateInformation(
+        blob.getData(), static_cast<int>(blob.getSize()));
+    require(
+        before_prepare.editorMasterVolumePercent() == 40,
+        "restore before prepareToPlay keeps master volume");
+    require(
+        soundBytes(before_prepare.copyPluginState().sound)
+            == soundBytes(composite.sound),
+        "restore before prepareToPlay keeps sound");
+    require(
+        !before_prepare.copyPluginState().sound.layers[1].enabled,
+        "disabled SCC layer round-trips");
+    before_prepare.prepareToPlay(48'000.0, 512);
+    const auto restored_pcm = captureHostNotePcm(before_prepare);
+    require(peakOf(restored_pcm) > 0.001, "editor-less restore is audible");
+
+    MgstcAudioProcessor after_prepare;
+    after_prepare.prepareToPlay(48'000.0, 512);
+    after_prepare.setStateInformation(
+        blob.getData(), static_cast<int>(blob.getSize()));
+    require(
+        after_prepare.editorMasterVolumePercent() == 40,
+        "restore after prepareToPlay keeps master volume");
+    processEmpty(after_prepare, 512);
+    processEmpty(after_prepare, 512);
+    const auto live_pcm = captureHostNotePcm(after_prepare);
+    require(peakOf(live_pcm) > 0.001, "restore after prepareToPlay is audible");
+
+    MgstcAudioProcessor reference;
+    require(reference.replacePluginState(composite), "reference 40%");
+    reference.prepareToPlay(48'000.0, 512);
+    const auto reference_pcm = captureHostNotePcm(reference);
+    require(
+        std::abs(peakOf(restored_pcm) / peakOf(reference_pcm) - 1.0) < 0.05,
+        "restored master volume matches a fresh processor");
+
+    MgstcAudioProcessor hydrate;
+    hydrate.setStateInformation(
+        blob.getData(), static_cast<int>(blob.getSize()));
+    const auto compiles = Access::stateCompileCount(hydrate);
+    auto* editor = hydrate.createEditor();
+    requireWorkingCompositeMatchesProcessor(
+        editor,
+        hydrate,
+        "createEditor after restore hydrates Processor composite");
+    require(
+        hydrate.copyPluginState().sound.name == composite.sound.name,
+        "editor open does not replace restored sound");
+    require(
+        hydrate.editorMasterVolumePercent() == 40,
+        "editor open does not reset restored master volume");
+    require(
+        Access::stateCompileCount(hydrate) == compiles,
+        "editor open after restore does not compile");
+    delete editor;
+
+    const auto v1 = asLegacyV1(
+        mgstc::plugin::serializePluginState(composite));
+    const auto v1_parsed = mgstc::plugin::parsePluginState(
+        v1.data(), v1.size());
+    require(
+        v1_parsed.status == mgstc::plugin::PluginStateStatus::Ok,
+        "schema v1 still parses");
+    require(
+        v1_parsed.document.master_volume_percent == 100,
+        "schema v1 restores master volume as 100");
+    require(
+        soundBytes(v1_parsed.document.sound) == soundBytes(composite.sound),
+        "schema v1 keeps the sound payload");
+
+    MgstcAudioProcessor v1_host;
+    v1_host.editorSetMasterVolumePercent(25);
+    v1_host.setStateInformation(v1.data(), static_cast<int>(v1.size()));
+    require(
+        v1_host.editorMasterVolumePercent() == 100,
+        "v1 project restore applies default master 100");
+
+    const auto* blob_begin =
+        static_cast<const std::uint8_t*>(blob.getData());
+    auto future = std::vector<std::uint8_t>(
+        blob_begin, blob_begin + blob.getSize());
+    future[8] = 3;
+    requireRejected(saved, future);
+
+    auto impossible = future;
+    impossible[8] = 2;
+    impossible[32] = 101;
+    impossible[33] = 0;
+    impossible[34] = 0;
+    impossible[35] = 0;
+    require(
+        saved.editorMasterVolumePercent() == 40, "guard still at 40");
+    requireRejected(saved, impossible);
+    require(
+        saved.editorMasterVolumePercent() == 40,
+        "impossible master volume does not partial-apply");
+
+    MgstcAudioProcessor instance_a;
+    MgstcAudioProcessor instance_b;
+    auto left = documentFrom(psgOnlyTimbre(), 0, {});
+    left.master_volume_percent = 30;
+    auto right = documentFrom(opllOnlyTimbre(), 0, {});
+    right.master_volume_percent = 70;
+    require(instance_a.replacePluginState(left), "instance A E4");
+    require(instance_b.replacePluginState(right), "instance B E4");
+    const auto a_bytes = stateBytes(instance_a);
+    const auto b_bytes = stateBytes(instance_b);
+    MgstcAudioProcessor restore_a;
+    MgstcAudioProcessor restore_b;
+    restore_a.setStateInformation(
+        a_bytes.getData(), static_cast<int>(a_bytes.getSize()));
+    restore_b.setStateInformation(
+        b_bytes.getData(), static_cast<int>(b_bytes.getSize()));
+    require(
+        restore_a.editorMasterVolumePercent() == 30
+            && restore_b.editorMasterVolumePercent() == 70,
+        "multi-instance master volumes stay independent");
+    require(
+        restore_a.copyPluginState().sound.name
+            != restore_b.copyPluginState().sound.name,
+        "multi-instance composites stay independent");
+
+    MgstcAudioProcessor at_441;
+    at_441.setStateInformation(
+        blob.getData(), static_cast<int>(blob.getSize()));
+    at_441.prepareToPlay(44'100.0, 512);
+    require(
+        peakOf(captureHostNotePcm(at_441)) > 0.001,
+        "44.1 kHz restore is audible");
+    require(
+        at_441.getLatencySamples() == 7,
+        "44.1 kHz restore does not touch latency");
 }
 
 void testPluginEditor() {
@@ -3485,6 +3682,7 @@ int main() {
         testBlockBoundaryMidiStaysOnItsFrame();
         testHostRateOverdueNoteIsAppliedNow();
         testPluginStateFoundation();
+        testPluginProjectRestore();
         testPluginEditor();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

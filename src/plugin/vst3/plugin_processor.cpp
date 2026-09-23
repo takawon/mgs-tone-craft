@@ -339,6 +339,12 @@ void MgstcAudioProcessor::prepareToPlay(
         latency = 0;
     }
     reportPluginLatency(latency);
+    master_volume_gain_ = static_cast<float>(
+        std::clamp(
+            editor_master_volume_percent_.load(std::memory_order_relaxed),
+            0,
+            100))
+        / 100.0F;
 }
 
 void MgstcAudioProcessor::releaseResources() {
@@ -420,6 +426,7 @@ void MgstcAudioProcessor::processBlock(
         if (!hostIsEngineRate()) {
             applyCommittedPlaybackPlan();
             processEngineOnlyBlock(buffer, midi, num_samples);
+            applyMasterVolume(buffer, num_samples);
             host_frame_position_ += static_cast<std::uint64_t>(num_samples);
             midi_it_ = {};
             midi_end_ = {};
@@ -446,6 +453,7 @@ void MgstcAudioProcessor::processBlock(
     } else {
         processDirectBlock(buffer, midi, num_samples);
     }
+    applyMasterVolume(buffer, num_samples);
     host_frame_position_ += static_cast<std::uint64_t>(num_samples);
     midi_it_ = {};
     midi_end_ = {};
@@ -1087,6 +1095,45 @@ void MgstcAudioProcessor::silenceFrom(
     }
 }
 
+void MgstcAudioProcessor::applyMasterVolume(
+    juce::AudioBuffer<float>& buffer,
+    int num_samples) noexcept {
+    if (num_samples <= 0 || buffer.getNumChannels() <= 0) {
+        return;
+    }
+    const float target =
+        static_cast<float>(std::clamp(
+            editor_master_volume_percent_.load(std::memory_order_relaxed),
+            0,
+            100))
+        / 100.0F;
+    float gain = master_volume_gain_;
+    if (std::abs(gain - target) <= 1.0e-7F) {
+        master_volume_gain_ = target;
+        if (target >= 1.0F) {
+            return;
+        }
+        if (target <= 0.0F) {
+            buffer.clear();
+            return;
+        }
+        buffer.applyGain(0, num_samples, target);
+        return;
+    }
+    const float rate = host_rate_hz_ != 0
+        ? static_cast<float>(host_rate_hz_)
+        : static_cast<float>(kEngineSampleRate);
+    const float coeff = 1.0F - std::exp(-1.0F / (0.008F * rate));
+    const int channels = buffer.getNumChannels();
+    for (int frame = 0; frame < num_samples; ++frame) {
+        gain += (target - gain) * coeff;
+        for (int channel = 0; channel < channels; ++channel) {
+            buffer.getWritePointer(channel)[frame] *= gain;
+        }
+    }
+    master_volume_gain_ = gain;
+}
+
 bool MgstcAudioProcessor::hasEditor() const {
     return true;
 }
@@ -1176,6 +1223,11 @@ PluginStateDocument MgstcAudioProcessor::copyPluginState() const {
     PluginStateDocument document;
     document.editor = editor_;
     document.library_id = library_id_;
+    document.master_volume_percent = static_cast<std::uint32_t>(
+        std::clamp(
+            editor_master_volume_percent_.load(std::memory_order_relaxed),
+            0,
+            100));
     document.sound = sound_;
     return document;
 }
@@ -1250,7 +1302,8 @@ bool MgstcAudioProcessor::commitPluginState(
         document.sound.playback_tempo,
         mgstc::engine::kMgscTempoMin,
         mgstc::engine::kMgscTempoMax);
-    if (!validatePluginSoundSnapshot(document.sound)) {
+    if (!validatePluginSoundSnapshot(document.sound)
+        || document.master_volume_percent > 100) {
         return false;
     }
 
@@ -1305,7 +1358,14 @@ bool MgstcAudioProcessor::commitPluginState(
     published_plan_.store(slot, std::memory_order_release);
     program_ready_.store(true, std::memory_order_release);
     editor_runtime_program_temporary_ = false;
+    const int next_volume = std::clamp(
+        static_cast<int>(document.master_volume_percent), 0, 100);
+    if (next_volume
+        != editor_master_volume_percent_.load(std::memory_order_relaxed)) {
+        editorSetMasterVolumePercent(next_volume);
+    }
     if (mode != CommitMode::Live) {
+        master_volume_gain_ = static_cast<float>(next_volume) / 100.0F;
         applied_plan_ = slot;
         acknowledged_plan_.store(slot, std::memory_order_release);
         const auto capacity = plan_slots_[slot].voice_capacity;
@@ -1378,12 +1438,13 @@ void MgstcAudioProcessor::editorSetMasterVolumePercent(int percent) {
     if (onAudioThread()) {
         return;
     }
-    editor_master_volume_percent_ = std::clamp(percent, 0, 100);
+    editor_master_volume_percent_.store(
+        std::clamp(percent, 0, 100), std::memory_order_relaxed);
     ++editor_master_volume_revision_;
 }
 
 int MgstcAudioProcessor::editorMasterVolumePercent() const noexcept {
-    return editor_master_volume_percent_;
+    return editor_master_volume_percent_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t MgstcAudioProcessor::editorMasterVolumeRevision()

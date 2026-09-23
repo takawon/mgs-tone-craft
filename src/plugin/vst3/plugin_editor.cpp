@@ -96,6 +96,14 @@ void MgstcAudioProcessorEditor::resized() {
     }
 }
 
+mgstc::engine::CompositeTimbre
+MgstcAudioProcessorEditor::copyWorkingComposite() const {
+    if (composite_ == nullptr) {
+        return {};
+    }
+    return composite_->workingTimbre();
+}
+
 void MgstcAudioProcessorEditor::openSatellite(
     const juce::String& kind,
     std::optional<std::uint64_t>) {

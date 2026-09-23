@@ -3714,7 +3714,9 @@ public:
           tooltip_window_(this, 450),
           timbre_(std::move(initial_timbre).value_or(
               mgstc::engine::defaultCompositeTimbre())),
-          performance_keyboard_(session_) {
+          performance_keyboard_(session_),
+          hydrate_from_host_(initial_timbre.has_value()) {
+        hydrating_ = true;
         setWantsKeyboardFocus(true);
         last_audition_note_ = loadLastAuditionNoteSetting();
 
@@ -4140,7 +4142,9 @@ public:
 
         // A new composite starts empty. The controls above are reusable slots;
         // channels are created only through the three add buttons.
-        timbre_.layers.clear();
+        if (!hydrate_from_host_) {
+            timbre_.layers.clear();
+        }
         history_.clear();
         history_.push_back(timbre_);
         history_cursor_ = 0;
@@ -4167,6 +4171,9 @@ public:
                 const mgstc::engine::CompositeTimbre& edited,
                 bool commit,
                 bool request_preview) {
+                if (hydrating_) {
+                    return;
+                }
                 const bool structure_changed =
                     edited.layers.size() != timbre_.layers.size();
                 timbre_ = edited;
@@ -4353,8 +4360,9 @@ public:
                 }
             });
         }
+        hydrating_ = false;
         engine_ready_ = session_.snapshot().audio_running;
-        composite_program_stale_ = true;
+        composite_program_stale_ = !hydrate_from_host_;
         applyHostCapabilities();
         startTimerHz(60);
         updateStatus(
@@ -4376,6 +4384,11 @@ public:
             mute_[index].setLookAndFeel(nullptr);
             solo_[index].setLookAndFeel(nullptr);
         }
+    }
+
+    [[nodiscard]] const mgstc::engine::CompositeTimbre& workingTimbre()
+        const noexcept {
+        return timbre_;
     }
 
     void prepareVisualInspection() {
@@ -6442,6 +6455,9 @@ private:
     }
 
     bool configureEngine() {
+        if (hydrating_) {
+            return false;
+        }
         MGSTC_UI_ACTIVITY("composite: configureEngine (compile + submit)");
         CompositeAuditionRequest request;
         request.timbre = &timbre_;
@@ -6866,6 +6882,8 @@ private:
     int settings_poll_ticks_{};
     std::uint64_t master_volume_revision_{};
     bool syncing_{};
+    bool hydrate_from_host_{};
+    bool hydrating_{};
     bool engine_ready_{};
     bool composite_program_stale_{true};
     LibraryFileFingerprint composite_library_fingerprint_{};
