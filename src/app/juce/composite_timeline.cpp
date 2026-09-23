@@ -35,7 +35,6 @@
 #include "ui_modal_dialog.hpp"
 #include "ui_paint.hpp"
 #include "ui_scale.hpp"
-#include "editor_stall_probe.hpp"
 
 #include "mgstc/engine/chip_volume_curve.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
@@ -4060,9 +4059,6 @@ public:
     }
 
     void resized() override {
-        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::TimelineResized);
-        mgstc::app::EditorStallProbe::instance().countEvent(
-            "resized: CompositeTimeline");
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(panelPad);
         // Single chrome row: help+tempo (paint) and channel add buttons.
@@ -4085,8 +4081,8 @@ public:
             graph.getX(), graph.getBottom(), graph.getWidth(), kScrollBarSize);
         updateScrollRanges();
         applyCountColumnWidth();
-        lane_layout_dirty_ = true;
-        ensureLaneLayout();
+        layoutLayerSetups();
+        layoutEditToolsDock();
     }
 
     void mouseDown(const juce::MouseEvent& event) override {
@@ -4233,65 +4229,12 @@ public:
     }
 
     void mouseMove(const juce::MouseEvent& event) override {
-        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::TimelineMouseMove);
-        const auto previous_popup = hoverPopupBounds();
-        const auto previous_value = hover_preview_value_;
-        const auto previous_count = selected_count_;
-        const auto previous_hover_parameter = hover_edit_parameter_;
         hover_mouse_pos_ = event.getPosition();
         inspectFromMouse(event.getPosition());
-        if (mgstc::app::editorJankSkipHover()) {
-            return;
-        }
-        const auto next_popup = hoverPopupBounds();
-        const bool selection_overlay_changed =
-            previous_count != selected_count_
-            || previous_hover_parameter != hover_edit_parameter_;
-        if (selection_overlay_changed) {
-            juce::Rectangle<int> dirty;
-            if (selected_layer_ >= 0
-                && selected_layer_ < static_cast<int>(graph_bounds_.size())) {
-                dirty = graph_bounds_[static_cast<std::size_t>(selected_layer_)];
-            }
-            if (previous_popup) {
-                dirty = dirty.getUnion(*previous_popup);
-            }
-            if (next_popup) {
-                dirty = dirty.getUnion(*next_popup);
-            }
-            if (!dirty.isEmpty()) {
-                MGSTC_JANK_EVENT("hoverChange");
-                MGSTC_JANK_REPAINT_RECT(
-                    *this,
-                    dirty.expanded(6),
-                    mgstc::app::JankRepaintKind::HoverPopup);
-            }
-            return;
-        }
-        if (previous_popup != next_popup
-            || previous_value != hover_preview_value_) {
-            MGSTC_JANK_EVENT("hoverChange");
-            if (previous_popup) {
-                MGSTC_JANK_REPAINT_RECT(
-                    *this,
-                    previous_popup->expanded(6),
-                    mgstc::app::JankRepaintKind::HoverPopup);
-            }
-            if (next_popup) {
-                MGSTC_JANK_REPAINT_RECT(
-                    *this,
-                    next_popup->expanded(6),
-                    mgstc::app::JankRepaintKind::HoverPopup);
-            }
-        }
-    }
-
-    void mouseEnter(const juce::MouseEvent&) override {
-        MGSTC_JANK_EVENT("mouseEnter");
+        repaint();
     }
 
     void mouseExit(const juce::MouseEvent&) override {
-        MGSTC_JANK_EVENT("mouseExit");
         if (drawing_) {
             return;
         }
@@ -4300,10 +4243,7 @@ public:
         hover_edit_parameter_.reset();
         setMouseCursor(juce::MouseCursor::CrosshairCursor);
         syncPointEditors();
-        if (mgstc::app::editorJankSkipHover()) {
-            return;
-        }
-        MGSTC_JANK_REPAINT_FULL(*this, mgstc::app::JankRepaintKind::HoverPopup);
+        repaint();
     }
 
     void mouseWheelMove(
@@ -4334,25 +4274,10 @@ public:
                     - delta * static_cast<double>(UiLayout::xl * 2),
                 juce::dontSendNotification);
         }
-        lane_layout_dirty_ = true;
-        ensureLaneLayout();
         repaint();
     }
 
     void paint(juce::Graphics& graphics) override {
-        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::TimelinePaint);
-        const auto incoming_clip =
-            graphics.getClipBounds().getSmallestIntegerContainer();
-        const auto incoming_popup = hoverPopupBounds();
-        const bool incoming_popup_only =
-            incoming_popup.has_value()
-            && incoming_popup->expanded(8).contains(incoming_clip);
-        MGSTC_JANK_PAINT(
-            incoming_popup_only
-                ? mgstc::app::JankRepaintKind::HoverPopup
-                : mgstc::app::JankRepaintKind::Timeline,
-            graphics,
-            *this);
         graphics.fillAll(juce::Colour(0xFF182028));
         auto area = getLocalBounds().reduced(UiLayout::panelPad);
         auto header = area.removeFromTop(UiLayout::textButtonH);
@@ -4375,25 +4300,12 @@ public:
         if (!drawing_) {
             edit_draw_bounds_.reset();
         }
-        ensureLaneLayout();
-        const auto clip = graphics.getClipBounds().getSmallestIntegerContainer();
-        if (clip.contains(getLocalBounds())
-            || (clip.getWidth() >= getWidth() - 2
-                && clip.getHeight() >= getHeight() - 2)) {
-            mgstc::app::EditorStallProbe::instance().countEvent(
-                "full-repaint: CompositeTimeline::paint");
-        }
-        const auto hover_popup = hoverPopupBounds();
-        const bool popup_only_clip =
-            hover_popup.has_value()
-            && hover_popup->expanded(8).contains(clip);
-        if (popup_only_clip) {
-            drawHoverValuePopup(graphics);
-            return;
-        }
         const std::size_t lane_count = timbre_.layers.size() + 1;
         const int scroll_y = juce::roundToInt(
             vertical_scroll_.getCurrentRangeStart());
+        const auto numbers = mgstc::engine::resolveTimbreNumbers(timbre_);
+            graph_bounds_.assign(timbre_.layers.size(), {});
+            lane_frames_.assign(timbre_.layers.size(), {});
             int lane_y = area.getY() - scroll_y;
             for (int lane_index = 0;
                  lane_index < static_cast<int>(lane_count);
@@ -4408,10 +4320,10 @@ public:
                 const bool mixed_lane =
                     lane_index == static_cast<int>(timbre_.layers.size());
                 const std::size_t index = static_cast<std::size_t>(lane_index);
-                if (!mixed_lane && index < lane_frames_.size()) {
-                    frame = lane_frames_[index];
+                if (!mixed_lane) {
+                    lane_frames_[index] = frame;
                 }
-                if (!frame.intersects(area) || !frame.intersects(clip)) {
+                if (!frame.intersects(area)) {
                     continue;
                 }
                 const auto colour = mixed_lane
@@ -4509,10 +4421,10 @@ public:
                     if (layer.volume_envelope.kind
                         == mgstc::engine::EnvelopeKind::Rate) {
                         const auto layout = rateEnvelopeHandlesForLayer(layer);
-                            paintRateEnvelopeGraph(
+                        paintRateEnvelopeGraph(
                             graphics,
                             plot,
-                            cachedLayerRateTrace(index),
+                            mgstc::app::makeLayerRateTrace(layer),
                             colour,
                             layer.source,
                             false,
@@ -4530,6 +4442,9 @@ public:
                 }
             }
         }
+        juce::ignoreUnused(numbers);
+        layoutLayerSetups();
+        layoutEditToolsDock();
     }
 
 private:
@@ -5675,28 +5590,6 @@ private:
         return -1;
     }
 
-    void applyMouseCursor(juce::MouseCursor::StandardCursorType type) {
-        if (last_mouse_cursor_ == type) {
-            return;
-        }
-        last_mouse_cursor_ = type;
-        setMouseCursor(juce::MouseCursor(type));
-    }
-
-    void setLabelTextIfChanged(
-        juce::Label& label, const juce::String& text) {
-        if (label.getText() != text) {
-            label.setText(text, juce::dontSendNotification);
-        }
-    }
-
-    void setEditorTextIfChanged(
-        juce::TextEditor& editor, const juce::String& text) {
-        if (editor.getText() != text) {
-            editor.setText(text, false);
-        }
-    }
-
     void inspectFromMouse(juce::Point<int> point) {
         if (drawing_) {
             return;
@@ -5705,15 +5598,15 @@ private:
         hover_edit_parameter_.reset();
         if (layer < 0) {
             hover_preview_value_.reset();
-            applyMouseCursor(juce::MouseCursor::CrosshairCursor);
+            setMouseCursor(juce::MouseCursor::CrosshairCursor);
             return;
         }
         if (layer != selected_layer_) {
             hover_preview_value_.reset();
-            applyMouseCursor(juce::MouseCursor::PointingHandCursor);
+            setMouseCursor(juce::MouseCursor::PointingHandCursor);
             return;
         }
-        applyMouseCursor(juce::MouseCursor::CrosshairCursor);
+        setMouseCursor(juce::MouseCursor::CrosshairCursor);
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())
             || selected_layer_ >= static_cast<int>(graph_bounds_.size())) {
@@ -5779,18 +5672,19 @@ private:
             storedValueAt(selected, selectedParameter(), selected_count_));
         const bool count_changed = selected_count_ != previous_count;
         hover_preview_value_ = mapped_value;
-        setLabelTextIfChanged(
-            position_, "ct " + juce::String(selected_count_));
+        position_.setText(
+            "ct " + juce::String(selected_count_),
+            juce::dontSendNotification);
         if (selectedParameter() == Parameter::Timbre && !mapped_value) {
-            setEditorTextIfChanged(
-                value_, timbreInspectLabel(selected, selected_count_));
+            value_.setText(
+                timbreInspectLabel(selected, selected_count_), false);
         } else if (
             selectedParameter() == Parameter::RegisterWrite
             && !mapped_value) {
-            setEditorTextIfChanged(
-                value_, registerInspectLabel(selected, selected_count_));
+            value_.setText(
+                registerInspectLabel(selected, selected_count_), false);
         } else {
-            setEditorTextIfChanged(value_, juce::String(shown));
+            value_.setText(juce::String(shown), false);
         }
         if (selectedParameter() == Parameter::RegisterWrite) {
             const auto tip = registerInspectTooltip(selected, selected_count_);
@@ -5832,6 +5726,7 @@ private:
             if (parameter_changed) {
                 syncInspector();
             }
+            repaint();
         }
     }
 
@@ -6155,8 +6050,6 @@ private:
             maybeExpandScrollExtent(static_cast<int>(std::ceil(
                 horizontal_scroll_.getCurrentRange().getEnd())));
         }
-        lane_layout_dirty_ = true;
-        ensureLaneLayout();
         repaint();
     }
 
@@ -6215,7 +6108,7 @@ private:
             return;
         }
         if (parameter == Parameter::Volume) {
-            drawVolumeBars(graphics, bounds, layer_index, colour);
+            drawVolumeBars(graphics, bounds, layer, colour);
             return;
         }
         const auto& events = eventsFor(layer, parameter);
@@ -6282,9 +6175,8 @@ private:
     void drawVolumeBars(
         juce::Graphics& graphics,
         juce::Rectangle<int> bounds,
-        std::size_t layer_index,
+        const mgstc::engine::CompositeLayer& layer,
         juce::Colour colour) const {
-        const auto& layer = timbre_.layers[layer_index];
         struct Point {
             int count{};
             int volume{};
@@ -6315,7 +6207,7 @@ private:
         }
         const int end_count = static_cast<int>(
             layer.envelope_timeline.length_counts);
-        const auto& sampled = cachedVolumeSamples(layer_index, end_count);
+        const auto sampled = mgstc::engine::sampleCompositeVolumeLane(layer, end_count);
         const auto draw_output_span = [&](int start, int stop) {
             const int last = juce::jmin(stop, end_count);
             for (int count = start; count < last; ++count) {
@@ -6728,7 +6620,7 @@ private:
             paintRateEnvelopeGraph(
                 graphics,
                 graph_slot,
-                cachedLayerRateTrace(layer_index),
+                mgstc::app::makeLayerRateTrace(layer),
                 colour,
                 layer.source,
                 true,
@@ -6795,7 +6687,6 @@ private:
     }
 
     void updateEnvelopeMmlPreview() {
-        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::CacheRebuild);
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
             if (last_envelope_mml_preview_.isNotEmpty()) {
@@ -8664,165 +8555,12 @@ private:
         layoutLayerSetups();
     }
 
-    void rebuildLaneFrames() {
-        const auto area = graphArea();
-        const std::size_t lane_count = timbre_.layers.size() + 1;
-        const int scroll_y = juce::roundToInt(
-            vertical_scroll_.getCurrentRangeStart());
-        graph_bounds_.assign(timbre_.layers.size(), {});
-        lane_frames_.assign(timbre_.layers.size(), {});
-        int lane_y = area.getY() - scroll_y;
-        for (int lane_index = 0;
-             lane_index < static_cast<int>(lane_count);
-             ++lane_index) {
-            const int lane_height = laneHeightForIndex(lane_index);
-            auto frame = juce::Rectangle<int>(
-                area.getX(),
-                lane_y,
-                area.getWidth(),
-                lane_height).reduced(0, UiLayout::editLaneFramePadV);
-            lane_y += lane_height;
-            const bool mixed_lane =
-                lane_index == static_cast<int>(timbre_.layers.size());
-            if (mixed_lane) {
-                continue;
-            }
-            const auto index = static_cast<std::size_t>(lane_index);
-            lane_frames_[index] = frame;
-            if (!frame.intersects(area)) {
-                continue;
-            }
-            auto lane = frame;
-            lane.removeFromLeft(UiLayout::compositeLaneLabelW)
-                .reduced(UiLayout::sm, 0);
-            lane.reduce(UiLayout::sm, UiLayout::editLaneInnerPadV);
-            graph_bounds_[index] = lane;
-        }
-    }
-
-    [[nodiscard]] static std::uint64_t volumeLaneFingerprint(
-        const mgstc::engine::CompositeLayer& layer) noexcept {
-        std::uint64_t hash = 14695981039346656037ull;
-        const auto mix = [&](std::uint64_t value) {
-            hash ^= value;
-            hash *= 1099511628211ull;
-        };
-        mix(layer.volume);
-        mix(static_cast<std::uint64_t>(layer.volume_envelope.kind));
-        mix(layer.envelope_timeline.length_counts);
-        mix(layer.envelope_timeline.loop_start_count.value_or(~0u));
-        mix(layer.envelope_timeline.loop_end_count.value_or(~0u));
-        const auto& rate = layer.volume_envelope.rate;
-        mix(rate.tone_mode);
-        mix(rate.noise);
-        mix(rate.attack_level);
-        mix(rate.attack_rate);
-        mix(rate.decay_rate);
-        mix(rate.sustain_level);
-        mix(rate.sustain_rate);
-        mix(rate.release_rate);
-        for (const auto& event : layer.volume_envelope.events) {
-            mix(static_cast<std::uint64_t>(event.kind));
-            mix(static_cast<std::uint64_t>(
-                static_cast<std::uint32_t>(event.value)));
-            mix(event.count);
-            mix(event.automatic ? 1u : 0u);
-            mix(event.precise ? 1u : 0u);
-            mix(event.after_loop_start ? 1u : 0u);
-        }
-        return hash;
-    }
-
-    [[nodiscard]] const mgstc::engine::RateEnvelopeTrace& cachedLayerRateTrace(
-        std::size_t layer_index) const {
-        if (layer_index >= rate_trace_cache_.size()) {
-            rate_trace_cache_.resize(timbre_.layers.size());
-        }
-        const auto& layer = timbre_.layers[layer_index];
-        auto& cache = rate_trace_cache_[layer_index];
-        const auto rate = mgstc::engine::clampRateEnvelope(
-            layer.volume_envelope.rate);
-        if (cache.valid
-            && cache.volume == layer.volume
-            && cache.source == layer.source
-            && cache.rate == rate) {
-            return cache.trace;
-        }
-        cache.volume = layer.volume;
-        cache.source = layer.source;
-        cache.rate = rate;
-        {
-            MGSTC_STALL_PROBE(mgstc::app::StallProbeId::CacheRebuild);
-            cache.trace = mgstc::app::makeLayerRateTrace(layer);
-        }
-        cache.valid = true;
-        return cache.trace;
-    }
-
-    [[nodiscard]] const std::vector<std::uint8_t>& cachedVolumeSamples(
-        std::size_t layer_index,
-        int ticks) const {
-        if (layer_index >= volume_sample_cache_.size()) {
-            volume_sample_cache_.resize(timbre_.layers.size());
-        }
-        const auto& layer = timbre_.layers[layer_index];
-        auto& cache = volume_sample_cache_[layer_index];
-        const auto fingerprint = volumeLaneFingerprint(layer);
-        if (cache.ticks == ticks
-            && cache.fingerprint == fingerprint) {
-            return cache.samples;
-        }
-        cache.ticks = ticks;
-        cache.fingerprint = fingerprint;
-        {
-            MGSTC_STALL_PROBE(mgstc::app::StallProbeId::CacheRebuild);
-            cache.samples = mgstc::engine::sampleCompositeVolumeLane(layer, ticks);
-        }
-        return cache.samples;
-    }
-
-    void ensureLaneLayout() {
-        if (!lane_layout_dirty_) {
-            return;
-        }
-        auto previous_frames = lane_frames_;
-        rebuildLaneFrames();
-        const auto envelope_kind =
-            selected_layer_ >= 0
-                && selected_layer_
-                    < static_cast<int>(timbre_.layers.size())
-            ? timbre_.layers[static_cast<std::size_t>(selected_layer_)]
-                  .volume_envelope.kind
-            : mgstc::engine::EnvelopeKind::Sequence;
-        const bool register_auto = selectedLayerShowsRegisterAuto();
-        if (lane_layout_applied_
-            && previous_frames == lane_frames_
-            && laid_out_selected_layer_ == selected_layer_
-            && laid_out_envelope_kind_ == envelope_kind
-            && laid_out_register_auto_ == register_auto) {
-            lane_layout_dirty_ = false;
-            return;
-        }
-        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::ComponentUpdate);
-        mgstc::app::EditorStallProbe::instance().countEvent(
-            "layout: CompositeTimeline lanes/dock");
-        layoutLayerSetups();
-        layoutEditToolsDock();
-        laid_out_selected_layer_ = selected_layer_;
-        laid_out_envelope_kind_ = envelope_kind;
-        laid_out_register_auto_ = register_auto;
-        lane_layout_applied_ = true;
-        lane_layout_dirty_ = false;
-    }
-
     void layoutLayerSetups() {
         using namespace UiLayout;
         for (int index = 0; index < layer_setups_.size(); ++index) {
             if (index >= static_cast<int>(lane_frames_.size())
                 || lane_frames_[static_cast<std::size_t>(index)].isEmpty()) {
-                if (layer_setups_[index]->isVisible()) {
-                    layer_setups_[index]->setVisible(false);
-                }
+                layer_setups_[index]->setVisible(false);
                 continue;
             }
             auto bounds = lane_frames_[static_cast<std::size_t>(index)];
@@ -8835,15 +8573,12 @@ private:
             bounds = bounds.translated(
                 -graph_clip_.getX(), -graph_clip_.getY());
             if (!bounds.intersects(graph_clip_.getLocalBounds())) {
-                if (layer_setups_[index]->isVisible()) {
-                    layer_setups_[index]->setVisible(false);
-                }
+                layer_setups_[index]->setVisible(false);
                 continue;
             }
             layer_setups_[index]->setBounds(bounds);
-            if (!layer_setups_[index]->isVisible()) {
-                layer_setups_[index]->setVisible(true);
-            }
+            layer_setups_[index]->setVisible(true);
+            layer_setups_[index]->toFront(false);
         }
     }
 
@@ -8988,6 +8723,23 @@ private:
         } else {
             envelope_mml_preview_.setVisible(false);
         }
+
+        for (auto* c : std::initializer_list<juce::Component*>{
+                 &edit_mode_, &parameter_, &position_, &value_label_, &value_,
+                 &apply_, &auto_mode_, &auto_depth_, &auto_speed_,
+                 &auto_coarseness_, &auto_stop_, &auto_depth_label_,
+                 &auto_speed_label_, &auto_coarseness_label_, &auto_stop_label_,
+                 &inspector_selection_, &length_label_, &length_editor_,
+                 &loop_start_label_, &loop_start_editor_, &loop_end_label_,
+                 &loop_end_editor_, &inspector_apply_, &clear_loop_,
+                 &command_stack_}) {
+            if (c->isVisible()) {
+                c->toFront(false);
+            }
+        }
+        if (envelope_mml_preview_.isVisible()) {
+            envelope_mml_preview_.toFront(false);
+        }
     }
 
     void commitPlaybackTempoFromEditor() {
@@ -9064,28 +8816,6 @@ private:
     juce::TextEditor tempo_;
     std::vector<juce::Rectangle<int>> graph_bounds_;
     std::vector<juce::Rectangle<int>> lane_frames_;
-    bool lane_layout_dirty_{true};
-    bool lane_layout_applied_{};
-    int laid_out_selected_layer_{-2};
-    mgstc::engine::EnvelopeKind laid_out_envelope_kind_{
-        mgstc::engine::EnvelopeKind::Sequence};
-    bool laid_out_register_auto_{};
-    struct RateTraceCache {
-        bool valid{};
-        std::uint8_t volume{};
-        mgstc::engine::TimbreSource source{};
-        mgstc::engine::RateEnvelope rate{};
-        mgstc::engine::RateEnvelopeTrace trace{};
-    };
-    struct VolumeSampleCache {
-        int ticks{-1};
-        std::uint64_t fingerprint{};
-        std::vector<std::uint8_t> samples;
-    };
-    mutable std::vector<RateTraceCache> rate_trace_cache_;
-    mutable std::vector<VolumeSampleCache> volume_sample_cache_;
-    juce::MouseCursor::StandardCursorType last_mouse_cursor_{
-        juce::MouseCursor::NormalCursor};
     std::optional<juce::Rectangle<int>> edit_draw_bounds_;
     std::optional<int> hover_preview_value_;
     std::optional<juce::Point<int>> hover_mouse_pos_;
@@ -9109,35 +8839,6 @@ private:
     int scope_size_{};
     std::size_t scope_visible_sample_count_{};
     std::uint8_t audition_note_{kPreviewNote};
-
-    [[nodiscard]] std::optional<juce::Rectangle<int>> hoverPopupBounds()
-        const {
-        if (!hover_preview_value_ || !hover_mouse_pos_) {
-            return std::nullopt;
-        }
-        const auto parameter = selectedParameter();
-        if (parameter != Parameter::Volume
-            && parameter != Parameter::Pitch
-            && parameter != Parameter::OpllTlAuto
-            && parameter != Parameter::OpllFbAuto) {
-            return std::nullopt;
-        }
-        const auto text = juce::String(*hover_preview_value_);
-        const int text_w = juce::jmax(24, text.length() * 8 + 12);
-        const int text_h = 18;
-        auto box = juce::Rectangle<int>(
-            hover_mouse_pos_->x + 12,
-            hover_mouse_pos_->y - text_h - 8,
-            text_w,
-            text_h);
-        if (auto area = graphArea(); !area.isEmpty()) {
-            box.setX(juce::jlimit(
-                area.getX(), area.getRight() - text_w, box.getX()));
-            box.setY(juce::jlimit(
-                area.getY(), area.getBottom() - text_h, box.getY()));
-        }
-        return box;
-    }
 
     void drawHoverValuePopup(juce::Graphics& graphics) const {
         if (!hover_preview_value_ || !hover_mouse_pos_) {

@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "editor_session.hpp"
-#include "editor_stall_probe.hpp"
 #include "mgstc/engine/opll_register_auto.hpp"
 #include "plugin_processor.hpp"
 
@@ -34,7 +33,6 @@ public:
     PluginEditorContext& operator=(const PluginEditorContext&) = delete;
 
     [[nodiscard]] mgstc::app::EditorSnapshot snapshot() override {
-        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::Snapshot);
         mgstc::app::EditorSnapshot snap;
         snap.capabilities = mgstc::app::pluginEditorCapabilities();
         snap.audio_running = processor_.editorProgramReady();

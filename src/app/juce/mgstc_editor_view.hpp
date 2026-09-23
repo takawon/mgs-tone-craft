@@ -38,7 +38,6 @@
 #include "BinaryData.h"
 
 #include "ui_hang_watchdog.hpp"
-#include "editor_stall_probe.hpp"
 #include "ui_chrome_constants.hpp"
 #include "ui_paths.hpp"
 #include "ui_scale.hpp"
@@ -117,24 +116,8 @@ using SpectrogramOpenCallback = std::function<void()>;
 using SpectrogramSourceMaskCallback = std::function<void(std::uint8_t)>;
 
 inline void greyOutHostControl(juce::Component& control) {
-    if (!control.isEnabled() && control.getAlpha() <= 0.46f) {
-        return;
-    }
-    MGSTC_STALL_PROBE(mgstc::app::StallProbeId::ComponentUpdate);
     control.setEnabled(false);
     control.setAlpha(0.45f);
-}
-
-inline void applyEditorJankHoverSkip(juce::Component& root, bool skip) {
-    if (!skip) {
-        return;
-    }
-    root.setRepaintsOnMouseActivity(false);
-    for (int index = 0; index < root.getNumChildComponents(); ++index) {
-        if (auto* child = root.getChildComponent(index)) {
-            applyEditorJankHoverSkip(*child, true);
-        }
-    }
 }
 
 inline void showDiscardConfirmation(
@@ -1897,12 +1880,6 @@ public:
         Orientation orientation)
         : juce::MidiKeyboardComponent(state, orientation) {}
 
-    void paint(juce::Graphics& graphics) override {
-        MGSTC_JANK_PAINT(
-            mgstc::app::JankRepaintKind::Keyboard, graphics, *this);
-        juce::MidiKeyboardComponent::paint(graphics);
-    }
-
     juce::String getWhiteNoteText(int midi_note_number) override {
         if (midi_note_number % 12 != 0) {
             return {};
@@ -3279,10 +3256,6 @@ private:
     }
 
     void timerCallback() override {
-        if (editorJankSkipKeyboard()) {
-            return;
-        }
-        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::KeyboardTimer);
         if (standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
             MGSTC_UI_ACTIVITY("settings: flush last audition note");
@@ -4229,7 +4202,6 @@ public:
                     timeline_preview_pending_ = true;
                     timeline_preview_due_ms_ =
                         juce::Time::getMillisecondCounterHiRes() + 50.0;
-                    ensureCompositeTimerRate();
                 }
                 updateStatus(
                     juce::String::fromUTF8(
@@ -4399,7 +4371,7 @@ public:
         engine_ready_ = session_.snapshot().audio_running;
         composite_program_stale_ = !hydrate_from_host_;
         applyHostCapabilities();
-        startTimerHz(10);
+        startTimerHz(60);
         updateStatus(
             engine_ready_
                 ? juce::String::fromUTF8(
@@ -4750,18 +4722,8 @@ public:
     }
 
     void paint(juce::Graphics& graphics) override {
-        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::EditorPaint);
-        MGSTC_JANK_PAINT(
-            mgstc::app::JankRepaintKind::FullEditor, graphics, *this);
         UiScale::syncEditorDrivenActivePercent(
             *this, effectiveUiScalePercent());
-        const auto clip = graphics.getClipBounds().getSmallestIntegerContainer();
-        if (clip.contains(getLocalBounds())
-            || (clip.getWidth() >= getWidth() - 1
-                && clip.getHeight() >= getHeight() - 1)) {
-            mgstc::app::EditorStallProbe::instance().countEvent(
-                "full-repaint: CompositeEditorComponent::paint");
-        }
         paintPageBackground(graphics, getLocalBounds());
         paintRoundedPanelFrame(graphics, editor_panel_bounds_);
         paintRoundedPanelFrame(graphics, composite_library_bounds_);
@@ -4769,9 +4731,6 @@ public:
     }
 
     void resized() override {
-        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::EditorResized);
-        mgstc::app::EditorStallProbe::instance().countEvent(
-            "resized: CompositeEditorComponent");
         UiScale::syncEditorDrivenActivePercent(
             *this, effectiveUiScalePercent());
         using namespace UiLayout;
@@ -6591,7 +6550,6 @@ private:
                 || !performance_keyboard_.polyphonic())) {
             silenceAuditionNotes();
         }
-        MGSTC_JANK_EVENT("noteOn");
         if (!ensureEngineReady()
             || (!already_configured
                 && voice_allocator_.activeVoiceCount() == 0
@@ -6645,7 +6603,6 @@ private:
         }
         last_audition_note_ = base_note;
         saveLastAuditionNoteSetting(last_audition_note_);
-        ensureCompositeTimerRate();
     }
 
     void restoreLibraryManagerTimbre() {
@@ -6684,7 +6641,6 @@ private:
     }
 
     void stopCompositeNote(std::uint8_t note) {
-        MGSTC_JANK_EVENT("noteOff");
         audition_stop_time_ms_.reset();
         const auto voice = voice_allocator_.noteOff(note);
         if (!voice) {
@@ -6760,13 +6716,8 @@ private:
     }
 
     void timerCallback() override {
-        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::CompositeTimer);
-        applyEditorJankSkips();
-        const bool skip_periodic = editorJankSkipPeriodic();
-        if (!skip_periodic) {
-            synchronizeMasterVolumeSlider(
-                master_volume_, master_volume_revision_, session_);
-        }
+        synchronizeMasterVolumeSlider(
+            master_volume_, master_volume_revision_, session_);
         const double now =
             juce::Time::getMillisecondCounterHiRes();
         for (auto pending = pending_notes_.begin();
@@ -6778,7 +6729,7 @@ private:
             startLayerNote(pending->track, pending->note);
             pending = pending_notes_.erase(pending);
         }
-        if (!skip_periodic && ++settings_poll_ticks_ >= 30) {
+        if (++settings_poll_ticks_ >= 30) {
             settings_poll_ticks_ = 0;
             immediate_audition_.setToggleState(
                 loadCompositeImmediateAuditionSetting(),
@@ -6791,22 +6742,14 @@ private:
         }
         mgstc::engine::OpllScopeFrame scope_frame{};
         bool repaint_scope = false;
-        if (!skip_periodic
-            && !editorJankSkipWaveform()
-            && session_.snapshot().capabilities.composite_playback_waveform) {
+        if (session_.snapshot().capabilities.composite_playback_waveform) {
             while (session_.pollOpllScope(scope_frame)) {
                 repaint_scope = timeline_.appendScopeFrame(
                     scope_frame, last_audition_note_) || repaint_scope;
             }
         }
-        if (repaint_scope != waveform_scope_active_) {
-            waveform_scope_active_ = repaint_scope;
-            MGSTC_JANK_EVENT(
-                repaint_scope ? "waveformStart" : "waveformStop");
-        }
         if (repaint_scope) {
-            MGSTC_JANK_REPAINT_FULL(
-                timeline_, mgstc::app::JankRepaintKind::Waveform);
+            timeline_.repaint();
         }
         if (timeline_preview_pending_
             && now >= timeline_preview_due_ms_) {
@@ -6830,36 +6773,6 @@ private:
         if (audition_stop_time_ms_
             && now >= *audition_stop_time_ms_) {
             stopAudition();
-        }
-        ensureCompositeTimerRate();
-    }
-
-    void applyEditorJankSkips() {
-        mgstc::app::EditorStallProbe::instance().reloadSkipFlags();
-        mgstc::app::EditorStallProbe::instance().setEditorPixels(
-            getWidth() * getHeight());
-        const bool skip_hover = editorJankSkipHover();
-        if (skip_hover && !jank_hover_applied_) {
-            tooltip_window_.setMillisecondsBeforeTipAppears(0x7fffffff);
-            applyEditorJankHoverSkip(*this, true);
-            jank_hover_applied_ = true;
-            MGSTC_JANK_EVENT("hoverSkip applied");
-        }
-    }
-
-    void ensureCompositeTimerRate() {
-        const bool needs_fast_timer =
-            !pending_notes_.empty()
-            || timeline_preview_pending_
-            || audition_stop_time_ms_.has_value();
-        const int interval_ms = needs_fast_timer ? 16 : 100;
-        if (interval_ms != last_composite_timer_ms_) {
-            last_composite_timer_ms_ = interval_ms;
-            MGSTC_JANK_EVENT(
-                interval_ms == 16 ? "guiActive" : "guiIdle");
-        }
-        if (!isTimerRunning() || getTimerInterval() != interval_ms) {
-            startTimer(interval_ms);
         }
     }
 
@@ -6988,9 +6901,6 @@ private:
     std::vector<PendingNote> pending_notes_;
     std::uint8_t last_audition_note_{kPreviewNote};
     int settings_poll_ticks_{};
-    int last_composite_timer_ms_{100};
-    bool waveform_scope_active_{};
-    bool jank_hover_applied_{};
     std::uint64_t master_volume_revision_{};
     bool syncing_{};
     bool engine_ready_{};

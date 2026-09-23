@@ -693,8 +693,7 @@ if(MGSTC_BUILD_TESTS)
                 JUCE_VST3_CAN_REPLACE_VST2=0
                 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
                 JUCE_MODAL_LOOPS_PERMITTED=1
-                MGSTC_VST3_DIAG_MODE=0
-                MGSTC_SKIP_MINIMAL_EDITOR=1)
+                MGSTC_VST3_DIAG_MODE=0)
         if(MSVC)
             target_compile_options(
                 mgstc_vst3_processor_tests PRIVATE
@@ -744,8 +743,7 @@ if(MGSTC_BUILD_TESTS)
                 JUCE_VST3_CAN_REPLACE_VST2=0
                 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
                 JUCE_MODAL_LOOPS_PERMITTED=1
-                MGSTC_VST3_DIAG_MODE=1
-                MGSTC_SKIP_MINIMAL_EDITOR=1)
+                MGSTC_VST3_DIAG_MODE=1)
         if(MSVC)
             target_compile_options(
                 mgstc_vst3_diag_null_tests PRIVATE
@@ -795,8 +793,7 @@ if(MGSTC_BUILD_TESTS)
                 JUCE_VST3_CAN_REPLACE_VST2=0
                 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
                 JUCE_MODAL_LOOPS_PERMITTED=1
-                MGSTC_VST3_DIAG_MODE=2
-                MGSTC_SKIP_MINIMAL_EDITOR=1)
+                MGSTC_VST3_DIAG_MODE=2)
         if(MSVC)
             target_compile_options(
                 mgstc_vst3_diag_lat0_tests PRIVATE
