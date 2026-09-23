@@ -6,8 +6,10 @@
 #include <optional>
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_gui_basics/juce_gui_basics.h>
 
 #include "plugin_editor_context.hpp"
+#include "mgstc/engine/composite_timbre.hpp"
 
 namespace mgstc::app {
 class CompositeEditorComponent;
@@ -21,6 +23,7 @@ public:
     ~MgstcAudioProcessorEditor() override;
 
     void resized() override;
+    [[nodiscard]] mgstc::engine::CompositeTimbre copyWorkingComposite() const;
 
 private:
     void openSatellite(
@@ -34,6 +37,9 @@ private:
     std::unique_ptr<mgstc::app::CompositeEditorComponent> composite_;
     std::unique_ptr<juce::DocumentWindow> scc_window_;
     std::unique_ptr<juce::DocumentWindow> opll_window_;
+#if !defined(NDEBUG)
+    std::unique_ptr<juce::MouseListener> hover_spy_;
+#endif
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MgstcAudioProcessorEditor)
 };

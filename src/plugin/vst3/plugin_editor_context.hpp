@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "editor_session.hpp"
+#include "editor_stall_probe.hpp"
 #include "mgstc/engine/opll_register_auto.hpp"
 #include "plugin_processor.hpp"
 
@@ -20,9 +21,12 @@ public:
         : processor_(processor),
           output_(*this),
           midi_(*this),
-          audition_(*this) {}
+          audition_(*this) {
+        processor_.editorRetainCompositeScope();
+    }
 
     ~PluginEditorContext() override {
+        processor_.editorReleaseCompositeScope();
         static_cast<void>(processor_.editorRestoreCommittedProgram());
     }
 
@@ -30,6 +34,7 @@ public:
     PluginEditorContext& operator=(const PluginEditorContext&) = delete;
 
     [[nodiscard]] mgstc::app::EditorSnapshot snapshot() override {
+        MGSTC_STALL_PROBE(mgstc::app::StallProbeId::Snapshot);
         mgstc::app::EditorSnapshot snap;
         snap.capabilities = mgstc::app::pluginEditorCapabilities();
         snap.audio_running = processor_.editorProgramReady();
@@ -59,8 +64,8 @@ public:
     }
 
     [[nodiscard]] bool pollOpllScope(
-        mgstc::engine::OpllScopeFrame&) override {
-        return false;
+        mgstc::engine::OpllScopeFrame& frame) override {
+        return processor_.editorPollCompositeScope(frame);
     }
 
     [[nodiscard]] bool pollLatestOpllScope(

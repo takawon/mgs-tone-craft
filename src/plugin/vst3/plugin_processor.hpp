@@ -104,6 +104,10 @@ public:
     [[nodiscard]] std::uint64_t editorSharedOpllRevision() const noexcept;
     [[nodiscard]] bool editorSharedProgramActive() const noexcept;
     [[nodiscard]] bool editorProgramReady() const noexcept;
+    void editorRetainCompositeScope() noexcept;
+    void editorReleaseCompositeScope() noexcept;
+    [[nodiscard]] bool editorPollCompositeScope(
+        mgstc::engine::OpllScopeFrame& frame) noexcept;
     void editorNoteBlockedBackendCall() noexcept;
     [[nodiscard]] std::uint64_t editorBlockedBackendCalls() const noexcept;
 
@@ -157,6 +161,9 @@ private:
     void silenceFrom(
         juce::AudioBuffer<float>& buffer,
         int start_frame) noexcept;
+    void applyMasterVolume(
+        juce::AudioBuffer<float>& buffer,
+        int num_samples) noexcept;
     void collectHostMidi(
         const juce::MidiBuffer& midi,
         int num_samples) noexcept;
@@ -276,13 +283,15 @@ private:
 
     bool editor_shared_program_active_{false};
     bool editor_runtime_program_temporary_{false};
-    int editor_master_volume_percent_{100};
+    std::atomic<int> editor_master_volume_percent_{100};
+    float master_volume_gain_{1.0F};
     std::uint64_t editor_master_volume_revision_{1};
     mgstc::engine::SccWaveform editor_shared_scc_{};
     std::uint64_t editor_shared_scc_revision_{1};
     mgstc::engine::OpllPatchParameters editor_shared_opll_{};
     std::uint64_t editor_shared_opll_revision_{1};
     std::uint64_t editor_blocked_backend_calls_{0};
+    std::atomic<int> composite_scope_clients_{0};
 
     bool in_process_block_{false};
     std::atomic<std::uint64_t> diag_process_block_{};
