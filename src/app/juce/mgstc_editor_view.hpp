@@ -116,6 +116,9 @@ using SpectrogramOpenCallback = std::function<void()>;
 using SpectrogramSourceMaskCallback = std::function<void(std::uint8_t)>;
 
 inline void greyOutHostControl(juce::Component& control) {
+    if (!control.isEnabled() && control.getAlpha() <= 0.46f) {
+        return;
+    }
     control.setEnabled(false);
     control.setAlpha(0.45f);
 }
@@ -4202,6 +4205,7 @@ public:
                     timeline_preview_pending_ = true;
                     timeline_preview_due_ms_ =
                         juce::Time::getMillisecondCounterHiRes() + 50.0;
+                    ensureCompositeTimerRate();
                 }
                 updateStatus(
                     juce::String::fromUTF8(
@@ -4371,7 +4375,8 @@ public:
         engine_ready_ = session_.snapshot().audio_running;
         composite_program_stale_ = !hydrate_from_host_;
         applyHostCapabilities();
-        startTimerHz(60);
+        startTimer(100);
+        ensureCompositeTimerRate();
         updateStatus(
             engine_ready_
                 ? juce::String::fromUTF8(
@@ -6603,6 +6608,7 @@ private:
         }
         last_audition_note_ = base_note;
         saveLastAuditionNoteSetting(last_audition_note_);
+        ensureCompositeTimerRate();
     }
 
     void restoreLibraryManagerTimbre() {
@@ -6774,6 +6780,19 @@ private:
             && now >= *audition_stop_time_ms_) {
             stopAudition();
         }
+        ensureCompositeTimerRate();
+    }
+
+    void ensureCompositeTimerRate() {
+        const bool needs_fast_timer =
+            !pending_notes_.empty()
+            || timeline_preview_pending_
+            || audition_stop_time_ms_.has_value();
+        const int interval_ms = needs_fast_timer ? 16 : 100;
+        last_composite_timer_ms_ = interval_ms;
+        if (!isTimerRunning() || getTimerInterval() != interval_ms) {
+            startTimer(interval_ms);
+        }
     }
 
     void updateStatus(const juce::String& text) {
@@ -6901,6 +6920,7 @@ private:
     std::vector<PendingNote> pending_notes_;
     std::uint8_t last_audition_note_{kPreviewNote};
     int settings_poll_ticks_{};
+    int last_composite_timer_ms_{100};
     std::uint64_t master_volume_revision_{};
     bool syncing_{};
     bool engine_ready_{};
