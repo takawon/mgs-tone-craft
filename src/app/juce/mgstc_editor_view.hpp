@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Shared Standalone / VST editor. Host access goes through EditorSession.
 // Do not include the standalone service headers or the realtime host header.
-// Scope polls run only when capabilities.waveform_scope is set.
+// Independent OPLL scope polls run only when capabilities.waveform_scope
+// is set. Composite Editor playback waveform uses
+// capabilities.composite_playback_waveform and the same OpllScopeFrame
+// ring; it is not the independent Waveform Scope workbench.
 
 #pragma once
 
@@ -113,6 +116,9 @@ using SpectrogramOpenCallback = std::function<void()>;
 using SpectrogramSourceMaskCallback = std::function<void(std::uint8_t)>;
 
 inline void greyOutHostControl(juce::Component& control) {
+    if (!control.isEnabled() && control.getAlpha() <= 0.46f) {
+        return;
+    }
     control.setEnabled(false);
     control.setAlpha(0.45f);
 }
@@ -4190,12 +4196,14 @@ public:
                     return;
                 }
                 recordHistory();
+                static_cast<void>(configureEngine());
                 if (request_preview
                     && !satellite_session_
                     && immediate_audition_.getToggleState()) {
                     timeline_preview_pending_ = true;
                     timeline_preview_due_ms_ =
                         juce::Time::getMillisecondCounterHiRes() + 50.0;
+                    ensureCompositeTimerRate();
                 }
                 updateStatus(
                     juce::String::fromUTF8(
@@ -4346,7 +4354,8 @@ public:
             });
         addAndMakeVisible(performance_keyboard_);
 
-        loadCompositeLibrary();
+        timeline_.setTimbre(timbre_, true);
+        static_cast<void>(loadCompositeLibrary());
         refreshTimbreSelectors();
         refreshCompositeSelector();
         syncControlsFromModel();
@@ -4364,7 +4373,8 @@ public:
         engine_ready_ = session_.snapshot().audio_running;
         composite_program_stale_ = !hydrate_from_host_;
         applyHostCapabilities();
-        startTimerHz(60);
+        startTimer(100);
+        ensureCompositeTimerRate();
         updateStatus(
             engine_ready_
                 ? juce::String::fromUTF8(
@@ -5441,6 +5451,7 @@ private:
         timeline_.setTimbre(timbre_, true);
         setEditorBaseline();
         resetHistoryToCurrent();
+        static_cast<void>(configureEngine());
         updateStatus(
             juce::String::fromUTF8(
                 "新しい総合音色を作成しました"));
@@ -5599,6 +5610,7 @@ private:
         timeline_.setTimbre(timbre_, true);
         setEditorBaseline();
         resetHistoryToCurrent();
+        static_cast<void>(configureEngine());
         updateStatus(
             juce::String::fromUTF8("総合音色を読み込みました"));
         auditionAfterEdit();
@@ -5979,6 +5991,7 @@ private:
             syncControlsFromModel();
             timeline_.setTimbre(timbre_);
             recordHistory();
+            static_cast<void>(configureEngine());
             return;
         }
         const auto* entry = timbre_library_.find(*library_id);
@@ -5996,6 +6009,7 @@ private:
         syncControlsFromModel();
         timeline_.setTimbre(timbre_);
         recordHistory();
+        static_cast<void>(configureEngine());
         auditionAfterEdit();
     }
 
@@ -6013,6 +6027,7 @@ private:
         syncControlsFromModel();
         timeline_.setTimbre(timbre_);
         recordHistory();
+        static_cast<void>(configureEngine());
         auditionAfterEdit();
     }
 
@@ -6432,6 +6447,10 @@ private:
         if (!caps.spectrum_analyzer && !caps.spectrogram) {
             greyOutHostControl(spectrogram_);
         }
+        if (!caps.independent_scc_opll_workbench) {
+            greyOutHostControl(open_scc_);
+            greyOutHostControl(open_opll_);
+        }
         if (!caps.tone_library) {
             greyOutHostControl(composite_library_title_);
             greyOutHostControl(layer_library_title_);
@@ -6526,6 +6545,9 @@ private:
         bool stop_after_one_second,
         bool already_configured = false,
         bool silence_notes_first = true) {
+        if (hydrating_) {
+            return;
+        }
         if (silence_notes_first
             && (stop_after_one_second
                 || !performance_keyboard_.polyphonic())) {
@@ -6584,6 +6606,7 @@ private:
         }
         last_audition_note_ = base_note;
         saveLastAuditionNoteSetting(last_audition_note_);
+        ensureCompositeTimerRate();
     }
 
     void restoreLibraryManagerTimbre() {
@@ -6723,7 +6746,7 @@ private:
         }
         mgstc::engine::OpllScopeFrame scope_frame{};
         bool repaint_scope = false;
-        if (session_.snapshot().capabilities.waveform_scope) {
+        if (session_.snapshot().capabilities.composite_playback_waveform) {
             while (session_.pollOpllScope(scope_frame)) {
                 repaint_scope = timeline_.appendScopeFrame(
                     scope_frame, last_audition_note_) || repaint_scope;
@@ -6754,6 +6777,19 @@ private:
         if (audition_stop_time_ms_
             && now >= *audition_stop_time_ms_) {
             stopAudition();
+        }
+        ensureCompositeTimerRate();
+    }
+
+    void ensureCompositeTimerRate() {
+        const bool needs_fast_timer =
+            !pending_notes_.empty()
+            || timeline_preview_pending_
+            || audition_stop_time_ms_.has_value();
+        const int interval_ms = needs_fast_timer ? 16 : 100;
+        last_composite_timer_ms_ = interval_ms;
+        if (!isTimerRunning() || getTimerInterval() != interval_ms) {
+            startTimer(interval_ms);
         }
     }
 
@@ -6880,6 +6916,7 @@ private:
     std::vector<PendingNote> pending_notes_;
     std::uint8_t last_audition_note_{kPreviewNote};
     int settings_poll_ticks_{};
+    int last_composite_timer_ms_{100};
     std::uint64_t master_volume_revision_{};
     bool syncing_{};
     bool hydrate_from_host_{};
@@ -10463,6 +10500,9 @@ private:
         if (!caps.spectrum_analyzer && !caps.spectrogram) {
             greyOutHostControl(spectrogram_);
         }
+        if (!caps.independent_scc_opll_workbench) {
+            greyOutHostControl(open_opll_);
+        }
         if (!caps.tone_library) {
             greyOutHostControl(library_filter_);
             greyOutHostControl(library_tag_filter_);
@@ -13604,6 +13644,9 @@ private:
         const auto caps = session_.snapshot().capabilities;
         if (!caps.spectrum_analyzer && !caps.spectrogram) {
             greyOutHostControl(spectrogram_);
+        }
+        if (!caps.independent_scc_opll_workbench) {
+            greyOutHostControl(open_scc_);
         }
         if (!caps.waveform_scope) {
             greyOutHostControl(scope_);

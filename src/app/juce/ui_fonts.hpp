@@ -6,12 +6,33 @@
 #define NOMINMAX
 #include <windows.h>
 
+#include <cmath>
+
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "ui_scale.hpp"
 
 namespace UiFonts {
-[[nodiscard]] inline juce::String windowsMessageFaceName() {
+namespace detail {
+struct MetricsCache {
+    juce::String face{"Segoe UI"};
+    float unscaled_body{18.0F};
+    int scale_percent{-1};
+    juce::Font body;
+    juce::Font body_bold;
+    juce::Font dense;
+    juce::Font dense_bold;
+    juce::Font heading;
+    juce::Font title;
+    juce::Font mono;
+};
+
+inline MetricsCache& metricsCache() {
+    static MetricsCache cache;
+    return cache;
+}
+
+inline void readSystemMetrics(MetricsCache& cache) {
     NONCLIENTMETRICSW metrics{};
     metrics.cbSize = sizeof(metrics);
     if (SystemParametersInfoW(
@@ -20,26 +41,61 @@ namespace UiFonts {
             &metrics,
             0)
         != FALSE) {
-        return juce::String(metrics.lfMessageFont.lfFaceName);
+        cache.face = juce::String(metrics.lfMessageFont.lfFaceName);
+        cache.unscaled_body = juce::jmax(
+            18.0F,
+            static_cast<float>(
+                std::abs(metrics.lfMessageFont.lfHeight)));
     }
-    return "Segoe UI";
+}
+
+inline juce::Font makeNamed(float height_px, bool bold) {
+    auto& cache = metricsCache();
+    return juce::Font(
+        juce::FontOptions(
+            cache.face,
+            height_px,
+            bold ? juce::Font::bold : juce::Font::plain));
+}
+
+inline void refreshMetricsIfNeeded() {
+    auto& cache = metricsCache();
+    if (cache.scale_percent == UiScale::active_percent
+        && cache.face.isNotEmpty()) {
+        return;
+    }
+    readSystemMetrics(cache);
+    cache.scale_percent = UiScale::active_percent;
+    const float body_h = juce::jmax(
+        12.0F, cache.unscaled_body * UiScale::active_factor);
+    const float dense_h = juce::jmax(10.0F, body_h * 0.8125F);
+    const float heading_h = juce::jmax(13.0F, body_h * 1.15F);
+    const float title_h = juce::jmax(
+        14.0F,
+        juce::jmax(26.0F, cache.unscaled_body * 1.45F)
+            * UiScale::active_factor);
+    cache.body = makeNamed(body_h, false);
+    cache.body_bold = makeNamed(body_h, true);
+    cache.dense = makeNamed(dense_h, false);
+    cache.dense_bold = makeNamed(dense_h, true);
+    cache.heading = makeNamed(heading_h, true);
+    cache.title = makeNamed(title_h, true);
+    cache.mono = juce::Font(
+        juce::FontOptions(
+            juce::Font::getDefaultMonospacedFontName(),
+            dense_h,
+            juce::Font::plain));
+}
+}  // namespace detail
+
+[[nodiscard]] inline juce::String windowsMessageFaceName() {
+    detail::refreshMetricsIfNeeded();
+    return detail::metricsCache().face;
 }
 
 [[nodiscard]] inline float unscaledBodyHeight() {
-    NONCLIENTMETRICSW metrics{};
-    metrics.cbSize = sizeof(metrics);
-    float pixels = 18.0F;
-    if (SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS,
-            sizeof(metrics),
-            &metrics,
-            0)
-        != FALSE) {
-        pixels = static_cast<float>(
-            std::abs(metrics.lfMessageFont.lfHeight));
-    }
-    // One step above classic JUCE body (~15–16px) / prior MGSTC body (16).
-    return juce::jmax(18.0F, pixels);
+    detail::refreshMetricsIfNeeded();
+    return detail::metricsCache().unscaled_body;
 }
 
 [[nodiscard]] inline float bodyHeight() {
@@ -74,35 +130,37 @@ namespace UiFonts {
 [[nodiscard]] inline juce::Font make(
     float height_px,
     bool bold = false) {
-    return juce::Font(
-        juce::FontOptions(
-            windowsMessageFaceName(),
-            height_px,
-            bold ? juce::Font::bold : juce::Font::plain));
+    detail::refreshMetricsIfNeeded();
+    return detail::makeNamed(height_px, bold);
 }
 
 [[nodiscard]] inline juce::Font title() {
-    return make(titleHeight(), true);
+    detail::refreshMetricsIfNeeded();
+    return detail::metricsCache().title;
 }
 
 [[nodiscard]] inline juce::Font heading() {
-    return make(headingHeight(), true);
+    detail::refreshMetricsIfNeeded();
+    return detail::metricsCache().heading;
 }
 
 [[nodiscard]] inline juce::Font body(bool bold = false) {
-    return make(bodyHeight(), bold);
+    detail::refreshMetricsIfNeeded();
+    return bold
+        ? detail::metricsCache().body_bold
+        : detail::metricsCache().body;
 }
 
 [[nodiscard]] inline juce::Font dense(bool bold = false) {
-    return make(denseHeight(), bold);
+    detail::refreshMetricsIfNeeded();
+    return bold
+        ? detail::metricsCache().dense_bold
+        : detail::metricsCache().dense;
 }
 
 [[nodiscard]] inline juce::Font mono() {
-    return juce::Font(
-        juce::FontOptions(
-            juce::Font::getDefaultMonospacedFontName(),
-            denseHeight(),
-            juce::Font::plain));
+    detail::refreshMetricsIfNeeded();
+    return detail::metricsCache().mono;
 }
 
 inline void setMgscPreviewText(

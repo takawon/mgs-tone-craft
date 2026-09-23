@@ -104,6 +104,10 @@ public:
     [[nodiscard]] std::uint64_t editorSharedOpllRevision() const noexcept;
     [[nodiscard]] bool editorSharedProgramActive() const noexcept;
     [[nodiscard]] bool editorProgramReady() const noexcept;
+    void editorRetainCompositeScope() noexcept;
+    void editorReleaseCompositeScope() noexcept;
+    [[nodiscard]] bool editorPollCompositeScope(
+        mgstc::engine::OpllScopeFrame& frame) noexcept;
     void editorNoteBlockedBackendCall() noexcept;
     [[nodiscard]] std::uint64_t editorBlockedBackendCalls() const noexcept;
 
@@ -287,6 +291,7 @@ private:
     mgstc::engine::OpllPatchParameters editor_shared_opll_{};
     std::uint64_t editor_shared_opll_revision_{1};
     std::uint64_t editor_blocked_backend_calls_{0};
+    std::atomic<int> composite_scope_clients_{0};
 
     bool in_process_block_{false};
     std::atomic<std::uint64_t> diag_process_block_{};
