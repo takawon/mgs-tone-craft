@@ -28,6 +28,10 @@ public:
     }
 };
 
+[[nodiscard]] bool independentWorkbenchKind(const juce::String& kind) {
+    return kind.equalsIgnoreCase("scc") || kind.equalsIgnoreCase("opll");
+}
+
 }  // namespace
 
 MgstcAudioProcessorEditor::MgstcAudioProcessorEditor(
@@ -106,7 +110,12 @@ MgstcAudioProcessorEditor::copyWorkingComposite() const {
 
 void MgstcAudioProcessorEditor::openSatellite(
     const juce::String& kind,
-    std::optional<std::uint64_t>) {
+    std::optional<std::uint64_t> library_id) {
+    if (independentWorkbenchKind(kind)
+        && !library_id
+        && !link_.owned_target) {
+        return;
+    }
     const auto open_editor =
         [this](const juce::String& next, std::optional<std::uint64_t> id) {
             openSatellite(next, id);
@@ -128,8 +137,16 @@ void MgstcAudioProcessorEditor::openSatellite(
                 kind.equalsIgnoreCase("scc-envelope"),
                 no_change);
             scc_window_ = std::make_unique<PluginSatelliteWindow>(
-                "MGS Tone Craft - SCC",
+                kind.equalsIgnoreCase("scc-envelope")
+                    ? juce::String::fromUTF8("MGS Tone Craft - 総合音色編集（SCC）")
+                    : juce::String("MGS Tone Craft - SCC"),
                 editor);
+        }
+        if (library_id) {
+            if (auto* editor = dynamic_cast<mgstc::app::SccEditorComponent*>(
+                    scc_window_->getContentComponent())) {
+                editor->requestLibraryEntry(*library_id);
+            }
         }
         scc_window_->setVisible(true);
         scc_window_->toFront(true);
@@ -147,8 +164,16 @@ void MgstcAudioProcessorEditor::openSatellite(
                 kind.equalsIgnoreCase("opll-envelope"),
                 no_change);
             opll_window_ = std::make_unique<PluginSatelliteWindow>(
-                "MGS Tone Craft - OPLL",
+                kind.equalsIgnoreCase("opll-envelope")
+                    ? juce::String::fromUTF8("MGS Tone Craft - 総合音色編集（OPLL）")
+                    : juce::String("MGS Tone Craft - OPLL"),
                 editor);
+        }
+        if (library_id) {
+            if (auto* editor = dynamic_cast<mgstc::app::OpllEditorComponent*>(
+                    opll_window_->getContentComponent())) {
+                editor->requestLibraryEntry(*library_id);
+            }
         }
         opll_window_->setVisible(true);
         opll_window_->toFront(true);

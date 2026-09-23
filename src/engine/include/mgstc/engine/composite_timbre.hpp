@@ -429,6 +429,9 @@ struct TimbreUse {
 
 [[nodiscard]] CompositeTimbre defaultCompositeTimbre();
 
+// Plugin 挿入直後の Current CompositeTimbre。Standalone「新規」（0 Layer）は使わない。
+[[nodiscard]] CompositeTimbre makePluginDefaultComposite();
+
 // Snapshot id for the Triangle waveform assigned when adding an SCC channel.
 // Not a library entry; the dedicated SCC editor stays closed until a saved
 // timbre is chosen.

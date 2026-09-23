@@ -20,9 +20,12 @@ public:
         : processor_(processor),
           output_(*this),
           midi_(*this),
-          audition_(*this) {}
+          audition_(*this) {
+        processor_.editorRetainCompositeScope();
+    }
 
     ~PluginEditorContext() override {
+        processor_.editorReleaseCompositeScope();
         static_cast<void>(processor_.editorRestoreCommittedProgram());
     }
 
@@ -59,8 +62,8 @@ public:
     }
 
     [[nodiscard]] bool pollOpllScope(
-        mgstc::engine::OpllScopeFrame&) override {
-        return false;
+        mgstc::engine::OpllScopeFrame& frame) override {
+        return processor_.editorPollCompositeScope(frame);
     }
 
     [[nodiscard]] bool pollLatestOpllScope(

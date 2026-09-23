@@ -28,6 +28,9 @@ struct EditorCapabilities {
     bool spectrum_analyzer{true};
     bool spectrogram{true};
     bool waveform_scope{true};
+    // Composite Editor MIX / lane playback waveform. Distinct from the
+    // independent OPLL Waveform Scope workbench (waveform_scope).
+    bool composite_playback_waveform{true};
     bool audio_device_settings{true};
     bool midi_device_settings{true};
     bool hardware_output{true};
@@ -35,6 +38,10 @@ struct EditorCapabilities {
     bool vsif{true};
     bool tone_library{true};
     bool on_screen_keyboard{true};
+    // Independent SCC / OPLL workbench windows. Plugin sound authority is the
+    // Processor Composite, so these stay off; Composite-owned layer editors stay
+    // on.
+    bool independent_scc_opll_workbench{true};
 };
 
 [[nodiscard]] inline EditorCapabilities standaloneEditorCapabilities() noexcept {
@@ -46,12 +53,14 @@ struct EditorCapabilities {
     caps.spectrum_analyzer = false;
     caps.spectrogram = false;
     caps.waveform_scope = false;
+    caps.composite_playback_waveform = true;
     caps.audio_device_settings = false;
     caps.midi_device_settings = false;
     caps.hardware_output = false;
     caps.mamidi = false;
     caps.vsif = false;
     caps.tone_library = false;
+    caps.independent_scc_opll_workbench = false;
     return caps;
 }
 
@@ -186,7 +195,8 @@ public:
 };
 
 // Thin composition root. No engine() accessor. Scope polls consume frames and
-// are not audition. Call them only when capabilities.waveform_scope is set.
+// are not audition. Independent OPLL scope uses waveform_scope.
+// Composite Editor playback waveform uses composite_playback_waveform.
 class EditorSession {
 public:
     virtual ~EditorSession() = default;
