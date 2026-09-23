@@ -8,6 +8,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "plugin_editor_context.hpp"
+#include "mgstc/engine/composite_timbre.hpp"
 
 namespace mgstc::app {
 class CompositeEditorComponent;
@@ -21,6 +22,7 @@ public:
     ~MgstcAudioProcessorEditor() override;
 
     void resized() override;
+    [[nodiscard]] mgstc::engine::CompositeTimbre copyWorkingComposite() const;
 
 private:
     void openSatellite(

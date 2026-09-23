@@ -179,7 +179,8 @@ bool validatePluginSoundSnapshot(const mgstc::engine::CompositeTimbre& timbre) {
 
 std::vector<std::uint8_t> serializePluginState(
     const PluginStateDocument& document) {
-    if (!validatePluginSoundSnapshot(document.sound)) {
+    if (!validatePluginSoundSnapshot(document.sound)
+        || document.master_volume_percent > 100) {
         return {};
     }
     const auto payload = mgstc::engine::serializeCompositeSoundPayload(
@@ -202,6 +203,7 @@ std::vector<std::uint8_t> serializePluginState(
     writer.u32(document.editor.selected_layer);
     writer.u32(document.editor.editor_tab);
     writer.u64(document.library_id);
+    writer.u32(document.master_volume_percent);
     writer.text(document.sound.name);
     writer.text(document.sound.memo);
     writer.u32(static_cast<std::uint32_t>(document.sound.tags.size()));
@@ -233,7 +235,8 @@ PluginStateParseResult parsePluginState(const void* data, std::size_t size) {
     if (!version) {
         return fail(PluginStateStatus::Truncated);
     }
-    if (*version != kPluginStateSchemaVersion) {
+    if (*version != kPluginStateSchemaVersion
+        && *version != kPluginStateSchemaVersionV1) {
         return fail(PluginStateStatus::UnsupportedVersion);
     }
 
@@ -245,6 +248,20 @@ PluginStateParseResult parsePluginState(const void* data, std::size_t size) {
         return fail(
             body.overflow() ? PluginStateStatus::InvalidContent
                             : PluginStateStatus::Truncated);
+    }
+
+    std::uint32_t master_volume_percent = 100;
+    if (*version >= kPluginStateSchemaVersion) {
+        const auto master = body.u32();
+        if (!master) {
+            return fail(
+                body.overflow() ? PluginStateStatus::InvalidContent
+                                : PluginStateStatus::Truncated);
+        }
+        if (*master > 100) {
+            return fail(PluginStateStatus::InvalidContent);
+        }
+        master_volume_percent = *master;
     }
 
     auto name = body.text(kMaxPluginStateNameBytes);
@@ -326,6 +343,7 @@ PluginStateParseResult parsePluginState(const void* data, std::size_t size) {
     result.document.editor.selected_layer = *selected_layer;
     result.document.editor.editor_tab = *editor_tab;
     result.document.library_id = *library_id;
+    result.document.master_volume_percent = master_volume_percent;
     result.document.sound = std::move(*sound);
     return result;
 }

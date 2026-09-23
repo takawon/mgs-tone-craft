@@ -208,6 +208,9 @@ private:
     };
 
     [[nodiscard]] bool onAudioThread() const noexcept;
+    void applyMasterVolume(
+        juce::AudioBuffer<float>& buffer,
+        int num_samples) noexcept;
     [[nodiscard]] bool commitPluginState(
         PluginStateDocument document,
         CommitMode mode,
@@ -276,7 +279,8 @@ private:
 
     bool editor_shared_program_active_{false};
     bool editor_runtime_program_temporary_{false};
-    int editor_master_volume_percent_{100};
+    std::atomic<int> editor_master_volume_percent_{100};
+    float master_volume_gain_{1.0F};
     std::uint64_t editor_master_volume_revision_{1};
     mgstc::engine::SccWaveform editor_shared_scc_{};
     std::uint64_t editor_shared_scc_revision_{1};
