@@ -64,23 +64,6 @@ struct NsAccum {
     ~NsAccum() { dest += nowNs() - start; }
 };
 
-mgstc::engine::CompositeTimbre stageCSmokeTimbre() {
-    using namespace mgstc::engine;
-    auto timbre = defaultCompositeTimbre();
-    // VST3 Stage C smoke only. Immediate PSG plus delayed SCC / OPLL so a
-    // DAW can hear the scheduler. Standalone defaultCompositeTimbre() is
-    // unchanged.
-    if (timbre.layers.size() >= 2) {
-        timbre.layers[1].start_delay_form = StartDelayForm::AbsoluteTicks;
-        timbre.layers[1].start_delay_value = 12;  // 200 ms at 1/60 s
-    }
-    if (timbre.layers.size() >= 3) {
-        timbre.layers[2].start_delay_form = StartDelayForm::AbsoluteTicks;
-        timbre.layers[2].start_delay_value = 24;  // 400 ms
-    }
-    return timbre;
-}
-
 }  // namespace
 
 MgstcAudioProcessor::MgstcAudioProcessor()
@@ -91,7 +74,7 @@ MgstcAudioProcessor::MgstcAudioProcessor()
     engine_.setSpectrumCaptureEnabled(false);
     engine_.setSpectrogramCaptureEnabled(false);
     PluginStateDocument document;
-    document.sound = stageCSmokeTimbre();
+    document.sound = mgstc::engine::makePluginDefaultComposite();
     static_cast<void>(commitPluginState(std::move(document), CommitMode::Initial));
 }
 
@@ -338,6 +321,12 @@ void MgstcAudioProcessor::prepareToPlay(
     if constexpr (vst3DiagForcesZeroLatency()) {
         latency = 0;
     }
+    master_volume_gain_ =
+        static_cast<float>(std::clamp(
+            editor_master_volume_percent_.load(std::memory_order_relaxed),
+            0,
+            100))
+        / 100.0F;
     reportPluginLatency(latency);
 }
 
@@ -420,6 +409,7 @@ void MgstcAudioProcessor::processBlock(
         if (!hostIsEngineRate()) {
             applyCommittedPlaybackPlan();
             processEngineOnlyBlock(buffer, midi, num_samples);
+            applyMasterVolume(buffer, num_samples);
             host_frame_position_ += static_cast<std::uint64_t>(num_samples);
             midi_it_ = {};
             midi_end_ = {};
@@ -446,6 +436,7 @@ void MgstcAudioProcessor::processBlock(
     } else {
         processDirectBlock(buffer, midi, num_samples);
     }
+    applyMasterVolume(buffer, num_samples);
     host_frame_position_ += static_cast<std::uint64_t>(num_samples);
     midi_it_ = {};
     midi_end_ = {};
@@ -1087,6 +1078,45 @@ void MgstcAudioProcessor::silenceFrom(
     }
 }
 
+void MgstcAudioProcessor::applyMasterVolume(
+    juce::AudioBuffer<float>& buffer,
+    int num_samples) noexcept {
+    if (num_samples <= 0 || buffer.getNumChannels() <= 0) {
+        return;
+    }
+    const float target =
+        static_cast<float>(std::clamp(
+            editor_master_volume_percent_.load(std::memory_order_relaxed),
+            0,
+            100))
+        / 100.0F;
+    float gain = master_volume_gain_;
+    if (std::abs(gain - target) <= 1.0e-7F) {
+        master_volume_gain_ = target;
+        if (target >= 1.0F) {
+            return;
+        }
+        if (target <= 0.0F) {
+            buffer.clear();
+            return;
+        }
+        buffer.applyGain(0, num_samples, target);
+        return;
+    }
+    const float rate = host_rate_hz_ != 0
+        ? static_cast<float>(host_rate_hz_)
+        : static_cast<float>(kEngineSampleRate);
+    const float coeff = 1.0F - std::exp(-1.0F / (0.008F * rate));
+    const int channels = buffer.getNumChannels();
+    for (int frame = 0; frame < num_samples; ++frame) {
+        gain += (target - gain) * coeff;
+        for (int channel = 0; channel < channels; ++channel) {
+            buffer.getWritePointer(channel)[frame] *= gain;
+        }
+    }
+    master_volume_gain_ = gain;
+}
+
 bool MgstcAudioProcessor::hasEditor() const {
     return true;
 }
@@ -1378,12 +1408,13 @@ void MgstcAudioProcessor::editorSetMasterVolumePercent(int percent) {
     if (onAudioThread()) {
         return;
     }
-    editor_master_volume_percent_ = std::clamp(percent, 0, 100);
+    editor_master_volume_percent_.store(
+        std::clamp(percent, 0, 100), std::memory_order_relaxed);
     ++editor_master_volume_revision_;
 }
 
 int MgstcAudioProcessor::editorMasterVolumePercent() const noexcept {
-    return editor_master_volume_percent_;
+    return editor_master_volume_percent_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t MgstcAudioProcessor::editorMasterVolumeRevision()
@@ -1426,69 +1457,12 @@ bool MgstcAudioProcessor::editorAuditionShared(
     if (commit_opll) {
         editorPublishSharedOpll(patch);
     }
-    auto edit = engine_.beginProgramEdit();
-    if (!edit.valid()) {
-        engine_.discardStuckProgramEdits();
-        edit = engine_.beginProgramEdit();
-    }
-    if (!edit.valid()) {
-        return false;
-    }
-    constexpr std::uint8_t kPsgTrack = mgstc::engine::kCompositePsgTrackBase;
-    constexpr std::uint8_t kSccTrack = mgstc::engine::kCompositeSccTrackBase;
-    constexpr std::uint8_t kOpllTrack = mgstc::engine::kCompositeOpllTrackBase;
-    std::array<std::uint8_t, 32> raw_wave{};
-    std::transform(
-        waveform.begin(),
-        waveform.end(),
-        raw_wave.begin(),
-        [](std::int8_t sample) {
-            return static_cast<std::uint8_t>(sample);
-        });
-    const auto opll_registers = mgstc::engine::encodeOpllPatch(patch);
-    bool configured =
-        edit.engine->session().setSequenceEnvelope(
-            kPsgTrack, {0x40, 0xEF, 0x01, 0x60})
-        && edit.engine->session().setPsgToneNoise(kPsgTrack, 1, 0)
-        && edit.engine->session().setPsgFixedVolume(kPsgTrack, 15)
-        && edit.engine->session().mapper().defineSccPatch(0, raw_wave)
-            == mgstc::engine::MapError::None
-        && edit.engine->session().mapper().defineOpllOriginalPatch(
-               16, opll_registers)
-            == mgstc::engine::MapError::None;
-    for (std::uint8_t scc = kSccTrack; scc < kSccTrack + 5; ++scc) {
-        configured = configured
-            && edit.engine->session().setSequenceEnvelope(
-                scc, {0x10, 0x00, 0x40, 0xEF, 0x01, 0x60})
-            && edit.engine->session().setTrackVolume(scc, 15);
-    }
-    for (std::uint8_t opll = kOpllTrack; opll < kOpllTrack + 9; ++opll) {
-        configured = configured
-            && edit.engine->session().setSequenceEnvelope(
-                opll, {0x10, 0x10, 0x40, 0xEF, 0x01, 0x60});
-    }
-    if (!configured) {
-        static_cast<void>(engine_.discardProgramEdit(edit));
-        return false;
-    }
-    const auto submitted = engine_.submitProgram(
-        edit,
-        {
-            .retrigger = retrigger,
-            .track = track,
-            .midi_note = note,
-        });
-    if (!submitted && edit.valid()) {
-        static_cast<void>(engine_.discardProgramEdit(edit));
-        return false;
-    }
-    if (!host_prepared_.load(std::memory_order_acquire)) {
-        std::array<float, 64> drain{};
-        engine_.drainPendingCommands(drain, 32, true);
-    }
-    editor_shared_program_active_ = true;
-    editor_runtime_program_temporary_ = true;
-    return true;
+    static_cast<void>(retrigger);
+    static_cast<void>(track);
+    static_cast<void>(note);
+    // Plugin DAW MIDI always plays Processor-owned CompositeTimbre.
+    // Shared SCC/OPLL programs are Standalone workbench audition only.
+    return false;
 }
 
 bool MgstcAudioProcessor::editorRestoreCommittedProgram() {
@@ -1526,6 +1500,29 @@ bool MgstcAudioProcessor::editorSharedProgramActive() const noexcept {
 
 bool MgstcAudioProcessor::editorProgramReady() const noexcept {
     return program_ready_.load(std::memory_order_acquire);
+}
+
+void MgstcAudioProcessor::editorRetainCompositeScope() noexcept {
+    if (composite_scope_clients_.fetch_add(1, std::memory_order_relaxed)
+        == 0) {
+        engine_.setOpllScopeEnabled(true);
+    }
+}
+
+void MgstcAudioProcessor::editorReleaseCompositeScope() noexcept {
+    const auto previous = composite_scope_clients_.fetch_sub(
+        1, std::memory_order_relaxed);
+    if (previous == 1) {
+        engine_.setOpllScopeEnabled(false);
+        mgstc::engine::OpllScopeFrame dump{};
+        while (engine_.pollOpllScope(dump)) {
+        }
+    }
+}
+
+bool MgstcAudioProcessor::editorPollCompositeScope(
+    mgstc::engine::OpllScopeFrame& frame) noexcept {
+    return engine_.pollOpllScope(frame);
 }
 
 void MgstcAudioProcessor::editorNoteBlockedBackendCall() noexcept {

@@ -73,6 +73,17 @@ CompositeTimbre defaultCompositeTimbre() {
     return timbre;
 }
 
+CompositeTimbre makePluginDefaultComposite() {
+    CompositeTimbre timbre;
+    timbre.format_version = CompositeTimbre::kFormatVersion;
+    timbre.name = "New Composite Timbre";
+    timbre.layers = {
+        makeLayer("PSG Layer", TimbreSource::Psg, 0),
+    };
+    timbre.layers.front().envelope_number = 0;
+    return timbre;
+}
+
 void seedDefaultLayerTimbre(CompositeLayer& layer) noexcept {
     if (layer.source == TimbreSource::Opll) {
         layer.base_timbre.reset();

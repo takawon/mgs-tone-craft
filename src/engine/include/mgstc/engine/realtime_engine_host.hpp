@@ -105,7 +105,8 @@ public:
         return spectrum_context_.load(std::memory_order_acquire);
     }
 
-    // VST has no waveform UI. Skip the 800-sample scope ring; chip mix is unchanged.
+    // Independent OPLL Waveform Scope stays off in VST. Composite Editor
+    // playback waveform uses this ring only while an editor context is live.
     void setOpllScopeEnabled(bool enabled) noexcept;
     [[nodiscard]] bool opllScopeEnabled() const noexcept {
         return opll_scope_enabled_;

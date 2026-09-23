@@ -429,6 +429,10 @@ struct TimbreUse {
 
 [[nodiscard]] CompositeTimbre defaultCompositeTimbre();
 
+// Plugin insert default. Processor Current CompositeTimbre starts here.
+// Standalone 「新規」 is empty layers (SPEC §12.0) and does not use this.
+[[nodiscard]] CompositeTimbre makePluginDefaultComposite();
+
 // Snapshot id for the Triangle waveform assigned when adding an SCC channel.
 // Not a library entry; the dedicated SCC editor stays closed until a saved
 // timbre is chosen.
