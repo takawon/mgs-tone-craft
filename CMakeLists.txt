@@ -260,8 +260,10 @@ if(WIN32)
             GIT_SHALLOW TRUE
             GIT_PROGRESS TRUE
             PATCH_COMMAND
-                git apply --whitespace=nowarn
-                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/juce/direct2d.patch"
+                "${CMAKE_COMMAND}"
+                "-DSOURCE_DIR=<SOURCE_DIR>"
+                "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/juce/direct2d.patch"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/apply-juce-direct2d-patch.cmake"
         )
         FetchContent_MakeAvailable(JUCE)
 
