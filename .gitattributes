@@ -1,0 +1,2 @@
+# Keep reuk's JUCE patch byte-identical so `git apply` succeeds on Windows.
+third_party/patches/**/*.patch text eol=lf

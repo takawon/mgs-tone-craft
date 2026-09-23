@@ -259,6 +259,9 @@ if(WIN32)
             GIT_TAG 91ad83ae34a81e0833b1a2b0866f54846370ae53
             GIT_SHALLOW TRUE
             GIT_PROGRESS TRUE
+            PATCH_COMMAND
+                git apply --whitespace=nowarn
+                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/juce/direct2d.patch"
         )
         FetchContent_MakeAvailable(JUCE)
 
