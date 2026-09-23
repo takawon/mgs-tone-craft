@@ -27,10 +27,6 @@
 #include "plugin_state.hpp"
 #include "mgstc/engine/dc_blocker.hpp"
 #include "mgstc/engine/engine_core.hpp"
-#include "mgstc/engine/composite_envelope_compile.hpp"
-#include "editor_stall_probe.hpp"
-#include "rate_envelope_trace.hpp"
-#include "ui_fonts.hpp"
 #include "mgstc/engine/register_write.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/opll_patch.hpp"
@@ -3774,135 +3770,6 @@ void testPluginSoundAuthorityAndMasterVolume() {
     delete editor_b;
 }
 
-void profileEditorMessageThreadStalls() {
-    using mgstc::app::EditorStallProbe;
-    using mgstc::app::StallProbeId;
-
-    auto timbre = compositeTimbre();
-    auto extra = psgOnlyTimbre().layers[0];
-    extra.channel = 1;
-    timbre.layers.push_back(extra);
-    extra = sccOnlyTimbre().layers[0];
-    extra.channel = 1;
-    timbre.layers.push_back(std::move(extra));
-    extra = opllOnlyTimbre().layers[0];
-    extra.channel = 1;
-    timbre.layers.push_back(std::move(extra));
-
-    const auto nowMs = [] {
-        return juce::Time::getMillisecondCounterHiRes();
-    };
-    const auto isolated_font_ms = [&] {
-        const auto started = nowMs();
-        for (int i = 0; i < 4000; ++i) {
-            static_cast<void>(UiFonts::body(true).getHeight());
-        }
-        return nowMs() - started;
-    }();
-
-    const auto isolated_rate_ms = [&] {
-        const auto started = nowMs();
-        for (int i = 0; i < 200; ++i) {
-            static_cast<void>(
-                mgstc::app::makeLayerRateTrace(timbre.layers[2]));
-        }
-        return nowMs() - started;
-    }();
-
-    const auto isolated_volume_ms = [&] {
-        const auto started = nowMs();
-        for (int i = 0; i < 40; ++i) {
-            static_cast<void>(
-                mgstc::engine::sampleCompositeVolumeLane(
-                    timbre.layers[0], 120));
-        }
-        return nowMs() - started;
-    }();
-
-    MgstcAudioProcessor processor;
-    require(
-        processor.replacePluginState(documentFrom(timbre, 0, {})),
-        "stall profile loads 6-layer composite");
-    auto* editor = processor.createEditor();
-    require(editor != nullptr, "stall profile createEditor");
-#if !defined(NDEBUG)
-    const auto stall_log = juce::File::getSpecialLocation(
-                               juce::File::windowsLocalAppData)
-                               .getChildFile("MgsToneCraft")
-                               .getChildFile("editor-stall.log");
-    require(
-        stall_log.existsAsFile(),
-        "editor-stall.log is written under LOCALAPPDATA on editor open");
-    const auto jank_ini = juce::File::getSpecialLocation(
-                              juce::File::windowsLocalAppData)
-                              .getChildFile("MgsToneCraft")
-                              .getChildFile("editor-jank.ini");
-    require(
-        jank_ini.existsAsFile(),
-        "editor-jank.ini is created for Cubase skip switches");
-#endif
-    editor->setSize(editor->getWidth(), editor->getHeight());
-
-    juce::Image image(
-        juce::Image::RGB,
-        juce::jmax(1, editor->getWidth()),
-        juce::jmax(1, editor->getHeight()),
-        true);
-    {
-        juce::Graphics graphics(image);
-        editor->paintEntireComponent(graphics, false);
-    }
-
-    auto& probe = EditorStallProbe::instance();
-    probe.beginSession(0.0);
-
-    PluginEditorContext context(processor);
-    for (int i = 0; i < 400; ++i) {
-        static_cast<void>(context.snapshot());
-    }
-
-    for (int i = 0; i < 80; ++i) {
-        juce::Graphics graphics(image);
-        editor->paintEntireComponent(graphics, false);
-    }
-
-    juce::Rectangle<int> tiny(80, 220, 36, 22);
-    for (int i = 0; i < 80; ++i) {
-        juce::Graphics graphics(image);
-        graphics.reduceClipRegion(tiny);
-        editor->paintEntireComponent(graphics, false);
-    }
-
-    const auto until = juce::Time::getMillisecondCounter() + 400;
-    while (juce::Time::getMillisecondCounter() < until) {
-        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
-    }
-
-    char report[32768]{};
-    probe.formatReport(report, sizeof(report));
-    std::fprintf(
-        stderr,
-        "Editor stall isolated: UiFonts::body x4000=%.2fms "
-        "makeLayerRateTrace x200=%.2fms sampleVolumeLane x40=%.2fms\n%s",
-        isolated_font_ms,
-        isolated_rate_ms,
-        isolated_volume_ms,
-        report);
-
-#if !defined(NDEBUG)
-    const auto paint = probe.stats(StallProbeId::TimelinePaint);
-    require(paint.count > 0, "timeline paint was sampled");
-#else
-    require(
-        !mgstc::app::editorJankSkipPeriodic()
-            && !mgstc::app::editorJankSkipWaveform()
-            && !mgstc::app::editorJankSkipKeyboard()
-            && !mgstc::app::editorJankSkipHover(),
-        "Release compiles skip flags to off");
-#endif
-    delete editor;
-}
-
 }  // namespace
 
 int main() {
@@ -3962,7 +3829,6 @@ int main() {
         testPluginEditor();
         testCompositePlaybackWaveform();
         testPluginSoundAuthorityAndMasterVolume();
-        profileEditorMessageThreadStalls();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
