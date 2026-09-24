@@ -261,6 +261,10 @@ if(WIN32)
             GIT_PROGRESS TRUE
         )
         FetchContent_MakeAvailable(JUCE)
+        include(
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/apply-juce-8012-windows-paint-overlay.cmake"
+        )
+        mgstc_apply_juce_8012_windows_paint_overlay("${juce_SOURCE_DIR}")
 
         juce_add_gui_app(
             mgstc
