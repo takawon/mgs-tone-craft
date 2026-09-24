@@ -1,0 +1,2 @@
+# Preserve official JUCE 8.0.12 blob line endings (CRLF in those three files).
+third_party/juce/windows-paint-8.0.12/** -text
