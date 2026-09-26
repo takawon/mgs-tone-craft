@@ -469,6 +469,13 @@ void seedDefaultLayerTimbre(
 bool replaceOwnedTimbreSnapshot(
     CompositeTimbre& dest, const SavedTimbreReference& snapshot);
 
+// Same source and the same manual @ number share one snapshot. Moving a
+// shared layer onto a free number clones it. Returns true when the edited
+// layer's library id changed.
+[[nodiscard]] bool reconcileLayerTimbreIdentity(
+    CompositeTimbre& timbre,
+    std::size_t edited_index);
+
 [[nodiscard]] bool layerIsAudible(
     const CompositeTimbre& timbre,
     std::size_t layer_index) noexcept;

@@ -75,6 +75,24 @@ bool notePitch(std::uint8_t midi_note, NotePitch& output) noexcept {
     return true;
 }
 
+bool psgSccModulationBase(
+    std::uint8_t midi_note,
+    std::int32_t micro,
+    PsgSccModulationBase& output) noexcept {
+    constexpr std::uint8_t kFirstMidiNote = 24;
+    constexpr std::uint8_t kLastMidiNote = 119;
+    if (midi_note < kFirstMidiNote || midi_note > kLastMidiNote) {
+        return false;
+    }
+    const auto index = static_cast<std::size_t>(midi_note - kFirstMidiNote);
+    const auto semitone = index % kNotesPerOctave;
+    output.octave = static_cast<std::uint8_t>(index / kNotesPerOctave);
+    output.unshifted = static_cast<std::uint16_t>(
+        kMgsdrvPsgSccOctaveOne[semitone]
+        + static_cast<std::uint16_t>(micro));
+    return true;
+}
+
 bool psgSccPeriodWithMicroDetune(
     std::uint8_t midi_note,
     std::int32_t micro,

@@ -3474,6 +3474,24 @@ public:
         resized();
     }
 
+    void setReplaceMode(
+        std::optional<LibraryManagerKind> kind,
+        std::function<void(std::uint64_t)> on_replace) {
+        const bool replacing = kind.has_value();
+        if (list_tab_ != nullptr) {
+            list_tab_->setReplaceMode(kind, std::move(on_replace));
+        }
+        tabs_.setCurrentTabIndex(0, juce::dontSendNotification);
+        tabs_.setTabBarDepth(replacing ? 0 : UiLayout::fieldH);
+        if (auto* bar = tabs_.getTabbedButtonBar().getTabButton(1)) {
+            bar->setEnabled(!replacing);
+        }
+        if (auto* bar = tabs_.getTabbedButtonBar().getTabButton(2)) {
+            bar->setEnabled(!replacing);
+        }
+        resized();
+    }
+
     bool keyPressed(const juce::KeyPress& key) override {
         // Scale shortcuts are editor-only (Composite / SCC / OPLL).
         if (performance_keyboard_.shouldConsumeKeyPress(key)) {
@@ -3671,6 +3689,14 @@ public:
     void reloadFromExternalChange() {
         if (content_ != nullptr) {
             content_->reloadFromExternalChange();
+        }
+    }
+
+    void setReplaceMode(
+        std::optional<LibraryManagerKind> kind,
+        std::function<void(std::uint64_t)> on_replace) {
+        if (content_ != nullptr) {
+            content_->setReplaceMode(kind, std::move(on_replace));
         }
     }
 
@@ -4252,6 +4278,24 @@ public:
                 manage_tags_(this);
             }
         });
+        timeline_.setLibraryReplaceCallback(
+            [this](mgstc::engine::TimbreSource source, std::size_t index) {
+                if (!library_replace_opener_) {
+                    return;
+                }
+                library_replace_opener_(
+                    source,
+                    [this, index](std::uint64_t id) {
+                        static_cast<void>(reloadToneLibrariesFromDisk());
+                        assignLayerLibraryId(index, id);
+                    });
+            });
+        timeline_.setBaseTimbrePerformance(
+            [this](std::uint8_t note) {
+                startCompositeNote(note, false);
+            },
+            [this](std::uint8_t note) { stopCompositeNote(note); },
+            [this] { startCompositeNote(last_audition_note_, true); });
         timeline_.setMutateTimbreNameCallback(
             [this](std::uint64_t id, juce::String name) {
                 return mutateSharedTimbreName(id, std::move(name));
@@ -4565,6 +4609,13 @@ public:
             return;
         }
         static_cast<void>(configureEngine());
+    }
+
+    void setLibraryReplaceOpener(
+        std::function<void(
+            mgstc::engine::TimbreSource,
+            std::function<void(std::uint64_t)>)> opener) {
+        library_replace_opener_ = std::move(opener);
     }
 
     void auditionOwnedEditOneSecond() {
@@ -5996,6 +6047,24 @@ private:
         }
         const auto* entry = timbre_library_.find(*library_id);
         if (entry == nullptr) {
+            const auto* snap = mgstc::engine::findEmbeddedTimbreSnapshot(
+                timbre_, *library_id);
+            if (snap == nullptr) {
+                return;
+            }
+            auto reference = *snap;
+            if (const auto& current = timbre_.layers[index].base_timbre) {
+                reference.number_mode = current->number_mode;
+                reference.manual_number = current->manual_number;
+            }
+            timbre_.layers[index].base_opll_rom.reset();
+            timbre_.layers[index].base_timbre = std::move(reference);
+            refreshTimbreSelectors();
+            syncControlsFromModel();
+            timeline_.setTimbre(timbre_);
+            recordHistory();
+            static_cast<void>(configureEngine());
+            auditionAfterEdit();
             return;
         }
         auto reference = mgstc::engine::adoptLibraryTimbre(timbre_, *entry);
@@ -6801,6 +6870,9 @@ private:
     SpectrogramOpenCallback open_spectrogram_;
     SpectrogramSourceMaskCallback spectrogram_source_mask_changed_;
     TagManagementCallback manage_tags_;
+    std::function<void(
+        mgstc::engine::TimbreSource,
+        std::function<void(std::uint64_t)>)> library_replace_opener_;
     LibrariesChangedCallback libraries_changed_;
     EditorSession& session_;
     EditorLink& link_;
@@ -8048,6 +8120,7 @@ public:
         updateStatus(
             juce::String::fromUTF8(
                 "総合音色のオリジナルコピーを編集中"));
+        syncOwnedLibraryActions();
         return true;
     }
 
@@ -8068,8 +8141,24 @@ public:
             [](std::int8_t value) {
                 return static_cast<std::uint8_t>(value);
             });
+        const auto owned_name = utf8Text(name_.getText().trim());
+        if (!owned_name.empty()) {
+            snapshot->name = owned_name;
+        }
         link_.owned_target = *snapshot;
         link_.publishOwned(*snapshot);
+    }
+
+    void syncOwnedLibraryActions() {
+        const bool owned = owned_edit_id_.has_value();
+        library_new_.setEnabled(!owned);
+        library_save_as_.setEnabled(!owned);
+        library_delete_.setEnabled(!owned);
+        library_save_.setTooltip(juce::String::fromUTF8(
+            owned
+                ? "この総合音色のオリジナルへ保存します。"
+                  "単音色ライブラリには書きません"
+                : "選択音色を更新します"));
     }
 
     void requestLibraryEntry(std::uint64_t id) {
@@ -8088,6 +8177,7 @@ public:
             }
         }
         owned_edit_id_.reset();
+        syncOwnedLibraryActions();
         selected_library_id_ = id;
         refreshLibraryList();
         loadSelectedLibraryEntry();
@@ -9807,7 +9897,28 @@ private:
         return entry;
     }
 
+    void saveOwnedCompositeSnapshot() {
+        if (utf8Text(name_.getText().trim()).empty()) {
+            showError(
+                juce::String::fromUTF8("総合音色"),
+                juce::String::fromUTF8(
+                    "保存する音色名を入力してください"));
+            name_.grabKeyboardFocus();
+            return;
+        }
+        publishOwnedSnapshot();
+        setEditorBaseline();
+        updateStatus(juce::String::fromUTF8(
+            "総合音色のオリジナルへ保存しました"));
+    }
+
     void saveLibraryEntry(bool save_as) {
+        if (owned_edit_id_) {
+            if (!save_as) {
+                saveOwnedCompositeSnapshot();
+            }
+            return;
+        }
         if (save_as || !selected_library_id_) {
             performSaveLibraryEntry(save_as);
             return;
@@ -11750,6 +11861,7 @@ public:
         updateStatus(
             juce::String::fromUTF8(
                 "総合音色のオリジナルコピーを編集中"));
+        syncOwnedLibraryActions();
         return true;
     }
 
@@ -11764,8 +11876,24 @@ public:
             snapshot->source = mgstc::engine::TimbreSource::Opll;
         }
         snapshot->opll_registers = mgstc::engine::encodeOpllPatch(patch_);
+        const auto owned_name = utf8Text(name_.getText().trim());
+        if (!owned_name.empty()) {
+            snapshot->name = owned_name;
+        }
         link_.owned_target = *snapshot;
         link_.publishOwned(*snapshot);
+    }
+
+    void syncOwnedLibraryActions() {
+        const bool owned = owned_edit_id_.has_value();
+        library_new_.setEnabled(!owned);
+        library_save_as_.setEnabled(!owned);
+        library_delete_.setEnabled(!owned);
+        library_save_.setTooltip(juce::String::fromUTF8(
+            owned
+                ? "この総合音色のオリジナルへ保存します。"
+                  "単音色ライブラリには書きません"
+                : "選択音色を更新します"));
     }
 
     void requestLibraryEntry(std::uint64_t id) {
@@ -11784,6 +11912,7 @@ public:
             }
         }
         owned_edit_id_.reset();
+        syncOwnedLibraryActions();
         selected_library_id_ = id;
         refreshLibraryList();
         loadSelectedLibraryEntry();
@@ -13087,7 +13216,28 @@ private:
                 "ライブラリ音色を読み込みました"));
     }
 
+    void saveOwnedCompositeSnapshot() {
+        if (utf8Text(name_.getText().trim()).empty()) {
+            showError(
+                juce::String::fromUTF8("総合音色"),
+                juce::String::fromUTF8(
+                    "保存する音色名を入力してください"));
+            name_.grabKeyboardFocus();
+            return;
+        }
+        publishOwnedSnapshot();
+        setEditorBaseline();
+        updateStatus(juce::String::fromUTF8(
+            "総合音色のオリジナルへ保存しました"));
+    }
+
     void saveLibraryEntry(bool save_as) {
+        if (owned_edit_id_) {
+            if (!save_as) {
+                saveOwnedCompositeSnapshot();
+            }
+            return;
+        }
         if (save_as || !selected_library_id_) {
             performSaveLibraryEntry(save_as);
             return;

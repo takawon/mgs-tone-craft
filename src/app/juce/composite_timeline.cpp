@@ -35,6 +35,7 @@
 #include "ui_modal_dialog.hpp"
 #include "ui_paint.hpp"
 #include "ui_scale.hpp"
+#include "mgstc_editor_view.hpp"
 
 #include "mgstc/engine/chip_volume_curve.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
@@ -266,7 +267,12 @@ public:
         std::function<bool(std::uint64_t, std::vector<std::string>)>
             on_set_tags = {},
         std::function<bool(std::uint64_t, juce::String)> on_set_memo = {},
-        bool layer_base = false)
+        bool layer_base = false,
+        mgstc::app::EditorSession* performance_session = nullptr,
+        std::function<void(std::uint8_t)> on_note_on = {},
+        std::function<void(std::uint8_t)> on_note_off = {},
+        std::function<void()> on_audition = {},
+        std::function<std::optional<std::uint64_t>()> on_blank = {})
         : source_(source),
           catalog_(catalog),
           current_(current),
@@ -277,6 +283,10 @@ public:
           on_rename_(std::move(on_rename)),
           on_set_tags_(std::move(on_set_tags)),
           on_set_memo_(std::move(on_set_memo)),
+          on_note_on_(std::move(on_note_on)),
+          on_note_off_(std::move(on_note_off)),
+          on_audition_(std::move(on_audition)),
+          on_blank_(std::move(on_blank)),
           layer_base_(layer_base) {
         current_label_.setText(
             currentAssignmentCaption(source_, current_, catalog_),
@@ -323,6 +333,7 @@ public:
                 list_.setSelectedId(0, juce::dontSendNotification);
             }
             syncDetailFromSelection();
+            liveApplySelection();
         };
         addAndMakeVisible(preset_);
 
@@ -347,6 +358,14 @@ public:
                 [edit, library_id] { edit(library_id); });
         };
         addAndMakeVisible(edit_);
+        if (layer_base_) {
+            blank_.setButtonText(
+                juce::String::fromUTF8("オリジナルを追加"));
+            blank_.setTooltip(juce::String::fromUTF8(
+                "ライブラリに無い素のオリジナルを、このチャンネルの基本音色にします"));
+            blank_.onClick = [this] { addBlankOriginal(); };
+            addAndMakeVisible(blank_);
+        }
 
         filter_.setTextToShowWhenEmpty(
             juce::String::fromUTF8("名前・タグ・メモを検索"),
@@ -363,9 +382,17 @@ public:
         tag_manage_.setTooltip(juce::String::fromUTF8(
             "音色ライブラリの一覧・複製・削除・タグ管理を行います"));
         tag_manage_.onClick = [this] {
-            if (on_manage_) {
-                on_manage_();
+            if (!on_manage_) {
+                return;
             }
+            if (layer_base_) {
+                auto manage = on_manage_;
+                closeHost();
+                juce::MessageManager::callAsync(
+                    [manage] { manage(); });
+                return;
+            }
+            on_manage_();
         };
         tag_manage_.setEnabled(on_manage_ != nullptr);
         addAndMakeVisible(tag_manage_);
@@ -394,6 +421,7 @@ public:
                 preset_.setSelectedId(0, juce::dontSendNotification);
             }
             syncDetailFromSelection();
+            liveApplySelection();
         };
         addAndMakeVisible(list_);
         load_.setButtonText(juce::String::fromUTF8("読込"));
@@ -440,13 +468,52 @@ public:
         memo_.onFocusLost = [this] { commitMemo(); };
         addAndMakeVisible(memo_);
 
+        if (layer_base_ && performance_session != nullptr) {
+            keyboard_ = std::make_unique<mgstc::app::PerformanceKeyboard>(
+                *performance_session);
+            keyboard_->setCallbacks(on_note_on_, on_note_off_);
+            keyboard_->setSuppressPcInputCallback(
+                [this] { return textEntryHasFocusWithin(*this); });
+            addAndMakeVisible(*keyboard_);
+            setWantsKeyboardFocus(true);
+        }
+
         refreshList();
         syncDetailFromSelection();
-        setSize(UiLayout::compositeTimbrePickW, UiLayout::compositeTimbrePickH);
+        live_apply_armed_ = true;
+        const int extra = layer_base_
+            ? UiLayout::textButtonH + UiLayout::sm
+                + (keyboard_ ? UiLayout::keyboardH + 40 : 0)
+            : 0;
+        setSize(
+            UiLayout::compositeTimbrePickW,
+            UiLayout::compositeTimbrePickH + extra);
     }
 
     ~EnvelopeTimbrePickContent() override {
         favorite_only_.setLookAndFeel(nullptr);
+    }
+
+    bool keyPressed(const juce::KeyPress& key) override {
+        if (keyboard_ != nullptr
+            && keyboard_->shouldConsumeKeyPress(key)) {
+            keyboard_->pollPerformanceInput();
+            return true;
+        }
+        return false;
+    }
+
+    bool keyStateChanged(bool) override {
+        if (keyboard_ != nullptr) {
+            keyboard_->pollPerformanceInput();
+        }
+        return false;
+    }
+
+    void visibilityChanged() override {
+        if (layer_base_ && isShowing()) {
+            grabKeyboardFocus();
+        }
     }
 
     void resized() override {
@@ -460,7 +527,15 @@ public:
         preset_.setBounds(preset_row);
         area.removeFromTop(sm);
         edit_.setBounds(area.removeFromTop(textButtonH));
+        if (blank_.isVisible()) {
+            area.removeFromTop(sm);
+            blank_.setBounds(area.removeFromTop(textButtonH));
+        }
         area.removeFromTop(sm);
+        if (keyboard_ != nullptr) {
+            keyboard_->setBounds(area.removeFromBottom(keyboardH + 40));
+            area.removeFromBottom(sm);
+        }
         layoutLibraryBrowserChrome(
             area,
             LibraryBrowserChromeWidgets{
@@ -770,6 +845,51 @@ private:
         }
     }
 
+    void liveApplySelection() {
+        if (!layer_base_ || !live_apply_armed_ || syncing_ || !on_choose_) {
+            return;
+        }
+        const auto choice = selectedChoice();
+        if (!choice) {
+            return;
+        }
+        on_choose_(*choice);
+        current_ = *choice;
+        current_label_.setText(
+            currentAssignmentCaption(source_, current_, catalog_),
+            juce::dontSendNotification);
+        if (on_audition_) {
+            on_audition_();
+        }
+    }
+
+    void addBlankOriginal() {
+        if (!on_blank_) {
+            return;
+        }
+        const auto id = on_blank_();
+        if (!id) {
+            return;
+        }
+        EnvelopeTimbreChoice choice;
+        choice.pick = mgstc::engine::TimbrePick::Library;
+        choice.library_id = *id;
+        current_ = choice;
+        insertCurrentAssignmentCatalogItem(
+            catalog_,
+            current_,
+            mgstc::engine::CompositeTimbre{},
+            juce::String::fromUTF8("オリジナル"));
+        if (source_ == mgstc::engine::TimbreSource::Opll) {
+            preset_.setSelectedId(0, juce::dontSendNotification);
+        }
+        refreshList();
+        selectLibraryId(*id);
+        current_label_.setText(
+            currentAssignmentCaption(source_, current_, catalog_),
+            juce::dontSendNotification);
+    }
+
     mgstc::engine::TimbreSource source_;
     std::vector<EnvelopeTimbreCatalogItem> catalog_;
     EnvelopeTimbreChoice current_;
@@ -785,12 +905,19 @@ private:
     std::function<bool(std::uint64_t, juce::String)> on_rename_;
     std::function<bool(std::uint64_t, std::vector<std::string>)> on_set_tags_;
     std::function<bool(std::uint64_t, juce::String)> on_set_memo_;
+    std::function<void(std::uint8_t)> on_note_on_;
+    std::function<void(std::uint8_t)> on_note_off_;
+    std::function<void()> on_audition_;
+    std::function<std::optional<std::uint64_t>()> on_blank_;
     bool layer_base_{};
+    bool live_apply_armed_{};
     SwitchLookAndFeel switch_look_and_feel_;
     juce::Label current_label_;
     juce::Label preset_label_;
     juce::ComboBox preset_;
     juce::TextButton edit_;
+    juce::TextButton blank_;
+    std::unique_ptr<mgstc::app::PerformanceKeyboard> keyboard_;
     juce::TextEditor filter_;
     juce::TextButton tag_filter_;
     juce::TextButton tag_manage_;
@@ -1060,9 +1187,13 @@ class SoftwareLfoWavePreview final : public juce::Component {
 public:
     void setSettings(
         mgstc::engine::SoftwareLfoSettings settings,
-        bool apply_extra_roughness) {
+        bool apply_extra_roughness,
+        mgstc::engine::PsgSccModulationBase pitch_base = {},
+        std::int32_t detune_pitch_up = 0) {
         settings_ = settings;
         apply_extra_roughness_ = apply_extra_roughness;
+        pitch_base_ = pitch_base;
+        detune_pitch_up_ = detune_pitch_up;
         repaint();
     }
 
@@ -1157,7 +1288,9 @@ public:
             const auto offset = mgstc::engine::softwareLfoOffsetAtTick(
                 settings_,
                 static_cast<std::uint32_t>(tick),
-                apply_extra_roughness_);
+                apply_extra_roughness_,
+                pitch_base_,
+                detune_pitch_up_);
             minimum_offset = std::min(minimum_offset, offset);
             maximum_offset = std::max(maximum_offset, offset);
             const float y = map_y(offset);
@@ -1197,6 +1330,8 @@ public:
 
 private:
     mgstc::engine::SoftwareLfoSettings settings_{};
+    mgstc::engine::PsgSccModulationBase pitch_base_{};
+    std::int32_t detune_pitch_up_{};
     bool apply_extra_roughness_{true};
 };
 
@@ -1212,10 +1347,14 @@ public:
     SoftwareLfoDialogContent(
         mgstc::engine::TimbreSource source,
         mgstc::engine::SoftwareLfoSettings initial,
+        mgstc::engine::PsgSccModulationBase pitch_base,
+        std::int32_t detune_pitch_up,
         ChangeCallback on_change,
         PreviewCallback on_preview,
         PollKeysCallback on_poll_keys)
         : source_(source),
+          pitch_base_(pitch_base),
+          detune_pitch_up_(detune_pitch_up),
           on_change_(std::move(on_change)),
           on_preview_(std::move(on_preview)),
           on_poll_keys_(std::move(on_poll_keys)) {
@@ -1275,7 +1414,9 @@ public:
             -32768.0,
             32767.0,
             juce::String::fromUTF8(
-                "LFO の粗さを細かく設定（PSG／SCCのみ。−32768～32767）"));
+                "LFO の16bit粗さ（PSG／SCCのみ。−32768～32767）。"
+                "0以外のとき n4 の代わりに、オクターブシフト前の周期へ足す。"
+                "正で周期が増え、音程は下がる"));
         extra_roughness_.setTextBoxStyle(
             juce::Slider::TextBoxLeft, false, 64, UiLayout::fieldH - 10);
 
@@ -1430,7 +1571,7 @@ private:
         roughness_.setValue(settings.roughness, juce::dontSendNotification);
         extra_roughness_.setValue(
             settings.extra_roughness, juce::dontSendNotification);
-        wave_.setSettings(settings, extra);
+        wave_.setSettings(settings, extra, pitch_base_, detune_pitch_up_);
         assigning_ = false;
     }
 
@@ -1446,13 +1587,15 @@ private:
             ? static_cast<std::int32_t>(extra_roughness_.getValue())
             : 0;
         settings = mgstc::engine::clampSoftwareLfo(settings, extra);
-        wave_.setSettings(settings, extra);
+        wave_.setSettings(settings, extra, pitch_base_, detune_pitch_up_);
         if (on_change_) {
             on_change_(settings);
         }
     }
 
     mgstc::engine::TimbreSource source_{};
+    mgstc::engine::PsgSccModulationBase pitch_base_{};
+    std::int32_t detune_pitch_up_{};
     ChangeCallback on_change_;
     PreviewCallback on_preview_;
     PollKeysCallback on_poll_keys_;
@@ -2491,9 +2634,9 @@ public:
         p_.setButtonText("p");
         p_.setClickingTogglesState(true);
         p_.setTooltip(juce::String::fromUTF8(
-            "発音前 p（PSG／SCC）。音程の自動上げ下げ。"
-            "0～255（128＝変化なし。旧MGSDRVの p は +128）。"
-            "LFO（h）と同時には使えません"));
+            "発音前 p（PSG／SCC）。音程の自動下げ。"
+            "下位7bitが量、128以上は出力後の加算。"
+            "0と128は変化なし。LFO（h）とは同時に使えない"));
         p_.onClick = [this] {
             if (assigning_) {
                 return;
@@ -3789,6 +3932,55 @@ public:
         manage_tags_callback_ = std::move(callback);
     }
 
+    void setLibraryReplaceCallback(LibraryReplaceCallback callback) {
+        library_replace_callback_ = std::move(callback);
+    }
+
+    void setBaseTimbrePerformance(
+        std::function<void(std::uint8_t)> note_on,
+        std::function<void(std::uint8_t)> note_off,
+        std::function<void()> audition) {
+        base_note_on_ = std::move(note_on);
+        base_note_off_ = std::move(note_off);
+        base_audition_ = std::move(audition);
+    }
+
+    [[nodiscard]] std::optional<std::uint64_t> addBlankOriginal(
+        std::size_t layer_index) {
+        if (layer_index >= timbre_.layers.size()) {
+            return std::nullopt;
+        }
+        auto& layer = timbre_.layers[layer_index];
+        if (layer.source == mgstc::engine::TimbreSource::Psg) {
+            return std::nullopt;
+        }
+        mgstc::engine::SavedTimbreReference reference;
+        reference.library_id =
+            mgstc::engine::allocateCompositeOwnedTimbreId(timbre_);
+        reference.revision = 1;
+        reference.name = "オリジナル";
+        reference.source = layer.source;
+        reference.number_mode = mgstc::engine::TimbreNumberMode::Automatic;
+        if (layer.source == mgstc::engine::TimbreSource::Opll) {
+            reference.opll_registers = mgstc::engine::encodeOpllPatch(
+                mgstc::engine::defaultOpllPatch());
+            layer.base_opll_rom.reset();
+        }
+        const auto id = reference.library_id;
+        layer.base_timbre = std::move(reference);
+        if (static_cast<int>(layer_index) < layer_setups_.size()) {
+            layer_setups_[static_cast<int>(layer_index)]->syncFromLayer(
+                layer);
+        }
+        if (edit_callback_) {
+            edit_callback_(timbre_, true, false);
+        }
+        if (base_audition_) {
+            base_audition_();
+        }
+        return id;
+    }
+
     void setMutateTimbreNameCallback(MutateTimbreNameCallback callback) {
         mutate_name_callback_ = std::move(callback);
     }
@@ -3906,6 +4098,20 @@ public:
         }
     }
 
+    [[nodiscard]] mgstc::engine::PsgSccModulationBase modulationBaseForLayer(
+        const mgstc::engine::CompositeLayer& layer) const {
+        const int midi = juce::jlimit(
+            24,
+            119,
+            static_cast<int>(audition_note_) + layer.relative_semitones);
+        mgstc::engine::PsgSccModulationBase base{};
+        static_cast<void>(mgstc::engine::psgSccModulationBase(
+            static_cast<std::uint8_t>(midi),
+            layer.micro_detune,
+            base));
+        return base;
+    }
+
     void openSoftwareLfoDialog(std::size_t layer_index) {
         if (layer_index >= timbre_.layers.size()) {
             return;
@@ -3922,6 +4128,8 @@ public:
         auto* content = new SoftwareLfoDialogContent(
             layer.source,
             layer.software_lfo,
+            modulationBaseForLayer(layer),
+            layer.detune,
             [this, layer_index](
                 const mgstc::engine::SoftwareLfoSettings& settings) {
                 if (layer_index >= timbre_.layers.size()) {
@@ -7255,17 +7463,23 @@ private:
             layer.source != mgstc::engine::TimbreSource::Opll;
         if (layer.pitch_sweep.enabled
             && layer.source != mgstc::engine::TimbreSource::Opll) {
+            const auto sweep_base = modulationBaseForLayer(layer);
             extent = juce::jmax(
                 extent,
                 mgstc::engine::pitchSweepDisplayExtent(
                     layer.pitch_sweep,
                     static_cast<std::uint32_t>(
-                        juce::jmax(1, maximumCount()))));
+                        juce::jmax(1, maximumCount())),
+                    sweep_base,
+                    layer.detune));
         } else {
             extent = juce::jmax(
                 extent,
                 mgstc::engine::softwareLfoDisplayExtent(
-                    layer.software_lfo, extra));
+                    layer.software_lfo,
+                    extra,
+                    modulationBaseForLayer(layer),
+                    layer.detune));
         }
         return {-extent, extent};
     }
@@ -7459,22 +7673,28 @@ private:
             const int end = juce::jmin(
                 maximumCount(),
                 juce::roundToInt(std::ceil(visible.getEnd())));
+            const auto sweep_base = modulationBaseForLayer(layer);
             juce::Path sweep_path;
             bool started = false;
+            float previous_y = 0.0F;
             for (int count = start; count <= end; ++count) {
                 const int value = cumulativePitchAt(layer, count)
                     + static_cast<int>(
                         mgstc::engine::pitchSweepOffsetAtTick(
                             layer.pitch_sweep,
-                            static_cast<std::uint32_t>(count)));
+                            static_cast<std::uint32_t>(count),
+                            sweep_base,
+                            layer.detune));
                 const float sx = static_cast<float>(xForCount(bounds, count));
                 const float sy = map_y(value);
                 if (!started) {
                     sweep_path.startNewSubPath(sx, sy);
                     started = true;
                 } else {
+                    sweep_path.lineTo(sx, previous_y);
                     sweep_path.lineTo(sx, sy);
                 }
+                previous_y = sy;
             }
             if (started) {
                 graphics.setColour(
@@ -7484,6 +7704,7 @@ private:
         } else if (layer.software_lfo.enabled) {
             const bool extra =
                 layer.source != mgstc::engine::TimbreSource::Opll;
+            const auto lfo_base = modulationBaseForLayer(layer);
             const auto visible = visibleCountRange();
             const int start = juce::jmax(
                 0, juce::roundToInt(std::floor(visible.getStart())));
@@ -7499,7 +7720,9 @@ private:
                         mgstc::engine::softwareLfoOffsetAtTick(
                             layer.software_lfo,
                             static_cast<std::uint32_t>(count),
-                            extra));
+                            extra,
+                            lfo_base,
+                            layer.detune));
                 const float lx = static_cast<float>(xForCount(bounds, count));
                 const float ly = map_y(value);
                 if (!started) {
@@ -7794,9 +8017,9 @@ private:
                 }
             },
             {},
-            [this] {
-                if (manage_tags_callback_) {
-                    manage_tags_callback_();
+            [this, layer_index, source = layer.source] {
+                if (library_replace_callback_) {
+                    library_replace_callback_(source, layer_index);
                 }
             },
             [this](std::uint64_t id, juce::String name) {
@@ -7814,7 +8037,14 @@ private:
                     ? mutate_memo_callback_(id, std::move(memo))
                     : false;
             },
-            true);
+            true,
+            session_,
+            base_note_on_,
+            base_note_off_,
+            base_audition_,
+            [this, layer_index]() -> std::optional<std::uint64_t> {
+                return addBlankOriginal(layer_index);
+            });
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         dialog->setContentOwned(content, true);
@@ -8551,6 +8781,20 @@ private:
                         && static_cast<int>(layer_index) < layer_setups_.size()) {
                         layer_setups_[static_cast<int>(layer_index)]
                             ->applyToLayer(timbre_.layers[layer_index]);
+                        if (commit
+                            && mgstc::engine::reconcileLayerTimbreIdentity(
+                                timbre_, layer_index)) {
+                            for (int setup_index = 0;
+                                 setup_index < layer_setups_.size();
+                                 ++setup_index) {
+                                const auto refreshed =
+                                    static_cast<std::size_t>(setup_index);
+                                if (refreshed < timbre_.layers.size()) {
+                                    layer_setups_[setup_index]->syncFromLayer(
+                                        timbre_.layers[refreshed]);
+                                }
+                            }
+                        }
                     }
                     syncPointEditors();
                     syncRegisterAutoEditors();
@@ -8991,6 +9235,10 @@ private:
     TimbreNameCallback timbre_name_callback_;
     TimbreLibraryCallback timbre_library_callback_;
     ManageTagsCallback manage_tags_callback_;
+    LibraryReplaceCallback library_replace_callback_;
+    std::function<void(std::uint8_t)> base_note_on_;
+    std::function<void(std::uint8_t)> base_note_off_;
+    std::function<void()> base_audition_;
     MutateTimbreNameCallback mutate_name_callback_;
     MutateTimbreTagsCallback mutate_tags_callback_;
     MutateTimbreMemoCallback mutate_memo_callback_;
@@ -9163,6 +9411,19 @@ void CompositeTimeline::setTimbreLibraryCallback(TimbreLibraryCallback callback)
 
 void CompositeTimeline::setManageTagsCallback(ManageTagsCallback callback) {
     impl_->setManageTagsCallback(std::move(callback));
+}
+
+void CompositeTimeline::setLibraryReplaceCallback(
+    LibraryReplaceCallback callback) {
+    impl_->setLibraryReplaceCallback(std::move(callback));
+}
+
+void CompositeTimeline::setBaseTimbrePerformance(
+    std::function<void(std::uint8_t)> note_on,
+    std::function<void(std::uint8_t)> note_off,
+    std::function<void()> audition) {
+    impl_->setBaseTimbrePerformance(
+        std::move(note_on), std::move(note_off), std::move(audition));
 }
 
 void CompositeTimeline::setMutateTimbreNameCallback(

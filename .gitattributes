@@ -1,2 +1,2 @@
-# Preserve official JUCE 8.0.12 blob line endings (CRLF in those three files).
-third_party/juce/windows-paint-8.0.12/** -text
+# Keep reuk's JUCE patch byte-identical so `git apply` succeeds on Windows.
+third_party/patches/**/*.patch text eol=lf

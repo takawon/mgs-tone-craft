@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #pragma once
 
+#include "mgstc/engine/note_pitch.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -8,7 +10,9 @@
 namespace mgstc::engine {
 
 // MGSDRV 3.20 software pitch LFO (pre-key-on MGSC `h` / `@p`).
-// Integrating triangle: n4 / `@p` is the signed step (粗さ), not a DC bias.
+// Integrating triangle: n4 is the signed pitch-up step. Non-zero `@p` on
+// PSG/SCC is a signed add to the pre-octave period instead (pitch falls
+// when the value is positive).
 // Applied as period/F-number FrequencyDelta each 60 Hz interrupt.
 // Not chip hardware AM/PM, and not OPLL built-in vibrato.
 // Delay/speed use the public MGS stored-byte encoding (param+1, 0 ⇒ 256).
@@ -75,27 +79,44 @@ constexpr int kSoftwareLfoPreviewExtent = 127;
     return settings;
 }
 
-// Pitch-offset units (same as track `\` / `@e` `\`).
-// `@p != 0` replaces n4 on PSG/SCC; OPLL always uses n4.
+// 8-bit n4, added to the current output as a pitch-up step.
+// `@p != 0` does not use this step (see softwareLfoOffsetAtTick).
 [[nodiscard]] constexpr std::int32_t softwareLfoStep(
     const SoftwareLfoSettings& settings,
     bool apply_extra_roughness) noexcept {
     if (apply_extra_roughness && settings.extra_roughness != 0) {
-        return settings.extra_roughness;
+        return 0;
     }
     return static_cast<std::int32_t>(settings.roughness);
 }
 
+[[nodiscard]] constexpr std::int32_t softwareLfoNegate16(
+    std::int32_t value) noexcept {
+    if (value == static_cast<std::int32_t>(-32768)) {
+        return value;
+    }
+    return -value;
+}
+
 // Offset at 60 Hz tick since key-on. Delay is folded into the first speed
 // countdown (stored delay + stored speed). Until the first step, offset is 0.
+// Pitch-up offset. n4 adds to the current output. Non-zero `@p` on PSG/SCC
+// instead adds the signed 16-bit value to the pre-octave word and re-shifts.
+// The first such update also drops track `\` (`detune_pitch_up`).
 [[nodiscard]] inline std::int32_t softwareLfoOffsetAtTick(
     const SoftwareLfoSettings& settings,
     std::uint32_t tick_from_key_on,
-    bool apply_extra_roughness = true) noexcept {
+    bool apply_extra_roughness = true,
+    PsgSccModulationBase base = {},
+    std::int32_t detune_pitch_up = 0) noexcept {
     if (!settings.enabled) {
         return 0;
     }
-    auto step = softwareLfoStep(settings, apply_extra_roughness);
+    const bool wide =
+        apply_extra_roughness && settings.extra_roughness != 0;
+    auto step = wide
+        ? settings.extra_roughness
+        : static_cast<std::int32_t>(settings.roughness);
     unsigned counter =
         (softwareLfoStoredParam(settings.delay)
          + softwareLfoStoredParam(settings.speed))
@@ -103,6 +124,9 @@ constexpr int kSoftwareLfoPreviewExtent = 127;
     const unsigned speed_reload = softwareLfoStoredParam(settings.speed);
     unsigned depth_reload = static_cast<unsigned>(settings.depth) + 1U;
     unsigned depth_count = (depth_reload >> 1) + 1U;
+    const auto octave = static_cast<unsigned>(base.octave & 7);
+    auto pre = base.unshifted;
+    const auto shifted0 = static_cast<std::int32_t>(base.unshifted >> octave);
     std::int32_t offset = 0;
     for (std::uint32_t tick = 0; tick <= tick_from_key_on; ++tick) {
         counter = (counter - 1U) & 0xFFU;
@@ -113,20 +137,55 @@ constexpr int kSoftwareLfoPreviewExtent = 127;
         --depth_count;
         if (depth_count == 0U) {
             depth_count = depth_reload;
-            step = -step;
+            step = wide ? softwareLfoNegate16(step) : -step;
         }
-        offset += step;
+        if (!wide) {
+            offset += step;
+            continue;
+        }
+        pre = static_cast<std::uint16_t>(
+            static_cast<int>(pre) + static_cast<int>(step));
+        const auto shifted = static_cast<std::int32_t>(pre >> octave);
+        offset = shifted0 - detune_pitch_up - shifted;
     }
     return offset;
 }
 
 [[nodiscard]] inline int softwareLfoDisplayExtent(
     const SoftwareLfoSettings& settings,
-    bool include_extra_roughness) noexcept {
+    bool include_extra_roughness,
+    PsgSccModulationBase base = {},
+    std::int32_t detune_pitch_up = 0) noexcept {
     if (!settings.enabled) {
         return 0;
     }
-    auto step = softwareLfoStep(settings, include_extra_roughness);
+    if (include_extra_roughness && settings.extra_roughness != 0) {
+        auto step = settings.extra_roughness;
+        const unsigned depth_reload =
+            static_cast<unsigned>(settings.depth) + 1U;
+        unsigned depth_count = (depth_reload >> 1) + 1U;
+        const auto octave = static_cast<unsigned>(base.octave & 7);
+        auto pre = base.unshifted;
+        const auto shifted0 =
+            static_cast<std::int32_t>(base.unshifted >> octave);
+        int extent = 0;
+        const unsigned updates = (depth_reload + 2U) * 4U;
+        for (unsigned i = 0; i < updates; ++i) {
+            --depth_count;
+            if (depth_count == 0U) {
+                depth_count = depth_reload;
+                step = softwareLfoNegate16(step);
+            }
+            pre = static_cast<std::uint16_t>(
+                static_cast<int>(pre) + static_cast<int>(step));
+            const auto shifted = static_cast<std::int32_t>(pre >> octave);
+            extent = std::max(
+                extent,
+                std::abs(shifted0 - detune_pitch_up - shifted));
+        }
+        return extent;
+    }
+    auto step = static_cast<std::int32_t>(settings.roughness);
     if (step == 0) {
         return 0;
     }
@@ -159,6 +218,13 @@ public:
         }
     }
 
+    void bindPitchBase(
+        PsgSccModulationBase base,
+        std::int32_t detune_pitch_up) noexcept {
+        base_ = base;
+        detune_pitch_up_ = detune_pitch_up;
+    }
+
     void resetForKeyOn() noexcept {
         tick_ = 0;
         applied_ = 0;
@@ -173,7 +239,7 @@ public:
     // Advance one interrupt. Returns FrequencyDelta vs last applied offset.
     [[nodiscard]] std::int32_t advance() noexcept {
         const auto next = softwareLfoOffsetAtTick(
-            settings_, tick_, apply_extra_roughness_);
+            settings_, tick_, apply_extra_roughness_, base_, detune_pitch_up_);
         ++tick_;
         const auto delta = next - applied_;
         applied_ = next;
@@ -190,6 +256,8 @@ public:
 
 private:
     SoftwareLfoSettings settings_{};
+    PsgSccModulationBase base_{};
+    std::int32_t detune_pitch_up_{};
     bool apply_extra_roughness_{true};
     std::uint32_t tick_{};
     std::int32_t applied_{};

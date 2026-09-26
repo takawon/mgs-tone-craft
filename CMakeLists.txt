@@ -259,12 +259,27 @@ if(WIN32)
             GIT_TAG 91ad83ae34a81e0833b1a2b0866f54846370ae53
             GIT_SHALLOW TRUE
             GIT_PROGRESS TRUE
+            PATCH_COMMAND
+                "${CMAKE_COMMAND}"
+                "-DSOURCE_DIR=<SOURCE_DIR>"
+                "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/juce/direct2d.patch"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/apply-juce-direct2d-patch.cmake"
         )
         FetchContent_MakeAvailable(JUCE)
-        include(
-            "${CMAKE_CURRENT_SOURCE_DIR}/tools/apply-juce-8012-windows-paint-overlay.cmake"
+        # Re-run after populate so an already-fetched tree (overlay leftovers)
+        # is restored to 8.0.15 Windowing and then patched. The apply script
+        # checkouts the three native files first, so Standalone keeps 8.0.15
+        # logicalBounds / userBounds. Do not keep the overlay Displays rewrite.
+        execute_process(
+            COMMAND
+                "${CMAKE_COMMAND}"
+                "-DSOURCE_DIR=${juce_SOURCE_DIR}"
+                "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/juce/direct2d.patch"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/apply-juce-direct2d-patch.cmake"
+            COMMAND_ERROR_IS_FATAL ANY
         )
-        mgstc_apply_juce_8012_windows_paint_overlay("${juce_SOURCE_DIR}")
+        message(STATUS
+            "MGSTC: restored JUCE 8.0.15 Windows painting and applied direct2d.patch")
 
         juce_add_gui_app(
             mgstc

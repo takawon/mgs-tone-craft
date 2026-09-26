@@ -595,6 +595,80 @@ TimbreNumberResolution resolveTimbreNumbers(
     return result;
 }
 
+bool reconcileLayerTimbreIdentity(
+    CompositeTimbre& timbre,
+    std::size_t edited_index) {
+    if (edited_index >= timbre.layers.size()) {
+        return false;
+    }
+    auto& layer = timbre.layers[edited_index];
+    if (!layer.base_timbre
+        || layerUsesOpllRomBase(layer)
+        || layer.base_timbre->source != layer.source
+        || layer.base_timbre->number_mode != TimbreNumberMode::Manual
+        || !layer.base_timbre->manual_number) {
+        return false;
+    }
+    const auto number = *layer.base_timbre->manual_number;
+    if (number < 15 || number > 31) {
+        return false;
+    }
+    const auto own_id = layer.base_timbre->library_id;
+
+    auto probe = timbre;
+    probe.layers[edited_index].base_timbre.reset();
+    const auto numbers = resolveTimbreNumbers(probe);
+    std::optional<std::uint64_t> owner_id;
+    for (const auto& assignment : numbers.assignments) {
+        if (assignment.number != number
+            || assignment.layer_index >= probe.layers.size()) {
+            continue;
+        }
+        if (probe.layers[assignment.layer_index].source != layer.source) {
+            continue;
+        }
+        owner_id = assignment.library_id;
+        break;
+    }
+
+    if (owner_id && *owner_id != 0 && *owner_id != own_id) {
+        const auto* owner = findEmbeddedTimbreSnapshot(probe, *owner_id);
+        if (owner == nullptr) {
+            return false;
+        }
+        auto joined = *owner;
+        joined.number_mode = TimbreNumberMode::Manual;
+        joined.manual_number = number;
+        layer.base_timbre = std::move(joined);
+        return true;
+    }
+    if (owner_id && *owner_id == own_id) {
+        return false;
+    }
+
+    bool shared = false;
+    for (std::size_t index = 0; index < timbre.layers.size(); ++index) {
+        if (index == edited_index) {
+            continue;
+        }
+        const auto& other = timbre.layers[index];
+        if (other.source == layer.source
+            && other.base_timbre
+            && other.base_timbre->library_id == own_id) {
+            shared = true;
+            break;
+        }
+    }
+    if (!shared || own_id == 0) {
+        return false;
+    }
+    auto copy = *layer.base_timbre;
+    copy.library_id = allocateCompositeOwnedTimbreId(timbre);
+    copy.revision = 1;
+    layer.base_timbre = std::move(copy);
+    return true;
+}
+
 std::optional<std::uint8_t> assignedNumberForLibraryId(
     const TimbreNumberResolution& numbers,
     std::uint64_t library_id) noexcept {

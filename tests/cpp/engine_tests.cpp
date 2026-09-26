@@ -5808,6 +5808,61 @@ void testCompositeSavedTimbreRevisionAndNumberAssignment() {
     REQUIRE_EQ(resolveTimbreNumbers(composite).valid(), false);
 }
 
+void testReconcileLayerTimbreIdentitySharesAndSplits() {
+    using namespace mgstc::engine;
+
+    auto composite = defaultCompositeTimbre();
+    SavedTimbreReference lead;
+    lead.library_id = kCompositeOwnedTimbreIdBase;
+    lead.name = "Lead";
+    lead.source = TimbreSource::Scc;
+    lead.number_mode = TimbreNumberMode::Manual;
+    lead.manual_number = 16;
+    lead.scc_waveform[0] = 0x11;
+    composite.layers[1].base_timbre = lead;
+
+    auto echo = composite.layers[1];
+    echo.name = "Echo";
+    echo.channel = 1;
+    echo.base_timbre->library_id = kCompositeOwnedTimbreIdBase + 1;
+    echo.base_timbre->name = "Echo wave";
+    echo.base_timbre->scc_waveform[0] = 0x22;
+    echo.base_timbre->manual_number = 17;
+    composite.layers.push_back(echo);
+
+    composite.layers.back().base_timbre->manual_number = 16;
+    REQUIRE_EQ(reconcileLayerTimbreIdentity(composite, 3), true);
+    REQUIRE_EQ(
+        composite.layers[3].base_timbre->library_id,
+        composite.layers[1].base_timbre->library_id);
+    REQUIRE_EQ(composite.layers[3].base_timbre->scc_waveform[0], 0x11);
+    REQUIRE_EQ(resolveTimbreNumbers(composite).valid(), true);
+
+    composite.layers[3].base_timbre->manual_number = 18;
+    REQUIRE_EQ(reconcileLayerTimbreIdentity(composite, 3), true);
+    REQUIRE_EQ(
+        composite.layers[3].base_timbre->library_id
+            == composite.layers[1].base_timbre->library_id,
+        false);
+    REQUIRE_EQ(composite.layers[3].base_timbre->scc_waveform[0], 0x11);
+    REQUIRE_EQ(composite.layers[1].base_timbre->scc_waveform[0], 0x11);
+    REQUIRE_EQ(resolveTimbreNumbers(composite).valid(), true);
+
+    SavedTimbreReference opll;
+    opll.library_id = kCompositeOwnedTimbreIdBase + 9;
+    opll.name = "FM";
+    opll.source = TimbreSource::Opll;
+    opll.number_mode = TimbreNumberMode::Manual;
+    opll.manual_number = 16;
+    opll.opll_registers[0] = 0x31;
+    composite.layers[2].base_timbre = opll;
+    composite.layers[2].base_opll_rom.reset();
+    REQUIRE_EQ(reconcileLayerTimbreIdentity(composite, 2), false);
+    REQUIRE_EQ(
+        composite.layers[2].base_timbre->library_id,
+        kCompositeOwnedTimbreIdBase + 9);
+}
+
 void testCompositeTimbreDependencyUpdatePreservesAssignment() {
     using namespace mgstc::engine;
 
@@ -5910,7 +5965,11 @@ void testSoftwareLfoTriangleDelayAndRoughness() {
     settings.delay = 0;
     settings.speed = 0;
     settings.extra_roughness = 5;
-    REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 1, true), static_cast<std::int32_t>(5));
+    mgstc::engine::PsgSccModulationBase c4{};
+    REQUIRE_EQ(psgSccModulationBase(60, 0, c4), true);
+    REQUIRE_EQ(
+        softwareLfoOffsetAtTick(settings, 1, true, c4),
+        static_cast<std::int32_t>(-1));
     REQUIRE_EQ(softwareLfoOffsetAtTick(settings, 1, false), static_cast<std::int32_t>(3));
     std::int32_t min_offset = 0;
     std::int32_t max_offset = 0;
@@ -6097,7 +6156,7 @@ void testRuntimePitchSweepAndKeyOffHangAndOpllSustain() {
     REQUIRE_EQ(session.processTick().ok(), true);
     const auto second_period = read_period(session.writes());
     REQUIRE_EQ(second_period.has_value(), true);
-    REQUIRE_EQ(*second_period != *first_period, true);
+    REQUIRE_EQ(*second_period, *first_period + 60);
 
     auto last_psg_volume = [](const auto& writes) -> std::optional<int> {
         std::optional<int> value;
@@ -6604,6 +6663,7 @@ int main(int argc, char** argv) {
         {"CompositeEnvelopeMgscOutputRules", testCompositeEnvelopeMgscOutputRules},
         {"CompositeSoloPitchAndChannelValidation", testCompositeSoloPitchAndChannelValidation},
         {"CompositeSavedTimbreRevisionAndNumberAssignment", testCompositeSavedTimbreRevisionAndNumberAssignment},
+        {"ReconcileLayerTimbreIdentitySharesAndSplits", testReconcileLayerTimbreIdentitySharesAndSplits},
         {"CompositeTimbreDependencyUpdatePreservesAssignment", testCompositeTimbreDependencyUpdatePreservesAssignment},
         {"SoftwareLfoTriangleDelayAndRoughness", testSoftwareLfoTriangleDelayAndRoughness},
         {"SoftwareLfoTrackSetupAndLibraryRoundTrip", testSoftwareLfoTrackSetupAndLibraryRoundTrip},

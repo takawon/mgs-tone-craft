@@ -1648,6 +1648,16 @@ public:
         removeCaptionZOrderHook();
     }
 
+    void setLibraryReplaceOpener(
+        std::function<void(
+            mgstc::engine::TimbreSource,
+            std::function<void(std::uint64_t)>)> opener) {
+        if (auto* editor = dynamic_cast<CompositeEditorComponent*>(
+                getContentComponent())) {
+            editor->setLibraryReplaceOpener(std::move(opener));
+        }
+    }
+
     void parentHierarchyChanged() override {
         DocumentWindow::parentHierarchyChanged();
         installCaptionZOrderHook();
@@ -2490,6 +2500,19 @@ private:
                 [this](const juce::String& active) {
                     activateEditor(active);
                 });
+            if (editor == "main") {
+                window->setLibraryReplaceOpener(
+                    [this](
+                        mgstc::engine::TimbreSource source,
+                        std::function<void(std::uint64_t)> on_replace) {
+                        const auto kind =
+                            source == mgstc::engine::TimbreSource::Scc
+                                ? LibraryManagerKind::Scc
+                                : LibraryManagerKind::Opll;
+                        showLibraryManager(
+                            nullptr, kind, std::move(on_replace));
+                    });
+            }
         }
         if (!show) {
             // addToDesktop on a visible peer can synchronously activate the
@@ -2575,12 +2598,41 @@ private:
         return ensureEditor(requested_editor, true);
     }
 
-    void showLibraryManager(juce::Component* anchor) {
+    void showLibraryManager(
+        juce::Component* anchor,
+        std::optional<LibraryManagerKind> replace_kind = std::nullopt,
+        std::function<void(std::uint64_t)> on_replace = {}) {
+        const auto raise = [this, replace_kind, on_replace] {
+            if (library_manager_window_ == nullptr) {
+                return;
+            }
+            library_manager_window_->setReplaceMode(
+                replace_kind, on_replace);
+            library_manager_window_->toFront(true);
+            if (auto* hosted =
+                    library_manager_window_->getContentComponent()) {
+                hosted->grabKeyboardFocus();
+            }
+            if (!replace_kind) {
+                return;
+            }
+            juce::Timer::callAfterDelay(40, [this] {
+                if (library_manager_window_ == nullptr
+                    || !library_manager_window_->isVisible()) {
+                    return;
+                }
+                library_manager_window_->toFront(true);
+                if (auto* hosted =
+                        library_manager_window_->getContentComponent()) {
+                    hosted->grabKeyboardFocus();
+                }
+            });
+        };
         if (library_manager_window_ != nullptr) {
             UiScale::forceGlobalForNonEditorUi();
             library_manager_window_->reloadFromExternalChange();
             library_manager_window_->setVisible(true);
-            library_manager_window_->toFront(true);
+            raise();
             return;
         }
         // Bounded IPC wait (see ScopedLibraryIpcLock); a second MGSTC
@@ -2599,11 +2651,14 @@ private:
                     "共有ライブラリを読み込めませんでした"));
             return;
         }
-        auto initial_kind = LibraryManagerKind::Composite;
-        if (dynamic_cast<SccEditorComponent*>(anchor) != nullptr) {
+        auto initial_kind = replace_kind.value_or(
+            LibraryManagerKind::Composite);
+        if (!replace_kind
+            && dynamic_cast<SccEditorComponent*>(anchor) != nullptr) {
             initial_kind = LibraryManagerKind::Scc;
         } else if (
-            dynamic_cast<OpllEditorComponent*>(anchor) != nullptr) {
+            !replace_kind
+            && dynamic_cast<OpllEditorComponent*>(anchor) != nullptr) {
             initial_kind = LibraryManagerKind::Opll;
         }
         UiScale::forceGlobalForNonEditorUi();
@@ -2669,10 +2724,7 @@ private:
         }
         clampWindowToDisplayWorkArea(*library_manager_window_);
         library_manager_window_->setVisible(true);
-        library_manager_window_->toFront(true);
-        if (auto* hosted = library_manager_window_->getContentComponent()) {
-            hosted->grabKeyboardFocus();
-        }
+        raise();
     }
 
     void stopAllImportPreviews() {
