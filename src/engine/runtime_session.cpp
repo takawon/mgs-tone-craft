@@ -424,6 +424,17 @@ TickResult RuntimeSession::processTick() {
                 };
             }
             runtime.resetForKeyOn();
+            PsgSccModulationBase modulation_base{};
+            if (track < 8) {
+                static_cast<void>(psgSccModulationBase(
+                    current_notes_[track],
+                    track_micro_detune_[track],
+                    modulation_base));
+            }
+            track_lfo_[track].bindPitchBase(
+                modulation_base, track_detune_[track]);
+            track_pitch_sweep_[track].bindPitchBase(
+                modulation_base, track_detune_[track]);
             track_lfo_[track].resetForKeyOn();
             track_pitch_sweep_[track].resetForKeyOn();
             if (track < 3) {

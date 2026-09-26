@@ -25,6 +25,18 @@ struct NotePitch {
     std::uint8_t midi_note,
     NotePitch& output) noexcept;
 
+// Unshifted PSG/SCC table word (plus `@\`) and the internal octave index.
+// `p` / `@p` accumulate on `unshifted`, then logical-shift `octave` times.
+struct PsgSccModulationBase {
+    std::uint16_t unshifted{};
+    std::uint8_t octave{};
+};
+
+[[nodiscard]] bool psgSccModulationBase(
+    std::uint8_t midi_note,
+    std::int32_t micro,
+    PsgSccModulationBase& output) noexcept;
+
 // Track MML `@\`: add the 16-bit value to the unshifted PSG/SCC table word,
 // then logical-shift by the internal octave (o1=0 … o8=7).
 [[nodiscard]] bool psgSccPeriodWithMicroDetune(

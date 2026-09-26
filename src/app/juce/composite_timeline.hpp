@@ -80,6 +80,8 @@ public:
     using TimbreLibraryCallback =
         std::function<const engine::TimbreLibrary*()>;
     using ManageTagsCallback = std::function<void()>;
+    using LibraryReplaceCallback = std::function<void(
+        engine::TimbreSource, std::size_t)>;
     using MutateTimbreNameCallback =
         std::function<bool(std::uint64_t, juce::String)>;
     using MutateTimbreTagsCallback =
@@ -104,6 +106,11 @@ public:
     void setTimbreNameCallback(TimbreNameCallback callback);
     void setTimbreLibraryCallback(TimbreLibraryCallback callback);
     void setManageTagsCallback(ManageTagsCallback callback);
+    void setLibraryReplaceCallback(LibraryReplaceCallback callback);
+    void setBaseTimbrePerformance(
+        std::function<void(std::uint8_t)> note_on,
+        std::function<void(std::uint8_t)> note_off,
+        std::function<void()> audition);
     void setMutateTimbreNameCallback(MutateTimbreNameCallback callback);
     void setMutateTimbreTagsCallback(MutateTimbreTagsCallback callback);
     void setMutateTimbreMemoCallback(MutateTimbreMemoCallback callback);

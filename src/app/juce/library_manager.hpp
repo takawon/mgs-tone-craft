@@ -545,6 +545,12 @@ public:
         close_.setButtonText(juce::String::fromUTF8("閉じる"));
         close_.onClick = [this] { closeParentDialog(); };
         addAndMakeVisible(close_);
+        replace_.setButtonText(juce::String::fromUTF8("差し替え"));
+        replace_.setTooltip(juce::String::fromUTF8(
+            "選択した音色を、開いたチャンネルの基本音色へコピーします"));
+        replace_.onClick = [this] { replaceSelected(); };
+        replace_.setVisible(false);
+        addAndMakeVisible(replace_);
 
         refreshTable(true);
     }
@@ -556,6 +562,27 @@ public:
 
     void reloadFromParent() {
         refreshTable(true);
+    }
+
+    void setReplaceMode(
+        std::optional<LibraryManagerKind> kind,
+        std::function<void(std::uint64_t)> on_replace) {
+        replace_mode_ = kind.has_value();
+        on_replace_ = std::move(on_replace);
+        if (kind == LibraryManagerKind::Opll) {
+            category_.setSelectedId(2, juce::dontSendNotification);
+        } else if (kind == LibraryManagerKind::Scc) {
+            category_.setSelectedId(1, juce::dontSendNotification);
+        }
+        category_.setEnabled(!replace_mode_);
+        duplicate_.setVisible(!replace_mode_);
+        remove_.setVisible(!replace_mode_);
+        assign_tags_.setVisible(!replace_mode_);
+        load_edit_.setVisible(!replace_mode_);
+        replace_.setVisible(replace_mode_);
+        setDetailFieldsEditable(!replace_mode_);
+        refreshTable(true);
+        resized();
     }
 
     [[nodiscard]] std::optional<LibraryManagerRow>
@@ -612,17 +639,22 @@ public:
         auto buttons = area.removeFromBottom(textButtonH);
         close_.setBounds(buttons.removeFromRight(libraryButtonMinW));
         buttons.removeFromRight(controlGap);
-        load_edit_.setBounds(
-            buttons.removeFromRight(libraryManageButtonW + xs));
-        buttons.removeFromRight(controlGap);
-        assign_tags_.setBounds(
-            buttons.removeFromRight(libraryManageButtonW));
-        buttons.removeFromRight(controlGap);
-        remove_.setBounds(
-            buttons.removeFromRight(libraryManageButtonW));
-        buttons.removeFromRight(controlGap);
-        duplicate_.setBounds(
-            buttons.removeFromRight(libraryButtonMinW));
+        if (replace_.isVisible()) {
+            replace_.setBounds(
+                buttons.removeFromRight(libraryManageButtonW));
+        } else {
+            load_edit_.setBounds(
+                buttons.removeFromRight(libraryManageButtonW + xs));
+            buttons.removeFromRight(controlGap);
+            assign_tags_.setBounds(
+                buttons.removeFromRight(libraryManageButtonW));
+            buttons.removeFromRight(controlGap);
+            remove_.setBounds(
+                buttons.removeFromRight(libraryManageButtonW));
+            buttons.removeFromRight(controlGap);
+            duplicate_.setBounds(
+                buttons.removeFromRight(libraryButtonMinW));
+        }
         area.removeFromBottom(sm);
 
         detail_bounds_ = area.removeFromRight(280);
@@ -1058,7 +1090,7 @@ private:
         }
         detail_row_ = selected.front();
         const auto& row = *detail_row_;
-        setDetailFieldsEditable(true);
+        setDetailFieldsEditable(!replace_mode_);
         detail_name_.setText(
             juce::String::fromUTF8(row.name.c_str()),
             juce::dontSendNotification);
@@ -1629,6 +1661,22 @@ private:
         }
     }
 
+    void replaceSelected() {
+        const auto selected = selectedRows();
+        if (selected.size() != 1 || !on_replace_) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::InfoIcon,
+                juce::String::fromUTF8("ライブラリ管理"),
+                juce::String::fromUTF8(
+                    "差し替える音色を1件選択してください"));
+            return;
+        }
+        if (selected.front().kind == LibraryManagerKind::Composite) {
+            return;
+        }
+        on_replace_(selected.front().id);
+    }
+
     void closeParentDialog() {
         if (auto* window =
                 findParentComponentOfClass<juce::DocumentWindow>()) {
@@ -1674,5 +1722,8 @@ private:
     juce::TextButton remove_;
     juce::TextButton assign_tags_;
     juce::TextButton load_edit_;
+    juce::TextButton replace_;
     juce::TextButton close_;
+    bool replace_mode_{};
+    std::function<void(std::uint64_t)> on_replace_;
 };
