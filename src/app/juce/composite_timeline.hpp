@@ -122,6 +122,8 @@ public:
         const engine::CompositeTimbre& timbre,
         bool reset_scroll_extent = false);
     void refreshUiScaleFonts();
+    void setInspectorVisible(bool visible);
+    [[nodiscard]] static juce::String verifyWorkspace(const juce::File& snapshot_directory);
     [[nodiscard]] bool appendScopeFrame(
         const engine::OpllScopeFrame& frame,
         std::uint8_t midi_note);

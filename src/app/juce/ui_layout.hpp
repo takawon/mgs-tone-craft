@@ -62,11 +62,17 @@ constexpr int setupDuplicateLayerW = 52; // 複製
 constexpr int setupRemoveLayerW = 72; // Ch.削除
 constexpr int setupNumberModeW = 72; // 自動 / 手動
 constexpr int setupSliderTextW = 40;
-constexpr int editMarkerLaneH = 16; // @ / y: no vertical value extent
+constexpr int editMarkerLaneH = 34; // @ / y: no vertical value extent
 constexpr int registerAutoLaneH = 44;
 constexpr int compositeMixLaneH = 104;
 constexpr int compositeEditLaneH = 520;
 constexpr int registerAutoLanePairExtra = 44 * 2;
+constexpr int compositeInspectorLabelW = 144;
+constexpr int compositeOverviewLabelW = 240;
+constexpr int compositeFocusW = 132;
+constexpr int compositeSelectorW = 144;
+constexpr int compositeInspectorContentH = 800;
+constexpr int compositeAuditionW = 112;
 constexpr int compositeSetupColumnW = 500;
 constexpr int compositeAddPsgW = 70;
 constexpr int compositeAddSccW = 70;
@@ -99,12 +105,12 @@ constexpr int compositeOpllYParamH = 680;
 constexpr int compositeLfoDialogW = 500;
 constexpr int compositeLfoDialogH = 680;
 constexpr int compositeLfoWaveH = 140;
-constexpr int rateEnvelopeDialogW = 560;
+constexpr int rateEnvelopeDialogW = 1100;
 constexpr int rateEnvelopeDialogH = 540; // overwritten in recomputeDerived
 constexpr int rateEnvelopeGraphH = 180;
-constexpr int rateEnvelopeBarW = 56;
+constexpr int rateEnvelopeBarW = 64;
 constexpr int rateEnvelopeBarTrackH = 256; // 1px ≥ 1 count (0–255)
-constexpr int rateEnvelopeBarTextH = 24;
+constexpr int rateEnvelopeBarTextH = 34;
 constexpr int rateEnvelopeHandleR = 7;
 constexpr int setupRateEditW = 96;
 constexpr int settingsDialogW = 500;
@@ -121,6 +127,12 @@ constexpr int editLaneFramePadV = 8; // sm: gap between channel frames
 constexpr int editLaneInnerPadV = 8; // sm: plot inset inside a frame
 } // namespace Base
 
+inline int compositeInspectorLabelW = Base::compositeInspectorLabelW;
+inline int compositeOverviewLabelW = Base::compositeOverviewLabelW;
+inline int compositeFocusW = Base::compositeFocusW;
+inline int compositeSelectorW = Base::compositeSelectorW;
+inline int compositeInspectorContentH = Base::compositeInspectorContentH;
+inline int compositeAuditionW = Base::compositeAuditionW;
 inline int xs = Base::xs;
 inline int sm = Base::sm;
 inline int md = Base::md;
@@ -267,24 +279,10 @@ inline void recomputeDerived() {
     compositeLayerLibraryH =
         panelPad * 2 + libraryTitleH + sm + fieldH * 2 + sm + fieldH;
     rateEnvelopeBarColumnH =
-        fieldH / 2 + rateEnvelopeBarTrackH + rateEnvelopeBarTextH;
-    rateEnvelopeDialogPsgExtraH =
-        fieldH
-        + controlGap
-        + fieldH
-        + sm;
+        fieldH + rateEnvelopeBarTrackH + rateEnvelopeBarTextH + panelPad * 2;
+    rateEnvelopeDialogPsgExtraH = fieldH + sm;
     rateEnvelopeDialogH =
-        panelPad * 2
-        + titleH
-        + xs
-        + rateEnvelopeGraphH
-        + sm
-        + rateEnvelopeBarColumnH
-        + sm
-        + descriptionH * 2
-        + sm
-        + sm
-        + textButtonH;
+        panelPad * 2 + titleH + sm + rateEnvelopeBarColumnH + sm + textButtonH;
     // Volume is the scaled 100% token `editVolumeLaneH` (265px). Pitch keeps
     // the 0.231 remainder (share 3/4 of that pre-growth value area).
     // `compositeEditLaneH` still holds the scaled 0.231 fallback here.
@@ -295,7 +293,7 @@ inline void recomputeDerived() {
             - editLaneInnerPadV * 2
             - envelopePreviewH
             - commandSummaryH
-            - editMarkerLaneH * 2);
+            - juce::roundToInt(16.0f * static_cast<float>(fieldH) / Base::fieldH) * 2);
     editPitchLaneMinH = juce::jmax(
         1,
         (legacy_value_h * editPitchLaneShare)
@@ -371,6 +369,12 @@ inline void applyScale(float factor) {
     compositeEditLaneH = s(Base::compositeEditLaneH);
     editLaneFramePadV = s(Base::editLaneFramePadV);
     editLaneInnerPadV = s(Base::editLaneInnerPadV);
+    compositeInspectorLabelW = s(Base::compositeInspectorLabelW);
+    compositeOverviewLabelW = s(Base::compositeOverviewLabelW);
+    compositeFocusW = s(Base::compositeFocusW);
+    compositeSelectorW = s(Base::compositeSelectorW);
+    compositeInspectorContentH = s(Base::compositeInspectorContentH);
+    compositeAuditionW = s(Base::compositeAuditionW);
     compositeSetupColumnW = s(Base::compositeSetupColumnW);
     compositeAddPsgW = s(Base::compositeAddPsgW);
     compositeAddSccW = s(Base::compositeAddSccW);

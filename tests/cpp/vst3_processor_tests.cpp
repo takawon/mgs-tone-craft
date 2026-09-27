@@ -3578,6 +3578,9 @@ void testPluginEditor() {
         Access::scopeEnabled(processor),
         "composite playback scope runs while editor is open");
 
+    juce::Button* library_toggle = nullptr;
+    juce::Button* count_tab = nullptr;
+    juce::Button* focus_button = nullptr;
     bool spectrum_disabled = false;
     bool library_disabled = false;
     bool scc_disabled = false;
@@ -3585,6 +3588,9 @@ void testPluginEditor() {
     const auto walk = [&](auto&& self, juce::Component* component) -> void {
         if (auto* button = dynamic_cast<juce::Button*>(component)) {
             const auto text = button->getButtonText();
+            if (text == juce::String::fromUTF8("ライブラリ")) library_toggle = button;
+            if (text == juce::String::fromUTF8("カウント編集")) count_tab = button;
+            if (text == juce::String::fromUTF8("編集に集中")) focus_button = button;
             if (text == juce::String::fromUTF8("スペアナ")) {
                 require(!button->isEnabled(), "spectrum control stays in place and is grey");
                 spectrum_disabled = true;
@@ -3611,6 +3617,31 @@ void testPluginEditor() {
     require(library_disabled, "library button is present");
     require(scc_disabled, "SCC workbench button is present");
     require(opll_disabled, "OPLL workbench button is present");
+    require(library_toggle && count_tab && focus_button, "main workspace navigation is present");
+    const auto captures = juce::File::getCurrentWorkingDirectory().getChildFile("composite-ui-captures");
+    require(captures.createDirectory().wasOk(), "create workspace snapshot directory");
+    const auto capture = [&](const char* name) {
+        auto stream = captures.getChildFile(name).createOutputStream();
+        require(stream != nullptr, "open workspace snapshot");
+        require(stream->setPosition(0) && stream->truncate().wasOk(), "truncate workspace snapshot");
+        juce::PNGImageFormat format;
+        require(format.writeImageToStream(editor->createComponentSnapshot(editor->getLocalBounds()), *stream),
+            "render shared main screen");
+    };
+    capture("main-editor.png");
+    library_toggle->setToggleState(true, juce::dontSendNotification);
+    library_toggle->onClick();
+    capture("main-library.png");
+    library_toggle->setToggleState(false, juce::dontSendNotification);
+    library_toggle->onClick();
+    count_tab->onClick();
+    focus_button->setToggleState(true, juce::dontSendNotification);
+    focus_button->onClick();
+    capture("main-focus.png");
+    require(sameBlock(before, stateBytes(processor)), "workspace navigation keeps processor state");
+    requireWorkingCompositeMatchesProcessor(editor, processor, "workspace navigation keeps editor sound");
+    require(Access::stateCompileCount(processor) == compiles, "workspace navigation does not compile");
+    require(Access::blockedBackendCalls(processor) == 0, "workspace navigation does not access backend");
     delete editor;
     require(sameBlock(before, stateBytes(processor)), "closing the editor keeps state");
     require(
