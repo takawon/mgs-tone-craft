@@ -4182,6 +4182,14 @@ public:
         history_cursor_ = 0;
         updateHistoryButtons();
 
+        library_toggle_.setButtonText(juce::String::fromUTF8("ライブラリ"));
+        library_toggle_.setClickingTogglesState(true);
+        library_toggle_.onClick = [this] { resized(); repaint(); };
+        addAndMakeVisible(library_toggle_);
+        audition_.setButtonText(juce::String::fromUTF8("試聴 1秒"));
+        audition_.onClick = [this] { startAudition(); };
+        addAndMakeVisible(audition_);
+
         stop_.setButtonText(juce::String::fromUTF8("全停止"));
         stop_.onClick = [this] { stopAudition(); };
         addAndMakeVisible(stop_);
@@ -4849,8 +4857,18 @@ public:
         area.removeFromBottom(keyboardGap);
         performance_keyboard_.setBounds(keyboard_area);
 
-        auto library_column = area.removeFromRight(libraryWidth);
-        area.removeFromRight(panelGap);
+        const bool library_open = library_toggle_.getToggleState();
+        auto library_column = library_open ? area.removeFromRight(libraryWidth) : juce::Rectangle<int>{};
+        if (library_open) area.removeFromRight(panelGap);
+        timeline_.setInspectorVisible(!library_open);
+        for (auto* c : std::initializer_list<juce::Component*>{
+                &composite_library_title_, &composite_filter_, &composite_tag_filter_,
+                &tag_manage_, &composite_favorite_only_, &composite_ab_, &composite_sort_,
+                &composite_select_, &load_, &delete_, &rename_, &tags_, &favorite_,
+                &save_, &save_as_, &new_, &duplicate_, &layer_library_title_,
+                &layer_library_hint_, &layer_favorite_only_}) {
+            c->setVisible(library_open);
+        }
         layer_library_bounds_ =
             library_column.removeFromBottom(compositeLayerLibraryH);
         library_column.removeFromBottom(sm);
@@ -4882,16 +4900,25 @@ public:
             layer_library_hint_,
             layer_favorite_only_);
 
+        library_toggle_.setBounds(file_row.removeFromRight(compositeSelectorW));
+        file_row.removeFromRight(sm);
+        file_row.removeFromLeft(sm);
+        name_.setBounds(file_row.withHeight(fieldH));
+        name_.setTooltip(juce::String::fromUTF8("編集中の総合音色名"));
+
         editor_panel_bounds_ = area;
         auto editor = area.reduced(panelPad);
         auto footer = editor.removeFromBottom(statusH);
+        audition_.setBounds(footer.removeFromLeft(compositeAuditionW));
+        footer.removeFromLeft(controlGap);
         stop_.setBounds(footer.removeFromLeft(compositeStopW));
         footer.removeFromLeft(controlGap);
         status_.setBounds(footer);
         editor.removeFromBottom(sm);
-        resource_.setBounds(editor.removeFromTop(fieldH));
-        editor.removeFromTop(sm);
-        warning_.setBounds(editor.removeFromTop(fieldH));
+        auto summary = editor.removeFromTop(fieldH);
+        resource_.setBounds(summary.removeFromLeft(summary.getWidth() / 2));
+        summary.removeFromLeft(sm);
+        warning_.setBounds(summary);
         editor.removeFromTop(sm);
         timeline_.setBounds(editor);
         applyCompositeFocusOrder();
@@ -5015,6 +5042,8 @@ private:
             component->setExplicitFocusOrder(editor_order++);
         }
         performance_keyboard_.setExplicitFocusOrder(400);
+        library_toggle_.setExplicitFocusOrder(90);
+        audition_.setExplicitFocusOrder(199);
     }
 
     void resetHistoryToCurrent() {
@@ -6484,6 +6513,8 @@ private:
         warning_.setText(
             warning_text,
             juce::dontSendNotification);
+        resource_.setTooltip(resource_.getText());
+        warning_.setTooltip(warning_text);
     }
 
     void publishSpectrogramSourceMask() const {
@@ -6922,6 +6953,8 @@ private:
     std::array<juce::Label, 3> delay_label_;
     std::array<juce::Label, 3> volume_label_;
     std::array<juce::TextButton, 3> edit_;
+    juce::TextButton library_toggle_;
+    juce::TextButton audition_;
     juce::TextButton stop_;
     juce::Label resource_;
     juce::Label warning_;

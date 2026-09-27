@@ -1621,7 +1621,8 @@ private:
 
 [[nodiscard]] juce::Rectangle<float> rateEnvelopePlotRect(
     juce::Rectangle<int> bounds) {
-    return bounds.toFloat().reduced(0.5F);
+    return bounds.reduced(UiLayout::rateEnvelopeHandleR)
+        .withTrimmedBottom(UiLayout::fieldH / 2).toFloat();
 }
 
 [[nodiscard]] float rateEnvelopeXFromSeconds(
@@ -1878,11 +1879,11 @@ void paintRateEnvelopeGraph(
         juce::Justification::bottomRight);
     graphics.setColour(juce::Colour(0xFFD98A8A));
     graphics.drawText(
-        "KO 1s",
+        juce::String::fromUTF8("試聴キーオフ 1.0秒"),
         juce::Rectangle<int>(
             juce::roundToInt(key_off_x) + UiScale::sx(4),
             bounds.getBottom() - UiScale::sx(21),
-            UiScale::sx(48),
+            UiLayout::compositeSelectorW + UiLayout::sm,
             UiScale::sx(16)),
         juce::Justification::centredLeft);
 }
@@ -2068,15 +2069,13 @@ public:
             juce::dontSendNotification);
         title_.setFont(UiFonts::heading());
         addAndMakeVisible(title_);
-        hint_.setText(
-            juce::String::fromUTF8(
-                "曲線上の赤い●をドラッグして AL〜RR を同時に動かせます。"
-                "AL〜RRは1割り込みあたりの8bit増減。赤い線はプレビュー用の"
-                "1秒キーオフ（定義には保存しません）。"
-                "PCキー／MIDIで総合ミックスを演奏できます（この窓に鍵盤は出しません）。"
-                "バー・ハンドル・Mode／Noiseの確定で1秒プレビューします。"
-                "「試聴（1秒）」でも1秒プレビューします。"),
+        hint_.setText(juce::String::fromUTF8(
+            "主線：8bit内部レベル　半透明：チップ実音量\n"
+            "赤い点をドラッグ／数値を入力。確定時に1秒試聴。"),
             juce::dontSendNotification);
+        hint_.setTooltip(juce::String::fromUTF8(
+            "ALとSLはレベル、AR／DR／SR／RRは1割り込みあたりの増減量。"
+            "1秒キーオフは試聴用で、定義には保存しません。"));
         hint_.setFont(UiFonts::body());
         hint_.setMinimumHorizontalScale(1.0F);
         addAndMakeVisible(hint_);
@@ -2134,11 +2133,21 @@ public:
             });
         preview_.setButtonText(juce::String::fromUTF8("試聴（1秒）"));
         preview_.setTooltip(juce::String::fromUTF8(
-            "最後の試聴音程で1秒キーオンします。離すと @r の Release が続きます"));
+            "最後の試聴音程で総合ミックスを1秒キーオンします。"
+            "キーオフ後は各音源の既存動作に従います"));
         preview_.onClick = [this] {
             commitFromEditors(true);
         };
         addAndMakeVisible(preview_);
+        input_hint_.setText(juce::String::fromUTF8("PCキー／MIDI：総合ミックスを演奏"), juce::dontSendNotification);
+        input_hint_.setFont(UiFonts::body());
+        addAndMakeVisible(input_hint_);
+        close_.setButtonText(juce::String::fromUTF8("閉じる"));
+        close_.onClick = [this] {
+            if (auto* window = findParentComponentOfClass<juce::DocumentWindow>())
+                window->closeButtonPressed();
+        };
+        addAndMakeVisible(close_);
         assignFromLayer(layer);
         setWantsKeyboardFocus(true);
         fitToContent();
@@ -2148,6 +2157,24 @@ public:
     void assignFromLayer(const mgstc::engine::CompositeLayer& layer) {
         assigning_ = true;
         source_ = layer.source;
+        title_.setText(juce::String(layer.source == mgstc::engine::TimbreSource::Psg ? "PSG" :
+                layer.source == mgstc::engine::TimbreSource::Scc ? "SCC" : "OPLL")
+            + " Ch." + juce::String(static_cast<int>(layer.channel) + 1)
+            + "  /  " + juce::String::fromUTF8(layer.name.c_str()) + "  /  @r " + juce::String(layer.envelope_number),
+            juce::dontSendNotification);
+        title_.setTooltip(title_.getText());
+        title_.setFont(UiFonts::heading());
+        hint_.setFont(UiFonts::body());
+        input_hint_.setFont(UiFonts::body());
+        hint_.setText(juce::String::fromUTF8(
+            source_ == mgstc::engine::TimbreSource::Opll
+                ? "主線：8bit内部レベル　半透明：チップ実音量\nキーオフはFM側。ソフトウェアRRへは移りません。"
+                : "主線：8bit内部レベル　半透明：チップ実音量\n赤い点をドラッグ／数値を入力。確定時に1秒試聴。"),
+            juce::dontSendNotification);
+        for (auto* label : {&attack_level_label_, &attack_rate_label_, &decay_rate_label_,
+                &sustain_level_label_, &sustain_rate_label_, &release_rate_label_,
+                &mode_label_, &noise_label_}) label->setFont(UiFonts::body());
+
         const auto rate = mgstc::engine::clampRateEnvelope(
             layer.volume_envelope.rate);
         attack_level_.setValue(rate.attack_level, juce::dontSendNotification);
@@ -2179,42 +2206,87 @@ public:
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(panelPad);
         title_.setBounds(area.removeFromTop(titleH));
-        area.removeFromTop(xs);
-        graph_.setBounds(area.removeFromTop(rateEnvelopeGraphH));
         area.removeFromTop(sm);
-        auto bars = area.removeFromTop(rateEnvelopeBarColumnH);
-        const int bar_w = rateEnvelopeBarW;
-        auto place_bar = [&bars, bar_w](
-            juce::Label& label, juce::Slider& slider) {
-            auto column = bars.removeFromLeft(bar_w);
-            bars.removeFromLeft(UiLayout::controlGap);
-            label.setBounds(column.removeFromTop(UiLayout::fieldH / 2));
+        auto footer = area.removeFromBottom(textButtonH);
+        preview_.setBounds(footer.removeFromLeft(compositeAuditionW + sm));
+        footer.removeFromLeft(controlGap);
+        close_.setBounds(footer.removeFromRight(libraryButtonMinW));
+        input_hint_.setBounds(footer);
+        area.removeFromBottom(sm);
+        auto bars = area.removeFromRight(rateEnvelopeBarW * 6 + controlGap * 5);
+        area.removeFromRight(panelGap);
+        auto place = [&bars](juce::Label& label, juce::Slider& slider) {
+            auto column = bars.removeFromLeft(rateEnvelopeBarW);
+            bars.removeFromLeft(controlGap);
+            label.setBounds(column.removeFromTop(fieldH));
+            slider.setTextBoxStyle(juce::Slider::TextBoxBelow, false,
+                rateEnvelopeBarW - xs, rateEnvelopeBarTextH);
             slider.setBounds(column);
         };
-        place_bar(attack_level_label_, attack_level_);
-        place_bar(attack_rate_label_, attack_rate_);
-        place_bar(decay_rate_label_, decay_rate_);
-        place_bar(sustain_level_label_, sustain_level_);
-        place_bar(sustain_rate_label_, sustain_rate_);
-        place_bar(release_rate_label_, release_rate_);
-        area.removeFromTop(sm);
+        place(attack_level_label_, attack_level_);
+        place(attack_rate_label_, attack_rate_);
+        place(decay_rate_label_, decay_rate_);
+        place(sustain_level_label_, sustain_level_);
+        place(sustain_rate_label_, sustain_rate_);
+        place(release_rate_label_, release_rate_);
+        hint_.setBounds(area.removeFromBottom(fieldH * 2));
+        area.removeFromBottom(sm);
         if (source_ == mgstc::engine::TimbreSource::Psg) {
-            auto mode_row = area.removeFromTop(fieldH);
-            mode_label_.setBounds(mode_row.removeFromLeft(setupValueLabelW));
-            mode_row.removeFromLeft(controlGap);
-            mode_.setBounds(mode_row.removeFromLeft(setupPitchSweepW * 2));
-            area.removeFromTop(controlGap);
-            auto noise_row = area.removeFromTop(fieldH);
-            noise_label_.setBounds(noise_row.removeFromLeft(setupValueLabelW));
-            noise_row.removeFromLeft(controlGap);
-            noise_.setBounds(noise_row);
+            auto row = area.removeFromTop(fieldH);
+            mode_label_.setBounds(row.removeFromLeft(rateEnvelopeBarW));
+            mode_.setBounds(row.removeFromLeft(compositeSelectorW));
+            row.removeFromLeft(controlGap);
+            noise_label_.setBounds(row.removeFromLeft(rateEnvelopeBarW));
+            noise_.setTextBoxStyle(juce::Slider::TextBoxLeft, false, setupSliderTextW, fieldH - sm);
+            noise_.setBounds(row);
             area.removeFromTop(sm);
         }
-        hint_.setBounds(area.removeFromTop(descriptionH * 2 + sm));
-        area.removeFromTop(sm);
-        preview_.setBounds(
-            area.removeFromTop(textButtonH).removeFromLeft(
-                libraryButtonMinW + 24));
+        graph_.setBounds(area);
+    }
+
+    void paint(juce::Graphics& g) override {
+        paintPageBackground(g, getLocalBounds());
+    }
+
+
+    juce::String verifyEditing() {
+        juce::String failures;
+        auto check = [&](bool ok, const char* message) { if (!ok) failures += juce::String(message) + "\n"; };
+        check(!graph_.getBounds().intersects(attack_level_.getBounds()), "rate graph overlaps bars");
+        check(getLocalBounds().contains(close_.getBounds()), "rate close button clipped");
+        check(attack_level_.getHeight() - UiLayout::rateEnvelopeBarTextH
+            >= UiLayout::rateEnvelopeBarTrackH, "rate track below 256 levels");
+        int changes = 0, previews = 0;
+        bool committed = false;
+        mgstc::engine::RateEnvelope result;
+        on_change_ = [&](const auto& rate, bool commit) { ++changes; result = rate; committed = commit; };
+        on_preview_ = [&] { ++previews; };
+        auto expected = readRate();
+        const auto original = expected;
+        std::array<juce::Slider*, 6> bars{&attack_level_, &attack_rate_, &decay_rate_,
+            &sustain_level_, &sustain_rate_, &release_rate_};
+        std::array<std::uint8_t mgstc::engine::RateEnvelope::*, 6> members{
+            &mgstc::engine::RateEnvelope::attack_level, &mgstc::engine::RateEnvelope::attack_rate,
+            &mgstc::engine::RateEnvelope::decay_rate, &mgstc::engine::RateEnvelope::sustain_level,
+            &mgstc::engine::RateEnvelope::sustain_rate, &mgstc::engine::RateEnvelope::release_rate};
+        for (std::size_t i = 0; i < bars.size(); ++i) {
+            const int value = expected.*members[i] == 255 ? 0 : 255;
+            expected.*members[i] = static_cast<std::uint8_t>(value);
+            changes = previews = 0;
+            bars[i]->setValue(value, juce::sendNotificationSync);
+            check(changes == 1 && !committed && previews == 0 && result == expected,
+                "rate slider changed unrelated fields or previewed during drag");
+            bars[i]->onDragEnd();
+            check(changes == 2 && committed && previews == 1 && result == expected,
+                "rate slider commit did not preserve preview behavior");
+        }
+        assigning_ = true; writeRateToEditors(original); assigning_ = false; refreshGraph();
+        changes = previews = 0;
+        preview_.onClick();
+        check(changes == 1 && committed && previews == 1 && result == original,
+            "rate explicit preview changed parameters");
+        on_change_ = {}; on_preview_ = {};
+        return failures;
     }
 
     bool keyPressed(const juce::KeyPress& key) override {
@@ -2250,6 +2322,17 @@ private:
         label.setFont(UiFonts::body());
         label.setJustificationType(juce::Justification::centred);
         addAndMakeVisible(label);
+        const auto explanation = juce::String::fromUTF8(
+            juce::String(name) == "AL" ? "開始レベル AL（0～255）" :
+            juce::String(name) == "AR" ? "上昇速度 AR（0～255）" :
+            juce::String(name) == "DR" ? "減衰速度 DR（0～255）" :
+            juce::String(name) == "SL" ? "持続レベル SL（0～255）" :
+            juce::String(name) == "SR" ? "持続中の減衰 SR（0～255）" :
+                                       "キーオフ後の減衰 RR（PSG／SCC、0～255）");
+        label.setTooltip(explanation);
+        slider.setTooltip(explanation);
+        slider.setName(explanation);
+        slider.setExplicitFocusOrder(getNumChildComponents());
         slider.setRange(0.0, 255.0, 1.0);
         slider.setSliderStyle(juce::Slider::LinearVertical);
         slider.setTextBoxStyle(
@@ -2365,6 +2448,8 @@ private:
     bool assigning_{};
     juce::Label title_;
     juce::Label hint_;
+    juce::Label input_hint_;
+    juce::TextButton close_;
     RateEnvelopeGraphView graph_;
     juce::Label attack_level_label_;
     juce::Label attack_rate_label_;
@@ -2617,7 +2702,7 @@ public:
             }
         };
         addAndMakeVisible(edit_);
-        h_.setButtonText("h");
+        h_.setButtonText(juce::String::fromUTF8("LFO h"));
         h_.setClickingTogglesState(false);
         h_.setTooltip(juce::String::fromUTF8(
             "MGSDRV ソフトウェア LFO（発音前 h）。"
@@ -2712,11 +2797,11 @@ public:
         pitch_label_.setText(
             juce::String::fromUTF8("相対音程"),
             juce::dontSendNotification);
-        detune_label_.setText(juce::String::fromUTF8("\\"), juce::dontSendNotification);
+        detune_label_.setText(juce::String::fromUTF8("デチューン \\"), juce::dontSendNotification);
         micro_detune_label_.setText(
-            juce::String::fromUTF8("@\\"), juce::dontSendNotification);
+            juce::String::fromUTF8("微デチューン @\\"), juce::dontSendNotification);
         delay_label_.setText(juce::String::fromUTF8("休符"), juce::dontSendNotification);
-        volume_label_.setText(juce::String::fromUTF8("v"), juce::dontSendNotification);
+        volume_label_.setText(juce::String::fromUTF8("音量 v"), juce::dontSendNotification);
         key_off_hang_label_.setText(
             juce::String::fromUTF8("k"), juce::dontSendNotification);
         mixer_mode_label_.setText(
@@ -2764,7 +2849,7 @@ public:
                  &key_off_hang_label_,
                  &mixer_mode_label_,
                  &mixer_noise_label_}) {
-            label->setFont(UiFonts::dense());
+            label->setFont(UiFonts::body());
             label->setJustificationType(juce::Justification::centredLeft);
             addAndMakeVisible(*label);
         }
@@ -2781,6 +2866,16 @@ public:
 
     void paint(juce::Graphics& graphics) override {
         graphics.fillAll(juce::Colour(UiLayout::panelFill));
+        const std::array<juce::String, 3> headings{
+            juce::String::fromUTF8("音色・エンベロープ"),
+            juce::String::fromUTF8("音量・音程"),
+            juce::String::fromUTF8("タイミング・変調")};
+        graphics.setFont(UiFonts::body(true));
+        graphics.setColour(juce::Colour(0xFF9FAFBD));
+        for (std::size_t i = 0; i < headings.size(); ++i) {
+            graphics.drawText(headings[i], section_bounds_[i], juce::Justification::centredLeft);
+        }
+
     }
 
     void setCallbacks(
@@ -3059,121 +3154,90 @@ public:
             : std::nullopt;
     }
 
-    void resized() override {
-        using namespace UiLayout;
-        auto area = getLocalBounds().reduced(panelPad);
-        auto title = area.removeFromTop(fieldH);
-        source_.setBounds(title.removeFromLeft(setupSourceLabelW));
-        title.removeFromLeft(controlGap);
-        auto place_switch = [&title](juce::ToggleButton& toggle) {
-            const int width = switchControlWidth(toggle.getButtonText(), fieldH);
-            toggle.setBounds(title.removeFromRight(width));
-        };
-        place_switch(solo_);
-        title.removeFromRight(controlGap);
-        place_switch(mute_);
-        title.removeFromRight(controlGap);
-        place_switch(enabled_);
-        area.removeFromTop(sm);
-        auto identity = area.removeFromTop(fieldH);
-        remove_.setBounds(identity.removeFromRight(setupRemoveLayerW));
-        identity.removeFromRight(controlGap);
-        duplicate_.setBounds(identity.removeFromRight(setupDuplicateLayerW));
-        identity.removeFromRight(controlGap);
-        channel_.setBounds(identity.removeFromRight(setupChannelComboW));
-        identity.removeFromRight(controlGap);
-        envelope_number_.setBounds(
-            identity.removeFromLeft(setupEnvelopeNumberW));
-        identity.removeFromLeft(controlGap);
-        name_.setBounds(identity);
-        area.removeFromTop(sm);
-        auto rate_row = area.removeFromTop(fieldH);
-        rate_edit_.setBounds(rate_row.removeFromRight(setupRateEditW));
-        rate_row.removeFromRight(controlGap);
-        const int rate_w = switchControlWidth(
-            rate_kind_.getButtonText(), fieldH);
-        rate_kind_.setBounds(rate_row.removeFromRight(rate_w));
-        area.removeFromTop(sm);
-        auto timbre_row = area.removeFromTop(fieldH);
-        edit_.setBounds(timbre_row.removeFromRight(libraryManageButtonW));
-        timbre_row.removeFromRight(controlGap);
-        timbre_settings_.setBounds(timbre_row);
-        area.removeFromTop(sm);
-        auto number_row = area.removeFromTop(fieldH);
-        auto volume_area = number_row.removeFromRight(
-            juce::jmax(
-                editSubLaneLabelW + controlGap + setupPitchSweepW,
-                number_row.getWidth() / 3));
-        number_row.removeFromRight(controlGap);
-        number_mode_.setBounds(number_row.removeFromLeft(setupNumberModeW));
-        number_row.removeFromLeft(controlGap);
-        timbre_number_label_.setBounds(
-            number_row.removeFromLeft(setupValueLabelW));
-        number_row.removeFromLeft(controlGap);
-        timbre_number_.setBounds(number_row);
-        layoutValue(volume_area, volume_label_, volume_);
-        area.removeFromTop(sm);
-        auto pitch_row = area.removeFromTop(fieldH);
-        if (p_.isVisible()) {
-            p_value_.setBounds(pitch_row.removeFromRight(setupPitchSweepW));
-            pitch_row.removeFromRight(controlGap);
-            p_.setBounds(pitch_row.removeFromRight(fieldH));
-            pitch_row.removeFromRight(controlGap);
-        } else {
-            p_.setBounds({});
-            p_value_.setBounds({});
-        }
-        h_.setBounds(pitch_row.removeFromRight(fieldH));
-        pitch_row.removeFromRight(controlGap);
-        layoutValue(
-            pitch_row, pitch_label_, pitch_, setupValueLabelW);
-        area.removeFromTop(sm);
-        auto detune_row = area.removeFromTop(fieldH);
-        const int half = juce::jmax(
-            1, (detune_row.getWidth() - controlGap) / 2);
-        layoutValue(detune_row.removeFromLeft(half), detune_label_, detune_);
-        detune_row.removeFromLeft(controlGap);
-        layoutValue(detune_row, micro_detune_label_, micro_detune_);
-        area.removeFromTop(sm);
-        auto delay_row = area.removeFromTop(fieldH);
-        auto delay_half = delay_row.removeFromLeft(half);
-        delay_label_.setBounds(delay_half.removeFromLeft(editSubLaneLabelW));
-        delay_half.removeFromLeft(controlGap);
-        delay_form_.setBounds(delay_half.removeFromLeft(setupSustainComboW));
-        delay_half.removeFromLeft(controlGap);
-        delay_.setBounds(delay_half);
-        delay_row.removeFromLeft(controlGap);
-        if (key_off_hang_.isVisible()) {
-            layoutValue(delay_row, key_off_hang_label_, key_off_hang_);
-            sustain_.setBounds({});
-        } else {
-            key_off_hang_label_.setBounds({});
-            key_off_hang_.setBounds({});
-            sustain_.setBounds(delay_row.removeFromLeft(setupSustainComboW));
-        }
-        area.removeFromTop(sm);
-        auto mixer_row = area.removeFromTop(fieldH);
-        if (mixer_mode_.isVisible()) {
-            auto noise_area = mixer_row.removeFromRight(
-                juce::jmax(1, (mixer_row.getWidth() - controlGap) / 2));
-            mixer_row.removeFromRight(controlGap);
-            mixer_mode_label_.setBounds(
-                mixer_row.removeFromLeft(editSubLaneLabelW));
-            mixer_row.removeFromLeft(controlGap);
-            mixer_mode_.setBounds(mixer_row);
-            layoutValue(noise_area, mixer_noise_label_, mixer_noise_);
-        } else {
-            mixer_mode_.setBounds({});
-            mixer_mode_label_.setBounds({});
-            mixer_noise_.setBounds({});
-            mixer_noise_label_.setBounds({});
+    void refreshFonts() {
+        source_.setFont(UiFonts::heading());
+        UiFonts::styleBodyField(name_);
+        for (auto* label : {&pitch_label_, &detune_label_, &micro_detune_label_,
+                 &delay_label_, &volume_label_, &key_off_hang_label_,
+                 &mixer_mode_label_, &mixer_noise_label_, &timbre_number_label_}) {
+            label->setFont(UiFonts::body());
         }
     }
 
-    void mouseDown(const juce::MouseEvent&) override {
-        if (changed_) {
-            changed_(true);
+    void resized() override {
+        using namespace UiLayout;
+        auto area = getLocalBounds().reduced(panelPad);
+        auto row = [&area] { auto r = area.removeFromTop(fieldH); area.removeFromTop(sm); return r; };
+        auto section = [&area](juce::Rectangle<int>& bounds) {
+            bounds = area.removeFromTop(libraryTitleH);
+            area.removeFromTop(sm);
+        };
+        auto title = row();
+        source_.setBounds(title.removeFromLeft(setupSourceLabelW));
+        channel_.setBounds(title);
+        auto switches = row();
+        for (auto* toggle : {&enabled_, &mute_, &solo_}) {
+            toggle->setBounds(switches.removeFromLeft(switchControlWidth(toggle->getButtonText(), fieldH)));
+            switches.removeFromLeft(controlGap);
         }
+        name_.setBounds(row());
+        section(section_bounds_[0]);
+        auto identity = row();
+        envelope_number_.setBounds(identity.removeFromLeft(setupEnvelopeNumberW));
+        identity.removeFromLeft(controlGap);
+        rate_kind_.setBounds(identity.removeFromLeft(switchControlWidth("@r", fieldH)));
+        identity.removeFromLeft(controlGap);
+        rate_edit_.setBounds(identity);
+        auto timbre = row();
+        edit_.setBounds(timbre.removeFromRight(libraryManageButtonW));
+        timbre.removeFromRight(controlGap);
+        timbre_settings_.setBounds(timbre);
+        auto number = row();
+        number_mode_.setBounds(number.removeFromLeft(setupNumberModeW));
+        number.removeFromLeft(controlGap);
+        timbre_number_label_.setBounds(number.removeFromLeft(setupValueLabelW));
+        timbre_number_.setBounds(number);
+        section(section_bounds_[1]);
+        layoutValue(row(), volume_label_, volume_, UiLayout::compositeInspectorLabelW);
+        layoutValue(row(), pitch_label_, pitch_, UiLayout::compositeInspectorLabelW);
+        layoutValue(row(), detune_label_, detune_, UiLayout::compositeInspectorLabelW);
+        layoutValue(row(), micro_detune_label_, micro_detune_, UiLayout::compositeInspectorLabelW);
+        section(section_bounds_[2]);
+        auto delay = row();
+        delay_label_.setBounds(delay.removeFromLeft(UiLayout::compositeInspectorLabelW));
+        delay_form_.setBounds(delay.removeFromLeft(setupSustainComboW));
+        delay.removeFromLeft(controlGap);
+        delay_.setBounds(delay);
+        auto gate = row();
+        if (key_off_hang_.isVisible()) {
+            layoutValue(gate, key_off_hang_label_, key_off_hang_, UiLayout::compositeInspectorLabelW);
+            sustain_.setBounds({});
+        } else {
+            key_off_hang_label_.setBounds({}); key_off_hang_.setBounds({});
+            sustain_.setBounds(gate);
+        }
+        auto modulation = row();
+        h_.setBounds(modulation.removeFromLeft(UiLayout::compositeInspectorLabelW));
+        modulation.removeFromLeft(controlGap);
+        p_.setBounds(modulation.removeFromLeft(fieldH));
+        p_value_.setBounds(modulation);
+        if (mixer_mode_.isVisible()) {
+            auto mixer = row();
+            mixer_mode_label_.setBounds(mixer.removeFromLeft(UiLayout::compositeInspectorLabelW));
+            mixer_mode_.setBounds(mixer);
+            layoutValue(row(), mixer_noise_label_, mixer_noise_, UiLayout::compositeInspectorLabelW);
+        } else {
+            mixer_mode_.setBounds({}); mixer_mode_label_.setBounds({});
+            mixer_noise_.setBounds({}); mixer_noise_label_.setBounds({});
+        }
+        auto actions = row();
+        duplicate_.setBounds(actions.removeFromLeft((actions.getWidth() - controlGap) / 2));
+        actions.removeFromLeft(controlGap);
+        remove_.setBounds(actions);
+    }
+
+    void mouseDown(const juce::MouseEvent&) override {
+        // Inspector whitespace never commits a model edit.
     }
 
 private:
@@ -3274,6 +3338,7 @@ private:
     juce::TextButton h_;
     juce::TextButton p_;
     juce::Slider p_value_;
+    std::array<juce::Rectangle<int>, 3> section_bounds_;
     juce::Label pitch_label_;
     juce::Label detune_label_;
     juce::Label micro_detune_label_;
@@ -3294,321 +3359,155 @@ private:
     juce::Slider mixer_noise_;
 };
 
-class CountCommandStackView final
-    : public juce::Component,
-      public juce::SettableTooltipClient {
+class CountCommandStackView final : public juce::Component {
 public:
-    using DeleteCallback = std::function<void(int chip_index)>;
-    using MoveCallback = std::function<void(int chip_index, bool to_after)>;
-    using InsertZoneCallback = std::function<void(bool insert_after)>;
-
-    void setDeleteCallback(DeleteCallback callback) {
-        delete_callback_ = std::move(callback);
-    }
-
-    void setMoveCallback(MoveCallback callback) {
-        move_callback_ = std::move(callback);
-    }
-
-    void setInsertZoneCallback(InsertZoneCallback callback) {
-        insert_zone_callback_ = std::move(callback);
-    }
-
-    void clearStack() {
-        count_ = -1;
-        has_loop_start_ = false;
-        has_loop_end_ = false;
-        insert_after_ = false;
-        before_.clear();
-        after_.clear();
-        after_end_.clear();
-        repaint();
-    }
-
-    void setStack(
-        int count,
-        bool has_loop_start,
-        bool has_loop_end,
-        bool insert_after,
-        std::vector<juce::String> before,
-        std::vector<juce::String> after,
+    using DeleteCallback = std::function<void(int)>;
+    using MoveCallback = std::function<void(int, bool)>;
+    using InsertZoneCallback = std::function<void(bool)>;
+    void setDeleteCallback(DeleteCallback cb) { delete_callback_ = std::move(cb); }
+    void setMoveCallback(MoveCallback cb) { move_callback_ = std::move(cb); }
+    void setInsertZoneCallback(InsertZoneCallback cb) { insert_zone_callback_ = std::move(cb); }
+    void clearStack() { setStack(-1, false, false, false, {}, {}, {}); }
+    void setStack(int count, bool loop_start, bool loop_end, bool insert_after,
+        std::vector<juce::String> before, std::vector<juce::String> after,
         std::vector<juce::String> after_end) {
-        count_ = count;
-        has_loop_start_ = has_loop_start;
-        has_loop_end_ = has_loop_end;
-        insert_after_ = insert_after && has_loop_start;
-        before_ = std::move(before);
-        after_ = std::move(after);
-        after_end_ = std::move(after_end);
-        setTooltip(juce::String::fromUTF8(
-            "選択中カウントのゼロ時間命令。"
-            "ゾーンをクリックで追加先（ループ前／後）を切替。"
-            "チップを右クリックで削除または前後へ移動。"
-            "[ より前は初回のみ、後はループのたびに実行。"));
-        repaint();
+        // Rebuild only when content changes: keep keyboard focus during repaint/sync.
+        if (count_ == count && has_loop_start_ == loop_start && has_loop_end_ == loop_end
+            && insert_after_ == (insert_after && loop_start)
+            && before_ == before && after_ == after && after_end_ == after_end) return;
+        count_ = count; has_loop_start_ = loop_start; has_loop_end_ = loop_end;
+        insert_after_ = insert_after && loop_start;
+        before_ = std::move(before); after_ = std::move(after); after_end_ = std::move(after_end);
+        rebuild();
     }
-
-    void mouseDown(const juce::MouseEvent& event) override {
-        if (count_ < 0) {
-            return;
-        }
-        const int index = hitChipIndex(event.getPosition());
-        if (event.mods.isPopupMenu() && index >= 0) {
-            const bool in_after = index >= static_cast<int>(before_.size());
-            juce::PopupMenu menu;
-            menu.addItem(1, juce::String::fromUTF8("削除"));
-            if (has_loop_start_) {
-                if (in_after) {
-                    menu.addItem(
-                        2, juce::String::fromUTF8("ループ前へ移動"));
-                } else {
-                    menu.addItem(
-                        3, juce::String::fromUTF8("ループ後へ移動"));
-                }
-            }
-            menu.showMenuAsync(
-                juce::PopupMenu::Options().withTargetComponent(this),
-                [this, index, in_after](int result) {
-                    if (result == 1 && delete_callback_ != nullptr) {
-                        delete_callback_(index);
-                    } else if (
-                        result == 2 && in_after && move_callback_ != nullptr) {
-                        move_callback_(index, false);
-                    } else if (
-                        result == 3 && !in_after && move_callback_ != nullptr) {
-                        move_callback_(index, true);
-                    }
-                });
-            return;
-        }
-        if (event.mods.isLeftButtonDown()) {
-            const auto zone = hitInsertZone(event.getPosition());
-            if (zone && insert_zone_callback_ != nullptr) {
-                insert_zone_callback_(*zone);
-            }
+    int preferredHeight() const {
+        return UiLayout::panelPad * 2
+            + (UiLayout::fieldH + UiLayout::xs) * static_cast<int>(rows_.size());
+    }
+    void resized() override {
+        auto area = getLocalBounds().reduced(UiLayout::panelPad);
+        for (auto& row : rows_) {
+            if (auto* label = dynamic_cast<juce::Label*>(row.get())) label->setFont(UiFonts::body());
+            row->setBounds(area.removeFromTop(UiLayout::fieldH));
+            area.removeFromTop(UiLayout::xs);
         }
     }
-
-    void paint(juce::Graphics& graphics) override {
-        auto bounds = getLocalBounds().toFloat();
-        graphics.setColour(juce::Colour(0xFF26313B));
-        graphics.fillRoundedRectangle(bounds, 5.0F);
-        graphics.setColour(juce::Colour(0xFF435160));
-        graphics.drawRoundedRectangle(bounds, 5.0F, 1.0F);
-
-        auto area = getLocalBounds().reduced(UiLayout::sm, UiLayout::xs);
-        graphics.setColour(juce::Colour(0xFFE6EDF3));
-        graphics.setFont(UiFonts::dense(true));
-        auto header = area.removeFromTop(16);
-        if (count_ < 0) {
-            graphics.drawText(
-                juce::String::fromUTF8("チャンネルを選択すると命令スタックを表示"),
-                header,
-                juce::Justification::centredLeft,
-                false);
-            return;
-        }
-        graphics.drawText(
-            juce::String::fromUTF8("カウント ")
-                + juce::String(count_)
-                + juce::String::fromUTF8(" の命令"),
-            header,
-            juce::Justification::centredLeft,
-            false);
-
-        drawZone(
-            graphics,
-            area.removeFromTop(20),
-            juce::String::fromUTF8("ループ前"),
-            before_,
-            juce::Colour(kUiHoverAccent),
-            false,
-            has_loop_start_ && !insert_after_);
-        drawDivider(
-            graphics,
-            area.removeFromTop(16),
-            has_loop_start_
-                ? juce::String::fromUTF8("[  ループ開始")
-                : juce::String::fromUTF8("[  なし（この列）"),
-            has_loop_start_);
-        drawZone(
-            graphics,
-            area.removeFromTop(20),
-            juce::String::fromUTF8("ループ後"),
-            after_,
-            juce::Colour(kUiHoverAccent),
-            !has_loop_start_,
-            has_loop_start_ && insert_after_);
-        drawDivider(
-            graphics,
-            area.removeFromTop(16),
-            has_loop_end_
-                ? juce::String::fromUTF8("]  ループ終了")
-                : juce::String::fromUTF8("]  なし（この列）"),
-            has_loop_end_);
-        drawZone(
-            graphics,
-            area,
-            juce::String::fromUTF8("]以降"),
-            after_end_,
-            juce::Colour(0xFF8896A3),
-            true,
-            false);
+    void paint(juce::Graphics& g) override {
+        g.setColour(juce::Colour(0xFF26313B));
+        g.fillRoundedRectangle(getLocalBounds().toFloat(), static_cast<float>(UiLayout::xs));
     }
-
 private:
-    void drawDivider(
-        juce::Graphics& graphics,
-        juce::Rectangle<int> row,
-        const juce::String& text,
-        bool active) const {
-        graphics.setColour(
-            active
-                ? juce::Colour(kUiHoverAccent).withAlpha(0.35F)
-                : juce::Colour(0xFF40505E));
-        graphics.fillRect(row.withHeight(1).withY(row.getCentreY()));
-        graphics.setFont(UiFonts::dense(true));
-        graphics.setColour(
-            active ? juce::Colour(kUiHoverAccent) : juce::Colour(0xFF8896A3));
-        graphics.drawText(
-            text, row.reduced(UiLayout::xs, 0),
-            juce::Justification::centredLeft, false);
+    class CommandButton final : public juce::TextButton {
+    public:
+        explicit CommandButton(const juce::String& text) : juce::TextButton(text) {}
+        void mouseDown(const juce::MouseEvent& e) override {
+            if (e.mods.isPopupMenu()) { if (onClick) onClick(); }
+            else juce::TextButton::mouseDown(e);
+        }
+    };
+    void label(const juce::String& text, bool accent = false) {
+        auto row = std::make_unique<juce::Label>();
+        row->setText(text, juce::dontSendNotification);
+        row->setFont(UiFonts::body());
+        row->setColour(juce::Label::textColourId,
+            juce::Colour(accent ? kUiHoverAccent : 0xFF9BA8B2));
+        row->setTooltip(text);
+        addAndMakeVisible(*row); rows_.push_back(std::move(row));
     }
-
-    void drawZone(
-        juce::Graphics& graphics,
-        juce::Rectangle<int> row,
-        const juce::String& title,
-        const std::vector<juce::String>& chips,
-        juce::Colour chip_colour,
-        bool dimmed,
-        bool insert_target) const {
-        if (insert_target) {
-            graphics.setColour(juce::Colour(kUiHoverAccent).withAlpha(0.12F));
-            graphics.fillRoundedRectangle(row.toFloat(), 3.0F);
-        }
-        auto label = row.removeFromLeft(64);
-        graphics.setFont(UiFonts::dense());
-        graphics.setColour(
-            insert_target
-                ? juce::Colour(kUiHoverAccent)
-                : (dimmed ? juce::Colour(0xFF6B7785) : juce::Colour(0xFFC9D1D9)));
-        graphics.drawText(
-            title, label, juce::Justification::centredLeft, false);
-        if (chips.empty()) {
-            graphics.setColour(juce::Colour(0xFF6B7785));
-            graphics.drawText(
-                juce::String::fromUTF8(
-                    insert_target ? "（追加先）" : "（なし）"),
-                row,
-                juce::Justification::centredLeft,
-                false);
-            return;
-        }
-        int x = row.getX();
-        graphics.setFont(UiFonts::dense(true));
-        for (const auto& chip : chips) {
-            const int width = juce::jmax(
-                28,
-                juce::GlyphArrangement::getStringWidthInt(
-                    UiFonts::dense(true), chip)
-                    + UiLayout::sm);
-            if (x + width > row.getRight()) {
-                break;
+    void zone(const juce::String& text, bool after) {
+        auto row = std::make_unique<juce::TextButton>(text);
+        row->setToggleState(insert_after_ == after, juce::dontSendNotification);
+        row->setTooltip(juce::String::fromUTF8("新しい命令の追加先を選択。既存の命令は移動しません"));
+        row->onClick = [safe = juce::Component::SafePointer<CountCommandStackView>(this), after] {
+            // The callback synchronously refreshes this list; keep a copy alive.
+            if (safe && safe->insert_zone_callback_) {
+                auto callback = safe->insert_zone_callback_;
+                callback(after);
             }
-            auto chip_bounds = juce::Rectangle<int>(
-                x, row.getY() + 1, width - 2, row.getHeight() - 2);
-            graphics.setColour(chip_colour.withAlpha(dimmed ? 0.18F : 0.28F));
-            graphics.fillRoundedRectangle(chip_bounds.toFloat(), 3.0F);
-            graphics.setColour(
-                dimmed ? juce::Colour(0xFF8896A3) : juce::Colour(0xFFE6EDF3));
-            graphics.drawText(
-                chip, chip_bounds, juce::Justification::centred, false);
-            x += width;
+        };
+        addAndMakeVisible(*row); rows_.push_back(std::move(row));
+    }
+    void commands(const std::vector<juce::String>& commands, int offset, bool readonly = false) {
+        if (commands.empty()) { label(juce::String::fromUTF8("（命令なし）")); return; }
+        for (int i = 0; i < static_cast<int>(commands.size()); ++i) {
+            if (readonly) { label(commands[i]); continue; }
+            const int index = offset + i;
+            auto row = std::make_unique<CommandButton>(commands[i] + "   ...");
+            row->setTooltip(commands[i] + juce::String::fromUTF8("：クリックで移動／削除"));
+            row->onClick = [safe = juce::Component::SafePointer<CountCommandStackView>(this), index] {
+                if (safe) safe->showCommandMenu(index);
+            };
+            addAndMakeVisible(*row); rows_.push_back(std::move(row));
         }
     }
-
-    [[nodiscard]] std::optional<bool> hitInsertZone(
-        juce::Point<int> point) const {
-        if (!has_loop_start_) {
-            return std::nullopt;
+    void rebuild() {
+        rows_.clear();
+        if (count_ < 0) { resized(); repaint(); return; }
+        label(juce::String::fromUTF8("カウント ") + juce::String(count_) + juce::String::fromUTF8(" の命令"), true);
+        if (has_loop_start_) zone(juce::String::fromUTF8("追加先：初回のみ（ [ より前）"), false);
+        commands(before_, 0);
+        if (has_loop_start_) {
+            label(juce::String::fromUTF8("[  ループ開始"), true);
+            zone(juce::String::fromUTF8("追加先：毎周実行（ [ より後）"), true);
+            commands(after_, static_cast<int>(before_.size()));
+        } else if (!after_.empty()) {
+            label(juce::String::fromUTF8("ループ後の保持命令"));
+            commands(after_, static_cast<int>(before_.size()), has_loop_end_);
         }
-        auto area = getLocalBounds().reduced(UiLayout::sm, UiLayout::xs);
-        area.removeFromTop(16);  // header
-        auto before_row = area.removeFromTop(20);
-        area.removeFromTop(16);  // [ divider
-        auto after_row = area.removeFromTop(20);
-        if (before_row.contains(point)) {
-            return false;
+        if (has_loop_end_) label(juce::String::fromUTF8("]  ループ終了"), true);
+        if (!after_end_.empty()) {
+            label(juce::String::fromUTF8("] 以降（読取専用）"));
+            commands(after_end_, 0, true);
         }
-        if (after_row.contains(point)) {
-            return true;
-        }
-        return std::nullopt;
+        resized(); repaint();
     }
-
-    [[nodiscard]] int hitChipIndex(juce::Point<int> point) const {
-        auto area = getLocalBounds().reduced(UiLayout::sm, UiLayout::xs);
-        area.removeFromTop(16);  // header
-        auto before_row = area.removeFromTop(20);
-        before_row.removeFromLeft(64);
-        int x = before_row.getX();
-        for (int index = 0; index < static_cast<int>(before_.size()); ++index) {
-            const auto& chip = before_[static_cast<std::size_t>(index)];
-            const int width = juce::jmax(
-                28,
-                juce::GlyphArrangement::getStringWidthInt(
-                    UiFonts::dense(true), chip)
-                    + UiLayout::sm);
-            auto chip_bounds = juce::Rectangle<int>(
-                x, before_row.getY() + 1, width - 2, before_row.getHeight() - 2);
-            if (chip_bounds.contains(point)) {
-                return index;
-            }
-            x += width;
-            if (x > before_row.getRight()) {
-                break;
-            }
-        }
-        area.removeFromTop(16);  // [ divider
-        auto after_row = area.removeFromTop(20);
-        after_row.removeFromLeft(64);
-        x = after_row.getX();
-        const int before_count = static_cast<int>(before_.size());
-        for (int index = 0; index < static_cast<int>(after_.size()); ++index) {
-            const auto& chip = after_[static_cast<std::size_t>(index)];
-            const int width = juce::jmax(
-                28,
-                juce::GlyphArrangement::getStringWidthInt(
-                    UiFonts::dense(true), chip)
-                    + UiLayout::sm);
-            auto chip_bounds = juce::Rectangle<int>(
-                x, after_row.getY() + 1, width - 2, after_row.getHeight() - 2);
-            if (chip_bounds.contains(point)) {
-                return before_count + index;
-            }
-            x += width;
-            if (x > after_row.getRight()) {
-                break;
-            }
-        }
-        return -1;
+    void mouseDown(const juce::MouseEvent& e) override {
+        if (!e.mods.isPopupMenu()) return;
+        auto* child = getComponentAt(e.getPosition());
+        if (auto* button = dynamic_cast<juce::Button*>(child)) button->triggerClick();
     }
-
+    void showCommandMenu(int index) {
+        const bool after = index >= static_cast<int>(before_.size());
+        juce::PopupMenu menu;
+        menu.addItem(1, juce::String::fromUTF8("削除"));
+        if (has_loop_start_) menu.addItem(after ? 2 : 3, juce::String::fromUTF8(
+            after ? "ループ前へ移動" : "ループ後へ移動"));
+        // Reject a stale popup after switching count/channel or changing the list.
+        const auto before = before_, after_commands = after_;
+        const int count = count_;
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
+            [safe = juce::Component::SafePointer<CountCommandStackView>(this),
+                index, count, before, after_commands](int result) {
+                if (!safe || safe->count_ != count || safe->before_ != before
+                    || safe->after_ != after_commands) return;
+                if (result == 1 && safe->delete_callback_) {
+                    auto cb = safe->delete_callback_; cb(index);
+                } else if ((result == 2 || result == 3) && safe->move_callback_) {
+                    auto cb = safe->move_callback_; cb(index, result == 3);
+                }
+            });
+    }
     DeleteCallback delete_callback_;
     MoveCallback move_callback_;
     InsertZoneCallback insert_zone_callback_;
     int count_{-1};
-    bool has_loop_start_{};
-    bool has_loop_end_{};
-    bool insert_after_{};
-    std::vector<juce::String> before_;
-    std::vector<juce::String> after_;
-    std::vector<juce::String> after_end_;
+    bool has_loop_start_{}, has_loop_end_{}, insert_after_{};
+    std::vector<juce::String> before_, after_, after_end_;
+    std::vector<std::unique_ptr<juce::Component>> rows_;
 };
 
 
 }  // namespace
+
+namespace {
+class CompositeOverviewCanvas final : public juce::Component {
+public:
+    std::function<void(juce::Graphics&)> draw;
+    std::function<void(juce::Point<int>)> select;
+    void mouseDown(const juce::MouseEvent& e) override { if (select && !e.mods.isPopupMenu()) select(e.getPosition()); }
+    void paint(juce::Graphics& g) override { if (draw) draw(g); }
+};
+}
 
 class mgstc::app::CompositeTimeline::Impl final
     : public juce::Component,
@@ -3861,8 +3760,11 @@ public:
             "マウスで範囲選択して Ctrl+C でコピーできます"));
         addAndMakeVisible(envelope_mml_preview_);
 
-        graph_clip_.setInterceptsMouseClicks(false, true);
-        addAndMakeVisible(graph_clip_);
+        mml_toggle_.setButtonText(juce::String::fromUTF8("MGSCプレビュー"));
+        mml_toggle_.setClickingTogglesState(true);
+        mml_toggle_.setTooltip(juce::String::fromUTF8("選択チャンネルの定義と発音前MML。読取専用・範囲コピー可能"));
+        mml_toggle_.onClick = [this] { resized(); repaint(); };
+        addAndMakeVisible(mml_toggle_);
         for (auto* c : std::initializer_list<juce::Component*>{
                  &edit_mode_, &parameter_, &position_, &value_label_,
                  &value_, &apply_, &inspector_selection_,
@@ -3874,8 +3776,42 @@ public:
                  &auto_coarseness_, &auto_stop_, &auto_depth_label_,
                  &auto_speed_label_, &auto_coarseness_label_,
                  &auto_stop_label_}) {
-            graph_clip_.addAndMakeVisible(*c);
+            inspector_content_.addAndMakeVisible(*c);
         }
+
+        command_view_.setViewedComponent(&command_stack_, false);
+        command_view_.setScrollBarsShown(true, false);
+        inspector_content_.addAndMakeVisible(command_view_);
+        rate_open_.setButtonText(juce::String::fromUTF8("@r レート編集を開く"));
+        rate_open_.onClick = [this] {
+            if (selected_layer_ >= 0) openRateEditor(static_cast<std::size_t>(selected_layer_));
+        };
+        inspector_content_.addAndMakeVisible(rate_open_);
+        addChildComponent(envelope_mml_preview_);
+        addAndMakeVisible(edit_mode_);
+        addAndMakeVisible(parameter_);
+        inspector_view_.setViewedComponent(&inspector_content_, false);
+        inspector_view_.setScrollBarsShown(true, false);
+        addAndMakeVisible(inspector_view_);
+        overview_view_.setViewedComponent(&overview_content_, false);
+        overview_view_.setScrollBarsShown(true, false);
+        addAndMakeVisible(overview_view_);
+        overview_content_.draw = [this](juce::Graphics& g) { paintOverview(g); };
+        overview_content_.select = [this](juce::Point<int> point) {
+            const int i = point.y / overviewRowHeight();
+            if (i >= 0 && i < static_cast<int>(timbre_.layers.size())) selectOverviewLayer(i);
+        };
+        setup_tab_.setButtonText(juce::String::fromUTF8("初期設定"));
+        count_tab_.setButtonText(juce::String::fromUTF8("カウント編集"));
+        focus_.setButtonText(juce::String::fromUTF8("編集に集中"));
+        for (auto* button : {&setup_tab_, &count_tab_, &focus_}) {
+            button->setClickingTogglesState(true);
+            addAndMakeVisible(button);
+        }
+        setup_tab_.onClick = [this] { setCountInspector(false); };
+        count_tab_.onClick = [this] { setCountInspector(true); };
+        focus_.onClick = [this] { resized(); repaint(); };
+        setup_tab_.setToggleState(true, juce::dontSendNotification);
 
         horizontal_scroll_.setRangeLimits(
             0.0, static_cast<double>(scroll_extent_counts_) + 1.0,
@@ -3898,6 +3834,210 @@ public:
         closeRateEditor(false);
         horizontal_scroll_.removeListener(this);
         vertical_scroll_.removeListener(this);
+    }
+
+    void setInspectorVisible(bool visible) {
+        if (inspector_visible_ == visible) return;
+        inspector_visible_ = visible;
+        resized(); repaint();
+    }
+
+    juce::String verifyWorkspace(const juce::File& directory) {
+        juce::String failures;
+        auto check = [&](bool ok, const char* message) {
+            if (!ok) failures += juce::String(message) + "\n";
+        };
+        int callbacks = 0;
+        setEditCallback([&](const auto&, bool, bool) { ++callbacks; });
+        auto model = mgstc::engine::defaultCompositeTimbre();
+        check(model.layers.size() == 3, "fixture must contain PSG/SCC/OPLL");
+        for (auto& layer : model.layers) {
+            layer.envelope_timeline.length_counts = 32;
+            layer.volume_envelope.events.clear();
+            for (const auto point : std::array<std::pair<int, int>, 4>{{{0, 15}, {6, 9}, {16, 4}, {24, 2}}}) {
+                mgstc::engine::EnvelopeEvent event;
+                event.kind = mgstc::engine::EnvelopeEventKind::Volume;
+                event.count = static_cast<std::uint32_t>(point.first);
+                event.value = point.second;
+                event.automatic = point.first != 0;
+                layer.volume_envelope.events.push_back(event);
+            }
+        }
+        model.layers[0].envelope_timeline.loop_start_count = 6;
+        model.layers[0].envelope_timeline.loop_end_count = 24;
+        mgstc::engine::EnvelopeEvent pitch;
+        pitch.kind = mgstc::engine::EnvelopeEventKind::Pitch;
+        pitch.count = 6;
+        pitch.value = 3;
+        model.layers[0].pitch_envelope.events.push_back(pitch);
+        pitch.after_loop_start = true;
+        pitch.value = -2;
+        model.layers[0].pitch_envelope.events.push_back(pitch);
+
+        setTimbre(model, true);
+        setVisible(true);
+        const auto save = [&](const juce::String& name) {
+            if (directory == juce::File{}) return;
+            auto stream = directory.getChildFile(name + ".png").createOutputStream();
+            check(stream != nullptr, "snapshot output could not be opened");
+            if (stream) {
+                check(stream->setPosition(0) && stream->truncate().wasOk(), "snapshot truncate failed");
+                juce::PNGImageFormat png;
+                check(png.writeImageToStream(createComponentSnapshot(getLocalBounds()), *stream),
+                    "snapshot encoding failed");
+            }
+        };
+        const int original_scale = UiScale::active_percent;
+        for (const int percent : {75, 100, 125}) {
+            UiScale::setActivePercent(percent);
+            setSize(UiScale::sx(1528), UiScale::sx(750));
+            refreshUiScaleFonts();
+            const auto before = timbre_;
+            callbacks = 0;
+            overview_select_[1]->onClick();
+            check(selected_layer_ == 1, "overview selection failed");
+            const auto editor = graphArea();
+            const auto frames = lane_frames_;
+            auto overview_plot = juce::Rectangle<int>(0, 0, overview_content_.getWidth(), overviewRowHeight())
+                .withTrimmedLeft(UiLayout::compositeOverviewLabelW).reduced(UiLayout::sm, UiLayout::xs);
+            overview_plot.translate(overview_view_.getX(), overview_view_.getY());
+            const auto detail_plot = timelinePlotBounds(graph_bounds_[1]);
+            check(overview_plot.getX() == detail_plot.getX() && overview_plot.getWidth() == detail_plot.getWidth(),
+                "overview and detail count columns are not aligned");
+            overview_view_.setViewPosition(0, overviewRowHeight());
+            check(graphArea() == editor && lane_frames_ == frames, "overview scroll moved editor");
+            count_tab_.onClick();
+            check(count_inspector_ && !layer_setups_[1]->isVisible(), "count tab did not hide setup");
+            setup_tab_.onClick();
+            focus_.setToggleState(true, juce::dontSendNotification);
+            focus_.onClick();
+            check(graphArea().getHeight() > editor.getHeight(), "focus mode did not enlarge editor");
+            focus_.setToggleState(false, juce::dontSendNotification);
+            focus_.onClick();
+            setInspectorVisible(false);
+            check(graphArea().getWidth() > editor.getWidth(), "library replacement did not reclaim inspector");
+            setInspectorVisible(true);
+            check(callbacks == 0 && timbre_ == before, "navigation changed model or issued edit callback");
+            check(graphArea().getWidth() > UiScale::sx(700), "detail graph too narrow");
+            check(inspector_view_.getBounds().getIntersection(graphArea()).isEmpty(), "inspector overlaps graph");
+            mml_toggle_.setToggleState(true, juce::dontSendNotification);
+            mml_toggle_.onClick();
+            check(envelope_mml_preview_.isVisible() && !envelope_mml_preview_.getText().isEmpty(),
+                "MGSC drawer is empty");
+            const auto preview_bounds = envelope_mml_preview_.getBounds();
+            vertical_scroll_.setCurrentRangeStart(100.0, juce::sendNotificationSync);
+            check(envelope_mml_preview_.getBounds() == preview_bounds, "MGSC drawer moved with graph");
+            check(callbacks == 0 && timbre_ == before, "MGSC navigation changed model");
+            save("workspace-mml-" + juce::String(percent));
+            mml_toggle_.setToggleState(false, juce::dontSendNotification);
+            mml_toggle_.onClick();
+            vertical_scroll_.setCurrentRangeStart(0.0, juce::sendNotificationSync);
+            for (const auto& fixture : model.layers) {
+                int changes = 0, previews = 0;
+                auto rate_fixture = fixture;
+                auto& rate = rate_fixture.volume_envelope.rate;
+                rate.tone_mode = fixture.source == mgstc::engine::TimbreSource::Psg ? 1 : 0;
+                rate.attack_level = 32; rate.attack_rate = 12; rate.decay_rate = 6;
+                rate.sustain_level = 160; rate.sustain_rate = 1; rate.release_rate = 5;
+                RateEnvelopeEditorContent rate_editor(rate_fixture,
+                    [&](const auto&, bool) { ++changes; }, [&] { ++previews; }, {});
+                rate_editor.setVisible(true);
+                check(changes == 0 && previews == 0, "opening rate editor changed or played sound");
+                const auto name = "rate-" + juce::String(static_cast<int>(fixture.source))
+                    + "-" + juce::String(percent) + ".png";
+                auto stream = directory.getChildFile(name).createOutputStream();
+                check(stream != nullptr, "rate snapshot unavailable");
+                if (stream) {
+                    stream->setPosition(0); stream->truncate();
+                    juce::PNGImageFormat format;
+                    check(format.writeImageToStream(rate_editor.createComponentSnapshot(rate_editor.getLocalBounds()), *stream),
+                        "rate snapshot failed");
+                }
+                failures += rate_editor.verifyEditing();
+            }
+            save("workspace-" + juce::String(percent));
+        }
+        UiScale::setActivePercent(100);
+        setSize(1528, 750);
+        selectOverviewLayer(0);
+        selected_count_ = 6;
+        syncPointEditors();
+        syncInspector();
+        count_tab_.onClick();
+        const auto before_zone = timbre_;
+        callbacks = 0;
+        // Exercise the visible insertion-zone button through its existing callback.
+        bool zone_clicked = false;
+        for (int i = 0; i < command_stack_.getNumChildComponents(); ++i) {
+            auto* button = dynamic_cast<juce::Button*>(command_stack_.getChildComponent(i));
+            if (button && button->getButtonText().contains(juce::String::fromUTF8("毎周実行"))) {
+                auto click = button->onClick;
+                click(); zone_clicked = true; break;
+            }
+        }
+        check(zone_clicked && loop_insert_after_, "vertical stack insertion button unavailable");
+        check(timbre_ == before_zone && callbacks == 0, "insert zone changed existing commands");
+        save("workspace-loop-commands");
+        moveStackChipAt(0, true);
+        check(timbre_.layers[0].pitch_envelope.events.size() == 2
+            && timbre_.layers[0].pitch_envelope.events[0].after_loop_start
+            && timbre_.layers[0].pitch_envelope.events[0].value == 3,
+            "vertical stack move changed command value/order");
+        setTimbre(model, true);
+        selectOverviewLayer(0);
+        const auto before_mute = timbre_;
+        callbacks = 0;
+        overview_mute_[0]->setToggleState(!timbre_.layers[0].muted, juce::dontSendNotification);
+        overview_mute_[0]->onClick();
+        auto expected = before_mute;
+        expected.layers[0].muted = !expected.layers[0].muted;
+        check(timbre_ == expected && callbacks == 1, "mute changed unrelated state or commit count");
+        setTimbre(model, true);
+        selectOverviewLayer(0);
+        // Exercise real hit testing and the actual mouse edit path after relayout.
+        const auto slots = makeEditLaneSlots(graph_bounds_[0], timbre_.layers[0].source);
+        const auto point = graphStrip(slots.volume).getCentre().toFloat();
+        const auto now = juce::Time::getCurrentTime();
+        const juce::MouseEvent event(
+            juce::Desktop::getInstance().getMainMouseSource(), point,
+            juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),
+            1.0f, 0.0f, 0.0f, 0.0f, 0.0f, this, this, now, point, now, 1, false);
+        callbacks = 0;
+        mouseDown(event); mouseUp(event);
+        check(callbacks > 0 && timbre_.layers[0] != model.layers[0], "volume mouse editing stopped working");
+        check(timbre_.layers[1] == model.layers[1] && timbre_.layers[2] == model.layers[2],
+            "mouse edit changed another channel");
+        setTimbre(model, true);
+        for (int i = 0; i < 3; ++i) addLayer(mgstc::engine::TimbreSource::Psg);
+        for (int i = 0; i < 5; ++i) addLayer(mgstc::engine::TimbreSource::Scc);
+        for (int i = 0; i < 9; ++i) addLayer(mgstc::engine::TimbreSource::Opll);
+        check(timbre_.layers.size() == 17, "17-channel fixture failed");
+        const auto full = timbre_;
+        callbacks = 0;
+        overview_select_[16]->onClick();
+        overview_view_.setViewPosition(0, overview_content_.getHeight());
+        const auto full_frames = lane_frames_;
+        overview_view_.setViewPosition(0, 0);
+        check(lane_frames_ == full_frames && callbacks == 0 && timbre_ == full,
+            "17-channel overview scroll changed selected edit or data");
+        count_tab_.onClick();
+        parameter_.setSelectedId(static_cast<int>(Parameter::OpllTlAuto), juce::sendNotificationSync);
+        check(auto_mode_.isVisible(), "TL selection did not show auto controls");
+        parameter_.setSelectedId(static_cast<int>(Parameter::Volume), juce::sendNotificationSync);
+        check(!auto_mode_.isVisible() && timbre_ == full && callbacks == 0,
+            "auto control navigation changed data or remained visible");
+        save("workspace-17-count");
+        focus_.setToggleState(true, juce::dontSendNotification); focus_.onClick();
+        save("workspace-focus");
+        model.layers[0].volume_envelope.kind = mgstc::engine::EnvelopeKind::Rate;
+        setTimbre(model, true); selectOverviewLayer(0); setup_tab_.onClick();
+        save("workspace-rate");
+        model.layers.clear(); setTimbre(model, true);
+        check(selected_layer_ == -1 && !envelope_mml_preview_.isVisible(), "empty model retained editable controls");
+        save("workspace-empty");
+        UiScale::setActivePercent(original_scale);
+        setEditCallback({});
+        return failures;
     }
 
     void setEditCallback(EditCallback callback) {
@@ -4231,6 +4371,9 @@ public:
         UiFonts::styleBodyField(tempo_);
         UiFonts::styleBodyField(value_);
         UiFonts::refreshMgscPreviewFont(envelope_mml_preview_);
+        for (auto* setup : layer_setups_) setup->refreshFonts();
+        syncRateEditorFromModel();
+        resized();
         repaint();
     }
 
@@ -4263,13 +4406,13 @@ public:
                 (scope_write_position_ + 1) % kScopeHistorySize;
             scope_size_ = juce::jmin(kScopeHistorySize, scope_size_ + 1);
         }
+        if (was_visible || scope_visible_sample_count_ != 0) overview_content_.repaint();
         return was_visible || scope_visible_sample_count_ != 0;
     }
 
     void resized() override {
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(panelPad);
-        // Single chrome row: help+tempo (paint) and channel add buttons.
         auto header = area.removeFromTop(textButtonH);
         tempo_.setBounds(header.removeFromRight(compositeTempoFieldW));
         tempo_label_.setBounds(header.removeFromRight(compositeTempoLabelW));
@@ -4279,16 +4422,36 @@ public:
         scc_add_.setBounds(header.removeFromRight(compositeAddSccW));
         header.removeFromRight(controlGap);
         psg_add_.setBounds(header.removeFromRight(compositeAddPsgW));
-        header.removeFromRight(sm);
-
+        focus_.setBounds(header.removeFromLeft(UiLayout::compositeFocusW));
+        auto side = inspectorArea();
+        setup_tab_.setVisible(inspector_visible_);
+        count_tab_.setVisible(inspector_visible_);
+        inspector_view_.setVisible(inspector_visible_);
+        auto tabs = side.removeFromTop(textButtonH);
+        setup_tab_.setBounds(tabs.removeFromLeft(tabs.getWidth() / 2));
+        count_tab_.setBounds(tabs);
+        side.removeFromTop(sm);
+        inspector_view_.setBounds(side);
+        inspector_content_.setSize(juce::jmax(1, side.getWidth() - kScrollBarSize),
+            count_inspector_ ? UiLayout::compositeInspectorContentH
+                : panelPad * 2 + (fieldH + sm) * 16 + (libraryTitleH + sm) * 3);
+        overview_view_.setVisible(!focus_.getToggleState());
+        overview_view_.setBounds(overviewArea());
+        layoutOverview();
         auto graph = graphArea();
-        graph_clip_.setBounds(graph);
-        vertical_scroll_.setBounds(
-            graph.getRight(), graph.getY(), kScrollBarSize, graph.getHeight());
-        horizontal_scroll_.setBounds(
-            graph.getX(), graph.getBottom(), graph.getWidth(), kScrollBarSize);
+        auto edit_header = graph.withY(graph.getY() - fieldH - sm).withHeight(fieldH);
+        parameter_.setBounds(edit_header.removeFromRight(UiLayout::compositeSelectorW));
+        edit_header.removeFromRight(controlGap);
+        edit_mode_.setBounds(edit_header.removeFromRight(UiLayout::compositeSelectorW));
+        auto preview_area = workspaceArea();
+        preview_area.setTop(graph.getBottom() + kScrollBarSize + sm);
+        mml_toggle_.setBounds(preview_area.removeFromTop(fieldH).removeFromLeft(compositeOverviewLabelW));
+        preview_area.removeFromTop(sm);
+        envelope_mml_preview_.setBounds(preview_area);
+        vertical_scroll_.setBounds(graph.getRight(), graph.getY(), kScrollBarSize, graph.getHeight());
+        horizontal_scroll_.setBounds(graph.getX(), graph.getBottom(), graph.getWidth(), kScrollBarSize);
         updateScrollRanges();
-        applyCountColumnWidth();
+        lane_layout_applied_ = false;
         lane_layout_dirty_ = true;
         ensureLaneLayout();
     }
@@ -4522,176 +4685,176 @@ public:
 
     void paint(juce::Graphics& graphics) override {
         const auto clip = graphics.getClipBounds().getSmallestIntegerContainer();
-        const auto hover_popup = hoverPopupBounds();
-        if (hover_popup.has_value()
-            && hover_popup->expanded(8).contains(clip)) {
+        const auto popup = hoverPopupBounds();
+        if (popup && popup->expanded(8).contains(clip)) {
             drawHoverValuePopup(graphics);
             return;
         }
-        graphics.fillAll(juce::Colour(0xFF182028));
-        auto area = getLocalBounds().reduced(UiLayout::panelPad);
-        auto header = area.removeFromTop(UiLayout::textButtonH);
-        // Leave room for tempo + add buttons on the right (resized).
-        header.removeFromRight(UiLayout::compositeHeaderControlsW);
-        graphics.setColour(juce::Colour(0xFFE6EDF3));
-        graphics.setFont(UiFonts::body(true));
-        graphics.drawText(
-            juce::String::fromUTF8(
-                "共通時間軸  ホバーで値確認、枠クリックでch切替、ドラッグで編集"
-                "（ホイールで縦スクロール、Shift＋ホイールで横、Ctrl＋ホイールでズーム）。"
-                "音程は累積オフセット、\\は複数可（Shift＋ドラッグで同一ctへ追加）"),
-            header,
-            juce::Justification::centredLeft);
-        area = graphArea();
-        graphics.reduceClipRegion(area);
-
-        // Keep draw bounds across mouseUp after mouseDown's repaint();
-        // clearing here made Y map fall back to the full lane height.
-        if (!drawing_) {
-            edit_draw_bounds_.reset();
-        }
-        const std::size_t lane_count = timbre_.layers.size() + 1;
-        const int scroll_y = juce::roundToInt(
-            vertical_scroll_.getCurrentRangeStart());
-            int lane_y = area.getY() - scroll_y;
-            for (int lane_index = 0;
-                 lane_index < static_cast<int>(lane_count);
-                 ++lane_index) {
-                const int lane_height = laneHeightForIndex(lane_index);
-                auto frame = juce::Rectangle<int>(
-                    area.getX(),
-                    lane_y,
-                    area.getWidth(),
-                    lane_height).reduced(0, UiLayout::editLaneFramePadV);
-                lane_y += lane_height;
-                const bool mixed_lane =
-                    lane_index == static_cast<int>(timbre_.layers.size());
-                const std::size_t index = static_cast<std::size_t>(lane_index);
-                if (!mixed_lane && index < lane_frames_.size()) {
-                    frame = lane_frames_[index];
-                }
-                if (!frame.intersects(area) || !frame.intersects(clip)) {
-                    continue;
-                }
-                const auto colour = mixed_lane
-                    ? juce::Colour(0xFF35C4ED)
-                    : sourceColour(timbre_.layers[index].source);
-                graphics.setColour(juce::Colour(0xFF26313B));
-                graphics.fillRoundedRectangle(frame.toFloat(), 5.0F);
-                // Veil behind left setup/dock so scrolled envelope cannot show
-                // through the controls (same family as frame fill).
-                {
-                    auto veil = frame;
-                    veil.setWidth(UiLayout::compositeLaneLabelW);
-                    graphics.setColour(juce::Colour(0xFF26313B).withAlpha(0.92F));
-                    graphics.fillRect(veil);
-                }
-                const bool edit_tier = !mixed_lane
-                    && static_cast<int>(index) == selected_layer_;
-                if (edit_tier) {
-                    const int setup_h = UiLayout::compositeSetupContentH;
-                    auto dock = frame;
-                    dock.setWidth(UiLayout::compositeLaneLabelW);
-                    dock.removeFromTop(setup_h);
-                    graphics.setColour(juce::Colour(0xFF1B222A));
-                    graphics.fillRect(dock);
-                    graphics.setColour(juce::Colour(0xFF8B9BAB));
-                    graphics.setFont(UiFonts::dense(true));
-                    graphics.drawText(
-                        juce::String::fromUTF8("エンベロープ編集"),
-                        dock.removeFromTop(UiLayout::editMarkerLaneH).reduced(
-                            UiLayout::panelPad, 0),
-                        juce::Justification::centredLeft,
-                        false);
-                }
-                graphics.setColour(
-                    !mixed_lane && static_cast<int>(index) == selected_layer_
-                        ? colour
-                        : colour.withAlpha(0.72F));
-                graphics.drawRoundedRectangle(
-                    frame.toFloat(), 5.0F,
-                    !mixed_lane && static_cast<int>(index) == selected_layer_
-                        ? 2.0F : 1.0F);
-
-                    auto lane = frame;
-                auto label = lane.removeFromLeft(UiLayout::compositeLaneLabelW)
-                    .reduced(UiLayout::sm, 0);
-            if (mixed_lane) {
-            graphics.setColour(colour);
+        graphics.fillAll(juce::Colour(0xFF161B22));
+        graphics.setColour(juce::Colour(0xFF20262E));
+        graphics.fillRect(inspectorArea());
+        auto area = workspaceArea();
+        if (!focus_.getToggleState()) {
+            area.removeFromTop(overviewHeight());
+            auto mix = area.removeFromTop(UiLayout::fieldH);
+            graphics.setColour(juce::Colour(0xFF9FAFBD));
             graphics.setFont(UiFonts::body(true));
-            graphics.drawFittedText(
-                juce::String::fromUTF8("MIX / 合成出力"),
-                label, juce::Justification::centredLeft, 2);
-            }
-
-            lane.reduce(UiLayout::sm, UiLayout::editLaneInnerPadV);
-            if (!mixed_lane) {
-                lane_frames_[index] = frame;
-                graph_bounds_[index] = lane;
-            }
-            // Same count X for every tier/ch (label gutter excluded).
-            const auto plot = timelinePlotBounds(lane);
-            drawCountGrid(graphics, plot);
-            drawSelectedCountBand(graphics, plot);
-            if (!mixed_lane) {
-                const auto& layer = timbre_.layers[index];
-                // Rest is pre-key-on (not an @e count). Tint the left wait
-                // band only; envelope counts still start at ct0.
-                const int delay_counts = static_cast<int>(
-                    mgstc::engine::startDelayGridCounts(
-                        layer.start_delay_form,
-                        layer.start_delay_value,
-                        playback_tempo_));
-                if (delay_counts > 0) {
-                    const int start_x = xForCount(plot, delay_counts);
-                    const int wait_w = juce::jmax(0, start_x - plot.getX());
-                    if (wait_w > 0) {
-                        graphics.setColour(juce::Colours::black.withAlpha(
-                            mgstc::engine::layerIsAudible(timbre_, index)
-                                ? 0.28F : 0.14F));
-                        graphics.fillRect(
-                            plot.getX(),
-                            plot.getY() + UiLayout::xs,
-                            wait_w,
-                            juce::jmax(1, plot.getHeight() - UiLayout::xs * 2));
-                    }
-                }
-            }
-            if (edit_tier) {
-                paintEditTier(graphics, lane, index, colour);
-                drawHoverValuePopup(graphics);
-            } else {
-                drawScope(graphics, plot, index, colour.withAlpha(0.48F));
-                if (!mixed_lane) {
-                    drawTimelineMarkers(graphics, plot, index, colour);
-                    const auto& layer = timbre_.layers[index];
-                    if (layer.volume_envelope.kind
-                        == mgstc::engine::EnvelopeKind::Rate) {
-                        const auto layout = rateEnvelopeHandlesForLayer(layer);
-                            paintRateEnvelopeGraph(
-                            graphics,
-                            plot,
-                            cachedLayerRateTrace(index),
-                            colour,
-                            layer.source,
-                            false,
-                            &layout);
-                    } else {
-                        drawAutomation(
-                            graphics, plot, index, colour, Parameter::Volume);
-                        drawAutomation(
-                            graphics,
-                            plot,
-                            index,
-                            colour.withAlpha(0.75F),
-                            Parameter::Pitch);
-                    }
-                }
-            }
+            graphics.drawText("MIX", mix.removeFromLeft(UiLayout::compositeOverviewLabelW), juce::Justification::centredLeft);
+            mix.removeFromRight(kScrollBarSize);
+            mix.reduce(UiLayout::sm, 0);
+            drawScope(graphics, mix, timbre_.layers.size(), juce::Colour(0xFFE6EDF3));
+            area.removeFromTop(UiLayout::sm);
         }
+        auto title = area.removeFromTop(UiLayout::fieldH);
+        graphics.setFont(UiFonts::body(true));
+        graphics.setColour(juce::Colour(0xFFE6EDF3));
+        if (selected_layer_ < 0 || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
+            graphics.drawText(juce::String::fromUTF8("＋ PSG / SCC / OPLL からチャンネルを追加"),
+                title, juce::Justification::centredLeft);
+            return;
+        }
+        const auto index = static_cast<std::size_t>(selected_layer_);
+        const auto& layer = timbre_.layers[index];
+        const auto colour = sourceColour(layer.source);
+        title.removeFromRight(UiLayout::compositeSelectorW * 2 + UiLayout::controlGap);
+        graphics.drawText(juce::String::fromUTF8(layer.name.c_str())
+            + juce::String::fromUTF8("  /  エンベロープ"), title, juce::Justification::centredLeft);
+        if (!clip.intersects(graphArea())) return;
+        graphics.reduceClipRegion(graphArea());
+        if (index >= graph_bounds_.size()) return;
+        const auto lane = graph_bounds_[index];
+        graphics.setColour(juce::Colour(0xFF20262E));
+        graphics.fillRect(lane_frames_[index]);
+        const auto plot = timelinePlotBounds(lane);
+        drawCountGrid(graphics, plot);
+        drawSelectedCountBand(graphics, plot);
+        paintStartDelay(graphics, plot, index);
+        paintEditTier(graphics, lane, index, colour);
+        drawHoverValuePopup(graphics);
     }
 
 private:
+    void setCountInspector(bool count) {
+        count_inspector_ = count;
+        setup_tab_.setToggleState(!count, juce::dontSendNotification);
+        count_tab_.setToggleState(count, juce::dontSendNotification);
+        inspector_view_.setViewPosition(0, 0);
+        resized(); repaint();
+    }
+
+    juce::Rectangle<int> inspectorArea() const {
+        auto a = getLocalBounds().reduced(UiLayout::panelPad);
+        a.removeFromTop(timelineChromeHeight());
+        return inspector_visible_ ? a.removeFromRight(UiLayout::libraryWidth) : juce::Rectangle<int>{};
+    }
+    juce::Rectangle<int> workspaceArea() const {
+        auto a = getLocalBounds().reduced(UiLayout::panelPad);
+        a.removeFromTop(timelineChromeHeight());
+        if (inspector_visible_) a.removeFromRight(UiLayout::libraryWidth + UiLayout::panelGap);
+        return a;
+    }
+    int overviewRowHeight() const { return UiLayout::fieldH * 2 + UiLayout::sm; }
+    int overviewHeight() const {
+        return juce::jmin(overviewRowHeight() * juce::jlimit(1, 3, static_cast<int>(timbre_.layers.size())),
+            juce::jmax(overviewRowHeight(), workspaceArea().getHeight() / 3));
+    }
+    juce::Rectangle<int> overviewArea() const {
+        return workspaceArea().withHeight(overviewHeight());
+    }
+    void selectOverviewLayer(int index) {
+        if (index == selected_layer_) return;
+        selected_layer_ = index;
+        drawing_ = false; edit_draw_bounds_.reset();
+        hover_preview_value_.reset(); hover_edit_parameter_.reset();
+        vertical_scroll_.setCurrentRangeStart(0.0, juce::dontSendNotification);
+        syncPointEditors(); syncRegisterAutoEditors(); syncInspector();
+        refreshCountCeilingCache();
+        resized(); repaint();
+    }
+    void layoutOverview() {
+        const int count = static_cast<int>(timbre_.layers.size());
+        while (overview_select_.size() > count) {
+            overview_select_.removeLast(); overview_enabled_.removeLast();
+            overview_mute_.removeLast(); overview_solo_.removeLast();
+        }
+        while (overview_select_.size() < count) {
+            const int i = overview_select_.size();
+            auto* select = overview_select_.add(new juce::TextButton());
+            select->onClick = [this, i] { selectOverviewLayer(i); };
+            overview_content_.addAndMakeVisible(select);
+            for (auto* buttons : {&overview_enabled_, &overview_mute_, &overview_solo_}) {
+                auto* button = buttons->add(new juce::TextButton());
+                button->setClickingTogglesState(true);
+                button->onClick = [this, i, buttons] {
+                    auto& layer = timbre_.layers[static_cast<std::size_t>(i)];
+                    const bool on = (*buttons)[i]->getToggleState();
+                    if (buttons == &overview_enabled_) layer.enabled = on;
+                    else if (buttons == &overview_mute_) layer.muted = on;
+                    else layer.solo = on;
+                    layer_setups_[i]->syncFromLayer(layer);
+                    repaint();
+                    if (edit_callback_) edit_callback_(timbre_, true, false);
+                };
+                overview_content_.addAndMakeVisible(button);
+            }
+        }
+        const int width = juce::jmax(1, overview_view_.getWidth() - kScrollBarSize);
+        overview_content_.setSize(width, juce::jmax(overview_view_.getHeight(), count * overviewRowHeight()));
+        for (int i = 0; i < count; ++i) {
+            const auto& layer = timbre_.layers[static_cast<std::size_t>(i)];
+            auto label = juce::Rectangle<int>(0, i * overviewRowHeight(), UiLayout::compositeOverviewLabelW, overviewRowHeight()).reduced(UiLayout::xs);
+            overview_select_[i]->setBounds(label.removeFromTop(UiLayout::fieldH));
+            overview_select_[i]->setButtonText(juce::String::fromUTF8(layer.name.c_str()));
+            overview_select_[i]->setTooltip(juce::String::fromUTF8("チャンネルを選択（音色・命令は変更しません）"));
+            overview_select_[i]->setToggleState(i == selected_layer_, juce::dontSendNotification);
+            overview_select_[i]->setColour(juce::TextButton::buttonOnColourId, sourceColour(layer.source).withAlpha(0.3F));
+            const int button_w = label.getWidth() / 3;
+            int n = 0;
+            for (auto* button : {overview_enabled_[i], overview_mute_[i], overview_solo_[i]}) {
+                button->setBounds(label.removeFromLeft(button_w));
+                button->setButtonText(n == 0 ? "ON" : n == 1 ? "M" : "S");
+                button->setTooltip(juce::String::fromUTF8(n == 0 ? "有効" : n == 1 ? "ミュート" : "ソロ"));
+                button->setToggleState(n == 0 ? layer.enabled : n == 1 ? layer.muted : layer.solo, juce::dontSendNotification);
+                ++n;
+            }
+        }
+        overview_content_.repaint();
+    }
+    void paintStartDelay(juce::Graphics& g, juce::Rectangle<int> plot, std::size_t index) {
+        const auto& layer = timbre_.layers[index];
+        const int delay = static_cast<int>(mgstc::engine::startDelayGridCounts(
+            layer.start_delay_form, layer.start_delay_value, playback_tempo_));
+        if (delay <= 0) return;
+        const int width = juce::jlimit(0, plot.getWidth(), xForCount(plot, delay) - plot.getX());
+        g.setColour(juce::Colours::black.withAlpha(
+            mgstc::engine::layerIsAudible(timbre_, index) ? 0.28F : 0.14F));
+        g.fillRect(plot.withWidth(width));
+    }
+
+    void paintOverview(juce::Graphics& g) {
+        g.fillAll(juce::Colour(0xFF161B22));
+        for (std::size_t i = 0; i < timbre_.layers.size(); ++i) {
+            auto row = juce::Rectangle<int>(0, static_cast<int>(i) * overviewRowHeight(), overview_content_.getWidth(), overviewRowHeight());
+            if (!g.getClipBounds().intersects(row)) continue;
+            auto plot = row.withTrimmedLeft(UiLayout::compositeOverviewLabelW).reduced(UiLayout::sm, UiLayout::xs);
+            const auto& layer = timbre_.layers[i];
+            const auto colour = sourceColour(layer.source);
+            g.setColour(juce::Colour(i == static_cast<std::size_t>(selected_layer_) ? 0xFF25343A : 0xFF20262E));
+            g.fillRect(plot);
+            drawCountGrid(g, plot);
+            paintStartDelay(g, plot, i);
+            if (layer.volume_envelope.kind == mgstc::engine::EnvelopeKind::Rate) {
+                const auto handles = rateEnvelopeHandlesForLayer(layer);
+                paintRateEnvelopeGraph(g, plot, cachedLayerRateTrace(i), colour, layer.source, false, &handles);
+            } else {
+                drawVolumeBars(g, plot, i, colour, 0.12F);
+                drawAutomation(g, plot, i, colour.withAlpha(0.7F), Parameter::Pitch);
+            }
+            drawScope(g, plot, i, colour.withAlpha(0.6F));
+            drawTimelineMarkers(g, plot, i, colour);
+        }
+    }
+
     enum class Parameter : int {
         Volume = 1,
         Pitch = 2,
@@ -4979,31 +5142,21 @@ private:
                 && lane_index < static_cast<int>(timbre_.layers.size())
                 && timbre_.layers[static_cast<std::size_t>(lane_index)].source
                     == mgstc::engine::TimbreSource::Opll) {
-                return UiLayout::compositeEditLaneH
+                return UiLayout::compositeEditLaneH - UiLayout::envelopePreviewH
                     + UiLayout::compositeEditLaneOpllExtraH;
             }
-            return UiLayout::compositeEditLaneH;
+            return UiLayout::compositeEditLaneH - UiLayout::envelopePreviewH;
         }
         return UiLayout::compositeChannelLaneH;
     }
 
     [[nodiscard]] int totalLaneStackHeight() const noexcept {
-        const int lane_count = juce::jmax(
-            1, static_cast<int>(timbre_.layers.size()) + 1);
-        int total = 0;
-        for (int index = 0; index < lane_count; ++index) {
-            total += laneHeightForIndex(index);
-        }
-        return juce::jmax(1, total);
+        return selected_layer_ >= 0 ? laneHeightForIndex(selected_layer_) : 1;
     }
 
     [[nodiscard]] int lanePixelOffset(int lane_index) const noexcept {
-        int y = 0;
-        const int last = juce::jmax(0, lane_index);
-        for (int index = 0; index < last; ++index) {
-            y += laneHeightForIndex(index);
-        }
-        return y;
+        juce::ignoreUnused(lane_index);
+        return 0;
     }
 
     [[nodiscard]] int maximumCount() const noexcept {
@@ -5265,6 +5418,7 @@ private:
                 : juce::String{},
             false);
         refreshCommandStack(layer);
+        layoutEditToolsDock();
     }
 
     void applyInspector() {
@@ -6168,11 +6322,12 @@ private:
     }
 
     [[nodiscard]] juce::Rectangle<int> graphArea() const {
-        using namespace UiLayout;
-        auto area = getLocalBounds().reduced(panelPad);
-        area.removeFromTop(timelineChromeHeight());
+        auto area = workspaceArea();
+        if (!focus_.getToggleState()) area.removeFromTop(overviewHeight() + UiLayout::fieldH + UiLayout::sm);
+        area.removeFromTop(UiLayout::fieldH + UiLayout::sm);
         area.removeFromRight(kScrollBarSize);
-        area.removeFromBottom(kScrollBarSize);
+        area.removeFromBottom(kScrollBarSize + UiLayout::fieldH + UiLayout::sm
+            + (mml_toggle_.getToggleState() ? UiLayout::envelopePreviewH + UiLayout::sm : 0));
         return area;
     }
 
@@ -6226,9 +6381,8 @@ private:
         return juce::jmax(
             1,
             graphArea().getWidth()
-                - UiLayout::compositeLaneLabelW
                 - UiLayout::panelGap
-                - UiLayout::editSubLaneLabelW);
+                - UiLayout::compositeOverviewLabelW);
     }
 
     [[nodiscard]] double countColumnWidthPx() const {
@@ -6256,9 +6410,8 @@ private:
     void zoomCountColumns(int anchor_x, double length_factor) {
         const auto graph = graphArea();
         auto bounds = graph;
-        bounds.removeFromLeft(UiLayout::compositeLaneLabelW);
         bounds.reduce(UiLayout::sm, 0);
-        bounds.removeFromLeft(UiLayout::editSubLaneLabelW);
+        bounds.removeFromLeft(UiLayout::compositeOverviewLabelW);
         const int count = countAtX(bounds, anchor_x);
         const double min_visible = juce::jmax(
             8.0,
@@ -6442,7 +6595,8 @@ private:
         juce::Graphics& graphics,
         juce::Rectangle<int> bounds,
         std::size_t layer_index,
-        juce::Colour colour) const {
+        juce::Colour colour,
+        float fill_opacity = 0.55F) const {
         const auto& layer = timbre_.layers[layer_index];
         struct Point {
             int count{};
@@ -6485,7 +6639,7 @@ private:
                     bounds,
                     sampled[static_cast<std::size_t>(count)],
                     layer.volume);
-                graphics.setColour(colour.withAlpha(0.32F));
+                graphics.setColour(colour.withAlpha(fill_opacity * (0.32F / 0.55F)));
                 graphics.fillRect(
                     x0,
                     juce::roundToInt(actual_top),
@@ -6521,7 +6675,7 @@ private:
                     static_cast<float>(x1),
                     static_cast<float>(bounds.getBottom()));
                 bar.closeSubPath();
-                graphics.setColour(colour.withAlpha(0.55F));
+                graphics.setColour(colour.withAlpha(fill_opacity));
                 graphics.fillPath(bar);
                 graphics.setColour(juce::Colour(kUiHoverAccent));
                 graphics.drawLine(
@@ -6533,7 +6687,7 @@ private:
             } else {
                 const float top = volumeYFromValue(
                     layer.source, bounds, points[index].volume);
-                graphics.setColour(colour.withAlpha(0.55F));
+                graphics.setColour(colour.withAlpha(fill_opacity));
                 graphics.fillRect(
                     x0,
                     juce::roundToInt(top),
@@ -6637,7 +6791,7 @@ private:
         juce::Rectangle<int> content,
         mgstc::engine::TimbreSource source) const {
         EditLaneSlots slots;
-        slots.preview = content.removeFromBottom(UiLayout::envelopePreviewH);
+        slots.preview = {}; // MGSC preview is pinned below the scrolling graph.
         slots.summary = content.removeFromTop(UiLayout::commandSummaryH);
         if (showsRegisterAutoLanes(source)) {
             slots.fb_auto = content.removeFromBottom(UiLayout::registerAutoLaneH);
@@ -6669,7 +6823,7 @@ private:
         if (lane_content.isEmpty()) {
             return {};
         }
-        lane_content.removeFromLeft(UiLayout::editSubLaneLabelW);
+        lane_content.removeFromLeft(UiLayout::compositeOverviewLabelW);
         return lane_content;
     }
 
@@ -6677,7 +6831,7 @@ private:
         if (slot.isEmpty()) {
             return {};
         }
-        slot.removeFromLeft(UiLayout::editSubLaneLabelW);
+        slot.removeFromLeft(UiLayout::compositeOverviewLabelW);
         return slot;
     }
 
@@ -6806,6 +6960,8 @@ private:
             std::move(before),
             std::move(after),
             std::move(after_end));
+        command_stack_.setSize(juce::jmax(1, command_view_.getWidth() - kScrollBarSize),
+            command_stack_.preferredHeight());
     }
 
     [[nodiscard]] bool newCommandAfterLoopStart(
@@ -6847,7 +7003,7 @@ private:
             const auto rate = mgstc::engine::clampRateEnvelope(
                 layer.volume_envelope.rate);
             auto summary = slots.summary;
-            auto label = summary.removeFromLeft(UiLayout::editSubLaneLabelW);
+            auto label = summary.removeFromLeft(UiLayout::compositeOverviewLabelW);
             graphics.setColour(juce::Colour(0xFFC9D1D9));
             graphics.setFont(UiFonts::dense(true));
             graphics.drawFittedText(
@@ -6876,7 +7032,7 @@ private:
                 graph_slot = graph_slot.getUnion(slots.register_write);
             }
             auto graph_label = graph_slot.removeFromLeft(
-                UiLayout::editSubLaneLabelW);
+                UiLayout::compositeOverviewLabelW);
             graphics.setColour(juce::Colour(0xFFC9D1D9));
             graphics.drawFittedText(
                 juce::String::fromUTF8("曲線"),
@@ -6895,7 +7051,7 @@ private:
             {
                 auto preview = slots.preview;
                 auto preview_label = preview.removeFromLeft(
-                    UiLayout::editSubLaneLabelW);
+                    UiLayout::compositeOverviewLabelW);
                 graphics.setColour(juce::Colour(0xFFC9D1D9));
                 graphics.setFont(UiFonts::dense(true));
                 graphics.drawFittedText(
@@ -6910,7 +7066,7 @@ private:
             colour.withAlpha(0.32F));
         {
             auto summary = slots.summary;
-            auto label = summary.removeFromLeft(UiLayout::editSubLaneLabelW);
+            auto label = summary.removeFromLeft(UiLayout::compositeOverviewLabelW);
             graphics.setColour(juce::Colour(0xFFC9D1D9));
             graphics.setFont(UiFonts::dense(true));
             graphics.drawFittedText(
@@ -6928,7 +7084,7 @@ private:
             Parameter::Pitch, juce::String::fromUTF8("音程"));
         paintEditSubLane(
             graphics, slots.timbre, layer_index, colour,
-            Parameter::Timbre, juce::String::fromUTF8("@"));
+            Parameter::Timbre, juce::String::fromUTF8("音色 @"));
         if (!slots.register_write.isEmpty()) {
             paintRegisterLane(graphics, slots.register_write, layer, colour);
         }
@@ -6945,7 +7101,7 @@ private:
         drawTimelineMarkers(graphics, graphStrip(slots.volume), layer_index, colour);
         {
             auto preview = slots.preview;
-            auto label = preview.removeFromLeft(UiLayout::editSubLaneLabelW);
+            auto label = preview.removeFromLeft(UiLayout::compositeOverviewLabelW);
             graphics.setColour(juce::Colour(0xFFC9D1D9));
             graphics.setFont(UiFonts::dense(true));
             graphics.drawFittedText(
@@ -7020,12 +7176,12 @@ private:
             graphics.setColour(uiHoverAccent().withAlpha(0.12F));
             graphics.fillRect(slot);
         }
-        auto label = slot.removeFromLeft(UiLayout::editSubLaneLabelW);
+        auto label = slot.removeFromLeft(UiLayout::compositeOverviewLabelW);
         graphics.setColour(
             hovered
                 ? uiHoverAccentStrong()
                 : selected ? uiHoverAccent() : juce::Colour(0xFFC9D1D9));
-        graphics.setFont(UiFonts::dense(true));
+        graphics.setFont(UiFonts::body());
         graphics.drawFittedText(
             title, label, juce::Justification::centredLeft, 1);
         graphics.setColour(juce::Colour(0xFF40505E));
@@ -7043,7 +7199,7 @@ private:
         Parameter parameter,
         const juce::String& title) {
         paintEditSubLaneChrome(graphics, slot, parameter, title);
-        slot.removeFromLeft(UiLayout::editSubLaneLabelW);
+        slot.removeFromLeft(UiLayout::compositeOverviewLabelW);
         const auto& auto_lane = parameter == Parameter::OpllTlAuto
             ? layer.opll_tl_auto
             : layer.opll_fb_auto;
@@ -7172,7 +7328,7 @@ private:
         Parameter parameter,
         const juce::String& title) {
         paintEditSubLaneChrome(graphics, slot, parameter, title);
-        slot.removeFromLeft(UiLayout::editSubLaneLabelW);
+        slot.removeFromLeft(UiLayout::compositeOverviewLabelW);
         drawAutomation(graphics, slot, layer_index, colour, parameter);
     }
 
@@ -7231,8 +7387,8 @@ private:
         const mgstc::engine::CompositeLayer& layer,
         juce::Colour colour) const {
         paintEditSubLaneChrome(
-            graphics, slot, Parameter::RegisterWrite, "y");
-        slot.removeFromLeft(UiLayout::editSubLaneLabelW);
+            graphics, slot, Parameter::RegisterWrite, juce::String::fromUTF8("手動 y"));
+        slot.removeFromLeft(UiLayout::compositeOverviewLabelW);
         graphics.setFont(UiFonts::dense(true));
         const auto visible = visibleCountRange();
         for (const auto& [count, events] : registerWritesByCount(layer)) {
@@ -8533,7 +8689,7 @@ private:
         }
         const auto slots = makeEditLaneSlots(graph, layer.source);
         auto count_bounds = graph;
-        count_bounds.removeFromLeft(UiLayout::editSubLaneLabelW);
+        count_bounds.removeFromLeft(UiLayout::compositeOverviewLabelW);
         selected_count_ = countAtX(count_bounds, point.x);
         const auto count = static_cast<std::uint32_t>(
             juce::jmax(0, selected_count_));
@@ -8769,7 +8925,7 @@ private:
         while (layer_setups_.size()
                < static_cast<int>(timbre_.layers.size())) {
             auto* setup = layer_setups_.add(new CompositeLayerSetupView());
-            graph_clip_.addAndMakeVisible(setup);
+            inspector_content_.addAndMakeVisible(setup);
         }
         for (int index = 0; index < layer_setups_.size(); ++index) {
             auto* setup = layer_setups_[index];
@@ -8860,38 +9016,14 @@ private:
 
     void rebuildLaneFrames() {
         const auto area = graphArea();
-        const std::size_t lane_count = timbre_.layers.size() + 1;
-        const int scroll_y = juce::roundToInt(
-            vertical_scroll_.getCurrentRangeStart());
         graph_bounds_.assign(timbre_.layers.size(), {});
         lane_frames_.assign(timbre_.layers.size(), {});
-        int lane_y = area.getY() - scroll_y;
-        for (int lane_index = 0;
-             lane_index < static_cast<int>(lane_count);
-             ++lane_index) {
-            const int lane_height = laneHeightForIndex(lane_index);
-            auto frame = juce::Rectangle<int>(
-                area.getX(),
-                lane_y,
-                area.getWidth(),
-                lane_height).reduced(0, UiLayout::editLaneFramePadV);
-            lane_y += lane_height;
-            const bool mixed_lane =
-                lane_index == static_cast<int>(timbre_.layers.size());
-            if (mixed_lane) {
-                continue;
-            }
-            const auto index = static_cast<std::size_t>(lane_index);
-            lane_frames_[index] = frame;
-            if (!frame.intersects(area)) {
-                continue;
-            }
-            auto lane = frame;
-            lane.removeFromLeft(UiLayout::compositeLaneLabelW)
-                .reduced(UiLayout::sm, 0);
-            lane.reduce(UiLayout::sm, UiLayout::editLaneInnerPadV);
-            graph_bounds_[index] = lane;
-        }
+        if (selected_layer_ < 0 || selected_layer_ >= static_cast<int>(timbre_.layers.size())) return;
+        auto frame = area.withY(area.getY() - juce::roundToInt(vertical_scroll_.getCurrentRangeStart()))
+            .withHeight(laneHeightForIndex(selected_layer_)).reduced(0, UiLayout::editLaneFramePadV);
+        lane_frames_[static_cast<std::size_t>(selected_layer_)] = frame;
+        graph_bounds_[static_cast<std::size_t>(selected_layer_)] =
+            frame.reduced(UiLayout::sm, UiLayout::editLaneInnerPadV);
     }
 
     [[nodiscard]] static std::uint64_t volumeLaneFingerprint(
@@ -9001,35 +9133,11 @@ private:
     }
 
     void layoutLayerSetups() {
-        using namespace UiLayout;
-        for (int index = 0; index < layer_setups_.size(); ++index) {
-            if (index >= static_cast<int>(lane_frames_.size())
-                || lane_frames_[static_cast<std::size_t>(index)].isEmpty()) {
-                if (layer_setups_[index]->isVisible()) {
-                    layer_setups_[index]->setVisible(false);
-                }
-                continue;
-            }
-            auto bounds = lane_frames_[static_cast<std::size_t>(index)];
-            bounds.setWidth(compositeLaneLabelW);
-            const bool edit_tier = index == selected_layer_;
-            if (edit_tier) {
-                bounds.setHeight(
-                    juce::jmin(bounds.getHeight(), compositeSetupContentH));
-            }
-            bounds = bounds.translated(
-                -graph_clip_.getX(), -graph_clip_.getY());
-            if (!bounds.intersects(graph_clip_.getLocalBounds())) {
-                if (layer_setups_[index]->isVisible()) {
-                    layer_setups_[index]->setVisible(false);
-                }
-                continue;
-            }
-            layer_setups_[index]->setBounds(bounds);
-            if (!layer_setups_[index]->isVisible()) {
-                layer_setups_[index]->setVisible(true);
-            }
+        for (int i = 0; i < layer_setups_.size(); ++i) {
+            layer_setups_[i]->setVisible(!count_inspector_ && i == selected_layer_);
+            layer_setups_[i]->setBounds(inspector_content_.getLocalBounds());
         }
+        layoutOverview();
     }
 
     void layoutEditToolsDock() {
@@ -9044,29 +9152,36 @@ private:
                     .volume_envelope.kind
                 == mgstc::engine::EnvelopeKind::Rate;
         const bool show_auto = show && !show_rate
-            && selectedLayerShowsRegisterAuto();
+            && selectedLayerShowsRegisterAuto()
+            && (selectedParameter() == Parameter::OpllTlAuto
+                || selectedParameter() == Parameter::OpllFbAuto);
 
         auto set_tools_visible = [this, show, show_auto, show_rate](
             bool visible) {
-            const bool sequence_tools = visible && !show_rate;
+            const bool sequence_tools = visible && !show_rate && count_inspector_;
             for (auto* c : std::initializer_list<juce::Component*>{
-                     &edit_mode_, &parameter_, &position_, &value_label_,
+                     &position_, &value_label_,
                      &value_, &apply_, &inspector_selection_,
                      &length_label_, &length_editor_, &loop_start_label_,
                      &loop_start_editor_, &loop_end_label_, &loop_end_editor_,
                      &inspector_apply_, &clear_loop_, &command_stack_}) {
                 c->setVisible(sequence_tools);
             }
-            envelope_mml_preview_.setVisible(visible);
-            auto_mode_.setVisible(visible && show_auto);
-            auto_depth_.setVisible(visible && show_auto);
-            auto_speed_.setVisible(visible && show_auto);
-            auto_coarseness_.setVisible(visible && show_auto);
-            auto_stop_.setVisible(visible && show_auto);
-            auto_depth_label_.setVisible(visible && show_auto);
-            auto_speed_label_.setVisible(visible && show_auto);
-            auto_coarseness_label_.setVisible(visible && show_auto);
-            auto_stop_label_.setVisible(visible && show_auto);
+            command_view_.setVisible(sequence_tools);
+            rate_open_.setVisible(visible && show_rate && count_inspector_);
+            edit_mode_.setVisible(visible && !show_rate);
+            parameter_.setVisible(visible && !show_rate);
+            mml_toggle_.setEnabled(visible);
+            envelope_mml_preview_.setVisible(visible && mml_toggle_.getToggleState());
+            auto_mode_.setVisible(visible && show_auto && count_inspector_);
+            auto_depth_.setVisible(visible && show_auto && count_inspector_);
+            auto_speed_.setVisible(visible && show_auto && count_inspector_);
+            auto_coarseness_.setVisible(visible && show_auto && count_inspector_);
+            auto_stop_.setVisible(visible && show_auto && count_inspector_);
+            auto_depth_label_.setVisible(visible && show_auto && count_inspector_);
+            auto_speed_label_.setVisible(visible && show_auto && count_inspector_);
+            auto_coarseness_label_.setVisible(visible && show_auto && count_inspector_);
+            auto_stop_label_.setVisible(visible && show_auto && count_inspector_);
         };
 
         if (!show) {
@@ -9076,103 +9191,37 @@ private:
         set_tools_visible(true);
         updateEnvelopeMmlPreview();
 
-        auto frame = lane_frames_[static_cast<std::size_t>(selected_layer_)];
-        frame = frame.translated(-graph_clip_.getX(), -graph_clip_.getY());
-        const int setup_h = compositeSetupContentH;
-        auto dock = frame;
-        dock.setWidth(compositeLaneLabelW);
-        dock.removeFromTop(setup_h);
-        dock = dock.reduced(panelPad);
-        dock.removeFromTop(editMarkerLaneH); // title painted in paint()
-
+        auto dock = inspector_content_.getLocalBounds().reduced(panelPad);
+        auto row = [&dock] { auto r = dock.removeFromTop(fieldH); dock.removeFromTop(sm); return r; };
+        auto split = [&](juce::Component& label, juce::Component& field) {
+            auto r = row(); label.setBounds(r.removeFromLeft(UiLayout::compositeInspectorLabelW)); field.setBounds(r);
+        };
+        rate_open_.setBounds(dock.withHeight(fieldH));
         if (!show_rate) {
-            auto row1 = dock.removeFromTop(fieldH);
-            apply_.setBounds(row1.removeFromRight(compositeDockApplyW));
-            row1.removeFromRight(controlGap);
-            value_.setBounds(row1.removeFromRight(compositeDockFieldW));
-            value_label_.setBounds(row1.removeFromRight(compositeDockLabelW));
-            row1.removeFromRight(controlGap);
-            position_.setBounds(row1.removeFromRight(compositeDockCountW));
-            row1.removeFromRight(controlGap);
-            parameter_.setBounds(row1.removeFromRight(compositeDockParamW));
-            row1.removeFromRight(controlGap);
-            edit_mode_.setBounds(row1);
-
+            auto point = row();
+            position_.setBounds(point.removeFromLeft(compositeDockCountW));
+            value_label_.setBounds(point.removeFromLeft(compositeDockLabelW));
+            apply_.setBounds(point.removeFromRight(compositeDockApplyW));
+            point.removeFromRight(controlGap); value_.setBounds(point);
             if (show_auto) {
-                dock.removeFromTop(sm);
-                auto auto_row = dock.removeFromTop(fieldH);
-                auto_stop_.setBounds(
-                    auto_row.removeFromRight(compositeDockAutoValueW));
-                auto_stop_label_.setBounds(
-                    auto_row.removeFromRight(compositeDockAutoLabelW));
-                auto_row.removeFromRight(controlGap);
-                auto_coarseness_.setBounds(
-                    auto_row.removeFromRight(compositeDockAutoValueW));
-                auto_coarseness_label_.setBounds(
-                    auto_row.removeFromRight(compositeDockAutoLabelW));
-                auto_row.removeFromRight(controlGap);
-                auto_speed_.setBounds(
-                    auto_row.removeFromRight(compositeDockAutoValueW));
-                auto_speed_label_.setBounds(
-                    auto_row.removeFromRight(compositeDockAutoLabelW));
-                auto_row.removeFromRight(controlGap);
-                auto_depth_.setBounds(
-                    auto_row.removeFromRight(compositeDockAutoValueW));
-                auto_depth_label_.setBounds(
-                    auto_row.removeFromRight(compositeDockAutoLabelW));
-                auto_row.removeFromRight(controlGap);
-                auto_mode_.setBounds(auto_row);
+                auto_mode_.setBounds(row());
+                split(auto_depth_label_, auto_depth_);
+                split(auto_speed_label_, auto_speed_);
+                split(auto_coarseness_label_, auto_coarseness_);
+                split(auto_stop_label_, auto_stop_);
             }
-
-            dock.removeFromTop(sm);
-            auto loop_row = dock.removeFromTop(fieldH);
-            clear_loop_.setBounds(
-                loop_row.removeFromRight(compositeDockClearLoopW));
-            loop_row.removeFromRight(controlGap);
-            inspector_apply_.setBounds(
-                loop_row.removeFromRight(compositeDockApplyW));
-            loop_row.removeFromRight(controlGap);
-            loop_end_editor_.setBounds(
-                loop_row.removeFromRight(compositeDockFieldW));
-            loop_end_label_.setBounds(
-                loop_row.removeFromRight(compositeDockLabelW));
-            loop_row.removeFromRight(controlGap);
-            loop_start_editor_.setBounds(
-                loop_row.removeFromRight(compositeDockFieldW));
-            loop_start_label_.setBounds(
-                loop_row.removeFromRight(compositeDockLabelW));
-            loop_row.removeFromRight(controlGap);
-            length_editor_.setBounds(
-                loop_row.removeFromRight(compositeDockFieldW));
-            length_label_.setBounds(
-                loop_row.removeFromRight(compositeDockLengthLabelW));
-            inspector_selection_.setBounds(loop_row);
-
-            dock.removeFromTop(sm);
-            command_stack_.setBounds(dock.removeFromTop(
-                juce::jmin(
-                    commandStackH, juce::jmax(fieldH, dock.getHeight()))));
+            inspector_selection_.setBounds(row());
+            split(length_label_, length_editor_);
+            split(loop_start_label_, loop_start_editor_);
+            split(loop_end_label_, loop_end_editor_);
+            auto actions = row();
+            inspector_apply_.setBounds(actions.removeFromLeft(actions.getWidth() / 2));
+            actions.removeFromLeft(controlGap); clear_loop_.setBounds(actions);
+            command_view_.setBounds(dock.removeFromTop(UiLayout::fieldH * 8));
+            command_stack_.setSize(juce::jmax(1, command_view_.getWidth() - kScrollBarSize),
+                command_stack_.preferredHeight());
         }
 
-        // Position MGSC preview over the edit-tier preview strip.
-        if (selected_layer_ >= 0
-            && selected_layer_ < static_cast<int>(graph_bounds_.size())
-            && selected_layer_ < static_cast<int>(timbre_.layers.size())) {
-            const auto graph =
-                graph_bounds_[static_cast<std::size_t>(selected_layer_)];
-            const auto slots = makeEditLaneSlots(
-                graph,
-                timbre_.layers[static_cast<std::size_t>(selected_layer_)]
-                    .source);
-            auto preview = slots.preview;
-            preview.removeFromLeft(editSubLaneLabelW);
-            preview = preview.translated(
-                -graph_clip_.getX(), -graph_clip_.getY());
-            envelope_mml_preview_.setBounds(preview);
-            envelope_mml_preview_.toFront(false);
-        } else {
-            envelope_mml_preview_.setVisible(false);
-        }
     }
 
     void commitPlaybackTempoFromEditor() {
@@ -9194,6 +9243,14 @@ private:
         }
     }
 
+    juce::Component inspector_content_;
+    juce::Viewport inspector_view_;
+    CompositeOverviewCanvas overview_content_;
+    juce::Viewport overview_view_;
+    juce::OwnedArray<juce::TextButton> overview_select_, overview_enabled_, overview_mute_, overview_solo_;
+    juce::TextButton setup_tab_, count_tab_, focus_;
+    bool count_inspector_{};
+    bool inspector_visible_{true};
     mgstc::engine::CompositeTimbre timbre_;
     juce::ComboBox parameter_;
     juce::ComboBox edit_mode_;
@@ -9222,7 +9279,9 @@ private:
     juce::TextEditor loop_end_editor_;
     juce::TextButton inspector_apply_;
     juce::TextButton clear_loop_;
+    juce::Viewport command_view_;
     CountCommandStackView command_stack_;
+    juce::TextButton rate_open_;
     juce::TextEditor envelope_mml_preview_;
     juce::String last_envelope_mml_preview_;
     juce::ScrollBar horizontal_scroll_;
@@ -9248,7 +9307,7 @@ private:
     std::unique_ptr<RateEnvelopeEditorWindow> rate_window_;
     std::optional<std::size_t> rate_editor_layer_;
     juce::OwnedArray<CompositeLayerSetupView> layer_setups_;
-    juce::Component graph_clip_;
+    juce::TextButton mml_toggle_;
     juce::Label tempo_label_;
     juce::TextEditor tempo_;
     std::vector<juce::Rectangle<int>> graph_bounds_;
@@ -9475,3 +9534,12 @@ bool CompositeTimeline::appendScopeFrame(
 }
 
 }  // namespace mgstc::app
+
+void mgstc::app::CompositeTimeline::setInspectorVisible(bool visible) {
+    impl_->setInspectorVisible(visible);
+}
+
+juce::String mgstc::app::CompositeTimeline::verifyWorkspace(const juce::File& directory) {
+    CompositeTimeline timeline;
+    return timeline.impl_->verifyWorkspace(directory);
+}

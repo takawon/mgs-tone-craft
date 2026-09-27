@@ -2270,10 +2270,23 @@ public:
     void initialise(const juce::String& command_line) override {
         UiScale::loadGlobalFromIni();
         juce::LookAndFeel::setDefaultLookAndFeel(&look_and_feel_);
-        hang_watchdog_.start();
         const juce::ArgumentList arguments(
             getApplicationName(),
             command_line);
+        if (arguments.containsOption("--verify-composite-workspace")) {
+            const auto directory = juce::File::getCurrentWorkingDirectory()
+                .getChildFile("composite-ui-captures");
+            const bool directory_ok = directory.createDirectory().wasOk();
+            const auto failures = directory_ok
+                ? mgstc::app::CompositeTimeline::verifyWorkspace(directory)
+                : juce::String("Could not create verification output directory");
+            directory.getChildFile("verification.txt").replaceWithText(
+                failures.isEmpty() ? "PASS\n" : failures);
+            setApplicationReturnValue(failures.isEmpty() ? 0 : 1);
+            quit();
+            return;
+        }
+        hang_watchdog_.start();
         const auto snapshot_target = arguments
             .getValueForOption("--capture-target")
             .trim()

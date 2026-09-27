@@ -506,6 +506,12 @@ endif()
 if(MGSTC_BUILD_TESTS)
     enable_testing()
 
+    if(TARGET mgstc)
+        add_test(NAME mgstc_composite_workspace_tests
+            COMMAND mgstc --verify-composite-workspace)
+        set_tests_properties(mgstc_composite_workspace_tests PROPERTIES TIMEOUT 60)
+    endif()
+
     add_executable(mgstc_engine_tests
         tests/cpp/engine_tests.cpp
     )
