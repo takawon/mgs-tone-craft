@@ -844,6 +844,34 @@ std::string formatMgsCompositeTrackSetup(
     return line;
 }
 
+std::string formatMgsCompositeTrackPreview(
+    const CompositeLayer& layer,
+    const TimbreNumberResolution* numbers) {
+    auto line = formatMgsCompositeTrackSetup(layer, numbers);
+    char channel = '\0';
+    switch (layer.source) {
+    case TimbreSource::Psg:
+        if (layer.channel < 3) {
+            channel = static_cast<char>('1' + layer.channel);
+        }
+        break;
+    case TimbreSource::Scc:
+        if (layer.channel < 5) {
+            channel = static_cast<char>('4' + layer.channel);
+        }
+        break;
+    case TimbreSource::Opll:
+        if (layer.channel < 9) {
+            channel = "9ABCDEFGH"[layer.channel];
+        }
+        break;
+    }
+    if (channel != '\0') {
+        line.replace(0, line.find(' '), 1, channel);
+    }
+    return line;
+}
+
 std::uint32_t maxEnvelopeLengthFittingBodyLimit(
     const CompositeLayer& layer,
     std::size_t compiled_byte_limit,

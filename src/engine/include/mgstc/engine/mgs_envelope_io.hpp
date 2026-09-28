@@ -55,6 +55,12 @@ inline constexpr std::size_t kMgscEnvelopeSourceLineLimit = 255;
     const CompositeLayer& layer,
     const TimbreNumberResolution* numbers = nullptr);
 
+// UI-only track setup preview. Uses display channel labels 0-2 (PSG),
+// 3-7 (SCC), and 9,A-H (OPLL); full MGSC export keeps its track syntax.
+[[nodiscard]] std::string formatMgsCompositeTrackPreview(
+    const CompositeLayer& layer,
+    const TimbreNumberResolution* numbers = nullptr);
+
 // Product UI/END ceiling: serializer probes stay cheap and usable even when
 // trailing holds collapse and sparse envelopes would otherwise grow forever.
 inline constexpr std::uint32_t kMgscEnvelopeUiLengthCap = 512;

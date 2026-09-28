@@ -471,20 +471,25 @@ public:
         if (layer_base_ && performance_session != nullptr) {
             keyboard_ = std::make_unique<mgstc::app::PerformanceKeyboard>(
                 *performance_session);
+            keyboard_->setHeadlessMode(true);
             keyboard_->setCallbacks(on_note_on_, on_note_off_);
             keyboard_->setSuppressPcInputCallback(
                 [this] { return textEntryHasFocusWithin(*this); });
-            addAndMakeVisible(*keyboard_);
+            addChildComponent(*keyboard_);
             setWantsKeyboardFocus(true);
+        }
+        if (layer_base_) {
+            preview_.setButtonText(juce::String::fromUTF8("試聴（1秒）"));
+            preview_.onClick = [this] {
+                if (on_audition_) on_audition_();
+            };
+            addAndMakeVisible(preview_);
         }
 
         refreshList();
         syncDetailFromSelection();
         live_apply_armed_ = true;
-        const int extra = layer_base_
-            ? UiLayout::textButtonH + UiLayout::sm
-                + (keyboard_ ? UiLayout::keyboardH + 40 : 0)
-            : 0;
+        const int extra = layer_base_ ? UiLayout::textButtonH + UiLayout::sm : 0;
         setSize(
             UiLayout::compositeTimbrePickW,
             UiLayout::compositeTimbrePickH + extra);
@@ -532,8 +537,8 @@ public:
             blank_.setBounds(area.removeFromTop(textButtonH));
         }
         area.removeFromTop(sm);
-        if (keyboard_ != nullptr) {
-            keyboard_->setBounds(area.removeFromBottom(keyboardH + 40));
+        if (layer_base_) {
+            preview_.setBounds(area.removeFromBottom(textButtonH));
             area.removeFromBottom(sm);
         }
         layoutLibraryBrowserChrome(
@@ -917,6 +922,7 @@ private:
     juce::ComboBox preset_;
     juce::TextButton edit_;
     juce::TextButton blank_;
+    juce::TextButton preview_;
     std::unique_ptr<mgstc::app::PerformanceKeyboard> keyboard_;
     juce::TextEditor filter_;
     juce::TextButton tag_filter_;
@@ -932,18 +938,23 @@ private:
     juce::TextButton tags_;
     juce::TextEditor memo_;
 };
-class EnvelopeOpllYParamContent final
-    : public juce::Component,
-      private juce::Timer {
+class EnvelopeOpllYParamContent final : public juce::Component {
 public:
+    using PreviewCallback = std::function<void(
+        mgstc::engine::OpllPatchParameters, std::uint8_t, bool)>;
     EnvelopeOpllYParamContent(
         const mgstc::engine::OpllPatchParameters& baseline,
         const mgstc::engine::OpllPatchParameters& initial,
         bool editing_existing,
         std::function<void(mgstc::engine::OpllPatchParameters)> on_apply,
-        mgstc::app::EditorSession* session = nullptr)
+        mgstc::app::EditorSession* session,
+        PreviewCallback on_preview,
+        std::function<void(std::uint8_t)> on_note_off,
+        std::function<void()> on_end)
         : on_apply_(std::move(on_apply)),
-          session_(session),
+          on_preview_(std::move(on_preview)),
+          on_note_off_(std::move(on_note_off)),
+          on_end_(std::move(on_end)),
           panel_(switch_look_and_feel_) {
         title_.setText(
             juce::String::fromUTF8(
@@ -977,6 +988,21 @@ public:
             auditionPreview();
         };
         addAndMakeVisible(panel_);
+        if (session != nullptr) {
+            keyboard_ = std::make_unique<mgstc::app::PerformanceKeyboard>(*session);
+            keyboard_->setHeadlessMode(true);
+            keyboard_->setCallbacks(
+                [this](std::uint8_t note) {
+                    if (on_preview_) on_preview_(panel_.parameters(), note, false);
+                },
+                [this](std::uint8_t note) {
+                    if (on_note_off_) on_note_off_(note);
+                });
+            keyboard_->setSuppressPcInputCallback(
+                [this] { return textEntryHasFocusWithin(*this); });
+            addChildComponent(*keyboard_);
+            setWantsKeyboardFocus(true);
+        }
 
         ok_.setButtonText(juce::String::fromUTF8("決定"));
         ok_.onClick = [this] {
@@ -999,6 +1025,23 @@ public:
 
     ~EnvelopeOpllYParamContent() override {
         stopPreviewAndRestore();
+    }
+
+    bool keyPressed(const juce::KeyPress& key) override {
+        if (keyboard_ != nullptr && keyboard_->shouldConsumeKeyPress(key)) {
+            keyboard_->pollPerformanceInput();
+            return true;
+        }
+        return false;
+    }
+
+    bool keyStateChanged(bool) override {
+        if (keyboard_ != nullptr) keyboard_->pollPerformanceInput();
+        return false;
+    }
+
+    void visibilityChanged() override {
+        if (isShowing()) grabKeyboardFocus();
     }
 
     void resized() override {
@@ -1029,66 +1072,26 @@ private:
         }
     }
 
-    void silencePreviewTracks() {
-        if (session_ == nullptr) {
-            return;
-        }
-        for (std::uint8_t channel = 0; channel < 9; ++channel) {
-            const auto track = static_cast<std::uint8_t>(kOpllTrack + channel);
-            static_cast<void>(session_->audition().noteOff(track));
-            session_->audition().armOpllKeyOffSilence(track);
-        }
-    }
-
     void auditionPreview() {
-        if (session_ == nullptr || !session_->snapshot().audio_running) {
-            return;
-        }
         const auto note = static_cast<std::uint8_t>(
             LastAuditionNoteStore::instance().get());
         panel_.setAuditionNote(note);
-        const auto patch = panel_.parameters();
-        silencePreviewTracks();
-        session_->audition().clearOpllKeyOffSilence();
-        const auto shared = session_->snapshot();
-        mgstc::app::SharedAuditionRequest request;
-        request.scc = &shared.shared_scc_waveform;
-        request.opll = &patch;
-        request.retrigger = true;
-        request.track = kOpllTrack;
-        request.note = note;
-        temporary_program_ = session_->audition().submitShared(request);
-        if (temporary_program_) {
-            startTimer(1000);
-        }
+        if (on_preview_) on_preview_(panel_.parameters(), note, true);
     }
 
     void stopPreviewAndRestore() {
-        stopTimer();
-        if (session_ == nullptr || !temporary_program_) {
-            temporary_program_ = false;
-            return;
+        if (keyboard_ != nullptr) keyboard_->allNotesOff();
+        if (on_end_) {
+            auto end = std::move(on_end_);
+            end();
         }
-        silencePreviewTracks();
-        const auto shared = session_->snapshot();
-        mgstc::app::SharedAuditionRequest request;
-        request.scc = &shared.shared_scc_waveform;
-        request.opll = &shared.shared_opll_patch;
-        request.retrigger = false;
-        request.track = kOpllTrack;
-        request.note = static_cast<std::uint8_t>(
-            LastAuditionNoteStore::instance().get());
-        static_cast<void>(session_->audition().submitShared(request));
-        temporary_program_ = false;
-    }
-
-    void timerCallback() override {
-        stopPreviewAndRestore();
     }
 
     std::function<void(mgstc::engine::OpllPatchParameters)> on_apply_;
-    mgstc::app::EditorSession* session_{};
-    bool temporary_program_{};
+    PreviewCallback on_preview_;
+    std::function<void(std::uint8_t)> on_note_off_;
+    std::function<void()> on_end_;
+    std::unique_ptr<mgstc::app::PerformanceKeyboard> keyboard_;
     SwitchLookAndFeel switch_look_and_feel_;
     juce::Label title_;
     juce::Label hint_;
@@ -2528,6 +2531,7 @@ public:
     using RateEditCallback = std::function<void()>;
     using DuplicateCallback = std::function<void()>;
     using RemoveCallback = std::function<void()>;
+    using AuditionCallback = std::function<void()>;
 
     CompositeLayerSetupView() {
         source_.setFont(UiFonts::heading());
@@ -2630,6 +2634,13 @@ public:
             }
         };
         addAndMakeVisible(timbre_settings_);
+        preview_.setButtonText(juce::String::fromUTF8("試聴（1秒）"));
+        preview_.setTooltip(juce::String::fromUTF8(
+            "現在の初期設定を含む総合音色を1秒試聴します"));
+        preview_.onClick = [this] {
+            if (audition_callback_) audition_callback_();
+        };
+        addAndMakeVisible(preview_);
         channel_.onChange = [this] {
             if (changed_) {
                 changed_(true);
@@ -2646,13 +2657,17 @@ public:
             }
         };
         addAndMakeVisible(duplicate_);
-        remove_.setButtonText(juce::String::fromUTF8("Ch.削除"));
+        remove_.setButtonText(juce::String::fromUTF8("その他"));
         remove_.setTooltip(juce::String::fromUTF8(
             "このチャンネルとその独立エンベロープを削除します"));
         remove_.onClick = [this] {
-            if (remove_callback_) {
-                remove_callback_();
-            }
+            juce::PopupMenu menu;
+            menu.addItem(1, juce::String::fromUTF8("チャンネルを削除…"));
+            menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&remove_),
+                [safe = juce::Component::SafePointer<CompositeLayerSetupView>(this)](int result) {
+                    if (safe != nullptr && result == 1 && safe->remove_callback_)
+                        safe->remove_callback_();
+                });
         };
         addAndMakeVisible(remove_);
         number_mode_.addItem(juce::String::fromUTF8("自動"), 1);
@@ -2775,7 +2790,7 @@ public:
         };
         delay_form_.setTooltip(juce::String::fromUTF8(
             "発音前休符の記法。r=音符長（テンポ依存）、"
-            "r%=1/60秒ティック（テンポ非依存）。@e内の待ちではない"));
+            "r%=48ステップで4分音符（テンポ依存）。@e内の待ちではない"));
         addAndMakeVisible(delay_form_);
         mixer_mode_.addItem(juce::String::fromUTF8("0 変化なし"), 1);
         mixer_mode_.addItem(juce::String::fromUTF8("1 トーン"), 2);
@@ -2820,7 +2835,7 @@ public:
         delay_.setTooltip(juce::String::fromUTF8(
             "キーオン前の休符ディレイ（トラックMML。エンベロープ内カウントではない）。"
             "r<n>は音符長（例 r4＝4分、実時間は複合音色のテンポ依存）。"
-            "r%<n>は1/60秒ティック（例 r%30＝0.5秒、テンポ非依存）。"
+            "r%<n>はMGSCステップ（48ステップ＝4分音符、テンポ依存）。"
             "グリッド左側の薄表示は発音前待ちの目安"));
         volume_.setTooltip(juce::String::fromUTF8(
             "トラック音量 v（発音前MML）。@eのfはこの値を最大として引き算"));
@@ -2885,7 +2900,8 @@ public:
         LfoCallback lfo,
         RateEditCallback rate_edit,
         DuplicateCallback duplicate,
-        RemoveCallback remove) {
+        RemoveCallback remove,
+        AuditionCallback audition) {
         changed_ = std::move(changed);
         edit_callback_ = std::move(edit);
         pick_ = std::move(pick);
@@ -2893,6 +2909,7 @@ public:
         rate_edit_callback_ = std::move(rate_edit);
         duplicate_callback_ = std::move(duplicate);
         remove_callback_ = std::move(remove);
+        audition_callback_ = std::move(audition);
     }
 
     void setDuplicateEnabled(bool enabled) {
@@ -3230,6 +3247,7 @@ public:
             mixer_mode_.setBounds({}); mixer_mode_label_.setBounds({});
             mixer_noise_.setBounds({}); mixer_noise_label_.setBounds({});
         }
+        preview_.setBounds(row());
         auto actions = row();
         duplicate_.setBounds(actions.removeFromLeft((actions.getWidth() - controlGap) / 2));
         actions.removeFromLeft(controlGap);
@@ -3317,6 +3335,7 @@ private:
     RateEditCallback rate_edit_callback_;
     DuplicateCallback duplicate_callback_;
     RemoveCallback remove_callback_;
+    AuditionCallback audition_callback_;
     bool assigning_{};
     SwitchLookAndFeel switch_look_and_feel_;
     juce::Label source_;
@@ -3328,6 +3347,7 @@ private:
     juce::ToggleButton rate_kind_;
     juce::TextButton rate_edit_;
     juce::TextButton timbre_settings_;
+    juce::TextButton preview_;
     juce::ComboBox channel_;
     juce::TextButton duplicate_;
     juce::TextButton remove_;
@@ -3616,6 +3636,28 @@ public:
         addAndMakeVisible(psg_add_);
         addAndMakeVisible(scc_add_);
         addAndMakeVisible(opll_add_);
+        add_channel_.setButtonText(juce::String::fromUTF8("+ チャンネル"));
+        add_channel_.setTooltip(juce::String::fromUTF8("音源ごとの使用数を確認してチャンネルを追加"));
+        add_channel_.onClick = [this] {
+            makeAddChannelMenu().showMenuAsync(
+                juce::PopupMenu::Options().withTargetComponent(&add_channel_),
+                [safe = juce::Component::SafePointer<Impl>(this)](int result) {
+                    if (safe != nullptr) safe->addChannelFromMenu(result);
+                });
+        };
+        addAndMakeVisible(add_channel_);
+        compact_overview_.setButtonText(juce::String::fromUTF8("概要を縮小"));
+        compact_overview_.setTooltip(juce::String::fromUTF8("概要の行をコンパクト表示に切り替え（音色は変更しません）"));
+        compact_overview_.setClickingTogglesState(true);
+        compact_overview_.onClick = [this] {
+            const int old_height = compact_overview_.getToggleState()
+                ? UiLayout::fieldH * 2 + UiLayout::sm : UiLayout::fieldH + UiLayout::xs * 2;
+            const double top_row = static_cast<double>(overview_view_.getViewPositionY()) / old_height;
+            resized();
+            overview_view_.setViewPosition(0, juce::roundToInt(top_row * overviewRowHeight()));
+            repaint();
+        };
+        addAndMakeVisible(compact_overview_);
 
         tempo_label_.setText(
             juce::String::fromUTF8("テンポ"),
@@ -3897,6 +3939,24 @@ public:
             overview_select_[1]->onClick();
             check(selected_layer_ == 1, "overview selection failed");
             const auto editor = graphArea();
+            const int normal_height = overviewRowHeight();
+            compact_overview_.setToggleState(true, juce::dontSendNotification);
+            compact_overview_.onClick();
+            check(overviewRowHeight() < normal_height, "compact overview did not shrink rows");
+            for (int i = 0; i < overview_select_.size(); ++i) {
+                check(!overview_select_[i]->getBounds().intersects(overview_enabled_[i]->getBounds()),
+                    "compact channel name overlaps ON");
+                check(overview_enabled_[i]->getHeight() >= UiLayout::fieldH,
+                    "compact controls lost their minimum height");
+            }
+            const auto compact_editor = graphArea();
+            overview_view_.setViewPosition(0, overviewRowHeight());
+            check(graphArea() == compact_editor && timbre_ == before && callbacks == 0,
+                "compact navigation changed data or moved editor");
+            save("workspace-compact-" + juce::String(percent));
+            compact_overview_.setToggleState(false, juce::dontSendNotification);
+            compact_overview_.onClick();
+            check(graphArea() == editor, "normal overview did not restore layout");
             const auto frames = lane_frames_;
             auto overview_plot = juce::Rectangle<int>(0, 0, overview_content_.getWidth(), overviewRowHeight())
                 .withTrimmedLeft(UiLayout::compositeOverviewLabelW).reduced(UiLayout::sm, UiLayout::xs);
@@ -4014,7 +4074,17 @@ public:
         check(timbre_.layers.size() == 17, "17-channel fixture failed");
         const auto full = timbre_;
         callbacks = 0;
+        auto full_menu = makeAddChannelMenu();
+        for (juce::PopupMenu::MenuItemIterator it(full_menu); it.next();)
+            check(!it.getItem().isEnabled, "full source remains enabled in add menu");
+        for (int id = 0; id <= 3; ++id) addChannelFromMenu(id);
+        check(timbre_ == full && callbacks == 0, "full/cancelled add changed data");
+        compact_overview_.setToggleState(true, juce::dontSendNotification);
+        compact_overview_.onClick();
         overview_select_[16]->onClick();
+        save("workspace-17-compact");
+        compact_overview_.setToggleState(false, juce::dontSendNotification);
+        compact_overview_.onClick();
         overview_view_.setViewPosition(0, overview_content_.getHeight());
         const auto full_frames = lane_frames_;
         overview_view_.setViewPosition(0, 0);
@@ -4034,7 +4104,19 @@ public:
         save("workspace-rate");
         model.layers.clear(); setTimbre(model, true);
         check(selected_layer_ == -1 && !envelope_mml_preview_.isVisible(), "empty model retained editable controls");
+        check(psg_add_.isVisible() && scc_add_.isVisible() && opll_add_.isVisible()
+            && !add_channel_.isVisible(), "empty workspace lost explicit add buttons");
         save("workspace-empty");
+        callbacks = 0;
+        addChannelFromMenu(0);
+        check(timbre_.layers.empty() && callbacks == 0, "cancelled add changed empty sound");
+        for (int id = 1; id <= 3; ++id) addChannelFromMenu(id);
+        check(timbre_.layers.size() == 3 && callbacks == 3
+            && timbre_.layers[0].source == mgstc::engine::TimbreSource::Psg
+            && timbre_.layers[1].source == mgstc::engine::TimbreSource::Scc
+            && timbre_.layers[2].source == mgstc::engine::TimbreSource::Opll,
+            "add menu changed source mapping or edit count");
+        check(add_channel_.isVisible() && !psg_add_.isVisible(), "nonempty add menu not visible");
         UiScale::setActivePercent(original_scale);
         setEditCallback({});
         return failures;
@@ -4083,6 +4165,15 @@ public:
         base_note_on_ = std::move(note_on);
         base_note_off_ = std::move(note_off);
         base_audition_ = std::move(audition);
+    }
+
+    void setManualYPerformance(
+        ManualYPreviewCallback preview,
+        std::function<void(std::uint8_t)> note_off,
+        std::function<void()> end) {
+        manual_y_preview_ = std::move(preview);
+        manual_y_note_off_ = std::move(note_off);
+        manual_y_end_ = std::move(end);
     }
 
     [[nodiscard]] std::optional<std::uint64_t> addBlankOriginal(
@@ -4417,12 +4508,22 @@ public:
         tempo_.setBounds(header.removeFromRight(compositeTempoFieldW));
         tempo_label_.setBounds(header.removeFromRight(compositeTempoLabelW));
         header.removeFromRight(sm);
-        opll_add_.setBounds(header.removeFromRight(compositeAddOpllW));
-        header.removeFromRight(controlGap);
-        scc_add_.setBounds(header.removeFromRight(compositeAddSccW));
-        header.removeFromRight(controlGap);
-        psg_add_.setBounds(header.removeFromRight(compositeAddPsgW));
-        focus_.setBounds(header.removeFromLeft(UiLayout::compositeFocusW));
+        const bool empty = timbre_.layers.empty();
+        for (auto* button : {&psg_add_, &scc_add_, &opll_add_}) button->setVisible(empty);
+        add_channel_.setVisible(!empty);
+        if (empty) {
+            opll_add_.setBounds(header.removeFromRight(compositeAddOpllW));
+            header.removeFromRight(controlGap);
+            scc_add_.setBounds(header.removeFromRight(compositeAddSccW));
+            header.removeFromRight(controlGap);
+            psg_add_.setBounds(header.removeFromRight(compositeAddPsgW));
+        } else {
+            add_channel_.setBounds(header.removeFromRight(compositeSelectorW));
+        }
+        focus_.setBounds(header.removeFromLeft(compositeFocusW));
+        header.removeFromLeft(controlGap);
+        compact_overview_.setBounds(header.removeFromLeft(compositeFocusW));
+        compact_overview_.setEnabled(!empty && !focus_.getToggleState());
         auto side = inspectorArea();
         setup_tab_.setVisible(inspector_visible_);
         count_tab_.setVisible(inspector_visible_);
@@ -4434,7 +4535,7 @@ public:
         inspector_view_.setBounds(side);
         inspector_content_.setSize(juce::jmax(1, side.getWidth() - kScrollBarSize),
             count_inspector_ ? UiLayout::compositeInspectorContentH
-                : panelPad * 2 + (fieldH + sm) * 16 + (libraryTitleH + sm) * 3);
+                : panelPad * 2 + (fieldH + sm) * 17 + (libraryTitleH + sm) * 3);
         overview_view_.setVisible(!focus_.getToggleState());
         overview_view_.setBounds(overviewArea());
         layoutOverview();
@@ -4753,9 +4854,12 @@ private:
         if (inspector_visible_) a.removeFromRight(UiLayout::libraryWidth + UiLayout::panelGap);
         return a;
     }
-    int overviewRowHeight() const { return UiLayout::fieldH * 2 + UiLayout::sm; }
+    int overviewRowHeight() const {
+        return compact_overview_.getToggleState()
+            ? UiLayout::fieldH + UiLayout::xs * 2 : UiLayout::fieldH * 2 + UiLayout::sm;
+    }
     int overviewHeight() const {
-        return juce::jmin(overviewRowHeight() * juce::jlimit(1, 3, static_cast<int>(timbre_.layers.size())),
+        return juce::jmin(overviewRowHeight() * juce::jlimit(1, compact_overview_.getToggleState() ? 6 : 3, static_cast<int>(timbre_.layers.size())),
             juce::jmax(overviewRowHeight(), workspaceArea().getHeight() / 3));
     }
     juce::Rectangle<int> overviewArea() const {
@@ -4803,15 +4907,20 @@ private:
         for (int i = 0; i < count; ++i) {
             const auto& layer = timbre_.layers[static_cast<std::size_t>(i)];
             auto label = juce::Rectangle<int>(0, i * overviewRowHeight(), UiLayout::compositeOverviewLabelW, overviewRowHeight()).reduced(UiLayout::xs);
-            overview_select_[i]->setBounds(label.removeFromTop(UiLayout::fieldH));
+            const bool compact = compact_overview_.getToggleState();
+            overview_select_[i]->setBounds(compact
+                ? label.removeFromLeft(label.getWidth() - UiLayout::fieldH * 3 - UiLayout::sm * 2)
+                : label.removeFromTop(UiLayout::fieldH));
             overview_select_[i]->setButtonText(juce::String::fromUTF8(layer.name.c_str()));
-            overview_select_[i]->setTooltip(juce::String::fromUTF8("チャンネルを選択（音色・命令は変更しません）"));
+            overview_select_[i]->setTooltip(juce::String::fromUTF8(layer.name.c_str())
+                + juce::String::fromUTF8(" — チャンネルを選択（音色・命令は変更しません）"));
             overview_select_[i]->setToggleState(i == selected_layer_, juce::dontSendNotification);
             overview_select_[i]->setColour(juce::TextButton::buttonOnColourId, sourceColour(layer.source).withAlpha(0.3F));
             const int button_w = label.getWidth() / 3;
             int n = 0;
             for (auto* button : {overview_enabled_[i], overview_mute_[i], overview_solo_[i]}) {
-                button->setBounds(label.removeFromLeft(button_w));
+                button->setBounds(label.removeFromLeft(compact
+                    ? UiLayout::fieldH + (n == 0 ? UiLayout::sm * 2 : 0) : button_w));
                 button->setButtonText(n == 0 ? "ON" : n == 1 ? "M" : "S");
                 button->setTooltip(juce::String::fromUTF8(n == 0 ? "有効" : n == 1 ? "ミュート" : "ソロ"));
                 button->setToggleState(n == 0 ? layer.enabled : n == 1 ? layer.muted : layer.solo, juce::dontSendNotification);
@@ -5532,6 +5641,27 @@ private:
         mgstc::engine::CompositeLayer& layer) {
         return const_cast<mgstc::engine::EnvelopeTimeline&>(
             std::as_const(*this).selectedTimeline(layer));
+    }
+
+    juce::PopupMenu makeAddChannelMenu() const {
+        juce::PopupMenu menu;
+        int id = 1;
+        for (const auto source : {mgstc::engine::TimbreSource::Psg,
+                 mgstc::engine::TimbreSource::Scc, mgstc::engine::TimbreSource::Opll}) {
+            const int used = static_cast<int>(std::count_if(timbre_.layers.begin(), timbre_.layers.end(),
+                [source](const auto& layer) { return layer.source == source; }));
+            const char* name = id == 1 ? "PSG" : id == 2 ? "SCC" : "OPLL";
+            const int maximum = id == 1 ? 3 : id == 2 ? 5 : 9;
+            menu.addItem(id++, juce::String(name) + juce::String::fromUTF8(" 追加  (")
+                + juce::String(used) + "/" + juce::String(maximum) + ")",
+                mgstc::engine::firstAvailableChannel(timbre_, source).has_value());
+        }
+        return menu;
+    }
+    void addChannelFromMenu(int id) {
+        if (id == 1) addLayer(mgstc::engine::TimbreSource::Psg);
+        else if (id == 2) addLayer(mgstc::engine::TimbreSource::Scc);
+        else if (id == 3) addLayer(mgstc::engine::TimbreSource::Opll);
     }
 
     void updateAddButtons() {
@@ -7146,7 +7276,7 @@ private:
             }
         }
         const auto track = juce::String::fromUTF8(
-            mgstc::engine::formatMgsCompositeTrackSetup(layer, &numbers)
+            mgstc::engine::formatMgsCompositeTrackPreview(layer, &numbers)
                 .c_str());
         const auto preview_text = definition + "\n" + track;
         if (preview_text == last_envelope_mml_preview_) {
@@ -7338,10 +7468,60 @@ private:
             + juce::String(event.secondary);
     }
 
-    [[nodiscard]] static juce::String formatRegisterGroupLabel(
-        const std::vector<const mgstc::engine::EnvelopeEvent*>& events) {
+    [[nodiscard]] juce::String formatRegisterGroupLabel(
+        const mgstc::engine::CompositeLayer& layer,
+        std::uint32_t count,
+        const std::vector<const mgstc::engine::EnvelopeEvent*>& events) const {
         if (events.empty()) {
             return {};
+        }
+        if (layer.source == mgstc::engine::TimbreSource::Opll) {
+            const auto before = mgstc::engine::opllOriginalRegisterImageAt(
+                layer, count, timbreLibrary(), false, true);
+            const auto after = mgstc::engine::opllOriginalRegisterImageAt(
+                layer, count, timbreLibrary(), true, true);
+            if (before && after) {
+                const auto old_patch = mgstc::engine::decodeOpllPatch(*before);
+                const auto new_patch = mgstc::engine::decodeOpllPatch(*after);
+                juce::StringArray parts;
+                const auto add_value = [&parts](const char* name, int value) {
+                    parts.add(juce::String(name) + " " + juce::String(value));
+                };
+                const auto add_operator = [&parts](
+                    const char* prefix,
+                    const mgstc::engine::OpllOperatorParameters& old_op,
+                    const mgstc::engine::OpllOperatorParameters& new_op) {
+                    juce::StringArray fields;
+                    const auto flag = [&fields](const char* name, bool old_value, bool new_value) {
+                        if (old_value != new_value)
+                            fields.add(juce::String(name) + (new_value ? "" : " OFF"));
+                    };
+                    const auto value = [&fields](const char* name, int old_value, int new_value) {
+                        if (old_value != new_value)
+                            fields.add(juce::String(name) + " " + juce::String(new_value));
+                    };
+                    flag("AM", old_op.amplitude_modulation, new_op.amplitude_modulation);
+                    flag("PM", old_op.pitch_modulation, new_op.pitch_modulation);
+                    flag("EG", old_op.sustained_tone, new_op.sustained_tone);
+                    flag("KR", old_op.key_rate_scaling, new_op.key_rate_scaling);
+                    flag("WS", old_op.waveform, new_op.waveform);
+                    value("MULT", old_op.multiplier, new_op.multiplier);
+                    value("KSL", old_op.key_scale_level, new_op.key_scale_level);
+                    value("AR", old_op.attack_rate, new_op.attack_rate);
+                    value("DR", old_op.decay_rate, new_op.decay_rate);
+                    value("SL", old_op.sustain_level, new_op.sustain_level);
+                    value("RR", old_op.release_rate, new_op.release_rate);
+                    if (!fields.isEmpty())
+                        parts.add(juce::String(prefix) + ": " + fields.joinIntoString(" / "));
+                };
+                if (old_patch.modulator.total_level != new_patch.modulator.total_level)
+                    add_value("TL", new_patch.modulator.total_level);
+                if (old_patch.feedback != new_patch.feedback)
+                    add_value("FB", new_patch.feedback);
+                add_operator("MOD", old_patch.modulator, new_patch.modulator);
+                add_operator("CAR", old_patch.carrier, new_patch.carrier);
+                if (!parts.isEmpty()) return parts.joinIntoString(" / ");
+            }
         }
         juce::StringArray parts;
         parts.ensureStorageAllocated(static_cast<int>(events.size()));
@@ -7403,7 +7583,7 @@ private:
                 static_cast<float>(slot.getCentreY() - 3),
                 6.0F,
                 6.0F);
-            const auto text = formatRegisterGroupLabel(events);
+            const auto text = formatRegisterGroupLabel(layer, count, events);
             const int text_w = juce::jmax(
                 28,
                 juce::jmin(
@@ -7474,7 +7654,7 @@ private:
         // Same-count y writes are listed side-by-side (y2,a y3,b), not y×N.
         for (const auto& [count, events] : registerWritesByCount(layer)) {
             items.push_back(
-                {count, formatRegisterGroupLabel(events), false});
+                {count, formatRegisterGroupLabel(layer, count, events), false});
         }
         if (layer.envelope_timeline.loop_start_count) {
             items.push_back(
@@ -7659,7 +7839,10 @@ private:
             && selected_layer_ < static_cast<int>(timbre_.layers.size())) {
             refreshCommandStack(
                 timbre_.layers[static_cast<std::size_t>(selected_layer_)]);
+            if (selectedParameter() == Parameter::RegisterWrite)
+                syncPointEditors();
         }
+        updateEnvelopeMmlPreview();
         repaint();
         if (edit_callback_) {
             edit_callback_(timbre_, commit, commit);
@@ -8392,7 +8575,7 @@ private:
         if (it == grouped.end() || it->second.empty()) {
             return juce::String::fromUTF8("（なし）");
         }
-        return formatRegisterGroupLabel(it->second);
+        return formatRegisterGroupLabel(layer, count, it->second);
     }
 
     [[nodiscard]] juce::String registerInspectTooltip(
@@ -8486,6 +8669,7 @@ private:
         auto* dialog = new ModalDialogWindow(
             juce::String::fromUTF8("手動 y（FMパラメータ）"),
             juce::Colour(0xFF1B222C));
+        const auto layer_index = static_cast<std::size_t>(selected_layer_);
         auto* content = new EnvelopeOpllYParamContent(
             baseline_patch,
             initial_patch,
@@ -8494,7 +8678,43 @@ private:
                 mgstc::engine::OpllPatchParameters patch) {
                 applyOpllManualYPatch(count, baseline, patch);
             },
-            session_);
+            session_,
+            [this, layer_index](mgstc::engine::OpllPatchParameters patch,
+                std::uint8_t note, bool one_second) {
+                if (!manual_y_preview_ || layer_index >= timbre_.layers.size())
+                    return;
+                auto preview = timbre_;
+                auto& preview_layer = preview.layers[layer_index];
+                if (!preview_layer.base_timbre) {
+                    mgstc::engine::SavedTimbreReference base;
+                    base.source = mgstc::engine::TimbreSource::Opll;
+                    base.name = "手動y試聴";
+                    preview_layer.base_timbre = std::move(base);
+                }
+                preview_layer.base_opll_rom.reset();
+                preview_layer.base_timbre->library_id =
+                    mgstc::engine::allocateCompositeOwnedTimbreId(preview);
+                preview_layer.base_timbre->number_mode =
+                    mgstc::engine::TimbreNumberMode::Automatic;
+                preview_layer.base_timbre->manual_number.reset();
+                preview_layer.base_timbre->opll_registers =
+                    mgstc::engine::encodeOpllPatch(patch);
+                std::erase_if(preview_layer.timbre_automation,
+                    [](const auto& event) {
+                        return event.kind == mgstc::engine::EnvelopeEventKind::Timbre
+                            || (event.kind == mgstc::engine::EnvelopeEventKind::RegisterWrite
+                                && event.value >= 0 && event.value <= 7);
+                    });
+                preview_layer.opll_tl_auto.mode = mgstc::engine::OpllRegisterAutoMode::Off;
+                preview_layer.opll_fb_auto.mode = mgstc::engine::OpllRegisterAutoMode::Off;
+                manual_y_preview_(std::move(preview), note, one_second);
+            },
+            [this](std::uint8_t note) {
+                if (manual_y_note_off_) manual_y_note_off_(note);
+            },
+            [this] {
+                if (manual_y_end_) manual_y_end_();
+            });
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         dialog->setContentOwned(content, true);
@@ -9007,6 +9227,9 @@ private:
                                 safe->requestRemoveLayer(layer_index);
                             }
                         });
+                },
+                [this] {
+                    if (base_audition_) base_audition_();
                 });
             setup->syncFromLayer(timbre_.layers[layer_index]);
         }
@@ -9255,6 +9478,8 @@ private:
     juce::ComboBox parameter_;
     juce::ComboBox edit_mode_;
     juce::ComboBox auto_mode_;
+    juce::TextButton add_channel_;
+    juce::TextButton compact_overview_;
     juce::TextButton psg_add_;
     juce::TextButton scc_add_;
     juce::TextButton opll_add_;
@@ -9298,6 +9523,9 @@ private:
     std::function<void(std::uint8_t)> base_note_on_;
     std::function<void(std::uint8_t)> base_note_off_;
     std::function<void()> base_audition_;
+    ManualYPreviewCallback manual_y_preview_;
+    std::function<void(std::uint8_t)> manual_y_note_off_;
+    std::function<void()> manual_y_end_;
     MutateTimbreNameCallback mutate_name_callback_;
     MutateTimbreTagsCallback mutate_tags_callback_;
     MutateTimbreMemoCallback mutate_memo_callback_;
@@ -9483,6 +9711,14 @@ void CompositeTimeline::setBaseTimbrePerformance(
     std::function<void()> audition) {
     impl_->setBaseTimbrePerformance(
         std::move(note_on), std::move(note_off), std::move(audition));
+}
+
+void CompositeTimeline::setManualYPerformance(
+    ManualYPreviewCallback preview,
+    std::function<void(std::uint8_t)> note_off,
+    std::function<void()> end) {
+    impl_->setManualYPerformance(
+        std::move(preview), std::move(note_off), std::move(end));
 }
 
 void CompositeTimeline::setMutateTimbreNameCallback(

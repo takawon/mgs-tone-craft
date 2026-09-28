@@ -91,6 +91,8 @@ public:
     using LfoSessionCallback =
         std::function<void(std::optional<std::size_t>, bool, bool)>;
     using LfoPollKeysCallback = std::function<void()>;
+    using ManualYPreviewCallback = std::function<void(
+        engine::CompositeTimbre, std::uint8_t, bool)>;
 
     CompositeTimeline();
     ~CompositeTimeline() override;
@@ -111,6 +113,10 @@ public:
         std::function<void(std::uint8_t)> note_on,
         std::function<void(std::uint8_t)> note_off,
         std::function<void()> audition);
+    void setManualYPerformance(
+        ManualYPreviewCallback preview,
+        std::function<void(std::uint8_t)> note_off,
+        std::function<void()> end);
     void setMutateTimbreNameCallback(MutateTimbreNameCallback callback);
     void setMutateTimbreTagsCallback(MutateTimbreTagsCallback callback);
     void setMutateTimbreMemoCallback(MutateTimbreMemoCallback callback);

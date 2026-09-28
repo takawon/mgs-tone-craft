@@ -75,6 +75,10 @@ public:
         mgstc::engine::CompositeTimbre sound,
         bool polyphonic,
         std::uint8_t& voice_capacity);
+    [[nodiscard]] bool previewEditorComposite(
+        mgstc::engine::CompositeTimbre sound,
+        bool polyphonic,
+        std::uint8_t& voice_capacity);
     [[nodiscard]] bool editorNoteOn(
         std::uint8_t track,
         std::uint8_t note);

@@ -3870,42 +3870,32 @@ public:
         };
         addAndMakeVisible(favorite_);
 
-        configureIconButton(
-            file_open_,
-            EditorIcon::Open,
-            juce::String::fromUTF8(
-                "総合音色ファイルを開く（.mgstc）"),
-            [this] { openCompositeFile(); });
-        configureIconButton(
-            file_save_,
-            EditorIcon::Save,
-            juce::String::fromUTF8(
-                "総合音色をファイルへ保存（.mgstc）"),
-            [this] { saveCompositeFile(); });
-        configureIconButton(
-            file_paste_,
-            EditorIcon::Paste,
-            juce::String::fromUTF8(
-                "クリップボードから総合音色を貼り付け"),
-            [this] { pasteCompositeProgram(); });
-        configureIconButton(
-            file_copy_,
-            EditorIcon::Copy,
-            juce::String::fromUTF8(
-                "総合音色をクリップボードへコピー"),
-            [this] { copyCompositeProgram(); });
-        configureButton(
-            mgsc_open_,
-            juce::String::fromUTF8("MGSC開く"),
-            juce::String::fromUTF8(
-                "MGSCソース（.mgs／.mus／.txt）から総合音色を開きます"),
-            [this] { openMgsCompositeFile(); });
-        configureButton(
-            mgsc_save_,
-            juce::String::fromUTF8("MGSC書出"),
-            juce::String::fromUTF8(
-                "総合音色をMGSCソース（.mgs）として書き出します"),
-            [this] { saveMgsCompositeFile(); });
+        configureButton(file_menu_, juce::String::fromUTF8("ファイル"),
+            juce::String::fromUTF8("総合音色の読み込み・保存・コピー・MGSC入出力"),
+            [this] {
+                juce::PopupMenu menu;
+                menu.addItem(1, juce::String::fromUTF8("総合音色を開く… (.mgstc)"));
+                menu.addItem(2, juce::String::fromUTF8("総合音色を保存… (.mgstc)"));
+                menu.addSeparator();
+                menu.addItem(3, juce::String::fromUTF8("コピー (Ctrl+C)"));
+                menu.addItem(4, juce::String::fromUTF8("貼り付け (Ctrl+V)"));
+                menu.addSeparator();
+                menu.addItem(5, juce::String::fromUTF8("MGSCソースを開く…"));
+                menu.addItem(6, juce::String::fromUTF8("MGSCソースを書き出す…"));
+                menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&file_menu_),
+                    [safe = juce::Component::SafePointer<CompositeEditorComponent>(this)](int result) {
+                        if (safe == nullptr) return;
+                        switch (result) {
+                        case 1: safe->openCompositeFile(); break;
+                        case 2: safe->saveCompositeFile(); break;
+                        case 3: safe->copyCompositeProgram(); break;
+                        case 4: safe->pasteCompositeProgram(); break;
+                        case 5: safe->openMgsCompositeFile(); break;
+                        case 6: safe->saveMgsCompositeFile(); break;
+                        default: break;
+                        }
+                    });
+            });
         configureIconButton(
             undo_,
             EditorIcon::Undo,
@@ -4304,6 +4294,24 @@ public:
             },
             [this](std::uint8_t note) { stopCompositeNote(note); },
             [this] { startCompositeNote(last_audition_note_, true); });
+        timeline_.setManualYPerformance(
+            [this](mgstc::engine::CompositeTimbre preview,
+                std::uint8_t note, bool one_second) {
+                if (!session_.snapshot().audio_running) return;
+                if (!manual_y_preview_timbre_
+                    || *manual_y_preview_timbre_ != preview) {
+                    silenceAuditionNotes();
+                    manual_y_preview_timbre_ = std::move(preview);
+                    if (!configureEngine()) return;
+                }
+                startCompositeNote(note, one_second, true);
+            },
+            [this](std::uint8_t note) { stopCompositeNote(note); },
+            [this] {
+                silenceAuditionNotes();
+                manual_y_preview_timbre_.reset();
+                static_cast<void>(configureEngine());
+            });
         timeline_.setMutateTimbreNameCallback(
             [this](std::uint64_t id, juce::String name) {
                 return mutateSharedTimbreName(id, std::move(name));
@@ -4833,24 +4841,12 @@ public:
         area.removeFromTop(titleH + descriptionH);
         area.removeFromTop(sm);
         auto file_row = area.removeFromTop(toolbarH);
-        for (auto* button :
-             std::array<juce::DrawableButton*, 6>{
-                 &file_open_,
-                 &file_save_,
-                 &file_paste_,
-                 &file_copy_,
-                 &undo_,
-                 &redo_}) {
+        file_menu_.setBounds(file_row.removeFromLeft(compositeSelectorW));
+        file_row.removeFromLeft(controlGap);
+        for (auto* button : {&undo_, &redo_}) {
             button->setBounds(file_row.removeFromLeft(iconButton));
             file_row.removeFromLeft(controlGap);
         }
-        mgsc_open_.setBounds(
-            file_row.removeFromLeft(
-                UiScale::sx(UiLayout::compositeMgscOpenW)));
-        file_row.removeFromLeft(controlGap);
-        mgsc_save_.setBounds(
-            file_row.removeFromLeft(
-                UiScale::sx(UiLayout::compositeMgscSaveW)));
         area.removeFromTop(sm);
 
         auto keyboard_area = area.removeFromBottom(keyboardH);
@@ -5030,10 +5026,6 @@ private:
         int editor_order = 200;
         for (juce::Component* component :
              std::initializer_list<juce::Component*>{
-                 &file_open_,
-                 &file_save_,
-                 &file_paste_,
-                 &file_copy_,
                  &undo_,
                  &redo_,
                  &timeline_,
@@ -5042,6 +5034,10 @@ private:
             component->setExplicitFocusOrder(editor_order++);
         }
         performance_keyboard_.setExplicitFocusOrder(400);
+        file_menu_.setExplicitFocusOrder(70);
+        undo_.setExplicitFocusOrder(71);
+        redo_.setExplicitFocusOrder(72);
+        name_.setExplicitFocusOrder(80);
         library_toggle_.setExplicitFocusOrder(90);
         audition_.setExplicitFocusOrder(199);
     }
@@ -6579,8 +6575,10 @@ private:
         }
         MGSTC_UI_ACTIVITY("composite: configureEngine (compile + submit)");
         CompositeAuditionRequest request;
-        request.timbre = &timbre_;
+        request.timbre = manual_y_preview_timbre_
+            ? &*manual_y_preview_timbre_ : &timbre_;
         request.polyphonic = performance_keyboard_.polyphonic();
+        request.temporary = manual_y_preview_timbre_.has_value();
         request.library = &timbre_library_;
         const auto result = session_.audition().submitComposite(request);
         if (result.update_allocator) {
@@ -6666,7 +6664,8 @@ private:
         if (assignment.stolen_note) {
             stopCompositeVoice(assignment.channel);
         }
-        const auto& note_timbre = timbre_;
+        const auto& note_timbre = manual_y_preview_timbre_
+            ? *manual_y_preview_timbre_ : timbre_;
         const auto plan =
             mgstc::engine::buildCompositePlaybackPlan(note_timbre);
         double maximum_delay_ms = 0.0;
@@ -6703,6 +6702,9 @@ private:
             if (!audition_layer_filter_) {
                 performance_keyboard_.showPreviewNote(base_note);
             }
+        } else {
+            audition_stop_time_ms_.reset();
+            performance_keyboard_.clearPreviewNote();
         }
         last_audition_note_ = base_note;
         saveLastAuditionNoteSetting(last_audition_note_);
@@ -6728,7 +6730,8 @@ private:
     }
 
     void stopCompositeVoice(std::uint8_t voice) {
-        const auto plan = mgstc::engine::buildCompositePlaybackPlan(timbre_);
+        const auto plan = mgstc::engine::buildCompositePlaybackPlan(
+            manual_y_preview_timbre_ ? *manual_y_preview_timbre_ : timbre_);
         for (const auto& binding : plan.audible_layers) {
             const auto track = plan.physicalTrack(binding, voice);
             static_cast<void>(session_.audition().noteOff(track));
@@ -6911,6 +6914,7 @@ private:
     juce::TooltipWindow tooltip_window_;
     SwitchLookAndFeel switch_look_and_feel_;
     mgstc::engine::CompositeTimbre timbre_;
+    std::optional<mgstc::engine::CompositeTimbre> manual_y_preview_timbre_;
     juce::Label title_;
     juce::Label description_;
     juce::Label composite_library_title_;
@@ -6973,16 +6977,7 @@ private:
         "settings", juce::DrawableButton::ImageOnButtonBackground};
     juce::Slider master_volume_;
     juce::Label master_volume_label_;
-    juce::DrawableButton file_open_{
-        "file open", juce::DrawableButton::ImageOnButtonBackground};
-    juce::DrawableButton file_save_{
-        "file save", juce::DrawableButton::ImageOnButtonBackground};
-    juce::DrawableButton file_paste_{
-        "file paste", juce::DrawableButton::ImageOnButtonBackground};
-    juce::DrawableButton file_copy_{
-        "file copy", juce::DrawableButton::ImageOnButtonBackground};
-    juce::TextButton mgsc_open_;
-    juce::TextButton mgsc_save_;
+    juce::TextButton file_menu_;
     juce::DrawableButton undo_{
         "undo", juce::DrawableButton::ImageOnButtonBackground};
     juce::DrawableButton redo_{
