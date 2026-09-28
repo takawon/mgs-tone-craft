@@ -466,12 +466,13 @@ void processEmpty(MgstcAudioProcessor& processor, int frames) {
 void loadDelayedThreeLayerProgram(MgstcAudioProcessor& processor) {
     mgstc::plugin::PluginStateDocument document;
     document.sound = mgstc::engine::defaultCompositeTimbre();
+    // Keep this scheduler fixture at 200/400 ms as r% follows tempo.
     document.sound.layers[1].start_delay_form =
-        mgstc::engine::StartDelayForm::AbsoluteTicks;
-    document.sound.layers[1].start_delay_value = 12;
+        mgstc::engine::StartDelayForm::NoteLength;
+    document.sound.layers[1].start_delay_value = 10;
     document.sound.layers[2].start_delay_form =
-        mgstc::engine::StartDelayForm::AbsoluteTicks;
-    document.sound.layers[2].start_delay_value = 24;
+        mgstc::engine::StartDelayForm::NoteLength;
+    document.sound.layers[2].start_delay_value = 5;
     require(
         processor.replacePluginState(std::move(document)),
         "load delayed three-layer composite");
@@ -3581,6 +3582,8 @@ void testPluginEditor() {
     juce::Button* library_toggle = nullptr;
     juce::Button* count_tab = nullptr;
     juce::Button* focus_button = nullptr;
+    juce::Button* compact_button = nullptr;
+    juce::Button* file_menu = nullptr;
     bool spectrum_disabled = false;
     bool library_disabled = false;
     bool scc_disabled = false;
@@ -3591,6 +3594,8 @@ void testPluginEditor() {
             if (text == juce::String::fromUTF8("ライブラリ")) library_toggle = button;
             if (text == juce::String::fromUTF8("カウント編集")) count_tab = button;
             if (text == juce::String::fromUTF8("編集に集中")) focus_button = button;
+            if (text == juce::String::fromUTF8("概要を縮小")) compact_button = button;
+            if (text == juce::String::fromUTF8("ファイル")) file_menu = button;
             if (text == juce::String::fromUTF8("スペアナ")) {
                 require(!button->isEnabled(), "spectrum control stays in place and is grey");
                 spectrum_disabled = true;
@@ -3629,6 +3634,15 @@ void testPluginEditor() {
             "render shared main screen");
     };
     capture("main-editor.png");
+    require(compact_button && file_menu, "density and file menu controls are present");
+    file_menu->onClick();
+    juce::PopupMenu::dismissAllActiveMenus();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    compact_button->setToggleState(true, juce::dontSendNotification);
+    compact_button->onClick();
+    capture("main-compact.png");
+    compact_button->setToggleState(false, juce::dontSendNotification);
+    compact_button->onClick();
     library_toggle->setToggleState(true, juce::dontSendNotification);
     library_toggle->onClick();
     capture("main-library.png");
@@ -3790,6 +3804,25 @@ void testCompositePlaybackWaveform() {
         "no composite waveform frames after the editor closes");
 }
 
+void testTemporaryCompositePreviewPreservesState() {
+    MgstcAudioProcessor processor;
+    const auto before = stateBytes(processor);
+    auto preview = processor.copyPluginState().sound;
+    preview.name = "temporary-manual-y-preview";
+    std::uint8_t capacity = 0;
+    require(processor.previewEditorComposite(preview, true, capacity),
+        "temporary composite preview compiles");
+    require(capacity >= 1, "temporary preview has a voice");
+    require(sameBlock(before, stateBytes(processor)),
+        "temporary preview does not change plugin state");
+    require(processor.copyPluginState().sound.name != preview.name,
+        "temporary preview does not replace processor sound");
+    require(processor.editorRestoreCommittedProgram(),
+        "temporary preview restores committed program");
+    require(sameBlock(before, stateBytes(processor)),
+        "restoring temporary preview preserves plugin state");
+}
+
 void testPluginSoundAuthority() {
     MgstcAudioProcessor reference;
     MgstcAudioProcessor shared;
@@ -3940,6 +3973,7 @@ int main() {
         testPluginEditor();
         testCompositePlaybackWaveform();
         testPluginSoundAuthority();
+        testTemporaryCompositePreviewPreservesState();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

@@ -117,6 +117,7 @@ struct EditorSnapshot {
 struct CompositeAuditionRequest {
     mgstc::engine::CompositeTimbre* timbre{};
     bool polyphonic{true};
+    bool temporary{false};
     const mgstc::engine::TimbreLibrary* library{};
 };
 

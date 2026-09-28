@@ -4758,8 +4758,7 @@ void testEnvelopeTimelineInspectorRangeNormalization() {
 void testStartDelayMillisecondsFollowsMgscTempoForRAndRPercent() {
     using namespace mgstc::engine;
 
-    // SPEC §6.5.4 (0.200): r% = absolute 1/60s ticks (tempo-independent);
-    // r = 240000/(tempo*n) ms (tempo-dependent).
+    // MGSC %48 is a quarter note; both rest forms follow tempo.
     const auto ms = [](StartDelayForm form, std::uint32_t value, int tempo) {
         return static_cast<int>(
             std::lround(startDelayMilliseconds(form, value, tempo)));
@@ -4768,14 +4767,13 @@ void testStartDelayMillisecondsFollowsMgscTempoForRAndRPercent() {
     REQUIRE_EQ(ms(StartDelayForm::NoteLength, 4, 120), 500);
     REQUIRE_EQ(ms(StartDelayForm::NoteLength, 4, 60), 1000);
 
-    // r% wall-clock must not change when tempo changes.
-    REQUIRE_EQ(ms(StartDelayForm::AbsoluteTicks, 48, 120), 800);
-    REQUIRE_EQ(ms(StartDelayForm::AbsoluteTicks, 48, 60), 800);
-    REQUIRE_EQ(ms(StartDelayForm::AbsoluteTicks, 30, 200), 500);
+    REQUIRE_EQ(ms(StartDelayForm::AbsoluteTicks, 48, 120), 500);
+    REQUIRE_EQ(ms(StartDelayForm::AbsoluteTicks, 48, 60), 1000);
+    REQUIRE_EQ(ms(StartDelayForm::AbsoluteTicks, 30, 200), 188);
 
     REQUIRE_EQ(
         startDelayGridCounts(StartDelayForm::AbsoluteTicks, 24, 120),
-        24U);
+        15U);
     REQUIRE_EQ(
         startDelayGridCounts(StartDelayForm::NoteLength, 4, 120),
         30U);
@@ -6121,6 +6119,26 @@ void testTrackSetupEnvelopeNumberAndPreKeyOnCommands() {
     REQUIRE_EQ(found->timbre.layers[2].opll_sustain, true);
 }
 
+void testCompositeTrackPreviewChannelLabels() {
+    using namespace mgstc::engine;
+    const auto base = defaultCompositeTimbre().layers;
+    const auto check = [&](TimbreSource source, int channel, char expected) {
+        auto layer = base[source == TimbreSource::Psg ? 0
+            : source == TimbreSource::Scc ? 1 : 2];
+        layer.channel = static_cast<std::uint8_t>(channel);
+        const auto text = formatMgsCompositeTrackPreview(layer);
+        REQUIRE_EQ(text.empty(), false);
+        REQUIRE_EQ(text.front(), expected);
+    };
+    for (int channel = 0; channel < 3; ++channel)
+        check(TimbreSource::Psg, channel, static_cast<char>('1' + channel));
+    for (int channel = 0; channel < 5; ++channel)
+        check(TimbreSource::Scc, channel, static_cast<char>('4' + channel));
+    check(TimbreSource::Opll, 0, '9');
+    for (int channel = 1; channel < 9; ++channel)
+        check(TimbreSource::Opll, channel, static_cast<char>('A' + channel - 1));
+}
+
 void testRuntimePitchSweepAndKeyOffHangAndOpllSustain() {
     using namespace mgstc::engine;
     RuntimeSession session(64, 256);
@@ -6670,6 +6688,8 @@ int main(int argc, char** argv) {
         {"RuntimeSoftwareLfoWritesFrequencyDeltas", testRuntimeSoftwareLfoWritesFrequencyDeltas},
         {"TrackSetupEnvelopeNumberAndPreKeyOnCommands",
          testTrackSetupEnvelopeNumberAndPreKeyOnCommands},
+        {"CompositeTrackPreviewChannelLabels",
+         testCompositeTrackPreviewChannelLabels},
         {"RuntimePitchSweepAndKeyOffHangAndOpllSustain",
          testRuntimePitchSweepAndKeyOffHangAndOpllSustain},
         {"CompositeTimbreLibraryRoundTripAndRevision", testCompositeTimbreLibraryRoundTripAndRevision},

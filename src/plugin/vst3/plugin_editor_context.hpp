@@ -162,10 +162,11 @@ private:
                     *request.timbre));
             std::uint8_t capacity = 1;
             result.update_allocator = true;
-            result.ok = self_.processor_.replaceEditorComposite(
-                *request.timbre,
-                request.polyphonic,
-                capacity);
+            result.ok = request.temporary
+                ? self_.processor_.previewEditorComposite(
+                    *request.timbre, request.polyphonic, capacity)
+                : self_.processor_.replaceEditorComposite(
+                    *request.timbre, request.polyphonic, capacity);
             result.voice_capacity = capacity;
             return result;
         }

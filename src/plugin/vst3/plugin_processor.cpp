@@ -1376,6 +1376,54 @@ bool MgstcAudioProcessor::replaceEditorComposite(
         std::move(document), mode, polyphonic, &voice_capacity);
 }
 
+bool MgstcAudioProcessor::previewEditorComposite(
+    mgstc::engine::CompositeTimbre sound,
+    bool polyphonic,
+    std::uint8_t& voice_capacity) {
+    voice_capacity = 1;
+    if (onAudioThread()
+        || !validatePluginSoundSnapshot(sound)) {
+        return false;
+    }
+    static_cast<void>(
+        mgstc::engine::enforceOpllRegisterAutoExclusivity(sound));
+    auto edit = engine_.beginProgramEdit();
+    if (!edit.valid()) {
+        engine_.discardStuckProgramEdits();
+        edit = engine_.beginProgramEdit();
+    }
+    if (!edit.valid()) return false;
+    mgstc::engine::CompositePlaybackPlan plan;
+    state_compile_count_.fetch_add(1, std::memory_order_relaxed);
+    if (!mgstc::engine::compileCompositeProgram(
+            *edit.engine, sound, {.polyphonic = polyphonic}, &plan)) {
+        static_cast<void>(engine_.discardProgramEdit(edit));
+        return false;
+    }
+    voice_capacity = plan.voice_capacity;
+    const auto slot = pickPlanSlot();
+    plan_slots_[slot] = plan;
+    if (!engine_.submitProgram(edit)) {
+        static_cast<void>(engine_.discardProgramEdit(edit));
+        return false;
+    }
+    if (!host_prepared_.load(std::memory_order_acquire)) {
+        std::array<float, 64> drain{};
+        engine_.drainPendingCommands(drain, 32, true);
+    }
+    published_plan_.store(slot, std::memory_order_release);
+    program_ready_.store(true, std::memory_order_release);
+    editor_runtime_program_temporary_ = true;
+    if (!host_prepared_.load(std::memory_order_acquire)) {
+        applied_plan_ = slot;
+        acknowledged_plan_.store(slot, std::memory_order_release);
+        voices_.setActiveChannelCount(
+            plan.voice_capacity == 0 ? 1 : plan.voice_capacity);
+        voices_.setPolyphonic(polyphonic);
+    }
+    return true;
+}
+
 bool MgstcAudioProcessor::editorSubmitEngine(
     const mgstc::engine::EngineCommand& command) {
     if (onAudioThread()) {

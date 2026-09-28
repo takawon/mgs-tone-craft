@@ -48,11 +48,13 @@ public:
             UiFonts::controlTextHeight(
                 static_cast<float>(button.getHeight())));
         graphics.setFont(font);
-        const auto text_colour = active
-            ? juce::Colour(kText)
-            : ((should_draw_highlight && enabled)
-                   ? juce::Colour(kUiHoverAccent)
-                   : juce::Colour(kText));
+        const auto text_colour = button.isColourSpecified(
+            juce::ToggleButton::textColourId)
+            ? button.findColour(juce::ToggleButton::textColourId)
+            : (active ? juce::Colour(kText)
+                      : ((should_draw_highlight && enabled)
+                             ? juce::Colour(kUiHoverAccent)
+                             : juce::Colour(kText)));
         graphics.setColour(
             text_colour.withMultipliedAlpha(enabled ? 1.0F : 0.5F));
         graphics.drawFittedText(

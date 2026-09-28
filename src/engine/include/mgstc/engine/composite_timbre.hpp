@@ -271,10 +271,8 @@ struct OpllRegisterAutoLane {
 enum class StartDelayForm : std::uint8_t {
     // Track MML `r<n>` — note-length rest (tempo-dependent wall-clock).
     NoteLength = 0,
-    // Track MML `r%<n>` — absolute 1/60s ticks (tempo-independent wall-clock).
-    // Product rule (Takao): changing global tempo must NOT change r% wait;
-    // only `r` scales. MGSC `%` step *identity* (a4=a%48) is still documented
-    // separately; audition maps r% to driver 1/60s ticks for the editor grid.
+    // Track MML `r%<n>` — MGSC steps (48 steps per quarter note).
+    // Keep the persisted enum value for existing composite files.
     AbsoluteTicks = 1,
 };
 
@@ -289,7 +287,7 @@ constexpr int kMgscQuarterSteps = 48;
 constexpr double kMgscInterruptHz = 60.0;
 
 // Wall-clock delay before key-on (keyboard / PC / MIDI / 1s preview).
-// `r%<n>`: n / 60 s (absolute tick; tempo ignored).
+// `r%<n>`: n * quarter / 48, where quarter = 60000 / tempo ms.
 // `r<n>`:  240000/(tempo*n) ms — quarter (n=4) = 60000/tempo ms
 //         (= same 14400/tempo family as MGSC shortest-note note).
 [[nodiscard]] inline double startDelayMilliseconds(
@@ -300,7 +298,10 @@ constexpr double kMgscInterruptHz = 60.0;
         return 0.0;
     }
     if (form == StartDelayForm::AbsoluteTicks) {
-        return static_cast<double>(value) * (1000.0 / kMgscInterruptHz);
+        const int tempo = std::clamp(
+            tempo_bpm, kMgscTempoMin, kMgscTempoMax);
+        return static_cast<double>(value) * 60000.0
+            / (static_cast<double>(tempo) * kMgscQuarterSteps);
     }
     const int tempo = std::clamp(
         tempo_bpm, kMgscTempoMin, kMgscTempoMax);
@@ -308,7 +309,7 @@ constexpr double kMgscInterruptHz = 60.0;
         / (static_cast<double>(tempo) * static_cast<double>(value));
 }
 
-// Shared-timeline tint counts (≈1/60s). `r%` exact; `r` rounds from ms.
+// Shared-timeline tint counts (≈1/60s), rounded from the tempo-based delay.
 [[nodiscard]] inline std::uint32_t startDelayGridCounts(
     StartDelayForm form,
     std::uint32_t value,
@@ -316,13 +317,10 @@ constexpr double kMgscInterruptHz = 60.0;
     if (value == 0) {
         return 0;
     }
-    if (form == StartDelayForm::AbsoluteTicks) {
-        return value;
-    }
     const double ms =
         startDelayMilliseconds(form, value, tempo_bpm);
     return static_cast<std::uint32_t>(
-        std::llround(ms * (kMgscInterruptHz / 1000.0)));
+        std::max(1LL, std::llround(ms * (kMgscInterruptHz / 1000.0))));
 }
 
 struct CompositeLayer {

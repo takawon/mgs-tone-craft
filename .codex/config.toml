@@ -1,0 +1,19 @@
+#:schema https://developers.openai.com/codex/config-schema.json
+
+# Primary coordinator.
+#
+# Medium is intentional:
+# this agent often receives detailed specifications and must understand
+# them correctly before delegating work.
+model = "gpt-6-sol"
+model_reasoning_effort = "medium"
+
+[agents]
+enabled = true
+
+# Safe fallback for ad-hoc or unnamed subagents.
+default_subagent_model = "gpt-6-sol"
+default_subagent_reasoning_effort = "medium"
+
+# Allows useful parallel investigation without encouraging agent swarms.
+max_concurrent_threads_per_session = 4
