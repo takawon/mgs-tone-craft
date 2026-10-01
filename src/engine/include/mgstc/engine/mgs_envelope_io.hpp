@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,13 +22,18 @@ enum class MgsEnvelopeIssue : std::uint8_t {
     InvalidTimbre,
     InvalidRegisterWrite,
     InvalidAutomaticVolumeDuration,
+    UnrepresentableModulationLoop,
 };
 
 struct MgsEnvelopeFormatResult {
     std::string definition;
     std::string body;
     std::size_t compiled_bytes{};
+    std::vector<std::uint8_t> bytecode;
     std::vector<MgsEnvelopeIssue> issues;
+    // First excluded execution count when the complete stream exceeds the
+    // byte budget. The generated definition/bytecode is a valid prefix.
+    std::optional<std::uint32_t> output_cutoff_count;
 
     [[nodiscard]] bool valid() const noexcept {
         return issues.empty();
@@ -36,8 +42,8 @@ struct MgsEnvelopeFormatResult {
     [[nodiscard]] bool hasIssue(MgsEnvelopeIssue issue) const noexcept;
 };
 
-// MGSC 1.11 compiles @e to at most 256 payload bytes (not source characters).
-inline constexpr std::size_t kMgscEnvelopeCompiledByteLimit = 256;
+// MGSC 1.11 rejects a command-byte count >= 254 (not source characters).
+inline constexpr std::size_t kMgscEnvelopeCompiledByteLimit = 253;
 // MGSC source line length (bytes). The serializer wraps at '.' when needed.
 inline constexpr std::size_t kMgscEnvelopeSourceLineLimit = 255;
 

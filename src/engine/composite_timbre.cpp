@@ -776,7 +776,9 @@ bool layerEnvelopeNeedsOriginalToneRestore(
     if (layerUsesOpllRomBase(layer) || !layer.base_timbre) {
         return false;
     }
-    if (layer.opll_tl_auto.active() || layer.opll_fb_auto.active()) {
+    if (layer.opll_tl_auto.active() || layer.opll_fb_auto.active()
+        || layer.opll_tl_modulation.enabled
+        || layer.opll_fb_modulation.enabled) {
         return true;
     }
     for (const auto& event : layer.timbre_automation) {

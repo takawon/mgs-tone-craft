@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "mgstc/engine/composite_envelope_compile.hpp"
+#include "mgstc/engine/mgs_envelope_io.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/opll_patch.hpp"
 #include "mgstc/engine/opll_register_auto.hpp"
@@ -143,6 +144,28 @@ bool compileCompositeProgram(
     const CompositeTimbre& timbre,
     const CompositeProgramCompileOptions& options,
     CompositePlaybackPlan* plan_out) {
+    // Validate every sequence before changing engine state. Audition uses
+    // the same finalized @e byte stream as export, so an invalid definition
+    // must not become an empty but apparently successful preview.
+    const auto preflight_numbers = resolveTimbreNumbers(timbre);
+    for (std::size_t index = 0; index < timbre.layers.size(); ++index) {
+        if (!layerIsAudible(timbre, index)) {
+            continue;
+        }
+        const auto& layer = timbre.layers[index];
+        if (layer.volume_envelope.kind != EnvelopeKind::Sequence) {
+            continue;
+        }
+        if (!formatMgsCompositeEnvelope(
+                layer, layer.envelope_number,
+                kMgscEnvelopeCompiledByteLimit,
+                &preflight_numbers, options.library).valid()) {
+            if (plan_out != nullptr) {
+                *plan_out = {};
+            }
+            return false;
+        }
+    }
     const auto sine = generateSccPreset(SccWavePreset::Sine, SccHarmonic::One);
     std::array<std::uint8_t, 32> raw_scc{};
     std::transform(

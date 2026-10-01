@@ -1,4 +1,5 @@
 #include "mgstc/engine/composite_timbre_library.hpp"
+#include "mgstc/engine/composite_modulation.hpp"
 #include "mgstc/engine/timbre_tags.hpp"
 
 #include <algorithm>
@@ -231,6 +232,10 @@ public:
             boolean(layer.pitch_sweep.enabled);
             unsignedInteger(layer.pitch_sweep.value, 1);
             boolean(layer.opll_sustain);
+            modulation(layer.pitch_modulation);
+            modulation(layer.volume_modulation);
+            modulation(layer.opll_tl_modulation);
+            modulation(layer.opll_fb_modulation);
         }
         unsignedInteger(value.embedded_timbres.size(), 4);
         for (const auto& reference_value : value.embedded_timbres) {
@@ -265,6 +270,15 @@ public:
         for (const auto point : value.free_curve) {
             unsignedInteger(point, 1);
         }
+    }
+
+    void modulation(const ModulationParameters& value) {
+        boolean(value.enabled);
+        enumeration(value.mode);
+        unsignedInteger(value.delay, 1);
+        unsignedInteger(value.depth, 1);
+        unsignedInteger(value.speed, 1);
+        unsignedInteger(static_cast<std::uint8_t>(value.roughness), 1);
     }
 
     [[nodiscard]] const std::string& data() const noexcept {
@@ -513,13 +527,15 @@ public:
     bool soundPayload(
         CompositeTimbre& value,
         std::uint32_t payload_version) {
-        if (payload_version != kCompositeSoundPayloadVersion) {
+        if (payload_version != 1
+            && payload_version != kCompositeSoundPayloadVersion) {
             return false;
         }
-        // v1 is the current sound-only layout (tempo, layers, embedded).
-        // Reuse the portable layer reader by treating it as the latest
-        // CompositeTimbre format; this is not the portable file version.
-        format_version_ = CompositeTimbre::kFormatVersion;
+        // SQLite payload v1 has the portable v19 sound body. Payload v2
+        // adds four modulation settings per layer (portable v20 body).
+        // The DB schema version and the portable file header are separate.
+        format_version_ = payload_version == 1
+            ? 19 : CompositeTimbre::kFormatVersion;
         return soundBody(value);
     }
 
@@ -714,6 +730,13 @@ public:
                     layer.software_lfo.enabled = false;
                 }
             }
+            if (format_version_ >= 20
+                && (!modulation(layer.pitch_modulation)
+                    || !modulation(layer.volume_modulation)
+                    || !modulation(layer.opll_tl_modulation)
+                    || !modulation(layer.opll_fb_modulation))) {
+                return false;
+            }
         }
         if (format_version_ < 15) {
             for (std::size_t index = 0; index < value.layers.size(); ++index) {
@@ -764,6 +787,27 @@ public:
                 return false;
             }
         }
+        return true;
+    }
+
+    bool modulation(ModulationParameters& value) {
+        std::uint8_t delay{};
+        std::uint8_t depth{};
+        std::uint8_t speed{};
+        std::uint8_t roughness{};
+        if (!boolean(value.enabled)
+            || !enumeration(value.mode, 2)
+            || !integer(delay, 1)
+            || !integer(depth, 1)
+            || !integer(speed, 1)
+            || !integer(roughness, 1)) {
+            return false;
+        }
+        value.delay = delay;
+        value.depth = depth;
+        value.speed = speed;
+        value.roughness = static_cast<std::int8_t>(roughness);
+        value = clampModulation(value);
         return true;
     }
 

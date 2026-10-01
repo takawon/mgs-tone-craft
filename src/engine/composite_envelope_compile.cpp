@@ -9,10 +9,192 @@
 #include <vector>
 
 #include "mgstc/engine/envelope_sequence.hpp"
+#include "mgstc/engine/composite_modulation.hpp"
+#include "mgstc/engine/mgs_envelope_io.hpp"
 #include "mgstc/engine/opll_register_auto.hpp"
 
 namespace mgstc::engine {
 namespace {
+
+void maybeOptimizeModulationLoop(
+    CompositeLayer& layer, const TimbreLibrary* library) {
+    auto& timeline = layer.envelope_timeline;
+    if (timeline.loop_start_count || timeline.loop_end_count
+        || layer.opll_tl_auto.active()
+        || layer.opll_fb_auto.active()) {
+        return;
+    }
+    const ModulationParameters* selected = nullptr;
+    enum class Target { Pitch, Volume, Tl, Fb };
+    Target target = Target::Pitch;
+    std::size_t active_count{};
+    const auto select = [&](const ModulationParameters& mod, Target candidate) {
+        if (!mod.enabled) {
+            return true;
+        }
+        ++active_count;
+        if (!selected) {
+            selected = &mod;
+            target = candidate;
+        }
+        return true;
+    };
+    if (!select(layer.pitch_modulation, Target::Pitch)
+        || !select(layer.volume_modulation, Target::Volume)
+        || !select(layer.opll_tl_modulation, Target::Tl)
+        || !select(layer.opll_fb_modulation, Target::Fb)
+        || !selected || (active_count == 1 && selected->roughness == 0)) {
+        return;
+    }
+    const auto& mod = *selected;
+    // Later serialized commands are barriers, regardless of target. The
+    // legacy default Wait event is ignored by the canonical serializer and
+    // must not prevent a loop. Repeated actual writes remain observable.
+    const auto later = [](const auto& events, EnvelopeEventKind first_kind,
+                          EnvelopeEventKind second_kind) {
+        return std::any_of(
+            events.begin(), events.end(),
+            [first_kind, second_kind](const EnvelopeEvent& event) {
+                // A count-zero automatic ramp still changes state later.
+                return (event.kind == first_kind || event.kind == second_kind)
+                    && (event.count != 0 || event.automatic
+                        || event.after_loop_start);
+            });
+    };
+    if (later(layer.volume_envelope.events, EnvelopeEventKind::Volume,
+              EnvelopeEventKind::Volume)
+        || later(layer.pitch_envelope.events, EnvelopeEventKind::Pitch,
+                 EnvelopeEventKind::Pitch)
+        || later(layer.timbre_automation, EnvelopeEventKind::Timbre,
+                 EnvelopeEventKind::RegisterWrite)) {
+        return;
+    }
+    if (active_count > 1) {
+        // Equal steady periods may share one body despite different delays.
+        // Each phase is evaluated at the common absolute count; no phase is
+        // reset at the loop marker. Absolute Step targets remain excluded.
+        const ModulationParameters* mods[] = {
+            &layer.pitch_modulation, &layer.volume_modulation,
+            &layer.opll_tl_modulation, &layer.opll_fb_modulation};
+        std::uint32_t common_period{};
+        std::uint32_t steady_start{};
+        for (std::size_t index = 0; index < 4; ++index) {
+            const auto& settings = *mods[index];
+            if (!settings.enabled) continue;
+            if (index != 0 && settings.mode != ModulationMode::Oscillate) return;
+            const auto speed = softwareLfoSpeedPeriod(settings.speed);
+            auto first = softwareLfoFirstUpdateTick(settings.delay, settings.speed);
+            auto cycle = speed;
+            if (settings.mode == ModulationMode::Oscillate) {
+                const auto depth = static_cast<std::uint32_t>(
+                    std::min<std::uint8_t>(settings.depth, 127)) + 1U;
+                first += ((depth >> 1U) + 1U) * speed;
+                cycle = 2U * depth * speed;
+            }
+            if (common_period && common_period != cycle) return;
+            common_period = cycle;
+            steady_start = std::max(steady_start, first);
+        }
+        int bases[] = {0, layer.volume, 0, 0};
+        const int maxima[] = {0, 15, 63, 7};
+        for (const auto& event : layer.volume_envelope.events) {
+            if (event.kind == EnvelopeEventKind::Volume) bases[1] = event.value;
+        }
+        if (bases[1] < 0 || bases[1] > 15) return;
+        if (layer.opll_tl_modulation.enabled || layer.opll_fb_modulation.enabled) {
+            const auto image = opllOriginalRegisterImageAt(layer, 0, library, true, false);
+            if (!image) return;
+            bases[2] = (*image)[2] & 0x3F;
+            bases[3] = (*image)[3] & 0x07;
+        }
+        // Choose an actual state-change boundary. Otherwise forcing the
+        // loop-start volume would add a write absent from the finite stream.
+        auto anchor = steady_start;
+        for (; anchor < steady_start + common_period; ++anchor) {
+            bool changes = false;
+            for (std::size_t index = 0; index < 4; ++index) {
+                const auto& settings = *mods[index];
+                if (!settings.enabled || settings.roughness == 0) continue;
+                if (index == 0) {
+                    changes |= modulationOffsetAtCount(settings, anchor)
+                        != modulationOffsetAtCount(settings, anchor - 1U);
+                } else {
+                    changes |= modulationEffectiveValueAtCount(
+                        settings, anchor, bases[index], 0, maxima[index])
+                        != modulationEffectiveValueAtCount(
+                            settings, anchor - 1U, bases[index], 0, maxima[index]);
+                }
+            }
+            if (changes) break;
+        }
+        if (anchor == steady_start + common_period
+            || anchor + common_period > timeline.length_counts) return;
+        timeline.loop_start_count = anchor;
+        timeline.loop_end_count = anchor + common_period;
+        return;
+    }
+    const auto speed = softwareLfoSpeedPeriod(mod.speed);
+    const auto first = softwareLfoFirstUpdateTick(
+        mod.delay, mod.speed);
+    int base = 0;
+    int maximum = 0;
+    if (target == Target::Volume) {
+        base = layer.volume;
+        for (const auto& event : layer.volume_envelope.events) {
+            if (event.kind == EnvelopeEventKind::Volume) {
+                base = event.value;
+            }
+        }
+        if (base < 0 || base > 15) {
+            return;
+        }
+        maximum = 15;
+    } else if (target == Target::Tl || target == Target::Fb) {
+        const auto image = opllOriginalRegisterImageAt(
+            layer, 0, library, true, false);
+        if (!image) {
+            return;
+        }
+        base = target == Target::Tl ? (*image)[2] & 0x3F
+                                    : (*image)[3] & 0x07;
+        maximum = target == Target::Tl ? 63 : 7;
+    }
+    std::uint32_t start = first;
+    std::uint32_t period = speed;
+    if (mod.mode == ModulationMode::Oscillate) {
+        const auto depth = static_cast<std::uint32_t>(
+            std::min<std::uint8_t>(mod.depth, 127)) + 1U;
+        // The first reversal has a transient prefix. A relative pitch loop
+        // must begin after it so the value just before the body repeats.
+        start += ((depth >> 1U) + 1U) * speed;
+        period = 2U * depth * speed;
+        if (target != Target::Pitch) {
+            // Absolute y writes are emitted only on value changes. Start at
+            // a real periodic change, so the next traversal repeats exactly
+            // the same writes, including clamped plateaus at either extreme.
+            const auto periodic_start = start;
+            while (start < periodic_start + period
+                   && modulationEffectiveValueAtCount(
+                       mod, start, base, 0, maximum)
+                       == modulationEffectiveValueAtCount(
+                           mod, start - 1U, base, 0, maximum)) {
+                start += speed;
+            }
+            if (start == periodic_start + period) {
+                return;
+            }
+        }
+    } else if (target != Target::Pitch) {
+        // Only pitch has a relative ENV change command. Absolute volume/y
+        // values cannot keep rising/falling by repeating the same body.
+        return;
+    }
+    if (start + period > timeline.length_counts) {
+        return;
+    }
+    timeline.loop_start_count = start;
+    timeline.loop_end_count = start + period;
+}
 
 [[nodiscard]] std::int32_t interpolatedLaneVolume(
     std::int32_t start_value,
@@ -38,7 +220,7 @@ namespace {
 }  // namespace
 
 [[nodiscard]] std::vector<std::uint8_t> compileCompositeEnvelopeLane(
-    const CompositeLayer& layer,
+    const CompositeLayer& source_layer,
     CompositeEnvelopeLane lane,
     const TimbreNumberResolution& numbers,
     const TimbreLibrary* library,
@@ -46,6 +228,8 @@ namespace {
     bool expand_tl_auto,
     bool expand_fb_auto,
     bool include_loop) {
+    const auto expanded = expandCompositeLayerModulations(source_layer, library);
+    const auto& layer = expanded;
     struct TimedEvent {
         std::uint32_t count{};
         mgstc::engine::EnvelopeEventKind kind{};
@@ -589,26 +773,69 @@ namespace {
     bool include_original_tone_y,
     bool expand_tl_auto,
     bool expand_fb_auto) {
-    return {
-        .volume = compileCompositeEnvelopeLane(
-            layer,
-            CompositeEnvelopeLane::Volume,
-            numbers,
-            library,
-            include_original_tone_y,
-            expand_tl_auto,
-            expand_fb_auto),
-        // Pitch `\` is in the volume `@e` stream (MGSDRV one bytecode).
-        .pitch = {},
-        .timbre = compileCompositeEnvelopeLane(
-            layer,
-            CompositeEnvelopeLane::Timbre,
-            numbers,
-            library,
-            include_original_tone_y,
-            expand_tl_auto,
-            expand_fb_auto),
-    };
+    // MGSDRV executes one @e byte stream. Compile the finalized MML token
+    // stream for audition as well, so ramp origin counts and intervening
+    // pitch/timbre/y commands have exactly the exported order and timing.
+    auto formatted_layer = layer;
+    if (include_original_tone_y && !expand_tl_auto) {
+        formatted_layer.opll_tl_auto = {};
+        formatted_layer.opll_tl_modulation.enabled = false;
+    }
+    if (include_original_tone_y && !expand_fb_auto) {
+        formatted_layer.opll_fb_auto = {};
+        formatted_layer.opll_fb_modulation.enabled = false;
+    }
+    const auto formatted = formatMgsCompositeEnvelope(
+        formatted_layer, 0, kMgscEnvelopeCompiledByteLimit,
+        &numbers, library);
+    if (!formatted.valid()) {
+        return {};
+    }
+    if (include_original_tone_y) {
+        return {.volume = formatted.bytecode};
+    }
+    auto voice_layer = layer;
+    auto& voice_events = voice_layer.timbre_automation;
+    voice_events.erase(std::remove_if(voice_events.begin(), voice_events.end(),
+        [](const EnvelopeEvent& event) {
+            return event.kind == EnvelopeEventKind::RegisterWrite
+                && event.value >= 0 && event.value <= 7;
+        }), voice_events.end());
+    voice_layer.opll_tl_auto = {};
+    voice_layer.opll_fb_auto = {};
+    voice_layer.opll_tl_modulation.enabled = false;
+    voice_layer.opll_fb_modulation.enabled = false;
+    const auto base_patch = layerBasePatchNumber(layer, &numbers);
+    const bool explicit_base_patch = std::any_of(
+        voice_events.begin(), voice_events.end(), [&](const EnvelopeEvent& event) {
+            return event.kind == EnvelopeEventKind::Timbre && event.count == 0
+                && !event.after_loop_start
+                && envelopeEventTimbreNumber(event, &numbers) == base_patch;
+        });
+    const bool omit_implicit_restore = base_patch && !explicit_base_patch
+        && layerEnvelopeNeedsLeadingBasePatch(layer, &numbers)
+        && !layerEnvelopeNeedsLeadingBasePatch(voice_layer, &numbers);
+    // Secondary voices suppress shared y writes only after the export budget
+    // and loop decision. Removing them before formatting would extend the
+    // playable prefix or change its period, diverging from the exported @e.
+    std::vector<std::uint8_t> voice_code;
+    voice_code.reserve(formatted.bytecode.size());
+    for (std::size_t at = 0; at < formatted.bytecode.size();) {
+        const auto opcode = formatted.bytecode[at];
+        const std::size_t size = opcode == 0x11 ? 3
+            : opcode == 0x10 || opcode == 0x12
+                || (opcode >= 0x20 && opcode <= 0x2F)
+                || opcode >= 0xE0 ? 2 : 1;
+        const bool shared_y = opcode == 0x11 && formatted.bytecode[at + 1] <= 7;
+        const bool implicit_restore = at == 0 && opcode == 0x10
+            && omit_implicit_restore && formatted.bytecode[at + 1] == *base_patch;
+        if (!shared_y && !implicit_restore) {
+            voice_code.insert(voice_code.end(), formatted.bytecode.begin() + at,
+                formatted.bytecode.begin() + at + size);
+        }
+        at += size;
+    }
+    return {.volume = std::move(voice_code)};
 }
 
 [[nodiscard]] std::vector<std::uint8_t> sampleCompositeVolumeLane(
@@ -620,15 +847,16 @@ namespace {
         return volumes;
     }
     const mgstc::engine::TimbreNumberResolution numbers{};
-    auto bytecode = compileCompositeEnvelopeLane(
-        layer,
-        CompositeEnvelopeLane::Volume,
-        numbers,
-        nullptr,
-        true,
-        false,
-        false,
-        false);
+    auto base_layer = layer;
+    base_layer.pitch_modulation.enabled = false;
+    base_layer.volume_modulation.enabled = false;
+    base_layer.opll_tl_modulation.enabled = false;
+    base_layer.opll_fb_modulation.enabled = false;
+    base_layer.opll_tl_auto = {};
+    base_layer.opll_fb_auto = {};
+    auto bytecode = formatMgsCompositeEnvelope(
+        base_layer, 0, std::numeric_limits<std::size_t>::max(),
+        &numbers).bytecode;
     mgstc::engine::SequenceEnvelopeRuntime runtime(std::move(bytecode));
     runtime.resetForKeyOn();
     mgstc::engine::EventBuffer buffer(16);
@@ -638,6 +866,192 @@ namespace {
         volumes[static_cast<std::size_t>(count)] = runtime.volume();
     }
     return volumes;
+}
+
+CompositeLayer expandCompositeLayerModulations(
+    const CompositeLayer& layer,
+    const TimbreLibrary* library,
+    bool optimize_loop) {
+    auto expanded = layer;
+    if (layer.volume_envelope.kind != EnvelopeKind::Sequence) {
+        expanded.pitch_modulation.enabled = false;
+        expanded.volume_modulation.enabled = false;
+        expanded.opll_tl_modulation.enabled = false;
+        expanded.opll_fb_modulation.enabled = false;
+        return expanded;
+    }
+    if (optimize_loop) {
+        maybeOptimizeModulationLoop(expanded, library);
+    }
+    // The evaluator and compiler share these exact 60 Hz count values.
+    // Only the temporary copy receives derived ENV commands.
+    expanded.pitch_modulation.enabled = false;
+    expanded.volume_modulation.enabled = false;
+    if (layer.pitch_modulation.enabled) {
+        const auto end = std::min(
+            expanded.envelope_timeline.loop_end_count.value_or(
+                expanded.envelope_timeline.length_counts),
+            expanded.envelope_timeline.length_counts);
+        auto previous = std::int32_t{0};
+        for (std::uint32_t count = 0; count < end; ++count) {
+            const auto current = modulationOffsetAtCount(
+                layer.pitch_modulation, count);
+            const auto delta = current - previous;
+            previous = current;
+            if (delta == 0) {
+                continue;
+            }
+            // Every update is one signed n4 step, hence within ENV \\ range.
+            expanded.pitch_envelope.events.push_back({
+                .kind = EnvelopeEventKind::Pitch,
+                .value = delta,
+                .count = count,
+                .after_loop_start = expanded.envelope_timeline.loop_start_count
+                    && count >= *expanded.envelope_timeline.loop_start_count,
+            });
+        }
+    }
+    if (layer.volume_modulation.enabled
+        && layer.volume_envelope.kind == EnvelopeKind::Sequence) {
+        const auto end = std::min(
+            expanded.envelope_timeline.loop_end_count.value_or(
+                expanded.envelope_timeline.length_counts),
+            expanded.envelope_timeline.length_counts);
+        // Sample the authoring Base ENV with modulation disabled and without
+        // loop expansion; this also preserves MGSDRV's integer ramp values.
+        const auto base = sampleCompositeVolumeLane(
+            expanded, static_cast<int>(end));
+        expanded.volume_envelope.events.erase(
+            std::remove_if(
+                expanded.volume_envelope.events.begin(),
+                expanded.volume_envelope.events.end(),
+                [](const EnvelopeEvent& event) {
+                    return event.kind == EnvelopeEventKind::Volume;
+                }),
+            expanded.volume_envelope.events.end());
+        std::int32_t previous = -1;
+        for (std::uint32_t count = 0; count < end; ++count) {
+            const auto value = modulationEffectiveValueAtCount(
+                layer.volume_modulation,
+                count,
+                base[static_cast<std::size_t>(count)], 0, 15);
+            if (value == previous
+                && (!expanded.envelope_timeline.loop_start_count
+                    || count != *expanded.envelope_timeline.loop_start_count)) {
+                continue;
+            }
+            expanded.volume_envelope.events.push_back({
+                .kind = EnvelopeEventKind::Volume,
+                .value = value,
+                .count = count,
+            });
+            previous = value;
+        }
+    }
+    return expanded;
+}
+
+bool compositeModulationLoopRepresentable(
+    const CompositeLayer& layer,
+    const TimbreLibrary* library) {
+    if (layer.volume_envelope.kind != EnvelopeKind::Sequence) {
+        return true;
+    }
+    const auto& timeline = layer.envelope_timeline;
+    if (!timeline.loop_start_count || !timeline.loop_end_count) {
+        return true;
+    }
+    const auto start = *timeline.loop_start_count;
+    const auto end = *timeline.loop_end_count;
+    if (start >= end || end > timeline.length_counts) {
+        return false;
+    }
+    const auto span = end - start;
+    const auto phase_fits = [start, span](
+        const ModulationParameters& mod, bool relative) {
+        if (!mod.enabled || mod.roughness == 0) {
+            return true;
+        }
+        const auto first = softwareLfoFirstUpdateTick(
+            mod.delay, mod.speed);
+        const auto speed = softwareLfoSpeedPeriod(mod.speed);
+        if (mod.mode == ModulationMode::Oscillate) {
+            const auto depth = static_cast<std::uint32_t>(
+                std::min<std::uint8_t>(mod.depth, 127)) + 1U;
+            const auto periodic_start = first
+                + (((depth >> 1U) + 1U) * speed);
+            const auto cycle = 2U * depth * speed;
+            return start >= periodic_start && span % cycle == 0;
+        }
+        return !relative || (start >= first && span % speed == 0);
+    };
+    if (!phase_fits(layer.pitch_modulation, true)
+        || !phase_fits(layer.volume_modulation, false)
+        || !phase_fits(layer.opll_tl_modulation, false)
+        || !phase_fits(layer.opll_fb_modulation, false)) {
+        return false;
+    }
+
+    // An absolute Step target is only invariant on all later loop passes
+    // after it reaches the same clamp boundary that later updates hold.
+    const auto stable_step = [start](
+        const ModulationParameters& mod, int base, int max_value) {
+        if (!mod.enabled || mod.roughness == 0
+            || mod.mode == ModulationMode::Oscillate) {
+            return true;
+        }
+        // The body must already be at its final clamp before the anchor.
+        // Otherwise its first-pass transition would be retransmitted on
+        // every traversal even though continuous Step has stopped changing.
+        const auto effective = base + modulationOffsetAtCount(
+            mod, start == 0 ? 0 : start - 1);
+        return mod.mode == ModulationMode::StepUp
+            ? effective >= max_value : effective <= 0;
+    };
+    if (layer.volume_modulation.enabled
+        && layer.volume_modulation.roughness != 0) {
+        if (std::any_of(
+                layer.volume_envelope.events.begin(),
+                layer.volume_envelope.events.end(),
+                [start, end](const EnvelopeEvent& event) {
+                    return event.kind == EnvelopeEventKind::Volume
+                        && ((event.count >= start && event.count <= end)
+                            || event.automatic);
+                })) {
+            return false;
+        }
+        if (layer.volume_modulation.mode != ModulationMode::Oscillate) {
+            const auto base = sampleCompositeVolumeLane(
+                layer, static_cast<int>(start) + 1);
+            if (base.empty() || !stable_step(
+                    layer.volume_modulation, base.back(), 15)) {
+                return false;
+            }
+        }
+    }
+    if (layer.opll_tl_modulation.enabled
+        || layer.opll_fb_modulation.enabled) {
+        if (std::any_of(
+                layer.timbre_automation.begin(),
+                layer.timbre_automation.end(),
+                [start, end](const EnvelopeEvent& event) {
+                    return event.count >= start && event.count <= end;
+                })) {
+            return false;
+        }
+        const auto image = opllOriginalRegisterImageAt(
+            layer, start, library, true, false);
+        if (!image) {
+            return false;
+        }
+        if (!stable_step(
+                layer.opll_tl_modulation, (*image)[2] & 0x3F, 63)
+            || !stable_step(
+                layer.opll_fb_modulation, (*image)[3] & 0x07, 7)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace mgstc::engine

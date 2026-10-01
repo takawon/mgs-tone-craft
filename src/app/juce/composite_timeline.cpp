@@ -39,6 +39,7 @@
 
 #include "mgstc/engine/chip_volume_curve.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
+#include "mgstc/engine/composite_modulation.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/envelope_rate.hpp"
 #include "mgstc/engine/envelope_sequence.hpp"
@@ -1619,6 +1620,189 @@ private:
     SoftwareLfoWavePreview wave_;
     juce::Label hint_;
     juce::TextButton preview_;
+    juce::TextButton close_;
+};
+
+enum class TimelineModulationTarget : std::uint8_t {
+    Pitch,
+    Tremolo,
+    TotalLevel,
+    Feedback,
+};
+
+[[nodiscard]] juce::String timelineModulationName(
+    TimelineModulationTarget target) {
+    switch (target) {
+    case TimelineModulationTarget::Pitch: return "Pitch LFO";
+    case TimelineModulationTarget::Tremolo: return "Tremolo";
+    case TimelineModulationTarget::TotalLevel: return "TL LFO";
+    case TimelineModulationTarget::Feedback: return "FB LFO";
+    }
+    return {};
+}
+
+class TimelineModulationDialogContent final : public juce::Component {
+public:
+    using ChangeCallback = std::function<void(
+        const mgstc::engine::ModulationParameters&, bool)>;
+
+    TimelineModulationDialogContent(
+        TimelineModulationTarget target,
+        mgstc::engine::ModulationParameters initial,
+        bool free_curve,
+        ChangeCallback on_change)
+        : on_change_(std::move(on_change)) {
+        title_.setText(timelineModulationName(target), juce::dontSendNotification);
+        title_.setFont(UiFonts::heading());
+        addAndMakeVisible(title_);
+
+        enabled_.setButtonText(juce::String::fromUTF8("有効"));
+        enabled_.setLookAndFeel(&switch_look_and_feel_);
+        enabled_.onClick = [this] { commit(); };
+        addAndMakeVisible(enabled_);
+
+        mode_label_.setText(juce::String::fromUTF8("モード"), juce::dontSendNotification);
+        mode_label_.setFont(UiFonts::body());
+        addAndMakeVisible(mode_label_);
+        mode_.addItem(juce::String::fromUTF8("往復"), 1);
+        mode_.addItem(juce::String::fromUTF8("上昇"), 2);
+        mode_.addItem(juce::String::fromUTF8("下降"), 3);
+        if (target == TimelineModulationTarget::TotalLevel
+            || target == TimelineModulationTarget::Feedback) {
+            mode_.addItem(juce::String::fromUTF8("自由曲線"), 4);
+        }
+        mode_.onChange = [this] { updateParamAvailability(); commit(); };
+        addAndMakeVisible(mode_);
+
+        configureParam(delay_, delay_label_, juce::String::fromUTF8("ディレイ"),
+            0, 255, juce::String::fromUTF8("開始までのカウント (0～255)"));
+        configureParam(depth_, depth_label_, juce::String::fromUTF8("深さ"),
+            0, 127, juce::String::fromUTF8("往復モードの折り返しステップ数 (0～127)"));
+        configureParam(speed_, speed_label_, juce::String::fromUTF8("速度"),
+            0, 255, juce::String::fromUTF8("1ステップの更新間隔 (0～255)"));
+        configureParam(roughness_, roughness_label_, juce::String::fromUTF8("粗さ"),
+            -127, 127, juce::String::fromUTF8(
+                "1ステップの変化量 (−127～127)。上昇／下降では絶対値を使用"));
+
+        hint_.setText(juce::String::fromUTF8(
+            "上昇／下降では深さを使わず、粗さの絶対値で変化します。"),
+            juce::dontSendNotification);
+        hint_.setFont(UiFonts::body());
+        hint_.setColour(juce::Label::textColourId, juce::Colour(0xFFB9C6D2));
+        addAndMakeVisible(hint_);
+
+        close_.setButtonText(juce::String::fromUTF8("閉じる"));
+        close_.onClick = [this] {
+            if (auto* window = findParentComponentOfClass<juce::DialogWindow>()) {
+                window->exitModalState(0);
+            }
+        };
+        addAndMakeVisible(close_);
+
+        assigning_ = true;
+        enabled_.setToggleState(initial.enabled || free_curve,
+            juce::dontSendNotification);
+        mode_.setSelectedId(free_curve ? 4 : static_cast<int>(initial.mode) + 1,
+            juce::dontSendNotification);
+        delay_.setValue(initial.delay, juce::dontSendNotification);
+        depth_.setValue(initial.depth, juce::dontSendNotification);
+        speed_.setValue(initial.speed, juce::dontSendNotification);
+        roughness_.setValue(initial.roughness, juce::dontSendNotification);
+        assigning_ = false;
+        updateParamAvailability();
+        setSize(UiLayout::compositeLfoDialogW,
+            UiLayout::panelPad * 2 + UiLayout::titleH + UiLayout::xs
+                + UiLayout::textButtonH + UiLayout::sm
+                + (UiLayout::fieldH + UiLayout::controlGap) * 5
+                + UiLayout::fieldH * 2 + UiLayout::sm
+                + UiLayout::textButtonH);
+    }
+
+    ~TimelineModulationDialogContent() override {
+        enabled_.setLookAndFeel(nullptr);
+    }
+
+    void resized() override {
+        using namespace UiLayout;
+        auto area = getLocalBounds().reduced(panelPad);
+        title_.setBounds(area.removeFromTop(titleH));
+        area.removeFromTop(xs);
+        enabled_.setBounds(area.removeFromTop(textButtonH).removeFromLeft(
+            switchControlWidth(juce::String::fromUTF8("有効"), textButtonH)));
+        area.removeFromTop(sm);
+        layoutParam(area.removeFromTop(fieldH), mode_label_, mode_);
+        area.removeFromTop(controlGap);
+        layoutParam(area.removeFromTop(fieldH), delay_label_, delay_);
+        area.removeFromTop(controlGap);
+        layoutParam(area.removeFromTop(fieldH), depth_label_, depth_);
+        area.removeFromTop(controlGap);
+        layoutParam(area.removeFromTop(fieldH), speed_label_, speed_);
+        area.removeFromTop(controlGap);
+        layoutParam(area.removeFromTop(fieldH), roughness_label_, roughness_);
+        area.removeFromTop(sm);
+        hint_.setBounds(area.removeFromTop(fieldH * 2));
+        close_.setBounds(area.removeFromBottom(textButtonH)
+            .removeFromLeft(libraryButtonMinW));
+    }
+
+private:
+    void configureParam(juce::Slider& slider, juce::Label& label,
+        const juce::String& name, int minimum, int maximum,
+        const juce::String& tooltip) {
+        label.setText(name, juce::dontSendNotification);
+        label.setFont(UiFonts::body());
+        label.setTooltip(tooltip);
+        addAndMakeVisible(label);
+        slider.setRange(minimum, maximum, 1.0);
+        slider.setSliderStyle(juce::Slider::LinearHorizontal);
+        slider.setTextBoxStyle(juce::Slider::TextBoxLeft, false,
+            UiLayout::setupValueLabelW / 2, UiLayout::fieldH - UiLayout::panelPad);
+        slider.setTooltip(tooltip);
+        slider.onValueChange = [this] { commit(); };
+        addAndMakeVisible(slider);
+    }
+
+    static void layoutParam(juce::Rectangle<int> area,
+        juce::Label& label, juce::Component& field) {
+        label.setBounds(area.removeFromLeft(UiLayout::setupValueLabelW));
+        area.removeFromLeft(UiLayout::xs);
+        field.setBounds(area);
+    }
+
+    void updateParamAvailability() {
+        const bool free_curve = mode_.getSelectedId() == 4;
+        for (auto* control : {&delay_, &speed_, &roughness_}) {
+            control->setEnabled(!free_curve);
+        }
+        depth_.setEnabled(mode_.getSelectedId() == 1);
+        hint_.setText(free_curve
+            ? juce::String::fromUTF8("自由曲線は TL/FB 自動レーンで描画します。")
+            : juce::String::fromUTF8(
+                "上昇／下降では深さを使わず、粗さの絶対値で変化します。"),
+            juce::dontSendNotification);
+    }
+
+    void commit() {
+        if (assigning_ || !on_change_) return;
+        mgstc::engine::ModulationParameters settings;
+        settings.enabled = enabled_.getToggleState();
+        settings.mode = static_cast<mgstc::engine::ModulationMode>(
+            juce::jlimit(0, 2, mode_.getSelectedId() - 1));
+        settings.delay = static_cast<std::uint8_t>(delay_.getValue());
+        settings.depth = static_cast<std::uint8_t>(depth_.getValue());
+        settings.speed = static_cast<std::uint8_t>(speed_.getValue());
+        settings.roughness = static_cast<std::int8_t>(roughness_.getValue());
+        on_change_(settings, mode_.getSelectedId() == 4);
+    }
+
+    ChangeCallback on_change_;
+    bool assigning_{};
+    SwitchLookAndFeel switch_look_and_feel_;
+    juce::Label title_, mode_label_, delay_label_, depth_label_, speed_label_,
+        roughness_label_, hint_;
+    juce::ToggleButton enabled_;
+    juce::ComboBox mode_;
+    juce::Slider delay_, depth_, speed_, roughness_;
     juce::TextButton close_;
 };
 
@@ -3712,7 +3896,16 @@ public:
                 return;
             }
             if (isRegisterAutoParameter(selectedParameter())) {
-                applyRegisterAutoFromEditors(true);
+                if (selectedRegisterAutoLane() != nullptr
+                    && selectedRegisterAutoLane()->mode
+                        == mgstc::engine::OpllRegisterAutoMode::FreeCurve) {
+                    applyRegisterAutoFromEditors(true);
+                } else {
+                    openTimelineModulationDialog(
+                        selectedParameter() == Parameter::OpllTlAuto
+                            ? TimelineModulationTarget::TotalLevel
+                            : TimelineModulationTarget::Feedback);
+                }
                 return;
             }
             if (selectedParameter() == Parameter::Timbre) {
@@ -3821,6 +4014,39 @@ public:
             inspector_content_.addAndMakeVisible(*c);
         }
 
+        modulation_heading_.setText(
+            "LFO / Modulation", juce::dontSendNotification);
+        modulation_heading_.setFont(UiFonts::heading());
+        inspector_content_.addAndMakeVisible(modulation_heading_);
+        modulation_issue_.setFont(UiFonts::body());
+        modulation_issue_.setColour(
+            juce::Label::textColourId, juce::Colour(0xFFE7A083));
+        inspector_content_.addAndMakeVisible(modulation_issue_);
+        constexpr std::array<const char*, 4> modulation_labels{
+            "Pitch", "Tremolo", "TL", "FB"};
+        for (std::size_t index = 0; index < modulation_labels.size(); ++index) {
+            auto& label = modulation_labels_[index];
+            label.setText(modulation_labels[index], juce::dontSendNotification);
+            label.setFont(UiFonts::body());
+            inspector_content_.addAndMakeVisible(label);
+            auto& toggle = modulation_toggles_[index];
+            toggle.setButtonText("ON");
+            toggle.setLookAndFeel(&modulation_switch_look_and_feel_);
+            toggle.onClick = [this, index] {
+                setTimelineModulationEnabled(
+                    static_cast<TimelineModulationTarget>(index),
+                    toggleStateForModulation(index));
+            };
+            inspector_content_.addAndMakeVisible(toggle);
+            auto& setup = modulation_settings_[index];
+            setup.setButtonText(juce::String::fromUTF8("設定"));
+            setup.onClick = [this, index] {
+                openTimelineModulationDialog(
+                    static_cast<TimelineModulationTarget>(index));
+            };
+            inspector_content_.addAndMakeVisible(setup);
+        }
+
         command_view_.setViewedComponent(&command_stack_, false);
         command_view_.setScrollBarsShown(true, false);
         inspector_content_.addAndMakeVisible(command_view_);
@@ -3874,6 +4100,9 @@ public:
 
     ~Impl() override {
         closeRateEditor(false);
+        for (auto& toggle : modulation_toggles_) {
+            toggle.setLookAndFeel(nullptr);
+        }
         horizontal_scroll_.removeListener(this);
         vertical_scroll_.removeListener(this);
     }
@@ -4092,10 +4321,12 @@ public:
             "17-channel overview scroll changed selected edit or data");
         count_tab_.onClick();
         parameter_.setSelectedId(static_cast<int>(Parameter::OpllTlAuto), juce::sendNotificationSync);
-        check(auto_mode_.isVisible(), "TL selection did not show auto controls");
+        check(modulation_toggles_[2].isVisible(),
+            "TL selection did not show modulation controls");
         parameter_.setSelectedId(static_cast<int>(Parameter::Volume), juce::sendNotificationSync);
-        check(!auto_mode_.isVisible() && timbre_ == full && callbacks == 0,
-            "auto control navigation changed data or remained visible");
+        check(modulation_toggles_[1].isVisible()
+                && timbre_ == full && callbacks == 0,
+            "modulation control navigation changed data or visibility");
         save("workspace-17-count");
         focus_.setToggleState(true, juce::dontSendNotification); focus_.onClick();
         save("workspace-focus");
@@ -4148,6 +4379,9 @@ public:
 
     void setTimbreLibraryCallback(TimbreLibraryCallback callback) {
         timbre_library_callback_ = std::move(callback);
+        refreshCountCeilingCache();
+        updateEnvelopeMmlPreview();
+        repaint();
     }
 
     void setManageTagsCallback(ManageTagsCallback callback) {
@@ -4433,7 +4667,7 @@ public:
         timbre_.playback_tempo = playback_tempo_;
         tempo_.setText(
             juce::String(playback_tempo_), juce::dontSendNotification);
-        clampAllLayersToBodyLimit();
+        clampAllLayersToTimelineRange();
         selected_layer_ = timbre_.layers.empty()
             ? -1
             : juce::jlimit(
@@ -4535,6 +4769,7 @@ public:
         inspector_view_.setBounds(side);
         inspector_content_.setSize(juce::jmax(1, side.getWidth() - kScrollBarSize),
             count_inspector_ ? UiLayout::compositeInspectorContentH
+                + (UiLayout::fieldH + UiLayout::sm) * 5
                 : panelPad * 2 + (fieldH + sm) * 17 + (libraryTitleH + sm) * 3);
         overview_view_.setVisible(!focus_.getToggleState());
         overview_view_.setBounds(overviewArea());
@@ -4843,6 +5078,155 @@ private:
         resized(); repaint();
     }
 
+    [[nodiscard]] bool toggleStateForModulation(std::size_t index) const {
+        return modulation_toggles_[index].getToggleState();
+    }
+
+    [[nodiscard]] static mgstc::engine::ModulationParameters& modulationFor(
+        mgstc::engine::CompositeLayer& layer,
+        TimelineModulationTarget target) {
+        switch (target) {
+        case TimelineModulationTarget::Pitch: return layer.pitch_modulation;
+        case TimelineModulationTarget::Tremolo: return layer.volume_modulation;
+        case TimelineModulationTarget::TotalLevel: return layer.opll_tl_modulation;
+        case TimelineModulationTarget::Feedback: return layer.opll_fb_modulation;
+        }
+        return layer.pitch_modulation;
+    }
+
+    [[nodiscard]] static mgstc::engine::OpllRegisterAutoLane* freeCurveFor(
+        mgstc::engine::CompositeLayer& layer,
+        TimelineModulationTarget target) {
+        if (target == TimelineModulationTarget::TotalLevel)
+            return &layer.opll_tl_auto;
+        if (target == TimelineModulationTarget::Feedback)
+            return &layer.opll_fb_auto;
+        return nullptr;
+    }
+
+    void syncTimelineModulationControls() {
+        const bool selected = selected_layer_ >= 0
+            && selected_layer_ < static_cast<int>(timbre_.layers.size());
+        for (std::size_t index = 0; index < modulation_toggles_.size(); ++index) {
+            const auto target = static_cast<TimelineModulationTarget>(index);
+            const bool supported = selected
+                && timbre_.layers[static_cast<std::size_t>(selected_layer_)]
+                    .volume_envelope.kind == mgstc::engine::EnvelopeKind::Sequence
+                && (index < 2 || timbre_.layers[static_cast<std::size_t>(selected_layer_)]
+                    .source == mgstc::engine::TimbreSource::Opll);
+            bool active = false;
+            if (supported) {
+                auto& layer = timbre_.layers[static_cast<std::size_t>(selected_layer_)];
+                active = modulationFor(layer, target).enabled;
+                if (auto* curve = freeCurveFor(layer, target)) {
+                    active = active || curve->mode
+                        == mgstc::engine::OpllRegisterAutoMode::FreeCurve;
+                }
+            }
+            modulation_toggles_[index].setToggleState(
+                active, juce::dontSendNotification);
+            modulation_toggles_[index].setButtonText(active ? "ON" : "OFF");
+            modulation_toggles_[index].setEnabled(supported);
+            modulation_settings_[index].setEnabled(supported);
+            modulation_labels_[index].setEnabled(supported);
+        }
+    }
+
+    void applyTimelineModulation(
+        std::size_t layer_index,
+        TimelineModulationTarget target,
+        mgstc::engine::ModulationParameters settings,
+        bool free_curve) {
+        if (layer_index >= timbre_.layers.size()) return;
+        auto& layer = timbre_.layers[layer_index];
+        if (layer.volume_envelope.kind != mgstc::engine::EnvelopeKind::Sequence)
+            return;
+        if ((target == TimelineModulationTarget::TotalLevel
+                || target == TimelineModulationTarget::Feedback)
+            && layer.source != mgstc::engine::TimbreSource::Opll) return;
+        if (settings.enabled && (target == TimelineModulationTarget::TotalLevel
+                || target == TimelineModulationTarget::Feedback)) {
+            const auto register_target = target == TimelineModulationTarget::TotalLevel
+                ? mgstc::engine::OpllRegisterAutoTarget::TotalLevel
+                : mgstc::engine::OpllRegisterAutoTarget::Feedback;
+            if (!mgstc::engine::opllRegisterAutoOwnedByLayer(
+                    timbre_, layer_index, register_target)) {
+                reportStatus(juce::String::fromUTF8(
+                    "TL/FB自動はそれぞれOPLL全体で1チャンネルのみ設定できます"));
+                syncTimelineModulationControls();
+                return;
+            }
+        }
+        settings = mgstc::engine::clampModulation(settings);
+        modulationFor(layer, target) = settings;
+        if (auto* curve = freeCurveFor(layer, target)) {
+            if (free_curve) {
+                modulationFor(layer, target).enabled = false;
+                curve->mode = settings.enabled
+                    ? mgstc::engine::OpllRegisterAutoMode::FreeCurve
+                    : mgstc::engine::OpllRegisterAutoMode::Off;
+                if (curve->free_curve.empty() && settings.enabled) {
+                    curve->free_curve.push_back(curve->depth);
+                }
+            } else {
+                curve->mode = mgstc::engine::OpllRegisterAutoMode::Off;
+            }
+        }
+        static_cast<void>(mgstc::engine::enforceOpllRegisterAutoExclusivity(timbre_));
+        syncTimelineModulationControls();
+        syncRegisterAutoEditors();
+        updateEnvelopeMmlPreview();
+        repaint();
+        if (edit_callback_) edit_callback_(timbre_, true, true);
+    }
+
+    void setTimelineModulationEnabled(
+        TimelineModulationTarget target, bool enabled) {
+        if (selected_layer_ < 0
+            || selected_layer_ >= static_cast<int>(timbre_.layers.size())) return;
+        const auto layer_index = static_cast<std::size_t>(selected_layer_);
+        auto& layer = timbre_.layers[layer_index];
+        if (layer.volume_envelope.kind != mgstc::engine::EnvelopeKind::Sequence)
+            return;
+        const auto* curve = freeCurveFor(layer, target);
+        const bool free_curve = curve != nullptr
+            && curve->mode == mgstc::engine::OpllRegisterAutoMode::FreeCurve;
+        auto settings = modulationFor(layer, target);
+        settings.enabled = enabled;
+        applyTimelineModulation(layer_index, target, settings, free_curve);
+    }
+
+    void openTimelineModulationDialog(TimelineModulationTarget target) {
+        if (selected_layer_ < 0
+            || selected_layer_ >= static_cast<int>(timbre_.layers.size())) return;
+        const auto layer_index = static_cast<std::size_t>(selected_layer_);
+        auto& layer = timbre_.layers[layer_index];
+        if (layer.volume_envelope.kind != mgstc::engine::EnvelopeKind::Sequence)
+            return;
+        const auto* curve = freeCurveFor(layer, target);
+        const bool free_curve = curve != nullptr
+            && curve->mode == mgstc::engine::OpllRegisterAutoMode::FreeCurve;
+        UiScale::forceGlobalForNonEditorUi();
+        auto* dialog = new ModalDialogWindow(
+            timelineModulationName(target), juce::Colour(0xFF1B222C));
+        auto* content = new TimelineModulationDialogContent(
+            target, modulationFor(layer, target), free_curve,
+            [safe = juce::Component::SafePointer<Impl>(this), layer_index, target](
+                const mgstc::engine::ModulationParameters& settings,
+                bool use_free_curve) {
+                if (safe != nullptr) {
+                    safe->applyTimelineModulation(
+                        layer_index, target, settings, use_free_curve);
+                }
+            });
+        dialog->setUsingNativeTitleBar(true);
+        dialog->setResizable(false, false);
+        dialog->setContentOwned(content, true);
+        dialog->centreAroundComponent(
+            this, content->getWidth(), content->getHeight() + UiLayout::fieldH);
+        dialog->enterModalState(true, nullptr, true);
+    }
+
     juce::Rectangle<int> inspectorArea() const {
         auto a = getLocalBounds().reduced(UiLayout::panelPad);
         a.removeFromTop(timelineChromeHeight());
@@ -4961,6 +5345,7 @@ private:
             }
             drawScope(g, plot, i, colour.withAlpha(0.6F));
             drawTimelineMarkers(g, plot, i, colour);
+            drawOutputCutoff(g, plot, i);
         }
     }
 
@@ -5072,7 +5457,8 @@ private:
         const bool count_ok =
             enabled && owned && registerAutoAvailableAtSelectedCount();
         // Other OPLL layers may view Off, but cannot take ownership.
-        auto_mode_.setEnabled(enabled && (owned || !lane->active()));
+        // The common dialog owns mode changes; this row only edits FreeCurve.
+        auto_mode_.setEnabled(false);
         auto_depth_.setEnabled(enabled && owned);
         auto_speed_.setEnabled(enabled && owned);
         auto_coarseness_.setEnabled(enabled && owned);
@@ -5168,9 +5554,16 @@ private:
             && set_start_count) {
             lane->free_curve.push_back(lane->depth);
         }
+        if (lane->mode == mgstc::engine::OpllRegisterAutoMode::FreeCurve) {
+            auto& layer = timbre_.layers[layer_index];
+            (target == mgstc::engine::OpllRegisterAutoTarget::TotalLevel
+                ? layer.opll_tl_modulation : layer.opll_fb_modulation).enabled = false;
+        }
         static_cast<void>(
             mgstc::engine::enforceOpllRegisterAutoExclusivity(timbre_));
         syncRegisterAutoEditors();
+        syncTimelineModulationControls();
+        updateEnvelopeMmlPreview();
         repaint();
         if (edit_callback_) {
             edit_callback_(timbre_, true, true);
@@ -5277,7 +5670,7 @@ private:
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
             return cached_count_ceiling_;
         }
-        return cached_layer_fit_;
+        return cached_count_ceiling_;
     }
 
     [[nodiscard]] int contentHorizonCount() const noexcept {
@@ -5377,42 +5770,28 @@ private:
     }
 
     void refreshCountCeilingCache() {
-        std::uint32_t max_fit = 1;
-        std::uint32_t selected_fit = 1;
+        cached_count_ceiling_ = static_cast<int>(
+            mgstc::engine::kMgscEnvelopeUiLengthCap);
+        output_cutoff_counts_.assign(timbre_.layers.size(), std::nullopt);
         const auto numbers = mgstc::engine::resolveTimbreNumbers(timbre_);
         const auto* library = timbreLibrary();
         for (std::size_t index = 0; index < timbre_.layers.size(); ++index) {
             const auto& layer = timbre_.layers[index];
-            const auto fit = mgstc::engine::maxEnvelopeLengthFittingBodyLimit(
+            if (layer.volume_envelope.kind != mgstc::engine::EnvelopeKind::Sequence) {
+                continue;
+            }
+            const auto formatted = mgstc::engine::formatMgsCompositeEnvelope(
                 layer,
+                layer.envelope_number,
                 mgstc::engine::kMgscEnvelopeCompiledByteLimit,
                 &numbers,
                 library);
-            max_fit = std::max(max_fit, fit);
-            max_fit = std::max(max_fit, layer.envelope_timeline.length_counts);
-            if (static_cast<int>(index) == selected_layer_) {
-                selected_fit = fit;
-            }
+            output_cutoff_counts_[index] = formatted.output_cutoff_count;
         }
-        cached_count_ceiling_ = static_cast<int>(std::min(
-            max_fit, mgstc::engine::kMgscEnvelopeUiLengthCap));
-        cached_layer_fit_ = selected_layer_ >= 0
-            ? static_cast<int>(std::min(
-                  selected_fit, mgstc::engine::kMgscEnvelopeUiLengthCap))
-            : cached_count_ceiling_;
     }
 
-    void clampLayerToBodyLimit(mgstc::engine::CompositeLayer& layer) {
-        const auto numbers = mgstc::engine::resolveTimbreNumbers(timbre_);
-        const auto fit = mgstc::engine::maxEnvelopeLengthFittingBodyLimit(
-            layer,
-            mgstc::engine::kMgscEnvelopeCompiledByteLimit,
-            &numbers,
-            timbreLibrary());
+    void clampLayerToTimelineRange(mgstc::engine::CompositeLayer& layer) {
         auto& timeline = layer.envelope_timeline;
-        if (timeline.length_counts > fit) {
-            timeline.length_counts = juce::jmax<std::uint32_t>(1, fit);
-        }
         if (timeline.loop_start_count
             && *timeline.loop_start_count > timeline.length_counts) {
             timeline.loop_start_count = timeline.length_counts;
@@ -5423,9 +5802,9 @@ private:
         }
     }
 
-    void clampAllLayersToBodyLimit() {
+    void clampAllLayersToTimelineRange() {
         for (auto& layer : timbre_.layers) {
-            clampLayerToBodyLimit(layer);
+            clampLayerToTimelineRange(layer);
         }
         refreshCountCeilingCache();
     }
@@ -5489,6 +5868,7 @@ private:
     }
 
     void syncInspector() {
+        syncTimelineModulationControls();
         const bool has_selection = selected_layer_ >= 0
             && selected_layer_ < static_cast<int>(timbre_.layers.size());
         length_editor_.setEnabled(has_selection);
@@ -6306,12 +6686,14 @@ private:
         const auto kind = selectedEventKind();
         bool automatic = false;
         bool precise = false;
+        std::int32_t ramp_start_metadata = 0;
         for (const auto& event : events) {
             if (event.kind == kind
                 && event.count
                     == static_cast<std::uint32_t>(timeline_count)) {
                 automatic = event.automatic;
                 precise = event.precise;
+                ramp_start_metadata = event.secondary;
                 break;
             }
         }
@@ -6325,6 +6707,7 @@ private:
         }
         if (!automatic) {
             precise = false;
+            ramp_start_metadata = 0;
         }
         std::erase_if(events, [kind, timeline_count](const auto& event) {
             return event.kind == kind
@@ -6333,6 +6716,7 @@ private:
         events.push_back({
             .kind = kind,
             .value = parameter_value,
+            .secondary = ramp_start_metadata,
             .count = static_cast<std::uint32_t>(timeline_count),
             .automatic = automatic,
             .precise = precise,
@@ -6400,16 +6784,6 @@ private:
             return;
         case EditMode::End: {
             timeline.length_counts = juce::jmax<std::uint32_t>(1, count);
-            const auto fit = static_cast<std::uint32_t>(
-                maximumCountForSelectedLayer());
-            if (timeline.length_counts > fit) {
-                timeline.length_counts = fit;
-                reportStatus(
-                    juce::String::fromUTF8(
-                        "@e はコンパイル後256バイトまでです。END を ")
-                    + juce::String(static_cast<int>(fit))
-                    + juce::String::fromUTF8(" に制限しました"));
-            }
             if (timeline.loop_start_count
                 && *timeline.loop_start_count > timeline.length_counts) {
                 timeline.loop_start_count = timeline.length_counts;
@@ -6637,6 +7011,39 @@ private:
         }
     }
 
+    void drawOutputCutoff(
+        juce::Graphics& graphics,
+        juce::Rectangle<int> bounds,
+        std::size_t layer_index) const {
+        if (layer_index >= output_cutoff_counts_.size()
+            || !output_cutoff_counts_[layer_index]) {
+            return;
+        }
+        const auto count = *output_cutoff_counts_[layer_index];
+        const auto visible = visibleCountRange();
+        if (count < visible.getStart() || count > visible.getEnd()) {
+            return;
+        }
+        const int x = xForCount(bounds, static_cast<int>(count));
+        graphics.setColour(juce::Colours::red);
+        graphics.drawVerticalLine(
+            x, static_cast<float>(bounds.getY()),
+            static_cast<float>(bounds.getBottom()));
+        graphics.setFont(UiFonts::dense(true));
+        const auto label = juce::String::fromUTF8("@e出力上限");
+        const int label_width = juce::GlyphArrangement::getStringWidthInt(
+            graphics.getCurrentFont(), label)
+            + UiLayout::xs * 2;
+        const int label_x = juce::jlimit(
+            bounds.getX(), juce::jmax(bounds.getX(), bounds.getRight() - label_width),
+            x + UiLayout::xs);
+        graphics.drawText(
+            label, label_x, bounds.getY(), label_width,
+            static_cast<int>(std::ceil(graphics.getCurrentFont().getHeight()))
+                + UiLayout::xs,
+            juce::Justification::centredLeft, false);
+    }
+
     void drawAutomation(
         juce::Graphics& graphics,
         juce::Rectangle<int> bounds,
@@ -6728,6 +7135,9 @@ private:
         juce::Colour colour,
         float fill_opacity = 0.55F) const {
         const auto& layer = timbre_.layers[layer_index];
+        if (layer.volume_modulation.enabled) {
+            fill_opacity *= 0.45F;
+        }
         struct Point {
             int count{};
             int volume{};
@@ -6831,6 +7241,33 @@ private:
                     juce::jmax(1, bounds.getBottom() - juce::roundToInt(top)));
             }
             draw_output_span(start, juce::jmax(start + 1, stop));
+        }
+        if (layer.volume_modulation.enabled) {
+            const auto visible = visibleCountRange();
+            const int first = juce::jmax(0, static_cast<int>(
+                std::floor(visible.getStart())));
+            const int last = juce::jmin(end_count - 1, static_cast<int>(
+                std::ceil(visible.getEnd())));
+            juce::Path base_path, effective_path;
+            for (int count = first; count <= last; ++count) {
+                const int base = sampled[static_cast<std::size_t>(count)];
+                const int effective = mgstc::engine::modulationEffectiveValueAtCount(
+                    layer.volume_modulation, static_cast<std::uint32_t>(count),
+                    base, 0, 15);
+                const float x0 = static_cast<float>(xForCount(bounds, count));
+                const float x1 = static_cast<float>(xForCount(bounds, count + 1));
+                const float base_y = volumeYFromValue(layer.source, bounds, base);
+                const float effective_y = volumeYFromValue(
+                    layer.source, bounds, effective);
+                base_path.startNewSubPath(x0, base_y);
+                base_path.lineTo(x1, base_y);
+                effective_path.startNewSubPath(x0, effective_y);
+                effective_path.lineTo(x1, effective_y);
+            }
+            graphics.setColour(colour.withAlpha(0.45F));
+            graphics.strokePath(base_path, juce::PathStrokeType(1.0F));
+            graphics.setColour(colour.brighter(0.2F));
+            graphics.strokePath(effective_path, juce::PathStrokeType(2.0F));
         }
     }
 
@@ -7229,6 +7666,14 @@ private:
                 Parameter::OpllFbAuto, juce::String::fromUTF8("FB自動"));
         }
         drawTimelineMarkers(graphics, graphStrip(slots.volume), layer_index, colour);
+        auto output_bounds = graphStrip(slots.volume).getUnion(graphStrip(slots.pitch));
+        for (const auto slot : {slots.timbre, slots.register_write,
+                               slots.tl_auto, slots.fb_auto}) {
+            if (!slot.isEmpty()) {
+                output_bounds = output_bounds.getUnion(graphStrip(slot));
+            }
+        }
+        drawOutputCutoff(graphics, output_bounds, layer_index);
         {
             auto preview = slots.preview;
             auto label = preview.removeFromLeft(UiLayout::compositeOverviewLabelW);
@@ -7253,6 +7698,10 @@ private:
             timbre_.layers[static_cast<std::size_t>(selected_layer_)];
         const auto numbers = mgstc::engine::resolveTimbreNumbers(timbre_);
         juce::String definition;
+        juce::String validation_error;
+        juce::String output_notice;
+        output_cutoff_counts_.resize(timbre_.layers.size());
+        output_cutoff_counts_[static_cast<std::size_t>(selected_layer_)].reset();
         if (layer.volume_envelope.kind == mgstc::engine::EnvelopeKind::Rate) {
             definition = juce::String::fromUTF8(
                 mgstc::engine::formatMgsRateDefinition(
@@ -7269,16 +7718,54 @@ private:
                 timbre_.name);
             definition = juce::String::fromUTF8(formatted.definition.c_str())
                               .trimEnd();
+            output_cutoff_counts_[static_cast<std::size_t>(selected_layer_)] =
+                formatted.output_cutoff_count;
+            if (formatted.valid() && formatted.output_cutoff_count) {
+                output_notice = juce::String::fromUTF8("ct ")
+                    + juce::String(static_cast<int>(*formatted.output_cutoff_count))
+                    + juce::String::fromUTF8(
+                        " 以降は@e出力上限のため出力不可。試聴・鍵盤再生は生成した@eに従います。");
+            }
+            if (formatted.hasIssue(
+                    mgstc::engine::MgsEnvelopeIssue::DefinitionLengthExceeded)) {
+                validation_error = juce::String::fromUTF8(
+                    "エンベロープ設定がMGSCの上限を超えています (")
+                    + juce::String(static_cast<int>(formatted.compiled_bytes))
+                    + "/"
+                    + juce::String(static_cast<int>(
+                        mgstc::engine::kMgscEnvelopeCompiledByteLimit))
+                    + juce::String::fromUTF8("バイト)。MML出力と試聴を停止します。");
+            } else if (formatted.hasIssue(
+                    mgstc::engine::MgsEnvelopeIssue::UnrepresentableModulationLoop)) {
+                validation_error = juce::String::fromUTF8(
+                    "変調と手動[]ループの位相を正確に表せません。MML出力と試聴を停止します。");
+            } else if (!formatted.valid()) {
+                validation_error = juce::String::fromUTF8(
+                    "エンベロープ設定を@eに変換できません。MML出力と試聴を停止します。");
+            }
             if (definition.isEmpty()) {
-                definition = "@e"
-                    + juce::String(static_cast<int>(layer.envelope_number))
-                    + juce::String::fromUTF8(" = { }");
+                definition = validation_error.isNotEmpty()
+                    ? validation_error
+                    : "@e" + juce::String(static_cast<int>(layer.envelope_number))
+                        + juce::String::fromUTF8(" = { }");
             }
         }
+        const auto envelope_notice = validation_error.isNotEmpty()
+            ? validation_error : output_notice;
+        const bool new_notice = envelope_notice.isNotEmpty()
+            && envelope_notice != modulation_issue_.getText();
+        modulation_issue_.setText(envelope_notice, juce::dontSendNotification);
+        modulation_issue_.setTooltip(envelope_notice);
+        modulation_issue_.setVisible(
+            count_inspector_ && envelope_notice.isNotEmpty());
+        if (new_notice) reportStatus(envelope_notice);
         const auto track = juce::String::fromUTF8(
             mgstc::engine::formatMgsCompositeTrackPreview(layer, &numbers)
                 .c_str());
-        const auto preview_text = definition + "\n" + track;
+        const auto preview_text = validation_error.isNotEmpty()
+            ? validation_error
+            : definition + "\n" + track
+                + (output_notice.isNotEmpty() ? "\n; " + output_notice : juce::String{});
         if (preview_text == last_envelope_mml_preview_) {
             return;
         }
@@ -7365,7 +7852,11 @@ private:
                 }
             }
         }
-        if (auto_lane.mode == mgstc::engine::OpllRegisterAutoMode::Off) {
+        const bool common_active = parameter == Parameter::OpllTlAuto
+            ? layer.opll_tl_modulation.enabled
+            : layer.opll_fb_modulation.enabled;
+        if (auto_lane.mode == mgstc::engine::OpllRegisterAutoMode::Off
+            && !common_active) {
             graphics.setColour(juce::Colour(0xFF6B7785));
             graphics.setFont(UiFonts::dense());
             graphics.drawText(
@@ -7795,6 +8286,15 @@ private:
         if (hover_preview_value_) {
             extent = juce::jmax(extent, std::abs(*hover_preview_value_));
         }
+        if (layer.pitch_modulation.enabled) {
+            const int end = juce::jmax(1, maximumCount());
+            for (int count = 0; count <= end; ++count) {
+                const int effective = mgstc::engine::modulationEffectiveValueAtCount(
+                    layer.pitch_modulation, static_cast<std::uint32_t>(count),
+                    cumulativePitchAt(layer, count), -32768, 32767);
+                extent = juce::jmax(extent, std::abs(effective));
+            }
+        }
         const bool extra =
             layer.source != mgstc::engine::TimbreSource::Opll;
         if (layer.pitch_sweep.enabled
@@ -7825,7 +8325,7 @@ private:
         if (commit
             && selected_layer_ >= 0
             && selected_layer_ < static_cast<int>(timbre_.layers.size())) {
-            clampLayerToBodyLimit(
+            clampLayerToTimelineRange(
                 timbre_.layers[static_cast<std::size_t>(selected_layer_)]);
             refreshCountCeilingCache();
             updateScrollRanges();
@@ -8002,8 +8502,41 @@ private:
             y = next_y;
         }
         path.lineTo(static_cast<float>(bounds.getRight()), y);
-        graphics.setColour(colour);
-        graphics.strokePath(path, juce::PathStrokeType(2.0F));
+        graphics.setColour(layer.pitch_modulation.enabled
+            ? colour.withAlpha(0.45F) : colour);
+        graphics.strokePath(path, juce::PathStrokeType(
+            layer.pitch_modulation.enabled ? 1.0F : 2.0F));
+        if (layer.pitch_modulation.enabled) {
+            const auto visible = visibleCountRange();
+            const int first = juce::jmax(0, static_cast<int>(
+                std::floor(visible.getStart())));
+            const int last = juce::jmin(maximumCount(), static_cast<int>(
+                std::ceil(visible.getEnd())));
+            juce::Path effective_path;
+            bool started = false;
+            float previous_y = 0.0F;
+            for (int count = first; count <= last; ++count) {
+                const int value = mgstc::engine::modulationEffectiveValueAtCount(
+                    layer.pitch_modulation, static_cast<std::uint32_t>(count),
+                    cumulativePitchAt(layer, count), -32768, 32767);
+                const float next_x = static_cast<float>(xForCount(bounds, count));
+                const float next_y = map_y(value);
+                if (!started) {
+                    effective_path.startNewSubPath(next_x, next_y);
+                    started = true;
+                } else {
+                    effective_path.lineTo(next_x, previous_y);
+                    effective_path.lineTo(next_x, next_y);
+                }
+                previous_y = next_y;
+            }
+            if (started) {
+                effective_path.lineTo(static_cast<float>(bounds.getRight()),
+                    previous_y);
+                graphics.setColour(colour.brighter(0.2F));
+                graphics.strokePath(effective_path, juce::PathStrokeType(2.0F));
+            }
+        }
         if (layer.pitch_sweep.enabled
             && layer.source != mgstc::engine::TimbreSource::Opll) {
             const auto visible = visibleCountRange();
@@ -9277,6 +9810,8 @@ private:
             mix(event.count);
             mix(event.automatic ? 1u : 0u);
             mix(event.precise ? 1u : 0u);
+            mix(static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(event.secondary)));
             mix(event.after_loop_start ? 1u : 0u);
         }
         return hash;
@@ -9377,7 +9912,10 @@ private:
         const bool show_auto = show && !show_rate
             && selectedLayerShowsRegisterAuto()
             && (selectedParameter() == Parameter::OpllTlAuto
-                || selectedParameter() == Parameter::OpllFbAuto);
+                || selectedParameter() == Parameter::OpllFbAuto)
+            && selectedRegisterAutoLane() != nullptr
+            && selectedRegisterAutoLane()->mode
+                == mgstc::engine::OpllRegisterAutoMode::FreeCurve;
 
         auto set_tools_visible = [this, show, show_auto, show_rate](
             bool visible) {
@@ -9392,6 +9930,14 @@ private:
             }
             command_view_.setVisible(sequence_tools);
             rate_open_.setVisible(visible && show_rate && count_inspector_);
+            modulation_heading_.setVisible(visible && !show_rate && count_inspector_);
+            modulation_issue_.setVisible(visible && !show_rate && count_inspector_
+                && modulation_issue_.getText().isNotEmpty());
+            for (std::size_t i = 0; i < modulation_toggles_.size(); ++i) {
+                modulation_labels_[i].setVisible(visible && !show_rate && count_inspector_);
+                modulation_toggles_[i].setVisible(visible && !show_rate && count_inspector_);
+                modulation_settings_[i].setVisible(visible && !show_rate && count_inspector_);
+            }
             edit_mode_.setVisible(visible && !show_rate);
             parameter_.setVisible(visible && !show_rate);
             mml_toggle_.setEnabled(visible);
@@ -9426,6 +9972,21 @@ private:
             value_label_.setBounds(point.removeFromLeft(compositeDockLabelW));
             apply_.setBounds(point.removeFromRight(compositeDockApplyW));
             point.removeFromRight(controlGap); value_.setBounds(point);
+        } else {
+            rate_open_.setBounds(row());
+        }
+        modulation_heading_.setBounds(row());
+        for (std::size_t i = 0; i < modulation_toggles_.size(); ++i) {
+            auto modulation_row = row();
+            modulation_labels_[i].setBounds(
+                modulation_row.removeFromLeft(UiLayout::compositeInspectorLabelW));
+            modulation_settings_[i].setBounds(
+                modulation_row.removeFromRight(UiLayout::libraryButtonMinW));
+            modulation_row.removeFromRight(controlGap);
+            modulation_toggles_[i].setBounds(modulation_row);
+        }
+        modulation_issue_.setBounds(row());
+        if (!show_rate) {
             if (show_auto) {
                 auto_mode_.setBounds(row());
                 split(auto_depth_label_, auto_depth_);
@@ -9487,6 +10048,12 @@ private:
     juce::Label position_;
     juce::Label value_label_;
     juce::TextButton apply_;
+    SwitchLookAndFeel modulation_switch_look_and_feel_;
+    juce::Label modulation_heading_;
+    juce::Label modulation_issue_;
+    std::array<juce::Label, 4> modulation_labels_;
+    std::array<juce::ToggleButton, 4> modulation_toggles_;
+    std::array<juce::TextButton, 4> modulation_settings_;
     juce::Label auto_depth_label_;
     juce::Label auto_speed_label_;
     juce::Label auto_coarseness_label_;
@@ -9572,8 +10139,7 @@ private:
     int playback_tempo_{mgstc::engine::kMgscDefaultTempo};
     int cached_count_ceiling_{
         static_cast<int>(mgstc::engine::EnvelopeTimeline::kDefaultLengthCounts)};
-    int cached_layer_fit_{
-        static_cast<int>(mgstc::engine::EnvelopeTimeline::kDefaultLengthCounts)};
+    std::vector<std::optional<std::uint32_t>> output_cutoff_counts_;
     int scroll_extent_counts_{
         static_cast<int>(mgstc::engine::EnvelopeTimeline::kDefaultLengthCounts)};
     bool scroll_extent_initialized_{};

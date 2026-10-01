@@ -1,12 +1,14 @@
 #include "mgstc/engine/mgs_envelope_io.hpp"
 
 #include "mgstc/engine/envelope_sequence.hpp"
+#include "mgstc/engine/composite_envelope_compile.hpp"
 #include "mgstc/engine/opll_register_auto.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string_view>
@@ -21,6 +23,7 @@ struct CountState {
         std::int32_t value{};
         bool automatic{};
         bool precise{};
+        std::optional<std::uint32_t> imported_ramp_start;
     };
 
     std::vector<std::string> before_timbre_tokens;
@@ -275,6 +278,121 @@ void collapseTrailingHold(std::vector<std::string>& tokens) {
     return total;
 }
 
+[[nodiscard]] std::optional<std::uint32_t> tokenDuration(
+    std::string_view token) {
+    if (const auto hold = parseHoldToken(token)) {
+        return hold->count;
+    }
+    const auto separator = token.find('=');
+    if (separator == std::string_view::npos) {
+        return std::nullopt;
+    }
+    std::uint32_t count{};
+    const auto parsed = std::from_chars(
+        token.data() + separator + 1, token.data() + token.size(), count);
+    if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size()) {
+        return std::nullopt;
+    }
+    return count;
+}
+
+// Keep complete same-tick command groups from the canonical stream. A ramp
+// remains intact: shortening the author model would change its interpolation.
+// Over-budget loops become a finite traversal, never an unmatched or shortened
+// repeating body. The runtime then applies MGSDRV's ordinary terminal hold.
+[[nodiscard]] bool retainEnvelopePrefix(
+    std::vector<std::string>& tokens,
+    std::size_t compiled_byte_limit,
+    std::uint32_t& cutoff_count) {
+    std::vector<std::string> prefix;
+    std::vector<std::string> pending;
+    std::size_t prefix_bytes{};
+    std::size_t pending_bytes{};
+    std::uint32_t count{};
+    bool consumed_time = false;
+    const auto commit = [&]() {
+        if (prefix_bytes + pending_bytes > compiled_byte_limit) {
+            return false;
+        }
+        for (auto& token : pending) {
+            prefix.push_back(std::move(token));
+        }
+        prefix_bytes += pending_bytes;
+        pending.clear();
+        pending_bytes = 0;
+        return true;
+    };
+    for (const auto& token : tokens) {
+        if (token == "[" || token == "]") {
+            continue;
+        }
+        pending.push_back(token);
+        pending_bytes += tokenCompiledBytes(token);
+        if (const auto duration = tokenDuration(token)) {
+            if (!commit()) {
+                cutoff_count = count;
+                if (consumed_time) {
+                    tokens = std::move(prefix);
+                }
+                return consumed_time;
+            }
+            consumed_time = true;
+            count += *duration;
+        }
+    }
+    // Final zero-time commands also form one indivisible group. If only the
+    // loop markers exceeded the budget, the finite traversal ends here.
+    static_cast<void>(commit());
+    cutoff_count = count;
+    if (consumed_time) {
+        tokens = std::move(prefix);
+    }
+    return consumed_time;
+}
+
+[[nodiscard]] std::vector<std::uint8_t> compileEnvelopeTokens(
+    const std::vector<std::string>& tokens) {
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(compiledEnvelopeBytes(tokens));
+    const auto number = [](std::string_view text) {
+        int value{};
+        std::from_chars(text.data(), text.data() + text.size(), value);
+        return value;
+    };
+    for (const auto& token : tokens) {
+        if (token == "[") {
+            bytes.push_back(0x40);
+        } else if (token == "]") {
+            bytes.push_back(0x60);
+        } else if (token.front() == '@') {
+            bytes.insert(bytes.end(), {0x10,
+                static_cast<std::uint8_t>(number(std::string_view(token).substr(1)))});
+        } else if (token.front() == '\\') {
+            bytes.insert(bytes.end(), {0x12,
+                static_cast<std::uint8_t>(number(std::string_view(token).substr(1)))});
+        } else if (token.front() == 'y') {
+            const auto comma = token.find(',');
+            bytes.insert(bytes.end(), {0x11,
+                static_cast<std::uint8_t>(number(std::string_view(token).substr(1, comma - 1))),
+                static_cast<std::uint8_t>(number(std::string_view(token).substr(comma + 1)))});
+        } else {
+            const auto value = static_cast<std::uint8_t>(
+                std::isdigit(static_cast<unsigned char>(token.front()))
+                    ? token.front() - '0' : token.front() - 'a' + 10);
+            const auto separator = token.find_first_of(":=");
+            if (separator == std::string::npos) {
+                bytes.push_back(value);
+            } else {
+                bytes.push_back(static_cast<std::uint8_t>(
+                    (token[separator] == ':' ? 0xE0 : 0x20) | value));
+                bytes.push_back(static_cast<std::uint8_t>(
+                    number(std::string_view(token).substr(separator + 1))));
+            }
+        }
+    }
+    return bytes;
+}
+
 [[nodiscard]] const char* envelopeSourceName(TimbreSource source) noexcept {
     switch (source) {
     case TimbreSource::Psg:
@@ -413,13 +531,38 @@ bool MgsEnvelopeFormatResult::hasIssue(
     return std::find(issues.begin(), issues.end(), issue) != issues.end();
 }
 
-MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
-    const CompositeLayer& layer,
+static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
+    const CompositeLayer& source_layer,
     std::uint8_t definition_number,
     std::size_t compiled_byte_limit,
     const TimbreNumberResolution* numbers,
     const TimbreLibrary* library,
-    std::string_view composite_name) {
+    std::string_view composite_name,
+    bool optimize_loop,
+    bool allow_prefix) {
+    if (source_layer.volume_envelope.kind == EnvelopeKind::Sequence
+        && source_layer.volume_modulation.enabled) {
+        // Tremolo replaces the authored volume events with sampled values.
+        // Validate that source first, so malformed values/ramps cannot turn
+        // into a valid silent sample and disappear during the replacement.
+        // Disable modulation to terminate this preflight recursion, and use
+        // an unlimited budget: capacity alone is recoverable after expansion.
+        auto base_layer = source_layer;
+        base_layer.pitch_modulation.enabled = false;
+        base_layer.volume_modulation.enabled = false;
+        base_layer.opll_tl_modulation.enabled = false;
+        base_layer.opll_fb_modulation.enabled = false;
+        const auto base = formatMgsCompositeEnvelopeImpl(
+            base_layer, definition_number,
+            std::numeric_limits<std::size_t>::max(), numbers, library,
+            composite_name, false, false);
+        if (!base.valid()) {
+            return base;
+        }
+    }
+    const auto expanded = expandCompositeLayerModulations(
+        source_layer, library, optimize_loop);
+    const auto& layer = expanded;
     MgsEnvelopeFormatResult result;
     if (definition_number > 31) {
         result.issues.push_back(MgsEnvelopeIssue::InvalidDefinitionNumber);
@@ -439,6 +582,11 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
         return result;
     }
 
+    if (!compositeModulationLoopRepresentable(source_layer, library)) {
+        result.issues.push_back(
+            MgsEnvelopeIssue::UnrepresentableModulationLoop);
+        return result;
+    }
     const bool looping = has_loop_start;
     const auto effective_end = looping
         ? *timeline.loop_end_count
@@ -450,7 +598,7 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
         if (event.kind != EnvelopeEventKind::Volume
             || event.count > effective_end
             || (looping && event.count == effective_end
-                && event.after_loop_start)) {
+                && event.after_loop_start && !event.automatic)) {
             return;
         }
         if (event.value < 0 || event.value > 15) {
@@ -458,7 +606,11 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
             return;
         }
         states[event.count].volume = CountState::VolumeSpec{
-            event.value, event.automatic, event.precise};
+            event.value, event.automatic, event.precise,
+            event.automatic && event.secondary > 0
+                ? std::optional<std::uint32_t>{
+                      static_cast<std::uint32_t>(event.secondary - 1)}
+                : std::nullopt};
     };
     for (const auto& event : layer.volume_envelope.events) {
         add_volume(event);
@@ -514,7 +666,8 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
     // TL/FB auto authoring expands to standard yreg,data after manual y
     // at the same count (§7.5). Packs from the active original's register
     // image (base / @-slide + prior manual y). Skips ROM intervals.
-    // Autos always land in the before-`[` zone (first-pass only).
+    // A derived modulation update at the loop anchor belongs in the body.
+    // Legacy auto events retain the before-`[` zone.
     if (layer.source == TimbreSource::Opll) {
         for (const auto& event :
              expandOpllLayerRegisterAutos(layer, library)) {
@@ -529,8 +682,10 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
                     result, MgsEnvelopeIssue::InvalidRegisterWrite);
                 continue;
             }
-            appendToken(
-                states[event.count].before_timbre_tokens,
+            auto& tokens = event.after_loop_start
+                ? states[event.count].after_timbre_tokens
+                : states[event.count].before_timbre_tokens;
+            appendToken(tokens,
                 "y" + std::to_string(event.value)
                     + "," + std::to_string(event.secondary));
         }
@@ -622,6 +777,74 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
                     && !(at_auto && ramp_started);
                 const bool precise_span =
                     states[*target_count].volume->precise;
+                const auto imported_start =
+                    states[*target_count].volume->imported_ramp_start;
+                // An edit inside the imported ramp may add a newer origin.
+                // In that case use the ordinary authored control-point rule.
+                if (imported_start && *imported_start >= cursor
+                    && *imported_start < *target_count) {
+                    if (*target_count - *imported_start > 255
+                        || *target_count - *imported_start == 240
+                        || *target_count - *imported_start == 1) {
+                        addIssueOnce(result,
+                            MgsEnvelopeIssue::InvalidAutomaticVolumeDuration);
+                        return result;
+                    }
+                    if (precise_span && waypoints.size() > 1) {
+                        std::vector<std::uint8_t> volumes(
+                            *imported_start - cursor,
+                            static_cast<std::uint8_t>(origin_value));
+                        auto ramp = sampleAutomaticRampVolumes(
+                            static_cast<std::uint8_t>(origin_value),
+                            static_cast<std::uint8_t>(target_value),
+                            *target_count - *imported_start, false);
+                        volumes.insert(volumes.end(),
+                            ramp.begin(), ramp.end());
+                        std::vector<std::uint32_t> cuts;
+                        for (std::size_t i = 0; i + 1 < waypoints.size(); ++i) {
+                            cuts.push_back(waypoints[i]);
+                        }
+                        emitPreciseAutomaticTokens(tokens, volumes, cursor,
+                            cuts, append_zero_time);
+                    } else {
+                        std::uint32_t from = cursor;
+                        for (const auto to : waypoints) {
+                            if (from < *imported_start) {
+                                const auto hold_end = std::min(to, *imported_start);
+                                appendHold(tokens, origin_value, hold_end - from);
+                                from = hold_end;
+                            }
+                            if (to > from) {
+                                const auto duration = to - from;
+                                if (duration == 240) {
+                                    addIssueOnce(result,
+                                        MgsEnvelopeIssue::InvalidAutomaticVolumeDuration);
+                                    return result;
+                                }
+                                const auto segment_value = to == *target_count
+                                    ? target_value
+                                    : interpolatedVolume(origin_value,
+                                          *imported_start, target_value,
+                                          *target_count, to);
+                                std::string token(1,
+                                    volumeCharacter(segment_value));
+                                if (duration > 1) {
+                                    token += '=' + std::to_string(duration);
+                                }
+                                appendToken(tokens, std::move(token));
+                                from = to;
+                            }
+                            if (to != *target_count) {
+                                append_zero_time(to);
+                            }
+                        }
+                    }
+                    current_volume = target_value;
+                    previous_volume_count = *target_count;
+                    automatic_ramp_started[*target_count] = true;
+                    cursor = *target_count;
+                    continue;
+                }
                 if (precise_span && waypoints.size() > 1) {
                     const auto duration = *target_count - cursor;
                     if (duration > 255) {
@@ -758,15 +981,56 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
                       layer.source, layer.volume_envelope.rate)
         + joinTokens(tokens);
     result.compiled_bytes = compiledEnvelopeBytes(tokens);
-    if (result.compiled_bytes > compiled_byte_limit) {
-        result.issues.push_back(MgsEnvelopeIssue::DefinitionLengthExceeded);
-        return result;
+    if (optimize_loop && looping
+        && !source_layer.envelope_timeline.loop_start_count
+        && !source_layer.envelope_timeline.loop_end_count) {
+        // Adopt an automatic loop only when the finalized byte stream is
+        // smaller. Absolute Step targets stay finite; only relative pitch
+        // can repeat its directional change inside the body.
+        const auto finite = formatMgsCompositeEnvelopeImpl(
+            source_layer, definition_number, compiled_byte_limit,
+            numbers, library, composite_name, false, false);
+        if (finite.compiled_bytes <= result.compiled_bytes) {
+            if (allow_prefix
+                && finite.hasIssue(MgsEnvelopeIssue::DefinitionLengthExceeded)) {
+                return formatMgsCompositeEnvelopeImpl(
+                    source_layer, definition_number, compiled_byte_limit,
+                    numbers, library, composite_name, false, true);
+            }
+            return finite;
+        }
     }
+    if (result.compiled_bytes > compiled_byte_limit) {
+        std::uint32_t cutoff_count{};
+        if (!allow_prefix
+            || !retainEnvelopePrefix(tokens, compiled_byte_limit, cutoff_count)) {
+            result.issues.push_back(MgsEnvelopeIssue::DefinitionLengthExceeded);
+            return result;
+        }
+        result.output_cutoff_count = cutoff_count;
+        result.body = formatSequenceEnvelopeHeader(
+                          layer.source, layer.volume_envelope.rate)
+            + joinTokens(tokens);
+        result.compiled_bytes = compiledEnvelopeBytes(tokens);
+    }
+    result.bytecode = compileEnvelopeTokens(tokens);
     result.definition = wrapEnvelopeDefinition(
         definition_number,
         result.body,
         formatEnvelopePlaybackComment(composite_name, layer));
     return result;
+}
+
+MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
+    const CompositeLayer& source_layer,
+    std::uint8_t definition_number,
+    std::size_t compiled_byte_limit,
+    const TimbreNumberResolution* numbers,
+    const TimbreLibrary* library,
+    std::string_view composite_name) {
+    return formatMgsCompositeEnvelopeImpl(
+        source_layer, definition_number, compiled_byte_limit,
+        numbers, library, composite_name, true, true);
 }
 
 std::string formatMgsCompositeTrackSetup(
@@ -883,8 +1147,8 @@ std::uint32_t maxEnvelopeLengthFittingBodyLimit(
     probe.envelope_timeline.loop_end_count.reset();
     auto fits = [&](std::uint32_t length) {
         probe.envelope_timeline.length_counts = std::max<std::uint32_t>(1, length);
-        const auto formatted = formatMgsCompositeEnvelope(
-            probe, 0, compiled_byte_limit, numbers, library);
+        const auto formatted = formatMgsCompositeEnvelopeImpl(
+            probe, 0, compiled_byte_limit, numbers, library, {}, true, false);
         if (formatted.body.empty()) {
             return false;
         }

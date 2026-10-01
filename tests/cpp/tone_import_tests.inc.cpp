@@ -367,6 +367,37 @@ void testToneImportMgsEnvelopeHoldWaitIsLiteral() {
         static_cast<std::uint32_t>(1));
 }
 
+void testToneImportMgsLoopEndingInAutomaticRamp() {
+    std::vector<std::uint8_t> bytes{'M', 'G', 'S', '3', '\r', '\n', 0x1A};
+    const auto header = bytes.size();
+    bytes.resize(header + 0x28, 0);
+    bytes[header] = 0x00;
+    bytes[header + 4] = 0x28;
+    bytes[header + 5] = 0x00;
+    bytes.push_back(0x02);
+    bytes.push_back(0x00);
+    bytes.push_back(0x00);
+    const std::vector<std::uint8_t> env{0x0F, 0x40, 0x28, 0x03, 0x60};
+    bytes.push_back(static_cast<std::uint8_t>(env.size()));
+    bytes.insert(bytes.end(), env.begin(), env.end());
+    bytes.push_back(0xFF);
+    appendMgsMusicTrack(bytes, header, 1, {0x49, 0x00, 0xFF});
+    const auto result = mgstc::engine::importTones(bytes, "mgs");
+    REQUIRE_EQ(result.valid(), true);
+    const auto* timbre = firstCompositeTimbre(result);
+    REQUIRE_EQ(timbre != nullptr, true);
+    const auto& layer = timbre->layers.front();
+    const auto formatted = mgstc::engine::formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(formatted.valid(), true);
+    const std::vector<std::uint8_t> ramp{0x28, 0x03};
+    REQUIRE_EQ(std::search(formatted.bytecode.begin(),
+                   formatted.bytecode.end(), ramp.begin(), ramp.end())
+            != formatted.bytecode.end(), true);
+    REQUIRE_EQ(std::find(formatted.bytecode.begin(),
+                   formatted.bytecode.end(), 0x60)
+            != formatted.bytecode.end(), true);
+}
+
 void testToneImportMmlStripsPsgModeNoise() {
     const std::string source = "@e0 = { n7./3.f }\n1 @e0 c\n";
     std::vector<std::uint8_t> bytes(source.begin(), source.end());
