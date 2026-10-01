@@ -4031,26 +4031,36 @@ void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
     legacy.playback_tempo = 147;
     REQUIRE_EQ(legacy.embedded_timbres.empty(), true);
 
-    // v1 is the exact pre-modulation sound body: four six-byte settings
-    // are absent from the end of each layer, before embedded_count.
-    const auto current_blob = serializeCompositeSoundPayload(legacy);
-    REQUIRE_EQ(current_blob.size() >= static_cast<std::size_t>(28), true);
-    REQUIRE_EQ(std::all_of(
-        current_blob.end() - 4, current_blob.end(),
-        [](char byte) { return byte == 0; }), true);
-    auto previous_blob = current_blob;
-    previous_blob.erase(previous_blob.size() - 28, 24);
-    std::string error;
-    const auto decoded = deserializeCompositeSoundPayload(
-        previous_blob, 1, &error);
-    REQUIRE_EQ(decoded.has_value(), true);
-    REQUIRE_EQ(serializeCompositeSoundPayload(*decoded), current_blob);
-    REQUIRE_EQ(deserializeCompositeSoundPayload(
-        previous_blob, kCompositeSoundPayloadVersion, &error).has_value(),
-        false);
-    REQUIRE_EQ(deserializeCompositeSoundPayload(
-        previous_blob, 99, &error).has_value(), false);
+    // Keep the historical payload fixtures free of event records. The current
+    // format appends morph settings to each event, so the legacy rows below
+    // isolate only the versioned tails they are meant to cover.
+    legacy.layers[0].volume_envelope.events.clear();
+    legacy.layers[0].pitch_envelope.events.clear();
+    legacy.layers[0].timbre_automation.clear();
 
+    // v1 is the pre-modulation body. v2 added the four per-layer modulation
+    // settings; both older versions predate the five-byte morph metadata tail.
+    const auto current_blob = serializeCompositeSoundPayload(legacy);
+    REQUIRE_EQ(current_blob.size() >= static_cast<std::size_t>(33), true);
+    REQUIRE_EQ(std::all_of(
+        current_blob.end() - 9, current_blob.end() - 5,
+        [](char byte) { return byte == 0; }), true);
+    REQUIRE_EQ(current_blob[current_blob.size() - 5], '\0');
+    REQUIRE_EQ(current_blob[current_blob.size() - 4], '\1');
+    REQUIRE_EQ(current_blob[current_blob.size() - 3], '\0');
+    REQUIRE_EQ(current_blob[current_blob.size() - 2], '\0');
+    REQUIRE_EQ(current_blob[current_blob.size() - 1], '\0');
+    auto previous_v1_blob = current_blob;
+    previous_v1_blob.erase(previous_v1_blob.size() - 5, 5);
+    previous_v1_blob.erase(previous_v1_blob.size() - 28, 24);
+    std::string error;
+    const auto decoded_v1 = deserializeCompositeSoundPayload(
+        previous_v1_blob, 1, &error);
+    REQUIRE_EQ(decoded_v1.has_value(), true);
+    REQUIRE_EQ(serializeCompositeSoundPayload(*decoded_v1), current_blob);
+    REQUIRE_EQ(deserializeCompositeSoundPayload(
+        previous_v1_blob, kCompositeSoundPayloadVersion, &error).has_value(),
+        false);
     auto current = legacy;
     current.name = "Current Pitch";
     current.layers[0].pitch_modulation = {
@@ -4059,6 +4069,22 @@ void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
         .speed = 2,
         .roughness = 3,
     };
+    auto current_blob_with_modulation = serializeCompositeSoundPayload(current);
+    auto previous_v2_blob = current_blob_with_modulation;
+    previous_v2_blob.erase(previous_v2_blob.size() - 5, 5);
+    const auto decoded_v2 = deserializeCompositeSoundPayload(
+        previous_v2_blob, 2, &error);
+    REQUIRE_EQ(decoded_v2.has_value(), true);
+    REQUIRE_EQ(decoded_v2->layers[0].pitch_modulation,
+        current.layers[0].pitch_modulation);
+    REQUIRE_EQ(serializeCompositeSoundPayload(*decoded_v2),
+        current_blob_with_modulation);
+    REQUIRE_EQ(deserializeCompositeSoundPayload(
+        previous_v2_blob, kCompositeSoundPayloadVersion, &error).has_value(),
+        false);
+    REQUIRE_EQ(deserializeCompositeSoundPayload(
+        previous_v2_blob, 99, &error).has_value(), false);
+
     CompositeTimbreLibrary composites;
     const auto legacy_id = composites.add(legacy, 100);
     const auto current_id = composites.add(current, 101);
@@ -4077,12 +4103,21 @@ void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
     REQUIRE_EQ(sqlite3_open(path.c_str(), &raw), SQLITE_OK);
     sqlite3_stmt* update = nullptr;
     REQUIRE_EQ(sqlite3_prepare_v2(raw,
-        "UPDATE composite_timbres SET payload_version = 1, payload = ? "
+        "UPDATE composite_timbres SET payload_version = ?, payload = ? "
         "WHERE id = ?;", -1, &update, nullptr), SQLITE_OK);
-    REQUIRE_EQ(sqlite3_bind_blob(update, 1, previous_blob.data(),
-        static_cast<int>(previous_blob.size()), SQLITE_TRANSIENT), SQLITE_OK);
-    REQUIRE_EQ(sqlite3_bind_int64(update, 2,
+    REQUIRE_EQ(sqlite3_bind_int(update, 1, 1), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_bind_blob(update, 2, previous_v1_blob.data(),
+        static_cast<int>(previous_v1_blob.size()), SQLITE_TRANSIENT), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_bind_int64(update, 3,
         static_cast<sqlite3_int64>(legacy_id)), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_step(update), SQLITE_DONE);
+    REQUIRE_EQ(sqlite3_reset(update), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_clear_bindings(update), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_bind_int(update, 1, 2), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_bind_blob(update, 2, previous_v2_blob.data(),
+        static_cast<int>(previous_v2_blob.size()), SQLITE_TRANSIENT), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_bind_int64(update, 3,
+        static_cast<sqlite3_int64>(current_id)), SQLITE_OK);
     REQUIRE_EQ(sqlite3_step(update), SQLITE_DONE);
     sqlite3_finalize(update);
     sqlite3_close(raw);
@@ -4106,8 +4141,12 @@ void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
     REQUIRE_EQ(old_entry->timbre.favorite, true);
     REQUIRE_EQ(old_entry->timbre.playback_tempo, 147);
     REQUIRE_EQ(old_entry->timbre.layers[0].pitch_modulation.enabled, false);
+    REQUIRE_EQ(old_entry->timbre.scc_morph_bank_base, 0);
+    REQUIRE_EQ(old_entry->timbre.scc_morph_algorithm_version, 1);
     REQUIRE_EQ(new_entry->timbre.layers[0].pitch_modulation,
         current.layers[0].pitch_modulation);
+    REQUIRE_EQ(new_entry->timbre.scc_morph_bank_base, 0);
+    REQUIRE_EQ(new_entry->timbre.scc_morph_algorithm_version, 1);
     REQUIRE_EQ(serializeCompositeSoundPayload(old_entry->timbre), current_blob);
 
     {

@@ -2,6 +2,7 @@
 
 #include "mgstc/engine/mgs_timbre_io.hpp"
 #include "mgstc/engine/opll_patch.hpp"
+#include "mgstc/engine/scc_morph.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1021,9 +1022,15 @@ std::string formatMgsRateDefinition(
 }
 
 MgsCompositeIoResult formatMgsComposite(
-    const CompositeTimbre& timbre,
+    const CompositeTimbre& source_timbre,
     const TimbreLibrary* library) {
     MgsCompositeIoResult result;
+    const auto morph = compileSccMorphCached(source_timbre);
+    if (!morph->valid) {
+        result.issues.push_back(morph->error);
+        return result;
+    }
+    const auto& timbre = morph->timbre;
     const auto validation = validateCompositeTimbre(timbre);
     for (const auto& warning : validation.warnings) {
         result.issues.push_back(warning);
@@ -1404,6 +1411,27 @@ ParsedMgsComposite parseMgsComposite(std::string_view source) {
     }
     if (result.timbre.layers.empty()) {
         addIssue(result.issues, "MGSC source has no numbered tracks");
+    }
+    // Event IDs must own their definitions just as base timbres do. Retain
+    // only referenced snapshots, and keep the declared manual number so an
+    // imported execution bank is independent of a live timbre library.
+    for (const auto& [key, reference] : timbres) {
+        if (findEmbeddedTimbreSnapshot(result.timbre, reference.library_id)) {
+            continue;
+        }
+        const bool referenced = std::any_of(
+            result.timbre.layers.begin(), result.timbre.layers.end(),
+            [&](const CompositeLayer& layer) {
+                return std::any_of(
+                    layer.timbre_automation.begin(), layer.timbre_automation.end(),
+                    [&](const EnvelopeEvent& event) {
+                        return event.kind == EnvelopeEventKind::Timbre
+                            && event.target_library_id == reference.library_id;
+                    });
+            });
+        if (referenced) {
+            result.timbre.embedded_timbres.push_back(reference);
+        }
     }
     if (result.issues.empty()) {
         result.timbre.format_version = CompositeTimbre::kFormatVersion;

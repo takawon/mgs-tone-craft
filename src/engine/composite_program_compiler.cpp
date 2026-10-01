@@ -11,6 +11,7 @@
 #include "mgstc/engine/opll_patch.hpp"
 #include "mgstc/engine/opll_register_auto.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
+#include "mgstc/engine/scc_morph.hpp"
 #include "mgstc/engine/spectrum_capture.hpp"
 
 namespace mgstc::engine {
@@ -141,13 +142,30 @@ RateEnvelopeDefinition rateEnvelopeDefinitionFrom(
 
 bool compileCompositeProgram(
     EngineCore& engine,
-    const CompositeTimbre& timbre,
+    const CompositeTimbre& source_timbre,
     const CompositeProgramCompileOptions& options,
     CompositePlaybackPlan* plan_out) {
+    // Program preparation runs off the audio callback. The generated bank and
+    // event sequence stay in the immutable derived snapshot, never in the
+    // user's authoring state or the standalone library.
+    const auto morph = compileSccMorphCached(source_timbre);
+    if (!morph->valid) {
+        if (plan_out != nullptr) {
+            *plan_out = {};
+        }
+        return false;
+    }
+    const auto& timbre = morph->timbre;
     // Validate every sequence before changing engine state. Audition uses
     // the same finalized @e byte stream as export, so an invalid definition
     // must not become an empty but apparently successful preview.
     const auto preflight_numbers = resolveTimbreNumbers(timbre);
+    if (timbre.scc_morph_materialized && !preflight_numbers.valid()) {
+        if (plan_out != nullptr) {
+            *plan_out = {};
+        }
+        return false;
+    }
     for (std::size_t index = 0; index < timbre.layers.size(); ++index) {
         if (!layerIsAudible(timbre, index)) {
             continue;

@@ -153,6 +153,7 @@ add_library(mgstc_engine STATIC
     src/engine/composite_program_compiler.cpp
     src/engine/composite_timbre.cpp
     src/engine/composite_timbre_library.cpp
+    src/engine/scc_morph.cpp
     src/engine/emulator_sound_output.cpp
     src/engine/engine_core.cpp
     src/engine/gzip_inflate.cpp
@@ -633,6 +634,16 @@ if(MGSTC_BUILD_TESTS)
     add_test(
         NAME mgstc_composite_envelope_compile_tests
         COMMAND mgstc_composite_envelope_compile_tests)
+
+    add_executable(mgstc_scc_morph_tests tests/cpp/scc_morph_tests.cpp)
+    target_link_libraries(mgstc_scc_morph_tests PRIVATE mgstc_engine sqlite3)
+    target_compile_features(mgstc_scc_morph_tests PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(mgstc_scc_morph_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    else()
+        target_compile_options(mgstc_scc_morph_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME mgstc_scc_morph_tests COMMAND mgstc_scc_morph_tests)
 
     add_executable(
         mgstc_realtime_engine_host_tests

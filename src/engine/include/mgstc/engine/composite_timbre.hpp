@@ -61,6 +61,17 @@ struct SavedTimbreReference {
         const SavedTimbreReference&) = default;
 };
 
+// Incoming SCC transition, owned by its destination `@` event. Derived
+// waveforms are compiled outside audio processing and are never saved here.
+struct SccMorphTransition {
+    bool enabled{};
+    std::uint8_t intermediate_count{6};
+    double curve{1.0};
+
+    friend bool operator==(const SccMorphTransition&,
+                           const SccMorphTransition&) = default;
+};
+
 struct EnvelopeEvent {
     EnvelopeEventKind kind{EnvelopeEventKind::Volume};
     std::int32_t value{};
@@ -83,6 +94,7 @@ struct EnvelopeEvent {
     // the unsplit remainder-ramp tick volumes (MGSC uses 1-count / `:` holds
     // instead of restarting `=`). Ignored when automatic is false.
     bool precise{};
+    SccMorphTransition scc_morph;
 
     friend bool operator==(const EnvelopeEvent&, const EnvelopeEvent&)
         = default;
@@ -396,7 +408,7 @@ struct CompositeLayer {
 struct CompositeTimbre {
     // Portable .mgstc / clipboard layout (name, tags, memo, favorite, then
     // sound body). Independent of SQLite kCompositeSoundPayloadVersion.
-    static constexpr std::uint32_t kFormatVersion = 20;
+    static constexpr std::uint32_t kFormatVersion = 21;
     static constexpr std::uint32_t kMinimumReadableFormatVersion = 5;
 
     std::uint32_t format_version{kFormatVersion};
@@ -411,6 +423,10 @@ struct CompositeTimbre {
     // layer base timbre. Import embeds linked `@s` / `@v` here so audition
     // and MGSC output work without a live library entry.
     std::vector<SavedTimbreReference> embedded_timbres;
+    std::uint8_t scc_morph_bank_base{};
+    std::uint32_t scc_morph_algorithm_version{1};
+    // Transient compilation marker, deliberately omitted from all save formats.
+    bool scc_morph_materialized{};
 
     friend bool operator==(const CompositeTimbre&, const CompositeTimbre&)
         = default;

@@ -409,6 +409,13 @@ TimbreNumberResolution resolveTimbreNumbers(
     std::map<TimbreKey, std::uint8_t> assigned;
     std::array<std::map<std::uint8_t, std::uint64_t>, 3> occupied;
 
+    const auto in_range = [&](TimbreSource source, std::uint8_t number) {
+        return number <= maximum_number
+            && (number >= minimum_number
+                || (source == TimbreSource::Scc
+                    && minimum_number == 15 && maximum_number == 31));
+    };
+
     const auto assign = [&](std::size_t layer_index,
                             const SavedTimbreReference& reference,
                             std::uint8_t number,
@@ -447,7 +454,7 @@ TimbreNumberResolution resolveTimbreNumbers(
             continue;
         }
         const auto number = *reference.manual_number;
-        if (number < minimum_number || number > maximum_number) {
+        if (!in_range(reference.source, number)) {
             result.warnings.push_back(
                 layer.name + " uses an out-of-range timbre number");
             continue;
@@ -481,6 +488,49 @@ TimbreNumberResolution resolveTimbreNumbers(
             continue;
         }
         assign(index, reference, number, true);
+    }
+
+    // Reserve owned event-only definitions before automatic allocation.
+    // SCC can declare any native 0..31 slot; OPLL retains its custom-patch
+    // range. Imported aliases must not overwrite another assigned waveform.
+    {
+        for (std::size_t index = 0; index < timbre.layers.size(); ++index) {
+            const auto& layer = timbre.layers[index];
+            if (layer.source == TimbreSource::Psg
+                || layer.volume_envelope.kind == EnvelopeKind::Rate) {
+                continue;
+            }
+            for (const auto& event : layer.timbre_automation) {
+                if (event.kind != EnvelopeEventKind::Timbre
+                    || event.timbre_pick != TimbrePick::Library
+                    || event.target_library_id == 0
+                    || assigned.contains({layer.source, event.target_library_id})) {
+                    continue;
+                }
+                const auto* reference = findEmbeddedTimbreSnapshot(
+                    timbre, event.target_library_id);
+                if (!reference || reference->source != layer.source
+                    || reference->number_mode != TimbreNumberMode::Manual
+                    || !reference->manual_number) {
+                    continue;
+                }
+                const auto number = *reference->manual_number;
+                if (!in_range(reference->source, number)) {
+                    result.warnings.emplace_back(
+                        std::string(sourceName(reference->source))
+                        + " timbre number is out of range");
+                    continue;
+                }
+                const auto source = sourceIndex(reference->source);
+                if (occupied[source].contains(number)) {
+                    result.warnings.emplace_back(
+                        std::string(sourceName(reference->source))
+                        + " timbre number is occupied");
+                    continue;
+                }
+                assign(index, *reference, number, true);
+            }
+        }
     }
 
     for (std::size_t index = 0;
@@ -547,7 +597,8 @@ TimbreNumberResolution resolveTimbreNumbers(
          index < timbre.layers.size();
          ++index) {
         const auto& layer = timbre.layers[index];
-        if (layer.source == TimbreSource::Psg) {
+        if (layer.source == TimbreSource::Psg
+            || layer.volume_envelope.kind == EnvelopeKind::Rate) {
             continue;
         }
         for (const auto& event : layer.timbre_automation) {
