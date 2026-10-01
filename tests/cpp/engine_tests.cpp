@@ -30,6 +30,9 @@
 #include "mgstc/engine/chip_volume_curve.hpp"
 #include "mgstc/engine/chip_rack.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
+#include "mgstc/engine/composite_modulation.hpp"
+#include "mgstc/engine/composite_envelope_compile.hpp"
+#include "mgstc/engine/composite_program_compiler.hpp"
 #include "mgstc/engine/software_lfo.hpp"
 #include "mgstc/engine/pitch_sweep.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
@@ -1387,6 +1390,67 @@ void testRuntimeOpllKeyOnAndOffRegisters() {
     REQUIRE_EQ(session.writes()[0].address, static_cast<std::uint8_t>(0x20));
     REQUIRE_EQ(session.writes()[0].value, static_cast<std::uint8_t>(0x06));
     REQUIRE_EQ(session.writes()[0].reason, WriteReason::KeyOff);
+}
+
+void testCompositeAutomaticRampAuditionMatchesOpllMmlPitchTicks() {
+    using namespace mgstc::engine;
+    auto composite = defaultCompositeTimbre();
+    const auto opll = composite.layers[2];
+    composite.layers = {opll};
+    auto& layer = composite.layers.front();
+    layer.source = TimbreSource::Opll;
+    layer.channel = 0;
+    layer.volume = 15;
+    layer.envelope_timeline = {.length_counts = 21};
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {EnvelopeEventKind::Volume, 15, 0, 5},
+        {EnvelopeEventKind::Volume, 14, 0, 6},
+        {EnvelopeEventKind::Volume, 13, 0, 7},
+        {.kind = EnvelopeEventKind::Volume, .value = 11,
+         .count = 14, .automatic = true},
+        {.kind = EnvelopeEventKind::Volume, .value = 11,
+         .count = 17, .automatic = true},
+        {.kind = EnvelopeEventKind::Volume, .value = 11,
+         .count = 20, .automatic = true},
+    };
+    layer.pitch_envelope.events = {
+        {EnvelopeEventKind::Pitch, -45, 0, 5},
+        {EnvelopeEventKind::Pitch, 53, 0, 8},
+        {EnvelopeEventKind::Pitch, -29, 0, 14},
+        {EnvelopeEventKind::Pitch, -29, 0, 17},
+        {EnvelopeEventKind::Pitch, 96, 0, 18},
+        {EnvelopeEventKind::Pitch, 29, 0, 20},
+    };
+    const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(formatted.valid(), true);
+    REQUIRE_EQ(formatted.body,
+        std::string(",,f:5.\\-45.f.e.d.\\53.b=6.\\-29.b=3.\\-29.b.\\96.b=2.\\29.b"));
+
+    EngineCore engine;
+    REQUIRE_EQ(compileCompositeProgram(engine, composite, {}), true);
+    REQUIRE_EQ(engine.session().queueNoteOn(8, 60), true);
+    std::vector<int> pitch_ticks;
+    for (int tick = 0; tick < 21; ++tick) {
+        REQUIRE_EQ(engine.session().processTick().ok(), true);
+        for (const auto& write : engine.session().writes()) {
+            if (write.chip == ChipId::Opll && write.address == 0x10
+                && tick != 0) {
+                pitch_ticks.push_back(tick);
+            }
+        }
+    }
+    REQUIRE_EQ(pitch_ticks, (std::vector<int>{5, 8, 14, 17, 18, 20}));
+
+    layer.envelope_timeline.length_counts = 241;
+    layer.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {.kind = EnvelopeEventKind::Volume, .value = 8,
+         .count = 240, .automatic = true},
+    };
+    layer.pitch_envelope.events.clear();
+    EngineCore invalid_engine;
+    REQUIRE_EQ(compileCompositeProgram(invalid_engine, composite, {}), false);
 }
 
 void testRuntimeOpllKeyOffKeepsFrequencyDetune() {
@@ -3956,6 +4020,118 @@ void testToneLibrarySqliteV1RoundTripAndPortableFormat() {
     std::filesystem::remove(db_path, remove_error);
 }
 
+void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
+    using namespace mgstc::engine;
+    auto legacy = defaultCompositeTimbre();
+    legacy.layers = {legacy.layers[2]};
+    legacy.name = "Previous OPLL";
+    legacy.memo = "keep memo";
+    legacy.tags = {"favorite", "old"};
+    legacy.favorite = true;
+    legacy.playback_tempo = 147;
+    REQUIRE_EQ(legacy.embedded_timbres.empty(), true);
+
+    // v1 is the exact pre-modulation sound body: four six-byte settings
+    // are absent from the end of each layer, before embedded_count.
+    const auto current_blob = serializeCompositeSoundPayload(legacy);
+    REQUIRE_EQ(current_blob.size() >= static_cast<std::size_t>(28), true);
+    REQUIRE_EQ(std::all_of(
+        current_blob.end() - 4, current_blob.end(),
+        [](char byte) { return byte == 0; }), true);
+    auto previous_blob = current_blob;
+    previous_blob.erase(previous_blob.size() - 28, 24);
+    std::string error;
+    const auto decoded = deserializeCompositeSoundPayload(
+        previous_blob, 1, &error);
+    REQUIRE_EQ(decoded.has_value(), true);
+    REQUIRE_EQ(serializeCompositeSoundPayload(*decoded), current_blob);
+    REQUIRE_EQ(deserializeCompositeSoundPayload(
+        previous_blob, kCompositeSoundPayloadVersion, &error).has_value(),
+        false);
+    REQUIRE_EQ(deserializeCompositeSoundPayload(
+        previous_blob, 99, &error).has_value(), false);
+
+    auto current = legacy;
+    current.name = "Current Pitch";
+    current.layers[0].pitch_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::StepUp,
+        .speed = 2,
+        .roughness = 3,
+    };
+    CompositeTimbreLibrary composites;
+    const auto legacy_id = composites.add(legacy, 100);
+    const auto current_id = composites.add(current, 101);
+    TimbreLibrary singles;
+    const auto db_path = std::filesystem::temp_directory_path()
+        / "mgstc_previous_composite_payload_test.sqlite";
+    std::error_code remove_error;
+    std::filesystem::remove(db_path, remove_error);
+    const auto path = db_path.string();
+    {
+        ToneLibraryDatabase database;
+        REQUIRE_EQ(database.open(path, &error), true);
+        REQUIRE_EQ(database.replaceAll(singles, composites, &error), true);
+    }
+    sqlite3* raw = nullptr;
+    REQUIRE_EQ(sqlite3_open(path.c_str(), &raw), SQLITE_OK);
+    sqlite3_stmt* update = nullptr;
+    REQUIRE_EQ(sqlite3_prepare_v2(raw,
+        "UPDATE composite_timbres SET payload_version = 1, payload = ? "
+        "WHERE id = ?;", -1, &update, nullptr), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_bind_blob(update, 1, previous_blob.data(),
+        static_cast<int>(previous_blob.size()), SQLITE_TRANSIENT), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_bind_int64(update, 2,
+        static_cast<sqlite3_int64>(legacy_id)), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_step(update), SQLITE_DONE);
+    sqlite3_finalize(update);
+    sqlite3_close(raw);
+
+    TimbreLibrary loaded_singles;
+    CompositeTimbreLibrary loaded;
+    {
+        ToneLibraryDatabase database;
+        REQUIRE_EQ(database.open(path, &error), true);
+        REQUIRE_EQ(database.load(loaded_singles, loaded, &error), true);
+        REQUIRE_EQ(database.userVersion(), 1);
+    }
+    REQUIRE_EQ(loaded.entries().size(), static_cast<std::size_t>(2));
+    const auto* old_entry = loaded.find(legacy_id);
+    const auto* new_entry = loaded.find(current_id);
+    REQUIRE_EQ(old_entry != nullptr, true);
+    REQUIRE_EQ(new_entry != nullptr, true);
+    REQUIRE_EQ(old_entry->timbre.name, legacy.name);
+    REQUIRE_EQ(old_entry->timbre.memo, legacy.memo);
+    REQUIRE_EQ(old_entry->timbre.tags, legacy.tags);
+    REQUIRE_EQ(old_entry->timbre.favorite, true);
+    REQUIRE_EQ(old_entry->timbre.playback_tempo, 147);
+    REQUIRE_EQ(old_entry->timbre.layers[0].pitch_modulation.enabled, false);
+    REQUIRE_EQ(new_entry->timbre.layers[0].pitch_modulation,
+        current.layers[0].pitch_modulation);
+    REQUIRE_EQ(serializeCompositeSoundPayload(old_entry->timbre), current_blob);
+
+    {
+        ToneLibraryDatabase database;
+        REQUIRE_EQ(database.open(path, &error), true);
+        REQUIRE_EQ(database.replaceAll(loaded_singles, loaded, &error), true);
+    }
+    REQUIRE_EQ(sqlite3_open(path.c_str(), &raw), SQLITE_OK);
+    sqlite3_stmt* versions = nullptr;
+    REQUIRE_EQ(sqlite3_prepare_v2(raw,
+        "SELECT payload_version FROM composite_timbres ORDER BY id;",
+        -1, &versions, nullptr), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_step(versions), SQLITE_ROW);
+    REQUIRE_EQ(sqlite3_column_int(versions, 0),
+        static_cast<int>(kCompositeSoundPayloadVersion));
+    REQUIRE_EQ(sqlite3_step(versions), SQLITE_ROW);
+    REQUIRE_EQ(sqlite3_column_int(versions, 0),
+        static_cast<int>(kCompositeSoundPayloadVersion));
+    REQUIRE_EQ(sqlite3_step(versions), SQLITE_DONE);
+    sqlite3_finalize(versions);
+    sqlite3_close(raw);
+    std::filesystem::remove(db_path, remove_error);
+}
+
 void testWavePcmCycleConvertsToScc() {
     constexpr std::uint32_t sample_rate = 8000;
     constexpr std::uint16_t sample_count = 64;
@@ -5319,6 +5495,115 @@ void testCompositeEnvelopeFormatsOneSharedMgscLoop() {
     REQUIRE_EQ(fit <= kMgscEnvelopeUiLengthCap, true);
 }
 
+void testCompositeEnvelopeLoopPrefixAndBodyPitchSemantics() {
+    using namespace mgstc::engine;
+    const auto makeLayer = [](std::int32_t pitch_delta,
+                              bool after_loop_start) {
+        auto layer = defaultCompositeTimbre().layers[1];
+        layer.volume = 15;
+        layer.envelope_timeline = {
+            .length_counts = 4,
+            .loop_start_count = 1,
+            .loop_end_count = 3,
+        };
+        layer.volume_envelope.events = {
+            {EnvelopeEventKind::Volume, 15, 0, 0},
+            {EnvelopeEventKind::Volume, 15, 0, 1},
+        };
+        layer.pitch_envelope.events = {
+            {
+                .kind = EnvelopeEventKind::Pitch,
+                .value = pitch_delta,
+                .count = 1,
+                .after_loop_start = after_loop_start,
+            },
+        };
+        return layer;
+    };
+    const auto pitchSumAfterTicks = [](const std::vector<std::uint8_t>& code,
+                                       int ticks) {
+        SequenceEnvelopeRuntime runtime(code);
+        runtime.resetForKeyOn(15);
+        EventBuffer buffer(16);
+        std::int32_t total = 0;
+        for (int tick = 0; tick < ticks; ++tick) {
+            buffer.clear();
+            REQUIRE_EQ(runtime.processTick(buffer), SequenceError::None);
+            for (std::size_t i = 0; i < buffer.size(); ++i) {
+                if (buffer.events()[i].kind
+                    == MeaningEventKind::FrequencyDelta) {
+                    total += buffer.events()[i].arg0;
+                }
+            }
+        }
+        return total;
+    };
+
+    const TimbreNumberResolution numbers{};
+    auto once_before = makeLayer(1, false);
+    auto once_text = formatMgsCompositeEnvelope(once_before, 3);
+    REQUIRE_EQ(once_text.valid(), true);
+    const auto once_loop = once_text.body.find('[');
+    const auto once_pitch = once_text.body.find("\\1");
+    REQUIRE_EQ(once_loop != std::string::npos, true);
+    REQUIRE_EQ(once_pitch < once_loop, true);
+    REQUIRE_EQ(once_text.body.find('f', once_loop) != std::string::npos, true);
+    const auto once_pitch_code = compileCompositeEnvelopeLane(
+        once_before, CompositeEnvelopeLane::Pitch, numbers);
+    const auto once_at_warmup = pitchSumAfterTicks(once_pitch_code, 12);
+    REQUIRE_EQ(once_at_warmup, 1);
+    REQUIRE_EQ(pitchSumAfterTicks(once_pitch_code, 40), once_at_warmup);
+
+    auto repeated = makeLayer(1, true);
+    auto repeated_text = formatMgsCompositeEnvelope(repeated, 4);
+    REQUIRE_EQ(repeated_text.valid(), true);
+    const auto repeated_loop = repeated_text.body.find('[');
+    const auto repeated_pitch = repeated_text.body.find("\\1");
+    REQUIRE_EQ(repeated_loop != std::string::npos, true);
+    REQUIRE_EQ(repeated_pitch > repeated_loop, true);
+    REQUIRE_EQ(repeated_text.body.find('f', repeated_loop) != std::string::npos, true);
+    const auto repeated_pitch_code = compileCompositeEnvelopeLane(
+        repeated, CompositeEnvelopeLane::Pitch, numbers);
+    REQUIRE_EQ(pitchSumAfterTicks(repeated_pitch_code, 40) > 1, true);
+
+    auto down = makeLayer(-1, true);
+    down.pitch_envelope.events[0].count = 2;
+    auto down_text = formatMgsCompositeEnvelope(down, 5);
+    REQUIRE_EQ(down_text.valid(), true);
+    const auto down_loop = down_text.body.find('[');
+    const auto down_pitch = down_text.body.find("\\-1");
+    REQUIRE_EQ(down_pitch > down_loop, true);
+    REQUIRE_EQ(down_text.body.find('f', down_loop) < down_pitch, true);
+    const auto down_pitch_code = compileCompositeEnvelopeLane(
+        down, CompositeEnvelopeLane::Pitch, numbers);
+    REQUIRE_EQ(pitchSumAfterTicks(down_pitch_code, 40) < -1, true);
+
+    auto up = makeLayer(1, true);
+    up.pitch_envelope.events[0].count = 2;
+    const auto up_text = formatMgsCompositeEnvelope(up, 6);
+    REQUIRE_EQ(up_text.valid(), true);
+    const auto up_loop = up_text.body.find('[');
+    const auto up_pitch = up_text.body.find("\\1");
+    REQUIRE_EQ(up_pitch > up_loop, true);
+    REQUIRE_EQ(up_text.body.find('f', up_loop) < up_pitch, true);
+    const auto up_pitch_code = compileCompositeEnvelopeLane(
+        up, CompositeEnvelopeLane::Pitch, numbers);
+    REQUIRE_EQ(pitchSumAfterTicks(up_pitch_code, 40) > 0, true);
+
+    // `f` is an absolute volume command (15). Relative `\\` pitch changes
+    // inside a permanent loop must never be interpreted as volume changes.
+    const auto volume_code = compileCompositeEnvelopeLane(
+        down, CompositeEnvelopeLane::Volume, numbers);
+    SequenceEnvelopeRuntime volume_runtime(volume_code);
+    volume_runtime.resetForKeyOn(0);
+    EventBuffer volume_buffer(16);
+    for (int tick = 0; tick < 40; ++tick) {
+        volume_buffer.clear();
+        REQUIRE_EQ(volume_runtime.processTick(volume_buffer), SequenceError::None);
+        REQUIRE_EQ(volume_runtime.volume(), static_cast<std::uint8_t>(15));
+    }
+}
+
 void testCompositeEnvelopeMgscOutputRules() {
     using namespace mgstc::engine;
 
@@ -5415,11 +5700,10 @@ void testCompositeEnvelopeMgscOutputRules() {
         layer.pitch_envelope.events.push_back(
             {EnvelopeEventKind::Pitch, 1, 0, count});
     }
-    const auto over_bytes = formatMgsCompositeEnvelope(layer, 0, 256);
-    REQUIRE_EQ(
-        over_bytes.hasIssue(MgsEnvelopeIssue::DefinitionLengthExceeded),
-        true);
-    REQUIRE_EQ(over_bytes.compiled_bytes > kMgscEnvelopeCompiledByteLimit, true);
+    const auto over_bytes = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(over_bytes.valid(), true);
+    REQUIRE_EQ(over_bytes.output_cutoff_count.has_value(), true);
+    REQUIRE_EQ(over_bytes.compiled_bytes <= kMgscEnvelopeCompiledByteLimit, true);
 }
 
 void testCompositeAutomaticVolumeRoundTripsThroughMgsc() {
@@ -5449,7 +5733,8 @@ void testCompositeAutomaticVolumeRoundTripsThroughMgsc() {
     REQUIRE_EQ(events.front().count, 0U);
     REQUIRE_EQ(events.front().value, 15);
     REQUIRE_EQ(events.front().automatic, false);
-    REQUIRE_EQ(events.back().count, 10U);
+    REQUIRE_EQ(events.back().count, 11U);
+    REQUIRE_EQ(events.back().secondary, 2);
     REQUIRE_EQ(events.back().value, 8);
     REQUIRE_EQ(events.back().automatic, true);
 
@@ -5460,6 +5745,7 @@ void testCompositeAutomaticVolumeRoundTripsThroughMgsc() {
         parsed_bare.timbre.layers.front().volume_envelope.events;
     REQUIRE_EQ(bare_events.size(), 1U);
     REQUIRE_EQ(bare_events.front().count, 10U);
+    REQUIRE_EQ(bare_events.front().secondary, 1);
     REQUIRE_EQ(bare_events.front().value, 8);
     REQUIRE_EQ(bare_events.front().automatic, true);
 
@@ -5485,7 +5771,8 @@ void testCompositeAutomaticVolumeRoundTripsThroughMgsc() {
     REQUIRE_EQ(wrap_events.front().count, 0U);
     REQUIRE_EQ(wrap_events.front().value, 12);
     REQUIRE_EQ(wrap_events.front().automatic, false);
-    REQUIRE_EQ(wrap_events.back().count, 254U);
+    REQUIRE_EQ(wrap_events.back().count, 255U);
+    REQUIRE_EQ(wrap_events.back().secondary, 2);
     REQUIRE_EQ(wrap_events.back().value, 0);
     REQUIRE_EQ(wrap_events.back().automatic, true);
 
@@ -5599,6 +5886,492 @@ void testCompositeAutomaticVolumeRoundTripsThroughMgsc() {
     REQUIRE_EQ(near_origin.valid(), true);
     REQUIRE_EQ(
         near_origin.body, std::string(",,f.d.\\20.8=2.\\10.3=2.0=10.0"));
+}
+
+void testImportedAutomaticRampKeepsOriginalExecutionTiming() {
+    using namespace mgstc::engine;
+    struct Case {
+        const char* body;
+        std::uint32_t pitch_count;
+        std::int32_t first_ramp_start_marker;
+    };
+    constexpr std::array cases{
+        Case{"f.8=10.\\1.8", 11, 2},
+        Case{"f:5.8=10.\\1.8", 15, 6},
+        Case{"8=10.\\1.8", 10, 1},
+        Case{"f.8=10.0=10.\\2.8", 21, 2},
+    };
+    for (const auto& item : cases) {
+        const auto source = std::string("1 v15 @e0\n@e0 = { ,,")
+            + item.body + " }\n";
+        const auto imported = parseMgsComposite(source);
+        REQUIRE_EQ(imported.valid(), true);
+        const auto& layer = imported.timbre.layers.front();
+        const auto first_ramp = std::find_if(
+            layer.volume_envelope.events.begin(),
+            layer.volume_envelope.events.end(),
+            [](const EnvelopeEvent& event) { return event.automatic; });
+        REQUIRE_EQ(first_ramp != layer.volume_envelope.events.end(), true);
+        REQUIRE_EQ(first_ramp->secondary, item.first_ramp_start_marker);
+        REQUIRE_EQ(layer.pitch_envelope.events.front().count,
+            item.pitch_count);
+        const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+        REQUIRE_EQ(formatted.valid(), true);
+        REQUIRE_EQ(formatted.body.find("8=10") != std::string::npos, true);
+        REQUIRE_EQ(formatted.body.find('\\') != std::string::npos, true);
+
+        SequenceEnvelopeRuntime runtime(formatted.bytecode);
+        runtime.resetForKeyOn(15);
+        EventBuffer output(32);
+        std::vector<std::uint32_t> pitch_ticks;
+        for (std::uint32_t tick = 0; tick <= item.pitch_count; ++tick) {
+            output.clear();
+            REQUIRE_EQ(runtime.processTick(output), SequenceError::None);
+            for (std::size_t i = 0; i < output.size(); ++i) {
+                if (output.events()[i].kind
+                    == MeaningEventKind::FrequencyDelta) {
+                    pitch_ticks.push_back(tick);
+                }
+            }
+        }
+        REQUIRE_EQ(pitch_ticks,
+            (std::vector<std::uint32_t>{item.pitch_count}));
+
+        const auto blob = serializeCompositeSoundPayload(imported.timbre);
+        std::string error;
+        const auto saved = deserializeCompositeSoundPayload(
+            blob, kCompositeSoundPayloadVersion, &error);
+        REQUIRE_EQ(saved.has_value(), true);
+        REQUIRE_EQ(error.empty(), true);
+        REQUIRE_EQ(formatMgsCompositeEnvelope(saved->layers.front(), 0).body,
+            formatted.body);
+    }
+
+    auto edited = parseMgsComposite(
+        "1 v15 @e0\n@e0 = { ,,f.8=10.\\1.8 }\n");
+    REQUIRE_EQ(edited.valid(), true);
+    edited.timbre.layers.front().volume_envelope.events.push_back({
+        .kind = EnvelopeEventKind::Volume, .value = 10, .count = 5});
+    REQUIRE_EQ(formatMgsCompositeEnvelope(
+        edited.timbre.layers.front(), 0).valid(), true);
+
+    const auto original_prefix = parseMgsComposite(
+        "9 v15 @e0\n@e0 = { ,,f:5.\\-45.f.e.d.\\53.b=6."
+        "\\-29.b=3.\\-29.b.\\96.b=2.\\29.b }\n");
+    REQUIRE_EQ(original_prefix.valid(), true);
+    const auto& original_layer = original_prefix.timbre.layers.front();
+    const auto original_formatted = formatMgsCompositeEnvelope(
+        original_layer, 0);
+    REQUIRE_EQ(original_formatted.valid(), true);
+    REQUIRE_EQ(original_formatted.body.find("b=6.\\-29")
+        != std::string::npos, true);
+    std::vector<std::uint32_t> original_pitch_counts;
+    for (const auto& event : original_layer.pitch_envelope.events) {
+        original_pitch_counts.push_back(event.count);
+    }
+    REQUIRE_EQ(original_pitch_counts,
+        (std::vector<std::uint32_t>{5, 8, 14, 17, 18, 20}));
+
+    const auto looped = parseMgsComposite(
+        "1 v15 @e0\n@e0 = { ,,f.[.8=3.\\1.8.] }\n");
+    REQUIRE_EQ(looped.valid(), true);
+    const auto looped_format = formatMgsCompositeEnvelope(
+        looped.timbre.layers.front(), 0);
+    REQUIRE_EQ(looped_format.valid(), true);
+    SequenceEnvelopeRuntime loop_runtime(looped_format.bytecode);
+    loop_runtime.resetForKeyOn(15);
+    EventBuffer loop_output(32);
+    std::vector<std::uint32_t> loop_pitch_ticks;
+    for (std::uint32_t tick = 0; tick < 9; ++tick) {
+        loop_output.clear();
+        REQUIRE_EQ(loop_runtime.processTick(loop_output), SequenceError::None);
+        for (std::size_t i = 0; i < loop_output.size(); ++i) {
+            if (loop_output.events()[i].kind
+                == MeaningEventKind::FrequencyDelta) {
+                loop_pitch_ticks.push_back(tick);
+            }
+        }
+    }
+    REQUIRE_EQ(loop_pitch_ticks,
+        (std::vector<std::uint32_t>{4, 8}));
+
+    // Legacy authored targets retain the established control-point rule.
+    auto authored = defaultCompositeTimbre().layers.front();
+    authored.volume = 15;
+    authored.envelope_timeline = {.length_counts = 20};
+    authored.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {.kind = EnvelopeEventKind::Volume, .value = 8,
+         .count = 10, .automatic = true},
+    };
+    REQUIRE_EQ(formatMgsCompositeEnvelope(authored, 0).body.find("8=10")
+        != std::string::npos, true);
+}
+
+void testMgscEnvelope253ByteBoundary() {
+    using namespace mgstc::engine;
+    auto timbre = defaultCompositeTimbre();
+    timbre.layers = {timbre.layers.front()};
+    auto& layer = timbre.layers.front();
+    const auto setVolumeSteps = [&](std::uint32_t count) {
+        layer.envelope_timeline = {.length_counts = count};
+        layer.volume_envelope.events.clear();
+        for (std::uint32_t tick = 0; tick < count; ++tick) {
+            layer.volume_envelope.events.push_back({
+                .kind = EnvelopeEventKind::Volume,
+                .value = tick % 2 ? 14 : 15,
+                .count = tick,
+            });
+        }
+    };
+    REQUIRE_EQ(kMgscEnvelopeCompiledByteLimit, 253U);
+    for (const auto count : {253U, 254U, 255U, 256U}) {
+        setVolumeSteps(count);
+        const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+        REQUIRE_EQ(formatted.valid(), true);
+        REQUIRE_EQ(formatted.compiled_bytes <= 253U, true);
+        REQUIRE_EQ(formatted.bytecode.empty(), false);
+        REQUIRE_EQ(formatted.output_cutoff_count.has_value(), count > 253U);
+        if (count > 253U) {
+            REQUIRE_EQ(*formatted.output_cutoff_count, 253U);
+        } else {
+            REQUIRE_EQ(formatted.compiled_bytes, count);
+        }
+        REQUIRE_EQ(formatMgsComposite(timbre).valid(), true);
+        EngineCore engine;
+        REQUIRE_EQ(compileCompositeProgram(engine, timbre, {}), true);
+    }
+    // A frequency command consumes two bytes; one literal volume consumes one.
+    setVolumeSteps(251);
+    layer.pitch_envelope.events = {
+        {.kind = EnvelopeEventKind::Pitch, .value = 9, .count = 0},
+    };
+    const auto with_pitch = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(with_pitch.compiled_bytes, 253U);
+    REQUIRE_EQ(with_pitch.valid(), true);
+    setVolumeSteps(252);
+    const auto with_extra_volume = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(with_extra_volume.valid(), true);
+    REQUIRE_EQ(with_extra_volume.compiled_bytes, 253U);
+    REQUIRE_EQ(with_extra_volume.output_cutoff_count.has_value(), true);
+}
+
+std::vector<std::vector<mgstc::engine::MeaningEvent>> sampleEnvelopeEvents(
+    const std::vector<std::uint8_t>& bytecode, std::size_t ticks);
+
+void testOversizedPitchModulationEnvelopeExportsAndAuditionsPlayablePrefix() {
+    using namespace mgstc::engine;
+    auto timbre = defaultCompositeTimbre();
+    timbre.layers = {timbre.layers[2]};
+    auto& layer = timbre.layers.front();
+    layer.envelope_number = 0;
+    layer.envelope_timeline = {.length_counts = 180};
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+    };
+    // A later manual command prevents the proven single-modulation loop.
+    layer.pitch_envelope.events = {
+        {.kind = EnvelopeEventKind::Pitch, .value = 3, .count = 4},
+    };
+    layer.pitch_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::Oscillate,
+        .delay = 4,
+        .depth = 7,
+        .speed = 1,
+        .roughness = 9,
+    };
+    const auto envelope = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(envelope.valid(), true);
+    REQUIRE_EQ(envelope.output_cutoff_count.has_value(), true);
+    REQUIRE_EQ(envelope.compiled_bytes <= kMgscEnvelopeCompiledByteLimit,
+        true);
+    REQUIRE_EQ(envelope.bytecode.empty(), false);
+    const auto source = formatMgsComposite(timbre);
+    REQUIRE_EQ(source.valid(), true);
+    REQUIRE_EQ(source.source.empty(), false);
+    EngineCore engine;
+    REQUIRE_EQ(compileCompositeProgram(engine, timbre, {}), true);
+}
+
+void testOverLimitEnvelopeUsesSameOrderedPrefixForExportAndCompile() {
+    using namespace mgstc::engine;
+    auto timbre = defaultCompositeTimbre();
+    timbre.layers = {timbre.layers[2]};
+    auto& layer = timbre.layers.front();
+    layer.envelope_timeline = {.length_counts = 300};
+    layer.volume_envelope.events.clear();
+    layer.pitch_envelope.events.clear();
+    layer.timbre_automation.clear();
+    layer.volume = 15;
+    for (std::uint32_t count = 0; count < 300; ++count) {
+        layer.volume_envelope.events.push_back({
+            .kind = EnvelopeEventKind::Volume,
+            .value = count % 2U == 0U ? 15 : 14,
+            .count = count,
+        });
+    }
+    layer.base_timbre = SavedTimbreReference{
+        .library_id = 1,
+        .revision = 1,
+        .name = "prefix test OPLL",
+        .source = TimbreSource::Opll,
+        .number_mode = TimbreNumberMode::Manual,
+        .manual_number = 16,
+        .opll_registers = {0x21, 0x18, 0xCA, 0xB2, 0x31, 0x42, 0x53, 0x64},
+    };
+    // These same-count Y writes are indivisible: a byte limit that leaves room
+    // for one write must stop before both, preserving the ordered event stream.
+    layer.timbre_automation = {
+        {.kind = EnvelopeEventKind::RegisterWrite,
+         .value = 1, .secondary = 0x22, .count = 0},
+        {.kind = EnvelopeEventKind::RegisterWrite,
+         .value = 2, .secondary = 0xC5, .count = 246},
+        {.kind = EnvelopeEventKind::RegisterWrite,
+         .value = 3, .secondary = 0x48, .count = 246},
+    };
+
+    const auto numbers = resolveTimbreNumbers(timbre);
+    constexpr std::uint32_t grouped_write_count = 246;
+    auto before_y = layer;
+    before_y.envelope_timeline.length_counts = grouped_write_count;
+    before_y.volume_envelope.events.erase(
+        std::remove_if(before_y.volume_envelope.events.begin(),
+                       before_y.volume_envelope.events.end(),
+                       [](const EnvelopeEvent& event) {
+                           return event.count >= grouped_write_count;
+                       }),
+        before_y.volume_envelope.events.end());
+    before_y.timbre_automation.erase(
+        before_y.timbre_automation.begin() + 1,
+        before_y.timbre_automation.end());
+    const auto before_y_output = formatMgsCompositeEnvelope(
+        before_y, 0, std::numeric_limits<std::size_t>::max(), &numbers);
+    REQUIRE_EQ(before_y_output.valid(), true);
+    const auto prefix = formatMgsCompositeEnvelope(
+        layer, 0, kMgscEnvelopeCompiledByteLimit, &numbers);
+    const auto complete = formatMgsCompositeEnvelope(
+        layer, 0, std::numeric_limits<std::size_t>::max(), &numbers);
+    REQUIRE_EQ(prefix.valid(), true);
+    REQUIRE_EQ(prefix.output_cutoff_count.has_value(), true);
+    REQUIRE_EQ(*prefix.output_cutoff_count, grouped_write_count);
+    REQUIRE_EQ(prefix.compiled_bytes, 251U);
+    REQUIRE_EQ(before_y_output.compiled_bytes < kMgscEnvelopeCompiledByteLimit,
+        true);
+    REQUIRE_EQ(complete.valid(), true);
+    REQUIRE_EQ(complete.body.find("y2,") != std::string::npos, true);
+    REQUIRE_EQ(complete.body.find("y3,") != std::string::npos, true);
+    REQUIRE_EQ(
+        sampleEnvelopeEvents(prefix.bytecode, *prefix.output_cutoff_count),
+        sampleEnvelopeEvents(complete.bytecode, *prefix.output_cutoff_count));
+
+    const auto programs = compileCompositeEnvelopes(layer, numbers);
+    REQUIRE_EQ(programs.volume, prefix.bytecode);
+    const auto secondary = compileCompositeEnvelopes(
+        layer, numbers, nullptr, false, false, false);
+    auto primary_events = sampleEnvelopeEvents(prefix.bytecode, 300);
+    for (auto& tick : primary_events) {
+        std::erase_if(tick, [](const MeaningEvent& event) {
+            return (event.kind == MeaningEventKind::RegisterWrite
+                && event.arg0 >= 0 && event.arg0 <= 7)
+                || (event.kind == MeaningEventKind::Patch && event.tick == 0);
+        });
+    }
+    REQUIRE_EQ(sampleEnvelopeEvents(secondary.volume, 300), primary_events);
+    EngineCore engine;
+    REQUIRE_EQ(compileCompositeProgram(engine, timbre, {}), true);
+
+    // Invalid authoring data anywhere remains a hard error, even when it lies
+    // beyond the first output cutoff.
+    auto invalid = layer;
+    invalid.pitch_envelope.events.push_back({
+        .kind = EnvelopeEventKind::Pitch,
+        .value = 128,
+        .count = 299,
+    });
+    const auto rejected = formatMgsCompositeEnvelope(invalid, 0, 253, &numbers);
+    REQUIRE_EQ(rejected.valid(), false);
+    REQUIRE_EQ(rejected.hasIssue(MgsEnvelopeIssue::InvalidPitch), true);
+
+    auto invalid_volume_timbre = defaultCompositeTimbre();
+    auto& invalid_volume_layer = invalid_volume_timbre.layers.front();
+    invalid_volume_layer.envelope_timeline = {.length_counts = 300};
+    invalid_volume_layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 16, .count = 299},
+    };
+    invalid_volume_layer.volume_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::Oscillate,
+        .delay = 1,
+        .depth = 1,
+        .speed = 2,
+        .roughness = 1,
+    };
+    const auto invalid_volume = formatMgsCompositeEnvelope(
+        invalid_volume_layer, 0);
+    REQUIRE_EQ(invalid_volume.valid(), false);
+    REQUIRE_EQ(invalid_volume.hasIssue(MgsEnvelopeIssue::InvalidVolume), true);
+    EngineCore invalid_volume_engine;
+    REQUIRE_EQ(compileCompositeProgram(
+        invalid_volume_engine, invalid_volume_timbre, {}), false);
+
+    auto invalid_ramp_timbre = defaultCompositeTimbre();
+    auto& invalid_ramp_layer = invalid_ramp_timbre.layers.front();
+    invalid_ramp_layer.envelope_timeline = {.length_counts = 300};
+    invalid_ramp_layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume, .value = 8,
+         .count = 240, .automatic = true},
+    };
+    invalid_ramp_layer.volume_modulation = invalid_volume_layer.volume_modulation;
+    const auto invalid_ramp = formatMgsCompositeEnvelope(invalid_ramp_layer, 0);
+    REQUIRE_EQ(invalid_ramp.valid(), false);
+    REQUIRE_EQ(invalid_ramp.hasIssue(
+        MgsEnvelopeIssue::InvalidAutomaticVolumeDuration), true);
+    EngineCore invalid_ramp_engine;
+    REQUIRE_EQ(compileCompositeProgram(invalid_ramp_engine, invalid_ramp_timbre, {}),
+        false);
+}
+
+void testOverLimitPrefixKeepsAutomaticVolumeRampWhole() {
+    using namespace mgstc::engine;
+    auto layer = defaultCompositeTimbre().layers.front();
+    layer.envelope_timeline = {.length_counts = 300};
+    layer.volume_envelope.events.clear();
+    for (std::uint32_t count = 0; count <= 230; ++count) {
+        layer.volume_envelope.events.push_back({
+            .kind = EnvelopeEventKind::Volume,
+            .value = count % 2U == 0U ? 15 : 14,
+            .count = count,
+        });
+    }
+    layer.volume_envelope.events.push_back({
+        .kind = EnvelopeEventKind::Volume,
+        .value = 9,
+        .count = 240,
+        .automatic = true,
+    });
+    for (std::uint32_t count = 241; count < 300; ++count) {
+        layer.volume_envelope.events.push_back({
+            .kind = EnvelopeEventKind::Volume,
+            .value = count % 2U == 0U ? 10 : 9,
+            .count = count,
+        });
+    }
+    const auto partial = formatMgsCompositeEnvelope(layer, 0);
+    const auto complete = formatMgsCompositeEnvelope(
+        layer, 0, std::numeric_limits<std::size_t>::max());
+    REQUIRE_EQ(partial.valid(), true);
+    REQUIRE_EQ(partial.output_cutoff_count.has_value(), true);
+    REQUIRE_EQ(*partial.output_cutoff_count > 240U, true);
+    REQUIRE_EQ(partial.compiled_bytes <= kMgscEnvelopeCompiledByteLimit, true);
+    REQUIRE_EQ(complete.valid(), true);
+    REQUIRE_EQ(partial.body.find("9=10") != std::string::npos, true);
+    REQUIRE_EQ(
+        sampleEnvelopeEvents(partial.bytecode, *partial.output_cutoff_count),
+        sampleEnvelopeEvents(complete.bytecode, *partial.output_cutoff_count));
+}
+
+void testOverLimitAuthoredLoopIsExportedAsSafeFinitePrefix() {
+    using namespace mgstc::engine;
+    auto layer = defaultCompositeTimbre().layers[0];
+    layer.envelope_timeline = {
+        .length_counts = 300,
+        .loop_start_count = 250,
+        .loop_end_count = 280,
+    };
+    layer.volume_envelope.events.clear();
+    layer.pitch_envelope.events.clear();
+    for (std::uint32_t count = 0; count < 300; ++count) {
+        layer.volume_envelope.events.push_back({
+            .kind = EnvelopeEventKind::Volume,
+            .value = count % 2U == 0U ? 15 : 14,
+            .count = count,
+        });
+    }
+    const auto partial = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(partial.valid(), true);
+    REQUIRE_EQ(partial.output_cutoff_count.has_value(), true);
+    REQUIRE_EQ(partial.compiled_bytes <= kMgscEnvelopeCompiledByteLimit, true);
+    REQUIRE_EQ(partial.body.find('[') == std::string::npos, true);
+    REQUIRE_EQ(partial.body.find(']') == std::string::npos, true);
+
+    // An unusably small budget cannot emit the count-zero command group and
+    // remains an error, as does a malformed authored loop.
+    const auto impossible = formatMgsCompositeEnvelope(layer, 0, 0);
+    REQUIRE_EQ(impossible.valid(), false);
+    REQUIRE_EQ(impossible.hasIssue(MgsEnvelopeIssue::DefinitionLengthExceeded),
+        true);
+    layer.envelope_timeline.loop_end_count.reset();
+    const auto malformed = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(malformed.valid(), false);
+    REQUIRE_EQ(malformed.hasIssue(MgsEnvelopeIssue::IncompleteLoop), true);
+}
+
+void testDefaultWaitDoesNotBlockAutomaticOscillateLoopOptimization() {
+    using namespace mgstc::engine;
+    enum class Target { Pitch, Volume, OpllTl, OpllFb };
+    for (const auto target : {Target::Pitch, Target::Volume,
+                              Target::OpllTl, Target::OpllFb}) {
+        const bool opll = target == Target::OpllTl
+            || target == Target::OpllFb;
+        auto layer = defaultCompositeTimbre().layers[opll ? 2U : 1U];
+        layer.envelope_timeline = {.length_counts = 120};
+        // Keep the factory's Volume + Wait(60) data intact. New layers use
+        // this legacy default, and the ignored Wait must not act as a barrier.
+        REQUIRE_EQ(layer.volume_envelope.events.size(), 2U);
+        REQUIRE_EQ(layer.volume_envelope.events[1].kind,
+            EnvelopeEventKind::Wait);
+        REQUIRE_EQ(layer.volume_envelope.events[1].count, 60U);
+        layer.pitch_envelope.events.clear();
+        layer.timbre_automation.clear();
+        if (opll) {
+            layer.base_timbre = SavedTimbreReference{
+                .library_id = 1,
+                .revision = 1,
+                .name = "default Wait OPLL",
+                .source = TimbreSource::Opll,
+                .number_mode = TimbreNumberMode::Manual,
+                .manual_number = 16,
+                .opll_registers = {0x21, 0x18, 0xCA, 0xB2, 0x31, 0x42, 0x53, 0x64},
+            };
+        }
+        const ModulationParameters modulation{
+            .enabled = true,
+            .mode = ModulationMode::Oscillate,
+            .delay = 1,
+            .depth = 0,
+            .speed = 2,
+            .roughness = 4,
+        };
+        switch (target) {
+        case Target::Pitch: layer.pitch_modulation = modulation; break;
+        case Target::Volume: layer.volume_modulation = modulation; break;
+        case Target::OpllTl: layer.opll_tl_modulation = modulation; break;
+        case Target::OpllFb: layer.opll_fb_modulation = modulation; break;
+        }
+        const auto expanded = expandCompositeLayerModulations(layer);
+        REQUIRE_EQ(expanded.envelope_timeline.loop_start_count.has_value(), true);
+        REQUIRE_EQ(expanded.envelope_timeline.loop_end_count.has_value(), true);
+        const auto optimized = formatMgsCompositeEnvelope(layer, 0);
+        REQUIRE_EQ(optimized.valid(), true);
+        REQUIRE_EQ(optimized.body.find('[') != std::string::npos, true);
+
+        auto finite = expandCompositeLayerModulations(layer, nullptr, false);
+        finite.pitch_modulation.enabled = false;
+        finite.volume_modulation.enabled = false;
+        const auto register_events = expandOpllLayerRegisterAutos(finite);
+        finite.timbre_automation.insert(finite.timbre_automation.end(),
+            register_events.begin(), register_events.end());
+        finite.opll_tl_modulation.enabled = false;
+        finite.opll_fb_modulation.enabled = false;
+        const auto finite_output = formatMgsCompositeEnvelope(
+            finite, 0, std::numeric_limits<std::size_t>::max());
+        REQUIRE_EQ(finite_output.valid(), true);
+        REQUIRE_EQ(optimized.compiled_bytes < finite_output.compiled_bytes, true);
+        REQUIRE_EQ(sampleEnvelopeEvents(optimized.bytecode, 100),
+            sampleEnvelopeEvents(finite_output.bytecode, 100));
+    }
 }
 
 void testPreciseAutomaticKeepsUnsplitRampVolumes() {
@@ -6022,6 +6795,849 @@ void testSoftwareLfoTrackSetupAndLibraryRoundTrip() {
     REQUIRE_EQ(
         loaded->find(id)->timbre.layers[1].software_lfo,
         layer.software_lfo);
+}
+
+void testCompositeModulationStepModesRespectDelayAndDirection() {
+    using namespace mgstc::engine;
+    ModulationParameters settings;
+    settings.enabled = true;
+    settings.mode = ModulationMode::StepUp;
+    settings.delay = 2;
+    settings.speed = 1;
+    settings.depth = 0;
+    settings.roughness = 3;
+
+    // ENV count zero is key-on. Delay and speed defer the first change;
+    // depth does not limit one-way movement.
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 0), 0);
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 2), 0);
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 3), 0);
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 4), 3);
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 6), 6);
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 7), 6);
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 10), 12);
+
+    settings.mode = ModulationMode::StepDown;
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 4), -3);
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 7), -6);
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 10), -12);
+
+    settings.enabled = false;
+    REQUIRE_EQ(modulationOffsetAtCount(settings, 100), 0);
+    REQUIRE_EQ(
+        modulationEffectiveValueAtCount(settings, 100, 11, 0, 15), 11);
+
+    settings.enabled = true;
+    settings.mode = ModulationMode::StepUp;
+    REQUIRE_EQ(
+        modulationEffectiveValueAtCount(settings, 10, 14, 0, 15), 15);
+}
+
+void testCompositeModulationClampsStoredRangeBoundaries() {
+    using namespace mgstc::engine;
+    ModulationParameters settings;
+    settings.enabled = true;
+    settings.mode = ModulationMode::StepDown;
+    settings.delay = 255;
+    settings.depth = 200;
+    settings.speed = 0;
+    settings.roughness = std::numeric_limits<std::int8_t>::min();
+
+    const auto clamped = clampModulation(settings);
+    REQUIRE_EQ(clamped.enabled, true);
+    REQUIRE_EQ(clamped.mode, ModulationMode::StepDown);
+    REQUIRE_EQ(clamped.delay, static_cast<std::uint8_t>(255));
+    REQUIRE_EQ(clamped.depth, static_cast<std::uint8_t>(127));
+    REQUIRE_EQ(clamped.speed, static_cast<std::uint8_t>(0));
+    REQUIRE_EQ(clamped.roughness, static_cast<std::int8_t>(-127));
+}
+
+void testCompositeModulationOscillateIsBoundedAndRepeats() {
+    using namespace mgstc::engine;
+    ModulationParameters settings;
+    settings.enabled = true;
+    settings.mode = ModulationMode::Oscillate;
+    settings.depth = 3;
+    settings.speed = 1;
+    settings.roughness = 2;
+
+    const auto first_update = softwareLfoFirstUpdateTick(
+        settings.delay, settings.speed);
+    const auto period = softwareLfoSpeedPeriod(settings.speed);
+    const auto cycle_ticks = period * 2U * (settings.depth + 1U);
+    const auto first = modulationOffsetAtCount(settings, first_update);
+    const auto next = modulationOffsetAtCount(
+        settings, first_update + cycle_ticks);
+    REQUIRE_EQ(first, 2);
+    REQUIRE_EQ(next, first);
+
+    std::int32_t peak = 0;
+    for (std::uint32_t count = first_update;
+         count < first_update + cycle_ticks;
+         ++count) {
+        peak = std::max(
+            peak, std::abs(modulationOffsetAtCount(settings, count)));
+    }
+    REQUIRE_EQ(peak <= static_cast<std::int32_t>((settings.depth + 1) * 2), true);
+}
+
+enum class AutoLoopTarget : std::uint8_t {
+    Pitch,
+    Volume,
+    OpllTl,
+    OpllFb,
+};
+
+mgstc::engine::CompositeLayer makeAutoLoopModulationLayer(
+    AutoLoopTarget target,
+    mgstc::engine::ModulationMode mode) {
+    using namespace mgstc::engine;
+    auto layer = target == AutoLoopTarget::OpllTl
+            || target == AutoLoopTarget::OpllFb
+        ? defaultCompositeTimbre().layers[2]
+        : defaultCompositeTimbre().layers[0];
+    layer.envelope_timeline = {.length_counts = 768};
+    layer.volume_envelope.events.clear();
+    layer.pitch_envelope.events.clear();
+    layer.timbre_automation.clear();
+    layer.volume = target == AutoLoopTarget::Volume ? 5 : 10;
+    const ModulationParameters modulation{
+        .enabled = true,
+        .mode = mode,
+        .delay = 5,
+        .depth = 3,
+        .speed = 2,
+        .roughness = static_cast<std::int8_t>(
+            mode == ModulationMode::Oscillate ? -2 : -1),
+    };
+    switch (target) {
+    case AutoLoopTarget::Pitch:
+        layer.pitch_modulation = modulation;
+        break;
+    case AutoLoopTarget::Volume:
+        layer.volume_modulation = modulation;
+        break;
+    case AutoLoopTarget::OpllTl:
+        layer.base_timbre = SavedTimbreReference{
+            .library_id = 1,
+            .revision = 1,
+            .name = "loop-test OPLL",
+            .source = TimbreSource::Opll,
+            .opll_registers = {0x21, 0x18, 0xCA, 0xB2, 0x31, 0x42, 0x53, 0x64},
+        };
+        layer.opll_tl_modulation = modulation;
+        break;
+    case AutoLoopTarget::OpllFb:
+        layer.base_timbre = SavedTimbreReference{
+            .library_id = 1,
+            .revision = 1,
+            .name = "loop-test OPLL",
+            .source = TimbreSource::Opll,
+            .opll_registers = {0x21, 0x18, 0xCA, 0xB2, 0x31, 0x42, 0x53, 0x64},
+        };
+        layer.opll_fb_modulation = modulation;
+        break;
+    }
+    return layer;
+}
+
+std::vector<std::vector<mgstc::engine::MeaningEvent>> sampleEnvelopeEvents(
+    const std::vector<std::uint8_t>& bytecode,
+    std::size_t ticks) {
+    using namespace mgstc::engine;
+    SequenceEnvelopeRuntime runtime(bytecode);
+    runtime.resetForKeyOn(15);
+    EventBuffer buffer(64);
+    std::vector<std::vector<MeaningEvent>> result;
+    result.reserve(ticks);
+    for (std::size_t count = 0; count < ticks; ++count) {
+        buffer.clear();
+        REQUIRE_EQ(runtime.processTick(buffer), SequenceError::None);
+        result.emplace_back(buffer.events().begin(), buffer.events().end());
+    }
+    return result;
+}
+
+void testEqualPeriodModulationsShareLoopDespiteDifferentDelays() {
+    using namespace mgstc::engine;
+    for (const unsigned mask : {3U, 5U, 10U, 12U, 15U}) {
+      for (const bool pitch_step : {false, true}) {
+        auto layer = makeAutoLoopModulationLayer(
+            AutoLoopTarget::OpllTl, ModulationMode::Oscillate);
+        layer.envelope_timeline.length_counts = 700;
+        ModulationParameters* mods[] = {&layer.pitch_modulation,
+            &layer.volume_modulation, &layer.opll_tl_modulation,
+            &layer.opll_fb_modulation};
+        for (std::size_t index = 0; index < 4; ++index) {
+            *mods[index] = {
+                .enabled = (mask & (1U << index)) != 0,
+                .mode = index == 0 && pitch_step
+                    ? ModulationMode::StepDown : ModulationMode::Oscillate,
+                .delay = static_cast<std::uint8_t>(1 + index * 5),
+                .depth = static_cast<std::uint8_t>(index % 2 == 0 ? 1 : 3),
+                .speed = static_cast<std::uint8_t>(index == 0 && pitch_step
+                    ? 7 : index % 2 == 0 ? 1 : 0),
+                .roughness = static_cast<std::int8_t>(index == 2 ? 20 : -2),
+            };
+        }
+        const auto optimized = formatMgsCompositeEnvelope(layer, 0);
+        REQUIRE_EQ(optimized.valid(), true);
+        REQUIRE_EQ(optimized.body.find('[') != std::string::npos, true);
+        REQUIRE_EQ(optimized.output_cutoff_count.has_value(), false);
+        auto finite = expandCompositeLayerModulations(layer, nullptr, false);
+        finite.opll_tl_modulation.enabled = false;
+        finite.opll_fb_modulation.enabled = false;
+        // Register modulations remain enabled in expanded layers, so derive
+        // their finite y stream explicitly before disabling the settings.
+        const auto ys = expandOpllLayerRegisterAutos(layer);
+        finite.timbre_automation.insert(finite.timbre_automation.end(), ys.begin(), ys.end());
+        const auto uncompressed = formatMgsCompositeEnvelope(
+            finite, 0, std::numeric_limits<std::size_t>::max());
+        REQUIRE_EQ(uncompressed.valid(), true);
+        REQUIRE_EQ(optimized.compiled_bytes < uncompressed.compiled_bytes, true);
+        REQUIRE_EQ(sampleEnvelopeEvents(optimized.bytecode, 600),
+            sampleEnvelopeEvents(uncompressed.bytecode, 600));
+        if (mask == 15U && !pitch_step) {
+            auto mismatch = layer;
+            mismatch.opll_fb_modulation.speed = 2;
+            REQUIRE_EQ(expandCompositeLayerModulations(mismatch)
+                .envelope_timeline.loop_start_count.has_value(), false);
+            for (std::size_t index = 1; index < 4; ++index) {
+                auto absolute_step = layer;
+                ModulationParameters* absolute[] = {&absolute_step.volume_modulation,
+                    &absolute_step.opll_tl_modulation, &absolute_step.opll_fb_modulation};
+                absolute[index - 1]->mode = ModulationMode::StepUp;
+                REQUIRE_EQ(expandCompositeLayerModulations(absolute_step)
+                    .envelope_timeline.loop_start_count.has_value(), false);
+            }
+        }
+      }
+    }
+}
+
+void testAutomaticOscillateLoopsSaveCompiledBytesAndPreserveRuntimeStream() {
+    using namespace mgstc::engine;
+    const std::array targets{
+        AutoLoopTarget::Pitch,
+        AutoLoopTarget::Volume,
+        AutoLoopTarget::OpllTl,
+        AutoLoopTarget::OpllFb,
+    };
+    TimbreNumberResolution numbers{};
+    numbers.assignments.push_back({
+        .layer_index = 2,
+        .library_id = 1,
+        .number = 0,
+        .manually_assigned = false,
+    });
+    for (const auto target : targets) {
+        auto optimized_layer = makeAutoLoopModulationLayer(
+            target, ModulationMode::Oscillate);
+        // A later zero-delta manual command suppresses automatic loop
+        // optimization while preserving the full finite LFO expansion.
+        auto finite_layer = optimized_layer;
+        finite_layer.pitch_envelope.events.push_back({
+            .kind = EnvelopeEventKind::Pitch,
+            .value = 0,
+            .count = 700,
+        });
+        REQUIRE_EQ(expandCompositeLayerModulations(finite_layer)
+            .envelope_timeline.loop_start_count.has_value(), false);
+
+        const auto optimized_loop = expandCompositeLayerModulations(
+            optimized_layer);
+        REQUIRE_EQ(optimized_loop.envelope_timeline.loop_start_count.has_value(), true);
+        REQUIRE_EQ(optimized_loop.envelope_timeline.loop_end_count.has_value(), true);
+
+        // Verify the canonical formatter used by MGSC export and audition.
+        // The old auxiliary lane compiler retains unreachable tail commands.
+        const auto optimized_export = formatMgsCompositeEnvelope(
+            optimized_layer, 0, kMgscEnvelopeCompiledByteLimit, &numbers);
+        const auto finite_export = formatMgsCompositeEnvelope(
+            finite_layer, 0, 65'535, &numbers);
+        REQUIRE_EQ(optimized_export.valid(), true);
+        REQUIRE_EQ(finite_export.valid(), true);
+        REQUIRE_EQ(optimized_export.body.find('[') != std::string::npos, true);
+        REQUIRE_EQ(optimized_export.compiled_bytes < finite_export.compiled_bytes, true);
+        REQUIRE_EQ(optimized_export.compiled_bytes <= kMgscEnvelopeCompiledByteLimit, true);
+
+        // Compare the ordered runtime events over many cycles, including the
+        // startup prefix and the first several traversals of the recurring body.
+        constexpr std::size_t comparison_ticks = 600;
+        const auto optimized_events = sampleEnvelopeEvents(
+            optimized_export.bytecode, comparison_ticks);
+        const auto finite_events = sampleEnvelopeEvents(
+            finite_export.bytecode, comparison_ticks);
+        REQUIRE_EQ(optimized_events, finite_events);
+        if (target == AutoLoopTarget::OpllTl
+            || target == AutoLoopTarget::OpllFb) {
+            const auto reg = target == AutoLoopTarget::OpllTl ? 2 : 3;
+            const auto preserved_mask = target == AutoLoopTarget::OpllTl
+                ? 0xC0 : 0xF8;
+            const auto preserved_bits = target == AutoLoopTarget::OpllTl
+                ? 0xC0 : 0xB0;
+            for (const auto& tick_events : optimized_events) {
+                for (const auto& event : tick_events) {
+                    if (event.kind == MeaningEventKind::RegisterWrite
+                        && event.arg0 == reg) {
+                        REQUIRE_EQ(event.arg1 & preserved_mask, preserved_bits);
+                    }
+                }
+            }
+        }
+
+    }
+}
+
+void testAutomaticStepLoopsPreserveDelayedSignedTransitions() {
+    using namespace mgstc::engine;
+    const TimbreNumberResolution numbers{};
+    for (const auto mode : {ModulationMode::StepUp, ModulationMode::StepDown}) {
+        auto optimized_layer = makeAutoLoopModulationLayer(
+            AutoLoopTarget::Pitch, mode);
+        const auto optimized_loop = expandCompositeLayerModulations(
+            optimized_layer);
+        REQUIRE_EQ(optimized_loop.envelope_timeline.loop_start_count.has_value(), true);
+        REQUIRE_EQ(optimized_loop.envelope_timeline.loop_end_count.has_value(), true);
+
+        auto finite_layer = optimized_layer;
+        finite_layer.pitch_envelope.events.push_back({
+            .kind = EnvelopeEventKind::Pitch,
+            .value = 0,
+            .count = 700,
+        });
+        const auto optimized_bytecode = compileCompositeEnvelopeLane(
+            optimized_layer, CompositeEnvelopeLane::Pitch, numbers);
+        const auto finite_bytecode = compileCompositeEnvelopeLane(
+            finite_layer, CompositeEnvelopeLane::Pitch, numbers);
+        REQUIRE_EQ(optimized_bytecode.size() < finite_bytecode.size(), true);
+        REQUIRE_EQ(
+            sampleEnvelopeEvents(optimized_bytecode, 600),
+            sampleEnvelopeEvents(finite_bytecode, 600));
+        const auto optimized_export = formatMgsCompositeEnvelope(
+            optimized_layer, 0, kMgscEnvelopeCompiledByteLimit, &numbers);
+        const auto finite_export = formatMgsCompositeEnvelope(
+            finite_layer, 0, 65'535, &numbers);
+        REQUIRE_EQ(optimized_export.valid(), true);
+        REQUIRE_EQ(finite_export.valid(), true);
+        REQUIRE_EQ(optimized_export.body.find('[') != std::string::npos, true);
+        REQUIRE_EQ(optimized_export.compiled_bytes < finite_export.compiled_bytes, true);
+        REQUIRE_EQ(sampleEnvelopeEvents(optimized_export.bytecode, 600),
+            sampleEnvelopeEvents(finite_export.bytecode, 600));
+    }
+
+    // The 8-bit delay/speed sum can make the first update occur at count0.
+    // A manual command at that same count remains in the one-time prefix.
+    auto at_zero = makeAutoLoopModulationLayer(
+        AutoLoopTarget::Pitch, ModulationMode::StepUp);
+    at_zero.pitch_modulation.delay = 255;
+    at_zero.pitch_modulation.speed = 0;
+    at_zero.pitch_envelope.events.push_back({
+        .kind = EnvelopeEventKind::Pitch, .value = 7, .count = 0,
+    });
+    auto zero_baseline = at_zero;
+    zero_baseline.pitch_envelope.events.push_back({
+        .kind = EnvelopeEventKind::Pitch, .value = 0, .count = 700,
+    });
+    const auto zero_export = formatMgsCompositeEnvelope(at_zero, 0);
+    const auto zero_finite = formatMgsCompositeEnvelope(
+        zero_baseline, 0, 65'535);
+    REQUIRE_EQ(zero_export.valid(), true);
+    REQUIRE_EQ(zero_finite.valid(), true);
+    REQUIRE_EQ(zero_export.body.find('[') != std::string::npos, true);
+    REQUIRE_EQ(sampleEnvelopeEvents(zero_export.bytecode, 600),
+        sampleEnvelopeEvents(zero_finite.bytecode, 600));
+}
+
+void testAutomaticLoopFallsBackForShortCyclesAndLaterBarriers() {
+    using namespace mgstc::engine;
+    auto short_layer = makeAutoLoopModulationLayer(
+        AutoLoopTarget::Pitch, ModulationMode::Oscillate);
+    short_layer.envelope_timeline.length_counts = 4;
+    REQUIRE_EQ(expandCompositeLayerModulations(short_layer)
+        .envelope_timeline.loop_start_count.has_value(), false);
+
+    auto one_cycle = makeAutoLoopModulationLayer(
+        AutoLoopTarget::Pitch, ModulationMode::Oscillate);
+    const auto candidate = expandCompositeLayerModulations(one_cycle);
+    one_cycle.envelope_timeline.length_counts =
+        *candidate.envelope_timeline.loop_end_count;
+    // A complete candidate exists, but brackets cost more than the single
+    // finite cycle. The product formatter must choose the smaller output.
+    REQUIRE_EQ(expandCompositeLayerModulations(one_cycle)
+        .envelope_timeline.loop_start_count.has_value(), true);
+    const auto no_savings = formatMgsCompositeEnvelope(one_cycle, 0);
+    REQUIRE_EQ(no_savings.valid(), true);
+    REQUIRE_EQ(no_savings.body.find('[') == std::string::npos, true);
+
+    auto later_pitch = makeAutoLoopModulationLayer(
+        AutoLoopTarget::Pitch, ModulationMode::Oscillate);
+    later_pitch.pitch_envelope.events.push_back({
+        .kind = EnvelopeEventKind::Pitch,
+        .value = 0,
+        .count = 700,
+    });
+    REQUIRE_EQ(expandCompositeLayerModulations(later_pitch)
+        .envelope_timeline.loop_start_count.has_value(), false);
+
+    auto later_timbre = makeAutoLoopModulationLayer(
+        AutoLoopTarget::Pitch, ModulationMode::Oscillate);
+    later_timbre.timbre_automation.push_back({
+        .kind = EnvelopeEventKind::RegisterWrite,
+        .value = 20,
+        .secondary = 7,
+        .count = 700,
+    });
+    REQUIRE_EQ(expandCompositeLayerModulations(later_timbre)
+        .envelope_timeline.loop_start_count.has_value(), false);
+
+    auto second_modulation = makeAutoLoopModulationLayer(
+        AutoLoopTarget::Pitch, ModulationMode::Oscillate);
+    second_modulation.volume_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::StepDown,
+        .roughness = 1,
+    };
+    REQUIRE_EQ(expandCompositeLayerModulations(second_modulation)
+        .envelope_timeline.loop_start_count.has_value(), false);
+
+    auto automatic_ramp = makeAutoLoopModulationLayer(
+        AutoLoopTarget::Pitch, ModulationMode::Oscillate);
+    automatic_ramp.volume_envelope.events.push_back({
+        .kind = EnvelopeEventKind::Volume,
+        .value = 12,
+        .secondary = 2,
+        .count = 0,
+        .automatic = true,
+    });
+    REQUIRE_EQ(expandCompositeLayerModulations(automatic_ramp)
+        .envelope_timeline.loop_start_count.has_value(), false);
+}
+
+void testAbsoluteStepModulationDoesNotRepeatWritesAfterClamp() {
+    using namespace mgstc::engine;
+    const TimbreNumberResolution numbers{};
+    for (const auto target : {AutoLoopTarget::Volume,
+                              AutoLoopTarget::OpllTl,
+                              AutoLoopTarget::OpllFb}) {
+      for (const auto mode : {ModulationMode::StepUp, ModulationMode::StepDown}) {
+        auto layer = makeAutoLoopModulationLayer(target, mode);
+        auto& settings = target == AutoLoopTarget::Volume
+            ? layer.volume_modulation
+            : target == AutoLoopTarget::OpllTl
+                ? layer.opll_tl_modulation
+                : layer.opll_fb_modulation;
+        settings.roughness = 4;
+        const auto expanded = expandCompositeLayerModulations(layer);
+        REQUIRE_EQ(expanded.envelope_timeline.loop_start_count.has_value(), false);
+        const auto lane = target == AutoLoopTarget::Volume
+            ? CompositeEnvelopeLane::Volume
+            : CompositeEnvelopeLane::Timbre;
+        const auto code = compileCompositeEnvelopeLane(
+            layer, lane, numbers);
+        auto finite_layer = layer;
+        finite_layer.pitch_envelope.events.push_back({
+            .kind = EnvelopeEventKind::Pitch,
+            .value = 0,
+            .count = 700,
+        });
+        const auto finite_code = compileCompositeEnvelopeLane(
+            finite_layer, lane, numbers);
+        REQUIRE_EQ(sampleEnvelopeEvents(code, 600),
+            sampleEnvelopeEvents(finite_code, 600));
+        SequenceEnvelopeRuntime runtime(code);
+        runtime.resetForKeyOn(15);
+        EventBuffer events(64);
+        const auto base_value = target == AutoLoopTarget::OpllTl
+            ? 10 : target == AutoLoopTarget::OpllFb ? 2 : 5;
+        const auto maximum = target == AutoLoopTarget::OpllTl
+            ? 63 : target == AutoLoopTarget::OpllFb ? 7 : 15;
+        const auto updates_to_clamp = static_cast<std::uint32_t>(mode
+                == ModulationMode::StepUp
+            ? (maximum - base_value + 3) / 4
+            : (base_value + 3) / 4);
+        const auto first_update = softwareLfoFirstUpdateTick(
+            settings.delay, settings.speed);
+        const auto clamp_tick = first_update
+            + (updates_to_clamp - 1U)
+                * softwareLfoSpeedPeriod(settings.speed);
+        std::size_t writes_after_clamp = 0;
+        for (std::uint32_t count = 0; count < 700; ++count) {
+            events.clear();
+            REQUIRE_EQ(runtime.processTick(events), SequenceError::None);
+            for (const auto& event : events.events()) {
+                const bool target_write = target == AutoLoopTarget::Volume
+                    ? event.kind == MeaningEventKind::Volume
+                    : event.kind == MeaningEventKind::RegisterWrite
+                        && event.arg0 == (target == AutoLoopTarget::OpllTl
+                            ? 2 : 3);
+                if (!target_write) {
+                    continue;
+                }
+                if (target != AutoLoopTarget::Volume
+                    && event.tick > clamp_tick) {
+                    ++writes_after_clamp;
+                }
+            }
+        }
+        if (target != AutoLoopTarget::Volume) {
+            REQUIRE_EQ(writes_after_clamp, 0U);
+        } else {
+            REQUIRE_EQ(std::any_of(
+                expanded.volume_envelope.events.begin(),
+                expanded.volume_envelope.events.end(),
+                [clamp_tick](const EnvelopeEvent& event) {
+                    return event.kind == EnvelopeEventKind::Volume
+                        && event.count > clamp_tick;
+                }), false);
+        }
+      }
+    }
+}
+
+void testOscillatingPitchLoopHasZeroNetDelta() {
+    using namespace mgstc::engine;
+    auto layer = defaultCompositeTimbre().layers[0];
+    layer.envelope_timeline.length_counts = 32;
+    layer.volume_envelope.events.clear();
+    layer.pitch_envelope.events.clear();
+    layer.timbre_automation.clear();
+    layer.pitch_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::Oscillate,
+        .delay = 0,
+        .depth = 3,
+        .speed = 0,
+        .roughness = 2,
+    };
+    const auto expanded = expandCompositeLayerModulations(layer);
+    REQUIRE_EQ(expanded.envelope_timeline.loop_start_count.has_value(), true);
+    REQUIRE_EQ(expanded.envelope_timeline.loop_end_count.has_value(), true);
+    const auto start = *expanded.envelope_timeline.loop_start_count;
+    const auto end = *expanded.envelope_timeline.loop_end_count;
+    REQUIRE_EQ(start, 4U);
+    REQUIRE_EQ(end - start, 8U);
+    int body_delta = 0;
+    for (const auto& event : expanded.pitch_envelope.events) {
+        if (event.count >= start && event.count < end) {
+            body_delta += event.value;
+        }
+    }
+    REQUIRE_EQ(body_delta, 0);
+    REQUIRE_EQ(modulationOffsetAtCount(layer.pitch_modulation, start - 1),
+        modulationOffsetAtCount(layer.pitch_modulation, end - 1));
+
+    const TimbreNumberResolution numbers{};
+    auto bytecode = compileCompositeEnvelopeLane(
+        layer, CompositeEnvelopeLane::Pitch, numbers);
+    SequenceEnvelopeRuntime runtime(std::move(bytecode));
+    runtime.resetForKeyOn(15);
+    EventBuffer buffer(16);
+    int accumulated = 0;
+    for (std::uint32_t tick = 0; tick < 100; ++tick) {
+        buffer.clear();
+        REQUIRE_EQ(runtime.processTick(buffer), SequenceError::None);
+        for (std::size_t i = 0; i < buffer.size(); ++i) {
+            if (buffer.events()[i].kind == MeaningEventKind::FrequencyDelta) {
+                accumulated += buffer.events()[i].arg0;
+            }
+        }
+        REQUIRE_EQ(accumulated,
+            modulationOffsetAtCount(layer.pitch_modulation, tick));
+    }
+}
+
+void testPitchLoopOptimizerHonorsBarriers() {
+    using namespace mgstc::engine;
+    auto layer = defaultCompositeTimbre().layers[0];
+    layer.envelope_timeline.length_counts = 32;
+    layer.volume_envelope.events.clear();
+    layer.pitch_envelope.events.clear();
+    layer.timbre_automation.clear();
+    layer.pitch_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::Oscillate,
+        .depth = 1,
+        .roughness = 1,
+    };
+    REQUIRE_EQ(expandCompositeLayerModulations(layer)
+        .envelope_timeline.loop_start_count.has_value(), true);
+
+    layer.volume_envelope.events.push_back({
+        .kind = EnvelopeEventKind::Volume,
+        .value = 10,
+        .count = 20,
+    });
+    REQUIRE_EQ(expandCompositeLayerModulations(layer)
+        .envelope_timeline.loop_start_count.has_value(), false);
+
+    layer.volume_envelope.events.clear();
+    layer.volume_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::StepDown,
+        .roughness = 1,
+    };
+    REQUIRE_EQ(expandCompositeLayerModulations(layer)
+        .envelope_timeline.loop_start_count.has_value(), false);
+}
+
+void testOpllModulationLoopBoundaryWriteRepeats() {
+    using namespace mgstc::engine;
+    auto layer = defaultCompositeTimbre().layers[2];
+    layer.base_timbre = SavedTimbreReference{
+        .library_id = 1,
+        .revision = 1,
+        .name = "original",
+        .source = TimbreSource::Opll,
+        .opll_registers = {0, 0, 10, 0, 0, 0, 0, 0},
+    };
+    layer.envelope_timeline = {
+        .length_counts = 8,
+        .loop_start_count = 3,
+        .loop_end_count = 7,
+    };
+    layer.opll_tl_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::Oscillate,
+        .delay = 0,
+        .depth = 1,
+        .speed = 0,
+        .roughness = 1,
+    };
+    REQUIRE_EQ(compositeModulationLoopRepresentable(layer), true);
+    const auto events = expandOpllLayerRegisterAutos(layer);
+    bool boundary_write_in_body = false;
+    for (const auto& event : events) {
+        if (event.count == 3 && event.value == 2
+            && event.secondary == 9 && event.after_loop_start) {
+            boundary_write_in_body = true;
+        }
+    }
+    REQUIRE_EQ(boundary_write_in_body, true);
+    const auto formatted = formatMgsCompositeEnvelope(layer, 2);
+    REQUIRE_EQ(formatted.valid(), true);
+    const auto anchor = formatted.body.find('[');
+    const auto boundary_write = formatted.body.find("y2,9");
+    REQUIRE_EQ(anchor != std::string::npos, true);
+    REQUIRE_EQ(boundary_write > anchor, true);
+    REQUIRE_EQ(boundary_write < formatted.body.find(']'), true);
+}
+
+void testCompositeModulationAllTargetsRoundTripThroughLibrary() {
+    using namespace mgstc::engine;
+    auto composite = defaultCompositeTimbre();
+    auto& layer = composite.layers[2];
+    layer.pitch_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::StepUp,
+        .delay = 2,
+        .depth = 17,
+        .speed = 3,
+        .roughness = 4,
+    };
+    layer.volume_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::StepDown,
+        .delay = 5,
+        .depth = 23,
+        .speed = 7,
+        .roughness = -2,
+    };
+    layer.opll_tl_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::Oscillate,
+        .delay = 11,
+        .depth = 31,
+        .speed = 13,
+        .roughness = 6,
+    };
+    layer.opll_fb_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::Oscillate,
+        .delay = 19,
+        .depth = 47,
+        .speed = 29,
+        .roughness = -8,
+    };
+
+    CompositeTimbreLibrary library;
+    const auto id = library.add(composite, 100);
+    std::string error;
+    auto loaded = CompositeTimbreLibrary::deserialize(
+        library.serialize(), &error);
+    REQUIRE_EQ(loaded.has_value(), true);
+    REQUIRE_EQ(error.empty(), true);
+    const auto* entry = loaded->find(id);
+    REQUIRE_EQ(entry != nullptr, true);
+    REQUIRE_EQ(entry->timbre.layers[2].pitch_modulation, layer.pitch_modulation);
+    REQUIRE_EQ(entry->timbre.layers[2].volume_modulation, layer.volume_modulation);
+    REQUIRE_EQ(entry->timbre.layers[2].opll_tl_modulation, layer.opll_tl_modulation);
+    REQUIRE_EQ(entry->timbre.layers[2].opll_fb_modulation, layer.opll_fb_modulation);
+}
+
+void testAuthoredModulationLoopRejectsPhaseResetAndAcceptsAlignment() {
+    using namespace mgstc::engine;
+    auto makeComposite = [](std::uint32_t loop_start,
+                            std::uint32_t loop_end) {
+        auto timbre = defaultCompositeTimbre();
+        for (auto& layer : timbre.layers) {
+            layer.enabled = false;
+        }
+        auto& layer = timbre.layers[0];
+        layer.enabled = true;
+        layer.envelope_timeline = {
+            .length_counts = loop_end + 1,
+            .loop_start_count = loop_start,
+            .loop_end_count = loop_end,
+        };
+        layer.pitch_modulation = {
+            .enabled = true,
+            .mode = ModulationMode::StepUp,
+            .delay = 0,
+            .depth = 5,
+            .speed = 0,
+            .roughness = 1,
+        };
+        return timbre;
+    };
+
+    // An authored loop beginning before the first modulation update would
+    // restart its delayed phase on every pass. Both export and audition must
+    // reject that representation instead of silently resetting the phase.
+    auto incompatible = makeComposite(0, 2);
+    const auto& incompatible_layer = incompatible.layers[0];
+    REQUIRE_EQ(
+        compositeModulationLoopRepresentable(incompatible_layer), false);
+    const auto rejected = formatMgsCompositeEnvelope(
+        incompatible_layer, 0);
+    REQUIRE_EQ(
+        rejected.hasIssue(MgsEnvelopeIssue::UnrepresentableModulationLoop),
+        true);
+    EngineCore rejected_engine;
+    REQUIRE_EQ(
+        compileCompositeProgram(rejected_engine, incompatible, {}), false);
+
+    // Starting on the first update and repeating on the same one-tick phase
+    // boundary preserves the continuous StepUp stream across every loop pass.
+    auto aligned = makeComposite(1, 3);
+    const auto& aligned_layer = aligned.layers[0];
+    REQUIRE_EQ(compositeModulationLoopRepresentable(aligned_layer), true);
+    const auto accepted = formatMgsCompositeEnvelope(aligned_layer, 0);
+    REQUIRE_EQ(accepted.valid(), true);
+    EngineCore aligned_engine;
+    REQUIRE_EQ(compileCompositeProgram(aligned_engine, aligned, {}), true);
+
+    const TimbreNumberResolution numbers{};
+    const auto aligned_pitch = compileCompositeEnvelopeLane(
+        aligned_layer, CompositeEnvelopeLane::Pitch, numbers);
+    SequenceEnvelopeRuntime pitch_runtime(aligned_pitch);
+    pitch_runtime.resetForKeyOn(15);
+    EventBuffer pitch_buffer(16);
+    std::int32_t accumulated_pitch = 0;
+    std::optional<std::int32_t> pitch_after_warmup;
+    for (int tick = 0; tick < 40; ++tick) {
+        pitch_buffer.clear();
+        REQUIRE_EQ(pitch_runtime.processTick(pitch_buffer), SequenceError::None);
+        for (std::size_t i = 0; i < pitch_buffer.size(); ++i) {
+            if (pitch_buffer.events()[i].kind
+                == MeaningEventKind::FrequencyDelta) {
+                accumulated_pitch += pitch_buffer.events()[i].arg0;
+            }
+        }
+        if (tick == 11) {
+            pitch_after_warmup = accumulated_pitch;
+        }
+    }
+    REQUIRE_EQ(pitch_after_warmup.has_value(), true);
+    REQUIRE_EQ(accumulated_pitch > *pitch_after_warmup, true);
+
+    // Absolute Tremolo can only share an infinite loop once it has reached a
+    // clamp boundary. Starting an unclamped StepDown inside the loop would
+    // replay the same absolute f-levels forever, so reject it.
+    auto unclamped_volume = makeComposite(1, 3);
+    auto& volume_layer = unclamped_volume.layers[0];
+    volume_layer.pitch_modulation = {};
+    volume_layer.volume_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::StepDown,
+        .delay = 0,
+        .depth = 0,
+        .speed = 0,
+        .roughness = 1,
+    };
+    REQUIRE_EQ(
+        compositeModulationLoopRepresentable(volume_layer), false);
+    const auto rejected_volume = formatMgsCompositeEnvelope(volume_layer, 0);
+    REQUIRE_EQ(
+        rejected_volume.hasIssue(
+            MgsEnvelopeIssue::UnrepresentableModulationLoop),
+        true);
+
+    // The first clamp transition belongs in the one-time prefix. Replaying
+    // that transition from a loop body would add an extra write each pass.
+    auto at_clamp = makeComposite(15, 17);
+    at_clamp.layers[0].pitch_modulation = {};
+    at_clamp.layers[0].volume_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::StepDown,
+        .speed = 0,
+        .roughness = 1,
+    };
+    REQUIRE_EQ(compositeModulationLoopRepresentable(at_clamp.layers[0]), false);
+    auto after_clamp = at_clamp.layers[0];
+    after_clamp.envelope_timeline.loop_start_count = 16;
+    REQUIRE_EQ(compositeModulationLoopRepresentable(after_clamp), true);
+}
+
+void testAllCompositeModulationOffPreservesBaseEnvelopeOutput() {
+    using namespace mgstc::engine;
+    auto baseline = defaultCompositeTimbre().layers[1];
+    baseline.volume = 12;
+    baseline.envelope_timeline.length_counts = 8;
+    baseline.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 12, 0, 0},
+        {EnvelopeEventKind::Volume, 7, 0, 4},
+    };
+    baseline.pitch_envelope.events = {
+        {EnvelopeEventKind::Pitch, -2, 0, 3},
+    };
+    const auto base_volumes = baseline.volume_envelope.events;
+    const auto base_pitches = baseline.pitch_envelope.events;
+
+    auto disabled = baseline;
+    disabled.pitch_modulation = {
+        .enabled = false,
+        .mode = ModulationMode::StepDown,
+        .delay = 4,
+        .depth = 80,
+        .speed = 7,
+        .roughness = -3,
+    };
+    disabled.volume_modulation = {
+        .enabled = false,
+        .mode = ModulationMode::StepUp,
+        .delay = 8,
+        .depth = 50,
+        .speed = 9,
+        .roughness = 2,
+    };
+    disabled.opll_tl_modulation.enabled = false;
+    disabled.opll_fb_modulation.enabled = false;
+
+    const auto baseline_mml = formatMgsCompositeEnvelope(baseline, 2);
+    const auto disabled_mml = formatMgsCompositeEnvelope(disabled, 2);
+    REQUIRE_EQ(baseline_mml.valid(), true);
+    REQUIRE_EQ(disabled_mml.valid(), true);
+    REQUIRE_EQ(disabled_mml.definition, baseline_mml.definition);
+    REQUIRE_EQ(disabled_mml.body, baseline_mml.body);
+
+    const TimbreNumberResolution numbers{};
+    const auto baseline_programs = compileCompositeEnvelopes(baseline, numbers);
+    const auto disabled_programs = compileCompositeEnvelopes(disabled, numbers);
+    REQUIRE_EQ(disabled_programs.volume, baseline_programs.volume);
+    REQUIRE_EQ(disabled_programs.pitch, baseline_programs.pitch);
+    REQUIRE_EQ(disabled.volume_envelope.events, base_volumes);
+    REQUIRE_EQ(disabled.pitch_envelope.events, base_pitches);
 }
 
 void testRuntimeSoftwareLfoWritesFrequencyDeltas() {
@@ -6568,6 +8184,19 @@ int main(int argc, char** argv) {
          testOneCountSustainLoopFormatsHoldInsideBrackets},
         {"CompositeSequenceLanesLoopIndependently", testCompositeSequenceLanesLoopIndependently},
         {"CompositeAutomaticVolumeRoundTripsThroughMgsc", testCompositeAutomaticVolumeRoundTripsThroughMgsc},
+        {"ImportedAutomaticRampKeepsOriginalExecutionTiming",
+         testImportedAutomaticRampKeepsOriginalExecutionTiming},
+        {"OversizedPitchModulationEnvelopeExportsAndAuditionsPlayablePrefix",
+         testOversizedPitchModulationEnvelopeExportsAndAuditionsPlayablePrefix},
+        {"OverLimitEnvelopeUsesSameOrderedPrefixForExportAndCompile",
+         testOverLimitEnvelopeUsesSameOrderedPrefixForExportAndCompile},
+        {"OverLimitAuthoredLoopIsExportedAsSafeFinitePrefix",
+         testOverLimitAuthoredLoopIsExportedAsSafeFinitePrefix},
+        {"OverLimitPrefixKeepsAutomaticVolumeRampWhole",
+         testOverLimitPrefixKeepsAutomaticVolumeRampWhole},
+        {"DefaultWaitDoesNotBlockAutomaticOscillateLoopOptimization",
+         testDefaultWaitDoesNotBlockAutomaticOscillateLoopOptimization},
+        {"MgscEnvelope253ByteBoundary", testMgscEnvelope253ByteBoundary},
         {"PreciseAutomaticKeepsUnsplitRampVolumes", testPreciseAutomaticKeepsUnsplitRampVolumes},
         {"CompositeAutomaticVolumeRejectsMgscCount240", testCompositeAutomaticVolumeRejectsMgscCount240},
         {"CompositeSequenceEnvelopeHeaderModeNoise",
@@ -6595,6 +8224,8 @@ int main(int argc, char** argv) {
         {"RuntimePsgSequenceKeyOffStaysSilent", testRuntimePsgSequenceKeyOffStaysSilent},
         {"AuditionGateSuppressesEnvelopeUntilNoteOn", testAuditionGateSuppressesEnvelopeUntilNoteOn},
         {"RuntimeOpllKeyOnAndOffRegisters", testRuntimeOpllKeyOnAndOffRegisters},
+        {"CompositeAutomaticRampAuditionMatchesOpllMmlPitchTicks",
+         testCompositeAutomaticRampAuditionMatchesOpllMmlPitchTicks},
         {"RuntimeOpllKeyOffKeepsFrequencyDetune",
          testRuntimeOpllKeyOffKeepsFrequencyDetune},
         {"ChipRackRendersAllThreeChips", testChipRackRendersAllThreeChips},
@@ -6650,6 +8281,7 @@ int main(int argc, char** argv) {
         {"TimbreTagsNormalizeMatchAndCollectUsage", testTimbreTagsNormalizeMatchAndCollectUsage},
         {"TimbreLibrarySelectedExportAndNonDestructiveImport", testTimbreLibrarySelectedExportAndNonDestructiveImport},
         {"ToneLibrarySqliteV1RoundTripAndPortableFormat", testToneLibrarySqliteV1RoundTripAndPortableFormat},
+        {"PreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave", testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave},
         {"WavePcmCycleConvertsToScc", testWavePcmCycleConvertsToScc},
         {"WaveCycleProducesValidOpllApproximation", testWaveCycleProducesValidOpllApproximation},
         {"SccApproximationMatchesSameRuntimeMidiPitch", testSccApproximationMatchesSameRuntimeMidiPitch},
@@ -6678,6 +8310,7 @@ int main(int argc, char** argv) {
         {"OpllOriginalRegisterImageIncludesRegisterAuto",
          testOpllOriginalRegisterImageIncludesRegisterAuto},
         {"CompositeEnvelopeFormatsOneSharedMgscLoop", testCompositeEnvelopeFormatsOneSharedMgscLoop},
+        {"CompositeEnvelopeLoopPrefixAndBodyPitchSemantics", testCompositeEnvelopeLoopPrefixAndBodyPitchSemantics},
         {"CompositeEnvelopeMgscOutputRules", testCompositeEnvelopeMgscOutputRules},
         {"CompositeSoloPitchAndChannelValidation", testCompositeSoloPitchAndChannelValidation},
         {"CompositeSavedTimbreRevisionAndNumberAssignment", testCompositeSavedTimbreRevisionAndNumberAssignment},
@@ -6685,6 +8318,25 @@ int main(int argc, char** argv) {
         {"CompositeTimbreDependencyUpdatePreservesAssignment", testCompositeTimbreDependencyUpdatePreservesAssignment},
         {"SoftwareLfoTriangleDelayAndRoughness", testSoftwareLfoTriangleDelayAndRoughness},
         {"SoftwareLfoTrackSetupAndLibraryRoundTrip", testSoftwareLfoTrackSetupAndLibraryRoundTrip},
+        {"CompositeModulationStepModesRespectDelayAndDirection", testCompositeModulationStepModesRespectDelayAndDirection},
+        {"CompositeModulationClampsStoredRangeBoundaries", testCompositeModulationClampsStoredRangeBoundaries},
+        {"CompositeModulationOscillateIsBoundedAndRepeats", testCompositeModulationOscillateIsBoundedAndRepeats},
+        {"AutomaticOscillateLoopsSaveCompiledBytesAndPreserveRuntimeStream",
+         testAutomaticOscillateLoopsSaveCompiledBytesAndPreserveRuntimeStream},
+        {"EqualPeriodModulationsShareLoopDespiteDifferentDelays",
+         testEqualPeriodModulationsShareLoopDespiteDifferentDelays},
+        {"AutomaticStepLoopsPreserveDelayedSignedTransitions",
+         testAutomaticStepLoopsPreserveDelayedSignedTransitions},
+        {"AutomaticLoopFallsBackForShortCyclesAndLaterBarriers",
+         testAutomaticLoopFallsBackForShortCyclesAndLaterBarriers},
+        {"AbsoluteStepModulationDoesNotRepeatWritesAfterClamp",
+         testAbsoluteStepModulationDoesNotRepeatWritesAfterClamp},
+        {"OscillatingPitchLoopHasZeroNetDelta", testOscillatingPitchLoopHasZeroNetDelta},
+        {"PitchLoopOptimizerHonorsBarriers", testPitchLoopOptimizerHonorsBarriers},
+        {"OpllModulationLoopBoundaryWriteRepeats", testOpllModulationLoopBoundaryWriteRepeats},
+        {"CompositeModulationAllTargetsRoundTripThroughLibrary", testCompositeModulationAllTargetsRoundTripThroughLibrary},
+        {"AuthoredModulationLoopRejectsPhaseResetAndAcceptsAlignment", testAuthoredModulationLoopRejectsPhaseResetAndAcceptsAlignment},
+        {"AllCompositeModulationOffPreservesBaseEnvelopeOutput", testAllCompositeModulationOffPreservesBaseEnvelopeOutput},
         {"RuntimeSoftwareLfoWritesFrequencyDeltas", testRuntimeSoftwareLfoWritesFrequencyDeltas},
         {"TrackSetupEnvelopeNumberAndPreKeyOnCommands",
          testTrackSetupEnvelopeNumberAndPreKeyOnCommands},
@@ -6726,6 +8378,8 @@ int main(int argc, char** argv) {
          testToneImportMgsVoiceTrackDoesNotWalkIntoMusic},
         {"ToneImportMgsEnvelopeHoldWaitIsLiteral",
          testToneImportMgsEnvelopeHoldWaitIsLiteral},
+        {"ToneImportMgsLoopEndingInAutomaticRamp",
+         testToneImportMgsLoopEndingInAutomaticRamp},
         {"ToneImportMusicaVcdNamesAndSccEnvelope",
          testToneImportMusicaVcdNamesAndSccEnvelope},
         {"ToneImportSngWaveAndName", testToneImportSngWaveAndName},

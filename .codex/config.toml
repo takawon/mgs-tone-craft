@@ -1,19 +1,45 @@
 #:schema https://developers.openai.com/codex/config-schema.json
 
-# Primary coordinator.
-#
-# Medium is intentional:
-# this agent often receives detailed specifications and must understand
-# them correctly before delegating work.
-model = "gpt-6-sol"
+# MGSTC primary coordinator.
+# Medium is intentional: it is strong enough to correctly interpret detailed
+# implementation instructions while staying efficient for ordinary changes.
+model = "gpt-6.1-sol"
 model_reasoning_effort = "medium"
 
 [agents]
 enabled = true
-
-# Safe fallback for ad-hoc or unnamed subagents.
-default_subagent_model = "gpt-6-sol"
+default_subagent_model = "gpt-6.1-sol"
 default_subagent_reasoning_effort = "medium"
-
-# Allows useful parallel investigation without encouraging agent swarms.
 max_concurrent_threads_per_session = 4
+
+[agents.explorer]
+description = "Read-only investigation of MGSTC ownership, execution paths, dependencies, threads, and relevant tests before implementation."
+config_file = "agents/explorer.toml"
+
+[agents.utility]
+description = "Bounded low-risk MGSTC implementation: helpers, adapters, conversions, boilerplate, repetitive edits, and simple isolated fixes."
+config_file = "agents/utility.toml"
+
+[agents.tester]
+description = "Focused MGSTC tests and regression coverage, including boundaries, fixtures, host-independent tests, and reproducible failure cases."
+config_file = "agents/tester.toml"
+
+[agents.implementer]
+description = "Substantial MGSTC implementation involving multiple files, DSP/analysis logic, VST3 integration, persistence, state handling, or performance-sensitive code."
+config_file = "agents/implementer.toml"
+
+[agents.debugger]
+description = "Difficult MGSTC root-cause debugging for plugin/host failures, audio timing, threading, lifetime, state corruption, or elusive regressions."
+config_file = "agents/debugger.toml"
+
+[agents.reviewer]
+description = "Independent technical review of consequential MGSTC changes, especially realtime audio, VST3, threading, persistence, compatibility, and multi-subsystem edits."
+config_file = "agents/reviewer.toml"
+
+[agents.architect]
+description = "Exceptional MGSTC architecture escalation when supplied requirements conflict, cannot be implemented safely, or force consequential irreversible design decisions."
+config_file = "agents/architect.toml"
+
+[agents.arbiter]
+description = "Rare highest-level independent review for unresolved high-consequence MGSTC architecture or correctness disputes after strong Sol analysis."
+config_file = "agents/arbiter.toml"

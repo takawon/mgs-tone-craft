@@ -477,6 +477,8 @@ std::string issueName(MgsEnvelopeIssue issue) {
         return "invalid envelope register write";
     case MgsEnvelopeIssue::InvalidAutomaticVolumeDuration:
         return "automatic envelope ramp exceeds one-byte duration";
+    case MgsEnvelopeIssue::UnrepresentableModulationLoop:
+        return "modulation cannot continue exactly across the permanent loop";
     }
     return "invalid envelope";
 }
@@ -562,7 +564,6 @@ bool parseSequence(
     std::optional<std::uint32_t> loop_start;
     std::optional<std::uint32_t> loop_end;
     bool after_loop_start = false;
-    std::optional<std::uint32_t> last_single_volume_count;
     std::vector<EnvelopeEvent> volume;
     std::vector<EnvelopeEvent> pitch;
     std::vector<EnvelopeEvent> timbre;
@@ -804,25 +805,19 @@ bool parseSequence(
                 }
             }
             if (automatic) {
-                // `f=cc` starts at the current execution position and
-                // reaches its target after `cc` ticks.  A preceding 1-count
-                // volume (`f.8=10`) is the ramp origin, so the authoring
-                // model keeps the target at origin + cc (not origin + 1 + cc).
-                auto origin = count;
-                if (last_single_volume_count
-                    && count == *last_single_volume_count + 1) {
-                    origin = *last_single_volume_count;
-                }
+                // Preserve the actual command start. A preceding one-count
+                // letter has already consumed its tick in MGSDRV.
+                const auto ramp_start = count;
                 count = std::min<std::uint32_t>(
                     EnvelopeTimeline::kMaximumLengthCounts,
-                    origin + hold);
+                    count + hold);
                 volume.push_back({
                     .kind = EnvelopeEventKind::Volume,
                     .value = value,
+                    .secondary = static_cast<std::int32_t>(ramp_start + 1),
                     .count = count,
                     .automatic = true,
                 });
-                last_single_volume_count.reset();
             } else {
                 const bool redundant_ramp_target =
                     !volume.empty()
@@ -831,7 +826,6 @@ bool parseSequence(
                     && volume.back().count == count
                     && volume.back().automatic
                     && volume.back().value == value;
-                const auto hold_start = count;
                 if (!redundant_ramp_target) {
                     volume.push_back({
                         .kind = EnvelopeEventKind::Volume,
@@ -842,11 +836,6 @@ bool parseSequence(
                 count = std::min<std::uint32_t>(
                     EnvelopeTimeline::kMaximumLengthCounts,
                     count + hold);
-                if (hold == 1) {
-                    last_single_volume_count = hold_start;
-                } else {
-                    last_single_volume_count.reset();
-                }
             }
             continue;
         }

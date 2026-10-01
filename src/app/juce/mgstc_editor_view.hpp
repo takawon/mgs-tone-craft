@@ -4220,7 +4220,12 @@ public:
                     return;
                 }
                 recordHistory();
-                static_cast<void>(configureEngine());
+                if (!structure_changed) {
+                    refreshValidationSummary();
+                }
+                if (!configureEngine()) {
+                    return;
+                }
                 if (request_preview
                     && !satellite_session_
                     && immediate_audition_.getToggleState()) {
@@ -6464,6 +6469,10 @@ private:
     void refreshModelViews() {
         timeline_.setTimbre(timbre_);
         publishSpectrogramSourceMask();
+        refreshValidationSummary();
+    }
+
+    void refreshValidationSummary() {
         const auto validation =
             mgstc::engine::validateCompositeTimbre(timbre_);
         const auto numbers =
@@ -6496,9 +6505,61 @@ private:
         juce::String warning_text =
             juce::String::fromUTF8(
                 "共有資源・チャンネル競合なし");
+        juce::StringArray envelope_limit_notices;
+        bool envelope_limit_error = false;
+        for (const auto& layer : timbre_.layers) {
+            if (layer.volume_envelope.kind
+                != mgstc::engine::EnvelopeKind::Sequence) {
+                continue;
+            }
+            const auto formatted =
+                mgstc::engine::formatMgsCompositeEnvelope(
+                    layer, layer.envelope_number,
+                    mgstc::engine::kMgscEnvelopeCompiledByteLimit,
+                    &numbers, &timbre_library_, timbre_.name);
+            const bool exceeds_limit = formatted.hasIssue(
+                mgstc::engine::MgsEnvelopeIssue::DefinitionLengthExceeded);
+            if (formatted.valid() && !formatted.output_cutoff_count) {
+                continue;
+            }
+            const auto track = layer.source == mgstc::engine::TimbreSource::Psg
+                ? static_cast<char>('1' + layer.channel)
+                : layer.source == mgstc::engine::TimbreSource::Scc
+                    ? static_cast<char>('4' + layer.channel)
+                    : layer.channel == 0
+                        ? '9'
+                        : static_cast<char>('A' + layer.channel - 1);
+            if (exceeds_limit) {
+                envelope_limit_error = true;
+                envelope_limit_notices.add(
+                    juce::String::charToString(track)
+                    + juce::String::fromUTF8("ch のエンベロープ設定が上限超過 (")
+                    + juce::String(static_cast<int>(formatted.compiled_bytes))
+                    + "/"
+                    + juce::String(static_cast<int>(
+                        mgstc::engine::kMgscEnvelopeCompiledByteLimit))
+                    + juce::String::fromUTF8("バイト)"));
+            } else if (!formatted.valid()) {
+                envelope_limit_error = true;
+                envelope_limit_notices.add(
+                    juce::String::charToString(track)
+                    + (formatted.hasIssue(
+                           mgstc::engine::MgsEnvelopeIssue::UnrepresentableModulationLoop)
+                        ? juce::String::fromUTF8("ch は変調と手動[]ループの位相を正確に表せません。試聴を停止します")
+                        : juce::String::fromUTF8("ch のエンベロープ設定を@eに変換できません。試聴を停止します")));
+            } else {
+                envelope_limit_notices.add(
+                    juce::String::charToString(track)
+                    + juce::String::fromUTF8("ch は ct ")
+                    + juce::String(static_cast<int>(*formatted.output_cutoff_count))
+                    + juce::String::fromUTF8(" 以降が@e出力不可。試聴は生成した@eに従います"));
+            }
+        }
         if (timbre_.layers.empty()) {
             warning_text = juce::String::fromUTF8(
                 "上の追加ボタンから必要なチャンネルを追加してください");
+        } else if (!envelope_limit_notices.isEmpty()) {
+            warning_text = envelope_limit_notices.joinIntoString(", ");
         } else if (!validation.warnings.empty()) {
             warning_text = juce::String::fromUTF8(
                 validation.warnings.front().c_str());
@@ -6509,6 +6570,11 @@ private:
         warning_.setText(
             warning_text,
             juce::dontSendNotification);
+        warning_.setColour(
+            juce::Label::textColourId,
+            !envelope_limit_error
+                ? juce::Colour(0xFFFFC56B)
+                : juce::Colours::red);
         resource_.setTooltip(resource_.getText());
         warning_.setTooltip(warning_text);
     }
@@ -6588,6 +6654,12 @@ private:
         }
         if (result.ok) {
             composite_program_stale_ = false;
+        } else {
+            engine_ready_ = false;
+            composite_program_stale_ = true;
+            silenceAuditionNotes();
+            updateStatus(juce::String::fromUTF8(
+                "総合音色を再生できません。設定を確認してください。試聴を停止します。"));
         }
         return result.ok;
     }
@@ -6651,6 +6723,32 @@ private:
                 || !performance_keyboard_.polyphonic())) {
             silenceAuditionNotes();
         }
+        const auto& note_timbre = manual_y_preview_timbre_
+            ? *manual_y_preview_timbre_ : timbre_;
+        // Editing a held polyphonic note does not replace its submitted program.
+        // A new note must still reject an invalid, currently edited envelope.
+        if (!already_configured && composite_program_stale_
+            && voice_allocator_.activeVoiceCount() != 0) {
+            const auto numbers = mgstc::engine::resolveTimbreNumbers(note_timbre);
+            for (std::size_t index = 0; index < note_timbre.layers.size(); ++index) {
+                const auto& layer = note_timbre.layers[index];
+                if (!mgstc::engine::layerIsAudible(note_timbre, index)
+                    || layer.volume_envelope.kind != mgstc::engine::EnvelopeKind::Sequence) {
+                    continue;
+                }
+                if (!mgstc::engine::formatMgsCompositeEnvelope(
+                        layer, layer.envelope_number,
+                        mgstc::engine::kMgscEnvelopeCompiledByteLimit,
+                        &numbers, &timbre_library_).valid()) {
+                    engine_ready_ = false;
+                    silenceAuditionNotes();
+                    refreshValidationSummary();
+                    updateStatus(juce::String::fromUTF8(
+                        "エンベロープ設定を@eに変換できません。試聴を停止します。"));
+                    return;
+                }
+            }
+        }
         if (!ensureEngineReady()
             || (!already_configured
                 && voice_allocator_.activeVoiceCount() == 0
@@ -6664,8 +6762,6 @@ private:
         if (assignment.stolen_note) {
             stopCompositeVoice(assignment.channel);
         }
-        const auto& note_timbre = manual_y_preview_timbre_
-            ? *manual_y_preview_timbre_ : timbre_;
         const auto plan =
             mgstc::engine::buildCompositePlaybackPlan(note_timbre);
         double maximum_delay_ms = 0.0;

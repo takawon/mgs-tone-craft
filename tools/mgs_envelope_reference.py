@@ -97,6 +97,8 @@ class EnvelopeState:
                 )
                 continue
             if 0x20 <= opcode <= 0x2F:
+                # The following command runs at this command's tick + count.
+                # A preceding one-tick volume letter has already advanced time.
                 target = opcode & 0x0F
                 delta = target - self.volume
                 count = self._read_byte()

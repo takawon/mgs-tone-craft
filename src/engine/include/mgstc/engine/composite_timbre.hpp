@@ -64,6 +64,9 @@ struct SavedTimbreReference {
 struct EnvelopeEvent {
     EnvelopeEventKind kind{EnvelopeEventKind::Volume};
     std::int32_t value{};
+    // RegisterWrite: data byte. Imported automatic Volume: MGSDRV ramp
+    // start count + 1; zero retains the legacy authored ramp convention.
+    // This field is already present in portable and SQLite sound payloads.
     std::int32_t secondary{};
     std::uint32_t count{};
     std::uint64_t target_library_id{};
@@ -221,6 +224,28 @@ struct SoftwareEnvelope {
         const SoftwareEnvelope&) = default;
 };
 
+enum class ModulationMode : std::uint8_t {
+    Oscillate,
+    StepUp,
+    StepDown,
+};
+
+// ENV-side modulation. This is independent of track-side h / @p.
+// Delay and speed use MGSDRV's public n1/n3 byte encoding for Oscillate.
+// Step modes use speed as their update interval and |roughness| as the
+// one-step change; depth is unused in those modes.
+struct ModulationParameters {
+    bool enabled{};
+    ModulationMode mode{ModulationMode::Oscillate};
+    std::uint8_t delay{};
+    std::uint8_t depth{};
+    std::uint8_t speed{};
+    std::int8_t roughness{};
+
+    friend bool operator==(const ModulationParameters&,
+                           const ModulationParameters&) = default;
+};
+
 enum class OpllRegisterAutoMode : std::uint8_t {
     Off = 0,
     Rise = 1,
@@ -352,10 +377,14 @@ struct CompositeLayer {
     SoftwareLfoSettings software_lfo{};
     SoftwareEnvelope volume_envelope;
     SoftwareEnvelope pitch_envelope;
+    ModulationParameters pitch_modulation;
+    ModulationParameters volume_modulation;
     std::vector<EnvelopeEvent> timbre_automation;
     EnvelopeTimeline envelope_timeline;
     OpllRegisterAutoLane opll_tl_auto;
     OpllRegisterAutoLane opll_fb_auto;
+    ModulationParameters opll_tl_modulation;
+    ModulationParameters opll_fb_modulation;
     bool enabled{true};
     bool muted{};
     bool solo{};
@@ -367,7 +396,7 @@ struct CompositeLayer {
 struct CompositeTimbre {
     // Portable .mgstc / clipboard layout (name, tags, memo, favorite, then
     // sound body). Independent of SQLite kCompositeSoundPayloadVersion.
-    static constexpr std::uint32_t kFormatVersion = 19;
+    static constexpr std::uint32_t kFormatVersion = 20;
     static constexpr std::uint32_t kMinimumReadableFormatVersion = 5;
 
     std::uint32_t format_version{kFormatVersion};

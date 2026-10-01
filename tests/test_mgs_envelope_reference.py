@@ -95,6 +95,17 @@ class EnvelopeReferenceTests(unittest.TestCase):
     def test_automatic_volume_opcode_uses_target_and_duration(self):
         self.assertEqual(automatic_volume_opcode(15, 4), bytes([0x2F, 0x04]))
 
+    def test_imported_ramp_pitch_follows_actual_execution_position(self):
+        # EC-020: f consumes tick 0; the ramp runs from tick 1 to tick 11.
+        state = EnvelopeState(bytes.fromhex("0F 28 0A 12 01 08"))
+        for _ in range(13):
+            state.tick()
+        self.assertEqual(
+            [(event.tick, event.args[0]) for event in state.events
+             if event.kind == "frequency_delta"],
+            [(11, 1)],
+        )
+
     def test_f_to_zero_over_100_matches_observed_driver_ticks(self):
         state = EnvelopeState(bytes([0x0F, 0x20, 100]))
         final_volumes = []

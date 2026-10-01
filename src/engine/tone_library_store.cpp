@@ -780,8 +780,9 @@ bool ToneLibraryDatabase::loadComposites(
             setError(error, "missing composite sound payload");
             return false;
         }
-        if (payload_version
-            != static_cast<sqlite3_int64>(kCompositeSoundPayloadVersion)) {
+        if (payload_version != 1
+            && payload_version
+                != static_cast<sqlite3_int64>(kCompositeSoundPayloadVersion)) {
             setError(error, "unsupported composite sound payload version");
             return false;
         }

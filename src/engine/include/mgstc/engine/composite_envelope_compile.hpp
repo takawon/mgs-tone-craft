@@ -44,4 +44,16 @@ enum class CompositeEnvelopeLane : std::uint8_t {
     const CompositeLayer& layer,
     int ticks);
 
+// Produces a transient ENV-side expansion. The stored authoring envelopes
+// remain unchanged. Track-side h / @p is never folded into these events.
+[[nodiscard]] CompositeLayer expandCompositeLayerModulations(
+    const CompositeLayer& layer,
+    const TimbreLibrary* library = nullptr,
+    bool optimize_loop = true);
+
+// An authored permanent loop must preserve modulation phase indefinitely.
+[[nodiscard]] bool compositeModulationLoopRepresentable(
+    const CompositeLayer& layer,
+    const TimbreLibrary* library = nullptr);
+
 }  // namespace mgstc::engine

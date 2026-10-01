@@ -1,4 +1,5 @@
 #include "mgstc/engine/opll_register_auto.hpp"
+#include "mgstc/engine/composite_modulation.hpp"
 
 #include <algorithm>
 #include <map>
@@ -400,7 +401,10 @@ std::optional<std::size_t> opllRegisterAutoOwnerLayer(
         const auto& lane = target == OpllRegisterAutoTarget::TotalLevel
             ? layer.opll_tl_auto
             : layer.opll_fb_auto;
-        if (lane.active()) {
+        const auto& modulation = target == OpllRegisterAutoTarget::TotalLevel
+            ? layer.opll_tl_modulation
+            : layer.opll_fb_modulation;
+        if (lane.active() || modulation.enabled) {
             return index;
         }
     }
@@ -436,9 +440,25 @@ bool enforceOpllRegisterAutoExclusivity(CompositeTimbre& timbre) {
                 tl_owner = index;
             }
         }
+        if (layer.opll_tl_modulation.enabled) {
+            if (tl_owner.has_value()) {
+                layer.opll_tl_modulation.enabled = false;
+                changed = true;
+            } else {
+                tl_owner = index;
+            }
+        }
         if (layer.opll_fb_auto.active()) {
             if (fb_owner.has_value()) {
                 layer.opll_fb_auto = {};
+                changed = true;
+            } else {
+                fb_owner = index;
+            }
+        }
+        if (layer.opll_fb_modulation.enabled) {
+            if (fb_owner.has_value()) {
+                layer.opll_fb_modulation.enabled = false;
                 changed = true;
             } else {
                 fb_owner = index;
@@ -484,18 +504,29 @@ std::vector<EnvelopeEvent> expandOpllLayerRegisterAutos(
     std::map<std::uint32_t, std::uint8_t> tl_schedule;
     std::map<std::uint32_t, std::uint8_t> fb_schedule;
     if (expand_tl) {
-        tl_schedule = fieldSchedule(
-            layer.opll_tl_auto,
-            OpllRegisterAutoTarget::TotalLevel,
-            length);
+        if (layer.opll_tl_auto.active()
+            || !layer.opll_tl_modulation.enabled) {
+            tl_schedule = fieldSchedule(
+                layer.opll_tl_auto,
+                OpllRegisterAutoTarget::TotalLevel,
+                length);
+        }
     }
     if (expand_fb) {
-        fb_schedule = fieldSchedule(
-            layer.opll_fb_auto,
-            OpllRegisterAutoTarget::Feedback,
-            length);
+        if (layer.opll_fb_auto.active()
+            || !layer.opll_fb_modulation.enabled) {
+            fb_schedule = fieldSchedule(
+                layer.opll_fb_auto,
+                OpllRegisterAutoTarget::Feedback,
+                length);
+        }
     }
-    if (tl_schedule.empty() && fb_schedule.empty()) {
+    const bool tl_mod = expand_tl && layer.opll_tl_modulation.enabled
+        && !layer.opll_tl_auto.active();
+    const bool fb_mod = expand_fb && layer.opll_fb_modulation.enabled
+        && !layer.opll_fb_auto.active();
+    if (tl_schedule.empty() && fb_schedule.empty()
+        && !tl_mod && !fb_mod) {
         return {};
     }
 
@@ -525,6 +556,8 @@ std::vector<EnvelopeEvent> expandOpllLayerRegisterAutos(
     }
 
     std::vector<EnvelopeEvent> events;
+    std::optional<std::uint8_t> last_tl_mod;
+    std::optional<std::uint8_t> last_fb_mod;
     std::uint32_t max_count = length;
     if (!tl_schedule.empty()) {
         max_count = std::max(max_count, tl_schedule.rbegin()->first);
@@ -540,6 +573,10 @@ std::vector<EnvelopeEvent> expandOpllLayerRegisterAutos(
         if (const auto found = automation.find(count);
             found != automation.end()) {
             // §7.5: @ then y at the same count.
+            if (!found->second.timbres.empty()) {
+                last_tl_mod.reset();
+                last_fb_mod.reset();
+            }
             for (const auto* event : found->second.timbres) {
                 if (event->timbre_pick == TimbrePick::OpllRom) {
                     if (event->value >= 0 && event->value <= 14) {
@@ -556,10 +593,57 @@ std::vector<EnvelopeEvent> expandOpllLayerRegisterAutos(
                 }
                 registers[static_cast<std::size_t>(event->value)] =
                     static_cast<std::uint8_t>(event->secondary);
+                if (event->value == 2) {
+                    last_tl_mod.reset();
+                } else if (event->value == 3) {
+                    last_fb_mod.reset();
+                }
             }
         }
 
         const bool emit = !on_rom && have_image;
+        if (tl_mod && emit) {
+            const auto base = static_cast<int>(registers[2] & 0x3F);
+            const auto value = static_cast<std::uint8_t>(std::clamp(
+                base + modulationOffsetAtCount(
+                    layer.opll_tl_modulation, count), 0, 63));
+            if ((!last_tl_mod || *last_tl_mod != value)
+                && (value != base || last_tl_mod.has_value())) {
+                const auto packed = packOpllRegisterAutoByte(
+                    OpllRegisterAutoTarget::TotalLevel,
+                    registers[2], value);
+                events.push_back({
+                    .kind = EnvelopeEventKind::RegisterWrite,
+                    .value = 2,
+                    .secondary = packed,
+                    .count = count,
+                    .after_loop_start = layer.envelope_timeline.loop_start_count
+                        && count == *layer.envelope_timeline.loop_start_count,
+                });
+            }
+            last_tl_mod = value;
+        }
+        if (fb_mod && emit) {
+            const auto base = static_cast<int>(registers[3] & 0x07);
+            const auto value = static_cast<std::uint8_t>(std::clamp(
+                base + modulationOffsetAtCount(
+                    layer.opll_fb_modulation, count), 0, 7));
+            if ((!last_fb_mod || *last_fb_mod != value)
+                && (value != base || last_fb_mod.has_value())) {
+                const auto packed = packOpllRegisterAutoByte(
+                    OpllRegisterAutoTarget::Feedback,
+                    registers[3], value);
+                events.push_back({
+                    .kind = EnvelopeEventKind::RegisterWrite,
+                    .value = 3,
+                    .secondary = packed,
+                    .count = count,
+                    .after_loop_start = layer.envelope_timeline.loop_start_count
+                        && count == *layer.envelope_timeline.loop_start_count,
+                });
+            }
+            last_fb_mod = value;
+        }
         if (const auto tl = tl_schedule.find(count);
             tl != tl_schedule.end() && emit) {
             const auto packed = packOpllRegisterAutoByte(

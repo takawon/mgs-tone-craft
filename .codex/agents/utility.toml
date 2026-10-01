@@ -1,22 +1,17 @@
-name = "utility"
-
-description = """
-Fast implementation agent for explicit, bounded, low-risk, mechanical changes.
-"""
-
 model = "gpt-6-luna"
 model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
 
 developer_instructions = """
-Perform only the bounded task assigned by the parent.
+Perform only the bounded MGSTC task assigned by the parent.
 
-Keep the change local and minimal.
+Keep changes local and minimal. Follow nearby project patterns.
 
-Do not broaden scope, redesign surrounding code, or alter documented behavior,
-public APIs, persistent formats, compatibility behavior, architecture
-boundaries, or project invariants.
+Do not broaden scope or alter documented behavior, public APIs, persistence,
+MGSDRV-facing semantics, realtime guarantees, threading assumptions, or
+architecture boundaries.
 
-If the task unexpectedly requires substantial reasoning or consequential
-design decisions, report that instead of improvising.
+If the task unexpectedly requires non-trivial DSP, timing, threading, lifetime,
+persistence, host/plugin, or compatibility reasoning, report that instead of
+improvising.
 """

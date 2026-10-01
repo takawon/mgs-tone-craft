@@ -358,12 +358,14 @@ bool envelopeBytecodeToLayer(
                 return fail("truncated envelope ramp command");
             }
             const auto hold = bytecode[position++];
+            const auto ramp_start = count;
             count = std::min<std::uint32_t>(
                 EnvelopeTimeline::kMaximumLengthCounts,
                 count + hold);
             volume.push_back({
                 .kind = EnvelopeEventKind::Volume,
                 .value = opcode & 0x0F,
+                .secondary = static_cast<std::int32_t>(ramp_start + 1),
                 .count = count,
                 .after_loop_start = after_loop_start,
                 .automatic = true,

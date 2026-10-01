@@ -37,6 +37,16 @@ def _volume_ticks(state: EnvelopeState, ticks: int):
     ]
 
 
+def _frequency_delta_ticks(state: EnvelopeState, ticks: int):
+    for _ in range(ticks):
+        state.tick()
+    return [
+        [event.tick, event.args[0]]
+        for event in state.events
+        if event.kind == "frequency_delta"
+    ]
+
+
 def _final_volume_runs(state: EnvelopeState, ticks: int):
     values = []
     for _ in range(ticks):
@@ -78,6 +88,9 @@ class EnvelopeCompatManifestTests(unittest.TestCase):
                 elif "expect_volume_ticks" in case:
                     actual = _volume_ticks(state, case["ticks"])
                     self.assertEqual(actual, case["expect_volume_ticks"])
+                elif "expect_frequency_delta_ticks" in case:
+                    actual = _frequency_delta_ticks(state, case["ticks"])
+                    self.assertEqual(actual, case["expect_frequency_delta_ticks"])
                 elif "expect_final_volume_runs" in case:
                     actual = _final_volume_runs(state, case["ticks"])
                     self.assertEqual(
