@@ -3355,6 +3355,65 @@ void testPluginStateFoundation() {
     require(peak > 0.001, "restored PSG is audible at 44.1 kHz");
 }
 
+void testSccMorphPluginStateCompatibility() {
+    using namespace mgstc::engine;
+    auto document = documentFrom(sccOnlyTimbre(), 0, {});
+    auto& layer = document.sound.layers.front();
+    layer.volume_envelope.events.clear();
+    layer.pitch_envelope.events.clear();
+    layer.timbre_automation.clear();
+    layer.pitch_modulation = {};
+    layer.volume_modulation = {};
+    layer.opll_tl_modulation = {};
+    layer.opll_fb_modulation = {};
+    document.sound.embedded_timbres.clear();
+    const auto original = toBytes(soundBytes(document.sound));
+    const auto framed = mgstc::plugin::serializePluginState(document);
+    // One event-free layer: v21 adds only the five global morph bytes.
+    // v20 adds four six-byte modulation settings before the embedded count.
+    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}}) {
+        auto legacy = original;
+        require(legacy.size() >= 33, "legacy sound fixture tail exists");
+        legacy.resize(legacy.size() - 5);
+        if (version == 1) {
+            legacy.erase(legacy.end() - 28, legacy.end() - 4);
+        }
+        auto blob = replacePayload(framed, original, legacy);
+        const auto found = std::search(blob.begin(), blob.end(), legacy.begin(), legacy.end());
+        require(found != blob.end(), "legacy payload framed");
+        const auto at = static_cast<std::size_t>(std::distance(blob.begin(), found));
+        require(at >= 8, "legacy payload version prefix");
+        blob[at - 8] = version;
+        blob[at - 7] = blob[at - 6] = blob[at - 5] = 0;
+        const auto parsed = mgstc::plugin::parsePluginState(blob.data(), blob.size());
+        require(parsed.status == mgstc::plugin::PluginStateStatus::Ok,
+                "legacy v1/v2 plugin sound payload readable");
+        require(soundBytes(parsed.document.sound) == soundBytes(document.sound),
+                "legacy plugin payload defaults preserve sound");
+    }
+    auto arrival = *layer.base_timbre;
+    arrival.library_id = allocateCompositeOwnedTimbreId(document.sound);
+    arrival.name = "Morph destination";
+    for (std::size_t i = 0; i < arrival.scc_waveform.size(); ++i) {
+        arrival.scc_waveform[i] = static_cast<std::uint8_t>(i < 16 ? 64 : -64);
+    }
+    document.sound.embedded_timbres.push_back(arrival);
+    layer.timbre_automation = {
+        {.kind = EnvelopeEventKind::Timbre, .count = 0,
+         .target_library_id = layer.base_timbre->library_id},
+        {.kind = EnvelopeEventKind::Timbre, .count = 20,
+         .target_library_id = arrival.library_id,
+         .scc_morph = {.enabled = true, .intermediate_count = 3, .curve = 2.0}},
+    };
+    document.sound.scc_morph_bank_base = 16;
+    requireSoundRoundTrip(document);
+    MgstcAudioProcessor processor;
+    require(processor.replacePluginState(document), "morph plugin state compiles");
+    requireSoundRoundTrip(processor.copyPluginState());
+    require(processor.copyPluginState().sound.embedded_timbres.size() == 1,
+            "plugin state keeps sources without generated bank snapshots");
+}
+
 std::vector<float> captureHostNotePcm(
     MgstcAudioProcessor& processor,
     int frames = 2048) {
@@ -3969,6 +4028,7 @@ int main() {
         testBlockBoundaryMidiStaysOnItsFrame();
         testHostRateOverdueNoteIsAppliedNow();
         testPluginStateFoundation();
+        testSccMorphPluginStateCompatibility();
         testPluginProjectRestore();
         testPluginEditor();
         testCompositePlaybackWaveform();

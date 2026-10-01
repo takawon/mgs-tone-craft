@@ -3,10 +3,12 @@
 #include "plugin_state.hpp"
 
 #include <cstring>
+#include <cmath>
 #include <optional>
 #include <string_view>
 
 #include "mgstc/engine/composite_timbre_library.hpp"
+#include "mgstc/engine/scc_morph.hpp"
 
 namespace mgstc::plugin {
 namespace {
@@ -157,7 +159,9 @@ private:
 
 bool validatePluginSoundSnapshot(const mgstc::engine::CompositeTimbre& timbre) {
     if (!metadataFits(timbre) || timbre.layers.size() > kMaxPluginStateLayers
-        || timbre.embedded_timbres.size() > kMaxPluginStateLayers) {
+        || timbre.embedded_timbres.size() > kMaxPluginStateLayers
+        || (timbre.scc_morph_bank_base != 0 && timbre.scc_morph_bank_base != 16)
+        || timbre.scc_morph_algorithm_version != mgstc::engine::kSccMorphAlgorithmVersion) {
         return false;
     }
     for (const auto& layer : timbre.layers) {
@@ -172,6 +176,22 @@ bool validatePluginSoundSnapshot(const mgstc::engine::CompositeTimbre& timbre) {
         }
         if (layer.base_opll_rom && *layer.base_opll_rom > 14) {
             return false;
+        }
+        const std::vector<mgstc::engine::EnvelopeEvent>* event_lanes[] = {
+            &layer.volume_envelope.events, &layer.pitch_envelope.events,
+            &layer.timbre_automation};
+        for (const auto* events : event_lanes) {
+            for (const auto& event : *events) {
+                const auto& morph = event.scc_morph;
+                if (!std::isfinite(morph.curve) || morph.curve < 1.0
+                    || morph.curve > mgstc::engine::kSccMorphGammaMax
+                    || (morph.enabled
+                        && (events != &layer.timbre_automation
+                            || layer.source != mgstc::engine::TimbreSource::Scc
+                            || event.kind != mgstc::engine::EnvelopeEventKind::Timbre))) {
+                    return false;
+                }
+            }
         }
     }
     return true;
@@ -297,7 +317,8 @@ PluginStateParseResult parsePluginState(const void* data, std::size_t size) {
     if (!payload_version || !payload_size) {
         return fail(PluginStateStatus::Truncated);
     }
-    if (*payload_version != mgstc::engine::kCompositeSoundPayloadVersion) {
+    if (*payload_version != 1 && *payload_version != 2
+        && *payload_version != mgstc::engine::kCompositeSoundPayloadVersion) {
         return fail(PluginStateStatus::UnsupportedVersion);
     }
     if (*payload_size > kMaxPluginSoundPayloadBytes) {

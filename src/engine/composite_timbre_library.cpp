@@ -1,9 +1,12 @@
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/composite_modulation.hpp"
 #include "mgstc/engine/timbre_tags.hpp"
+#include "mgstc/engine/scc_morph.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <type_traits>
@@ -131,6 +134,9 @@ public:
         boolean(value.after_loop_start);
         boolean(value.automatic);
         boolean(value.precise);
+        boolean(value.scc_morph.enabled);
+        unsignedInteger(value.scc_morph.intermediate_count, 1);
+        unsignedInteger(std::bit_cast<std::uint64_t>(value.scc_morph.curve), 8);
     }
 
     void timeline(const EnvelopeTimeline& value) {
@@ -241,6 +247,8 @@ public:
         for (const auto& reference_value : value.embedded_timbres) {
             reference(reference_value);
         }
+        unsignedInteger(value.scc_morph_bank_base, 1);
+        unsignedInteger(value.scc_morph_algorithm_version, 4);
     }
 
     void timbre(const CompositeTimbre& value) {
@@ -395,6 +403,21 @@ public:
         if (!value.automatic) {
             value.precise = false;
         }
+        value.scc_morph = {};
+        if (format_version_ >= 21) {
+            std::uint64_t curve{};
+            if (!boolean(value.scc_morph.enabled)
+                || !integer(value.scc_morph.intermediate_count, 1)
+                || !integer(curve, 8)) {
+                return false;
+            }
+            value.scc_morph.curve = std::bit_cast<double>(curve);
+            if (!std::isfinite(value.scc_morph.curve)
+                || value.scc_morph.curve < 1.0
+                || value.scc_morph.curve > kSccMorphGammaMax) {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -527,15 +550,15 @@ public:
     bool soundPayload(
         CompositeTimbre& value,
         std::uint32_t payload_version) {
-        if (payload_version != 1
+        if (payload_version != 1 && payload_version != 2
             && payload_version != kCompositeSoundPayloadVersion) {
             return false;
         }
-        // SQLite payload v1 has the portable v19 sound body. Payload v2
-        // adds four modulation settings per layer (portable v20 body).
+        // Each SQLite payload version names a fixed portable sound layout:
+        // v1 = portable v19, v2 = v20 modulation, v3 = v21 SCC morphing.
         // The DB schema version and the portable file header are separate.
-        format_version_ = payload_version == 1
-            ? 19 : CompositeTimbre::kFormatVersion;
+        format_version_ = payload_version == 1 ? 19
+            : payload_version == 2 ? 20 : 21;
         return soundBody(value);
     }
 
@@ -758,6 +781,15 @@ public:
             }
         } else {
             value.embedded_timbres.clear();
+        }
+        value.scc_morph_bank_base = 0;
+        value.scc_morph_algorithm_version = 1;
+        if (format_version_ >= 21
+            && (!integer(value.scc_morph_bank_base, 1)
+                || (value.scc_morph_bank_base != 0
+                    && value.scc_morph_bank_base != 16)
+                || !integer(value.scc_morph_algorithm_version, 4))) {
+            return false;
         }
         value.format_version = CompositeTimbre::kFormatVersion;
         return position_ == data_.size();

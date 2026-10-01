@@ -178,17 +178,26 @@ void testImportedSccBaseBelowFifteenAssignsAndRenders() {
     timbre.embedded_timbres = {*layer.base_timbre, wave16};
 
     const auto numbers = resolveTimbreNumbers(timbre);
+    require(numbers.valid(), "explicit native SCC numbers must resolve without warnings");
     const auto assigned_base =
         assignedNumberForLibraryId(numbers, base.library_id);
     require(
         assigned_base.has_value(),
         "imported SCC @s5 base was not assigned a mapper slot");
     require(
-        *assigned_base >= 15,
-        "imported SCC @s5 base should remap into 15-31");
+        *assigned_base == 5,
+        "imported SCC @s5 base must preserve its explicit native slot");
     require(
         layerBasePatchNumber(layer, &numbers) == assigned_base,
-        "key-on patch still used the raw @s5 number");
+        "key-on patch must use the resolved explicit @s5 slot");
+    require(assignedNumberForLibraryId(numbers, wave16.library_id) == 16,
+            "event-only SCC @s16 must preserve its declared slot");
+    auto automatic = timbre;
+    automatic.layers[0].base_timbre->number_mode = TimbreNumberMode::Automatic;
+    const auto automatic_numbers = resolveTimbreNumbers(automatic);
+    require(automatic_numbers.valid()
+                && assignedNumberForLibraryId(automatic_numbers, base.library_id) == 15,
+            "automatic SCC allocation still begins at 15");
 
     const auto envelopes = compileCompositeEnvelopes(layer, numbers);
     RealtimeEngineHost host;
