@@ -8,6 +8,7 @@
 #include <map>
 #include <numbers>
 #include <numeric>
+#include <stdexcept>
 #include <tuple>
 #include <utility>
 
@@ -32,8 +33,27 @@ struct Config {
     static constexpr double rms_weight = 3.0;
     static constexpr double dc_weight = 3.0;
     static constexpr double shape_weight = 0.08;
-    static constexpr double smoothness_weight = 0.15;
     static constexpr double trajectory_weight = 2.0;
+    // Bounded dimensionless distance: sample/128 MSE / 4, RMS squared,
+    // Parseval-weighted harmonic amplitude squared, normalized power-shape
+    // L2 / 2, and descriptor squared divided by its total weight (13).
+    // Spectrum/level carry 80% of the connection metric; phase-invariant
+    // sample shape carries 20%. The quartic rate term discourages outliers
+    // without imposing a hard limit or equalizing every neighboring distance.
+    static constexpr double connection_wave_weight = 0.2;
+    static constexpr double connection_rms_weight = 0.3;
+    static constexpr double connection_harmonic_weight = 0.3;
+    static constexpr double connection_shape_weight = 0.1;
+    static constexpr double connection_descriptor_weight = 0.1;
+    // Finite coherent blends preserve the spectral objective while allowing
+    // smooth connections; this balance was compared against three-state DP.
+    static constexpr double motion_weight = 0.3;
+    // Discourage meaningful mixture changes at a fixed interpolation position.
+    // Nearly identical original spectra make this term vanish automatically.
+    static constexpr double mixture_weight = 0.01;
+    static constexpr double descriptor_weight_sum = centroid_weight + spread_weight
+        + spectral_slope_weight + odd_even_weight + irregularity_weight
+        + flatness_weight + rms_weight + dc_weight;
     static constexpr double harmonic_search_step = 0.18;
     static constexpr int quantization_passes = 2;
 };
@@ -219,7 +239,8 @@ SccWaveform quantize(const FloatWave& wave) {
 }
 
 FloatWave reconstruct(const Harmonics& magnitude, const Spectrum& guide,
-                      const SccMorphDescriptors& target) {
+                      const SccMorphDescriptors& target,
+                      FloatWave* uncorrected = nullptr) {
     FloatWave result{};
     const auto& basis = dftBasis();
     for (std::size_t n = 0; n < 32; ++n) {
@@ -232,6 +253,7 @@ FloatWave reconstruct(const Harmonics& magnitude, const Spectrum& guide,
         result[n] += magnitude[16] * (guide[16].real() >= 0.0 ? 1.0 : -1.0)
             * (n & 1U ? -1.0 : 1.0);
     }
+    if (uncorrected) *uncorrected = result;
     return correct(result, target);
 }
 
@@ -256,11 +278,16 @@ struct Candidate {
     SccMorphAnalysis analysis;
     SccMorphCandidate method{};
     double pre_error{}, error{};
+    FloatWave fitted{};
+    std::array<double,3> weights{};
 };
 
 Candidate spectralCandidate(Harmonics magnitude, const Spectrum& guide,
-                            const Target& target, SccMorphCandidate method) {
-    auto wave = reconstruct(magnitude, guide, target.descriptors);
+                            const Target& target, SccMorphCandidate method,
+                            SccMorphCandidateTrace* trace = nullptr) {
+    auto wave = reconstruct(magnitude, guide, target.descriptors,
+                            trace ? &trace->reconstructed : nullptr);
+    if (trace) { trace->method = method; trace->corrected = wave; }
     double best = objective(wave, target, analyze(wave));
     // Deterministic spectral coordinate descent before quantization. This
     // reconciles linear descriptor targets with nonlinear log-magnitude paths.
@@ -280,10 +307,20 @@ Candidate spectralCandidate(Harmonics magnitude, const Spectrum& guide,
     }
     Candidate candidate;
     candidate.method = method;
+    if (method != SccMorphCandidate::Blend)
+        candidate.weights[method == SccMorphCandidate::LogHarmonic ? 0 : 2] = 1.0;
     candidate.pre_error = best;
     candidate.wave = quantize(wave);
     candidate.analysis = analyze(floating(candidate.wave));
     candidate.error = objective(floating(candidate.wave), target, candidate.analysis);
+    candidate.fitted = wave;
+    if (trace) {
+        trace->fitted = wave;
+        trace->quantized = candidate.wave;
+        trace->pre_quantization_error = candidate.pre_error;
+        trace->post_quantization_error = candidate.error;
+        trace->weights = candidate.weights;
+    }
     return candidate;
 }
 
@@ -304,17 +341,67 @@ double trajectoryPosition(const SccMorphDescriptors& value,
     return denominator > Config::epsilon ? numerator / denominator : 0.0;
 }
 
-double connection(const Candidate& a, const Candidate& b,
+double connection(const Candidate& a, const Candidate& b, double dt, double du,
                   const SccMorphDescriptors& first,
-                  const SccMorphDescriptors& second) {
+                  const SccMorphDescriptors& second,
+                  SccMorphConnectionTrace* trace = nullptr) {
+    SccMorphConnectionTrace edge;
+    edge.dt = dt; edge.du = du;
+    // Circular shift is exclusively a distance measurement here. Candidate
+    // bytes and the block's endpoint/phase policy remain unchanged.
+    std::uint32_t wave = std::numeric_limits<std::uint32_t>::max();
+    for (std::size_t shift = 0; shift < 32; ++shift) {
+        std::uint32_t error{};
+        for (std::size_t n = 0; n < 32; ++n) {
+            const int difference = int(a.wave[n])-int(b.wave[(n+shift)%32]);
+            error += static_cast<std::uint32_t>(difference*difference);
+        }
+        wave = std::min(wave,error);
+    }
+    // At most 32*255^2, so exact integer accumulation fits uint32_t and avoids
+    // floating normalization inside all 32 alignment trials.
+    edge.phase_wave = double(wave)/(32.0*128.0*128.0*4.0);
+    edge.rms = std::pow(a.analysis.descriptors.rms-b.analysis.descriptors.rms,2);
+    double energy_a{}, energy_b{};
+    for (std::size_t k = 1; k <= 16; ++k) {
+        const double weight = k == 16 ? 1.0 : 2.0;
+        const double ma = a.analysis.magnitude[k], mb = b.analysis.magnitude[k];
+        edge.harmonic += weight*(ma-mb)*(ma-mb);
+        energy_a += weight*ma*ma; energy_b += weight*mb*mb;
+    }
+    for (std::size_t k = 1; k <= 16; ++k) {
+        const double weight = k == 16 ? 1.0 : 2.0;
+        const double ma = a.analysis.magnitude[k], mb = b.analysis.magnitude[k];
+        const double power_a = weight*ma*ma / std::max(energy_a,Config::tolerance);
+        const double power_b = weight*mb*mb / std::max(energy_b,Config::tolerance);
+        edge.spectral_shape += (power_a-power_b)*(power_a-power_b)/2.0;
+    }
+    // A virtually silent tone has no salient normalized spectral shape.
+    edge.spectral_shape *= std::min(1.0,std::sqrt(std::max(energy_a,energy_b)));
+    edge.descriptor = descriptorDistance(a.analysis.descriptors,b.analysis.descriptors)
+        / Config::descriptor_weight_sum;
+    edge.distance = Config::connection_wave_weight*edge.phase_wave
+        + Config::connection_rms_weight*edge.rms
+        + Config::connection_harmonic_weight*edge.harmonic
+        + Config::connection_shape_weight*edge.spectral_shape
+        + Config::connection_descriptor_weight*edge.descriptor;
     const double reverse = std::max(0.0,
         trajectoryPosition(a.analysis.descriptors, first, second)
         - trajectoryPosition(b.analysis.descriptors, first, second));
-    return Config::smoothness_weight * (
-        spectralDistance(a.analysis.magnitude, b.analysis.magnitude)
-        + descriptorDistance(a.analysis.descriptors, b.analysis.descriptors)
-        + sccMorphTransitionCost(a.wave, b.wave))
-        + Config::trajectory_weight * reverse * reverse;
+    edge.reverse = reverse;
+    // Integrate squared velocity over normalized time. The fourth-power
+    // term measures an unusually large change relative to the authored du;
+    // it follows fast curves rather than imposing a uniform perceptual rate.
+    const double interval = std::max(dt,Config::tolerance);
+    // Below one byte of progress per ideal interval, rate estimates describe
+    // quantization noise rather than controllable motion. This also bounds
+    // gamma=8 tails where adjacent u values can round to exactly 1.0.
+    const double position = std::max(du,interval/128.0);
+    edge.cost = Config::motion_weight*(edge.distance/interval
+        + edge.distance*edge.distance/(interval*position*position))
+        + interval*Config::trajectory_weight*reverse*reverse;
+    if (trace) *trace = edge;
+    return edge.cost;
 }
 
 SccWaveform sourceWave(const SavedTimbreReference& reference) {
@@ -354,31 +441,76 @@ double sccMorphTransitionCost(const SccWaveform& first,
     return Config::value_weight * value + Config::slope_weight * slope;
 }
 
-SccMorphPairResult generateSccMorph(const SccWaveform& first,
-    const SccWaveform& second, std::uint8_t count, double gamma) {
+namespace {
+
+std::vector<double> playbackIntervals(const std::vector<std::uint32_t>& counts) {
+    std::vector<double> intervals;
+    intervals.reserve(counts.size()-1);
+    const double duration = double(counts.back())-double(counts.front());
+    for (std::size_t index = 1; index < counts.size(); ++index)
+        intervals.push_back((double(counts[index])-double(counts[index-1]))/duration);
+    return intervals;
+}
+
+SccMorphPairResult generateSccMorphImpl(const SccWaveform& first,
+    const SccWaveform& second, std::uint8_t count, double gamma,
+    SccMorphPairTrace* trace, const std::vector<double>* intervals = nullptr) {
     SccMorphPairResult result;
+    if (trace) {
+        *trace = {};
+        trace->first = first; trace->second = second;
+        trace->epsilon = Config::epsilon; trace->silence = Config::silence;
+    }
     if (count == 0) return result;
-    const auto aligned = shifted(second, align(first, second));
+    const auto alignment_shift = align(first, second);
+    const auto aligned = shifted(second, alignment_shift);
     const auto a = analyzeSccMorphWaveform(first);
     const auto b = analyzeSccMorphWaveform(aligned);
+    if (trace) {
+        trace->alignment_shift = alignment_shift;
+        trace->aligned_second = aligned;
+        trace->first_analysis = a; trace->second_analysis = b;
+        trace->steps.resize(count);
+    }
     const auto fa = floating(first), fb = floating(aligned);
     const auto spectrum_a = transform(fa), spectrum_b = transform(fb);
     const auto envelope_a = smoothEnvelope(a.magnitude);
     const auto envelope_b = smoothEnvelope(b.magnitude);
     std::vector<Target> targets;
-    std::vector<std::array<Candidate,3>> choices;
+    std::vector<std::array<Candidate,kSccMorphCandidateCount>> choices;
+    std::vector<std::array<Harmonics,3>> mixture_bases;
     targets.reserve(count); choices.reserve(count);
+    mixture_bases.reserve(count);
     for (unsigned index = 1; index <= count; ++index) {
         const double u = morphPosition(double(index) / (double(count)+1.0), gamma);
         Target target{};
         target.descriptors = interpolate(a.descriptors,b.descriptors,u);
         for (std::size_t n = 0; n < 32; ++n)
             target.shape[n] = (1-u)*fa[n] + u*fb[n];
+        auto* step = trace ? &trace->steps[index-1] : nullptr;
+        if (step) {
+            step->t = double(index) / (double(count)+1.0);
+            step->u = u; step->target = target.descriptors;
+            step->target_shape = target.shape;
+        }
         // Phase-equivalent sources require no synthesized timbre changes.
         if (first == aligned) {
             Candidate candidate{first,a,SccMorphCandidate::Source,0,0};
-            choices.push_back({candidate,candidate,candidate});
+            std::array<Candidate,kSccMorphCandidateCount> unchanged;
+            unchanged.fill(candidate);
+            choices.push_back(unchanged);
+            mixture_bases.push_back({a.magnitude,a.magnitude,a.magnitude});
             target.magnitude = a.magnitude;
+            if (step) {
+                step->raw_log_magnitude = step->target_magnitude
+                    = step->advanced_magnitude = a.magnitude;
+                step->guide_phase = a.phase;
+                for (auto& candidate_trace : step->candidates) {
+                    candidate_trace.reconstructed = candidate_trace.corrected
+                        = candidate_trace.fitted = fa;
+                    candidate_trace.quantized = first;
+                }
+            }
             targets.push_back(target);
             continue;
         }
@@ -406,6 +538,12 @@ SccMorphPairResult generateSccMorph(const SccWaveform& first,
             guide[k] = std::abs(chosen)>Config::epsilon ? chosen/std::abs(chosen)
                                                        : std::complex<double>{1,0};
         }
+        if (step) {
+            step->raw_log_magnitude = target.magnitude;
+            step->advanced_magnitude = advanced;
+            for (std::size_t k = 0; k <= 16; ++k)
+                step->guide_phase[k] = std::arg(guide[k]);
+        }
         // The log spectrum controls harmonic proportions, not overall gain.
         // Evaluate against the same interpolated RMS/DC used by reconstruction
         // so silence fades and endpoint level differences are not penalized
@@ -426,28 +564,115 @@ SccMorphPairResult generateSccMorph(const SccWaveform& first,
         time_candidate.wave = quantize(time);
         time_candidate.analysis = analyzeSccMorphWaveform(time_candidate.wave);
         time_candidate.method = SccMorphCandidate::AlignedTime;
+        time_candidate.fitted = time;
+        time_candidate.weights[1] = 1.0;
         time_candidate.pre_error = objective(time,target,analyze(time));
         time_candidate.error = objective(floating(time_candidate.wave),target,time_candidate.analysis);
-        choices.push_back({
-            spectralCandidate(target.magnitude,guide,target,SccMorphCandidate::LogHarmonic),
-            time_candidate,
-            spectralCandidate(advanced,guide,target,SccMorphCandidate::SpectralEnvelope)});
+        if (step) {
+            step->target_magnitude = target.magnitude;
+            auto& candidate_trace = step->candidates[1];
+            candidate_trace.method = SccMorphCandidate::AlignedTime;
+            candidate_trace.reconstructed = target.shape;
+            candidate_trace.corrected = candidate_trace.fitted = time;
+            candidate_trace.quantized = time_candidate.wave;
+            candidate_trace.pre_quantization_error = time_candidate.pre_error;
+            candidate_trace.post_quantization_error = time_candidate.error;
+            candidate_trace.weights = time_candidate.weights;
+        }
+        std::array<Candidate,kSccMorphCandidateCount> candidates;
+        candidates[0] = spectralCandidate(target.magnitude,guide,target,
+            SccMorphCandidate::LogHarmonic,step ? &step->candidates[0] : nullptr);
+        candidates[1] = time_candidate;
+        candidates[2] = spectralCandidate(advanced,guide,target,
+            SccMorphCandidate::SpectralEnvelope,step ? &step->candidates[2] : nullptr);
+        // All three original float candidates share the complex guide phases:
+        // time interpolation produces that guide, and correction/coordinate
+        // fitting only change real AC gain and harmonic magnitudes. Blend the
+        // fitted amplitudes under that guide, so incompatible phases cannot
+        // cancel. Reuse those fitted spectra, then apply the same bounded
+        // correction, harmonic fit, and post-quantization objective.
+        std::array<Harmonics,3> fitted_magnitude;
+        for (std::size_t c = 0; c < 3; ++c) {
+            const auto spectrum = transform(candidates[c].fitted);
+            for (std::size_t k = 0; k <= 16; ++k)
+                fitted_magnitude[c][k] = std::abs(spectrum[k]);
+        }
+        mixture_bases.push_back(fitted_magnitude);
+        std::size_t state = 3;
+        for (const auto [left,right] : {std::pair{0U,1U},std::pair{1U,2U},std::pair{0U,2U}})
+            for (const double mix : {0.25,0.5,0.75}) {
+                Harmonics magnitude{};
+                for (std::size_t k = 1; k <= 16; ++k)
+                    magnitude[k] = (1-mix)*fitted_magnitude[left][k]
+                        + mix*fitted_magnitude[right][k];
+                auto* candidate_trace = step ? &step->candidates[state] : nullptr;
+                candidates[state] = spectralCandidate(magnitude,guide,target,
+                    SccMorphCandidate::Blend,candidate_trace);
+                candidates[state].weights[left] = 1-mix;
+                candidates[state].weights[right] = mix;
+                if (candidate_trace) candidate_trace->weights = candidates[state].weights;
+                ++state;
+            }
+        choices.push_back(candidates);
         targets.push_back(target);
     }
     // Choose a whole trajectory of post-quantized candidates. Independent
     // per-node minima can produce descriptor reversals or abrupt neighbors.
     const Candidate start{first,a,SccMorphCandidate::Source,0,0};
     const Candidate end{aligned,b,SccMorphCandidate::Source,0,0};
-    std::vector<std::array<double,3>> cost(count);
-    std::vector<std::array<std::size_t,3>> previous(count);
-    for (std::size_t c = 0; c < 3; ++c)
-        cost[0][c] = choices[0][c].error + connection(start,choices[0][c],a.descriptors,b.descriptors);
+    const double ideal_dt = 1.0/(double(count)+1.0);
+    const auto interval = [&](std::size_t arrival) {
+        return intervals ? (*intervals)[arrival-1] : ideal_dt;
+    };
+    // Trapezoidal time integration gives each interior node the half-width
+    // of its two neighboring intervals. Uniform timing reduces to ideal_dt.
+    const auto node_width = [&](std::size_t index) {
+        return (interval(index+1)+interval(index+2))/2.0;
+    };
+    const auto position = [&](std::size_t index) {
+        return morphPosition(double(index)/(double(count)+1.0),gamma);
+    };
+    const auto connect = [&](const Candidate& left, const Candidate& right,
+                             std::size_t arrival, SccMorphConnectionTrace* edge = nullptr) {
+        double value = connection(left,right,interval(arrival),
+            position(arrival)-position(arrival-1),a.descriptors,b.descriptors,edge);
+        if (arrival > 1 && arrival <= count) {
+            // Evaluate both coefficient vectors against the same arrival-node
+            // fitted spectra under the common phase guide. Parseval weights
+            // exclude DC: all candidates have the same authored DC target.
+            // Source endpoints have no mixture coefficients and are excluded.
+            const auto& bases = mixture_bases[arrival-1];
+            double mixture{};
+            for (std::size_t k = 1; k <= 16; ++k) {
+                double difference{};
+                for (std::size_t c = 0; c < 3; ++c)
+                    difference += (right.weights[c]-left.weights[c])*bases[c][k];
+                mixture += (k == 16 ? 1.0 : 2.0)*difference*difference;
+            }
+            value += Config::mixture_weight*mixture
+                / std::max(interval(arrival),Config::tolerance);
+            // distance retains the physical waveform/feature components;
+            // cost includes this coefficient term and can be reconstructed
+            // from the recorded original candidates and mixture weights.
+            if (edge) edge->cost = value;
+        }
+        return value;
+    };
+    std::vector<std::array<double,kSccMorphCandidateCount>> cost(count);
+    std::vector<std::array<std::size_t,kSccMorphCandidateCount>> previous(count);
+    for (std::size_t c = 0; c < kSccMorphCandidateCount; ++c) {
+        auto* incoming = trace ? &trace->steps[0].candidates[c].incoming : nullptr;
+        cost[0][c] = choices[0][c].error*node_width(0)
+            + connect(start,choices[0][c],1,incoming ? &(*incoming)[0] : nullptr);
+        if (incoming) incoming->fill((*incoming)[0]);
+    }
     for (std::size_t index = 1; index < count; ++index)
-        for (std::size_t c = 0; c < 3; ++c) {
+        for (std::size_t c = 0; c < kSccMorphCandidateCount; ++c) {
             cost[index][c] = std::numeric_limits<double>::infinity();
-            for (std::size_t p = 0; p < 3; ++p) {
-                const double candidate = cost[index-1][p] + choices[index][c].error
-                    + connection(choices[index-1][p],choices[index][c],a.descriptors,b.descriptors);
+            for (std::size_t p = 0; p < kSccMorphCandidateCount; ++p) {
+                auto* edge = trace ? &trace->steps[index].candidates[c].incoming[p] : nullptr;
+                const double candidate = cost[index-1][p] + choices[index][c].error*node_width(index)
+                    + connect(choices[index-1][p],choices[index][c],index+1,edge);
                 if (candidate + Config::tolerance < cost[index][c]) {
                     cost[index][c] = candidate; previous[index][c] = p;
                 }
@@ -455,14 +680,28 @@ SccMorphPairResult generateSccMorph(const SccWaveform& first,
         }
     std::size_t selected{};
     double best = std::numeric_limits<double>::infinity();
-    for (std::size_t c = 0; c < 3; ++c) {
+    for (std::size_t c = 0; c < kSccMorphCandidateCount; ++c) {
         const double candidate = cost[count-1][c]
-            + connection(choices[count-1][c],end,a.descriptors,b.descriptors);
+            + connect(choices[count-1][c],end,count+1,trace ? &trace->terminal[c] : nullptr);
         if (candidate + Config::tolerance < best) { best=candidate; selected=c; }
     }
     std::vector<Candidate> trajectory(count);
+    if (trace) {
+        trace->trajectory_cost = best;
+        for (std::size_t index = 0; index < count; ++index)
+            for (std::size_t c = 0; c < kSccMorphCandidateCount; ++c) {
+                auto& candidate_trace = trace->steps[index].candidates[c];
+                candidate_trace.cumulative_cost = cost[index][c];
+                candidate_trace.predecessor = previous[index][c];
+            }
+    }
     for (std::size_t index = count; index-- > 0;) {
         trajectory[index] = choices[index][selected];
+        if (trace) {
+            trace->steps[index].selected_candidate = selected;
+            trace->steps[index].selected_pre_local = trajectory[index].wave;
+            trace->steps[index].selected_pre_local_error = trajectory[index].error;
+        }
         selected = previous[index][selected];
     }
     // Re-evaluate each +/- one-byte mutation, including its neighbors, after
@@ -474,9 +713,9 @@ SccMorphPairResult generateSccMorph(const SccWaveform& first,
                 const auto& left = index ? trajectory[index-1] : start;
                 const auto& right = index+1 < count ? trajectory[index+1] : end;
                 const auto quality = [&](const Candidate& candidate) {
-                    return candidate.error
-                        + connection(left,candidate,a.descriptors,b.descriptors)
-                        + connection(candidate,right,a.descriptors,b.descriptors);
+                    return candidate.error*node_width(index)
+                        + connect(left,candidate,index+1)
+                        + connect(candidate,right,index+2);
                 };
                 double best_score = quality(current);
                 for (std::size_t n = 0; n < 32; ++n) {
@@ -498,10 +737,15 @@ SccMorphPairResult generateSccMorph(const SccWaveform& first,
             }
     for (std::size_t index = 0; index < count; ++index) {
         const auto& candidate = trajectory[index];
+        if (trace) {
+            trace->steps[index].selected_post_local = candidate.wave;
+            trace->steps[index].selected_post_local_error = candidate.error;
+        }
         result.intermediate.push_back(candidate.wave);
         SccMorphWaveDiagnostic diagnostic;
         diagnostic.u = morphPosition(double(index+1)/(double(count)+1.0),gamma);
         diagnostic.candidate = candidate.method;
+        diagnostic.candidate_weights = candidate.weights;
         diagnostic.pre_quantization_error = candidate.pre_error;
         diagnostic.post_quantization_error = candidate.error;
         diagnostic.target = targets[index].descriptors;
@@ -510,6 +754,30 @@ SccMorphPairResult generateSccMorph(const SccWaveform& first,
         result.diagnostics.push_back(diagnostic);
     }
     return result;
+}
+
+} // namespace
+
+SccMorphPairResult generateSccMorph(const SccWaveform& first,
+    const SccWaveform& second, std::uint8_t count, double gamma) {
+    return generateSccMorphImpl(first,second,count,gamma,nullptr);
+}
+
+SccMorphPairResult generateSccMorphTraced(const SccWaveform& first,
+    const SccWaveform& second, std::uint8_t count, double gamma,
+    SccMorphPairTrace& trace) {
+    return generateSccMorphImpl(first,second,count,gamma,&trace);
+}
+
+SccMorphPairResult generateSccMorphTraced(const SccWaveform& first,
+    const SccWaveform& second, std::uint8_t count, double gamma,
+    SccMorphPairTrace& trace, const std::vector<std::uint32_t>& counts) {
+    if (counts.size() != std::size_t(count)+2
+        || std::adjacent_find(counts.begin(),counts.end(),
+            [](auto left,auto right) { return left >= right; }) != counts.end())
+        throw std::invalid_argument("SCC morph diagnostic counts must increase and include both endpoints");
+    const auto intervals = playbackIntervals(counts);
+    return generateSccMorphImpl(first,second,count,gamma,&trace,&intervals);
 }
 
 std::vector<std::size_t> optimizeSccMorphBlockPhases(
@@ -588,7 +856,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
     };
     if (input.scc_morph_bank_base != 0 && input.scc_morph_bank_base != 16)
         return fail("SCC Morph Bank start must be @0 or @16");
-    if (input.scc_morph_algorithm_version != kSccMorphAlgorithmVersion)
+    if (!isSupportedSccMorphAlgorithmVersion(input.scc_morph_algorithm_version))
         return fail("Unsupported SCC morph algorithm version");
     const auto source_numbers = resolveTimbreNumbers(input);
     for (const auto& warning : source_numbers.warnings) {
@@ -634,6 +902,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
         if (layer.base_timbre) freeze(*layer.base_timbre);
     for (auto& reference : result.timbre.embedded_timbres) freeze(reference);
     result.timbre.scc_morph_materialized = true;
+    result.timbre.scc_morph_algorithm_version = kSccMorphAlgorithmVersion;
 
     const auto sourceForEvent = [&](const EnvelopeEvent& event)
         -> const SavedTimbreReference* {
@@ -692,7 +961,10 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
     };
     struct Pending { std::size_t layer{}; Node node; };
     std::vector<Pending> pending;
-    using PairKey = std::tuple<SccWaveform,SccWaveform,std::uint8_t,double>;
+    // Integer event placement below is translation-invariant in start count:
+    // rounded and clamp bounds are all start + an integer relative count.
+    // Duration therefore uniquely determines the normalized interval vector.
+    using PairKey = std::tuple<SccWaveform,SccWaveform,std::uint8_t,double,std::uint32_t>;
     std::map<PairKey,SccMorphPairResult> pair_cache;
     for (std::size_t layer_index = 0; layer_index < input.layers.size(); ++layer_index) {
         const auto& layer = input.layers[layer_index];
@@ -764,29 +1036,35 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
                 const auto original_start = sourceNode(position-1);
                 if (!end_node || !original_start)
                     return fail("SCC morph source waveform snapshot is unavailable");
-                const PairKey key{original_start->wave,end_node->wave,
-                    settings.intermediate_count,settings.curve};
-                auto cached = pair_cache.find(key);
-                if (cached == pair_cache.end())
-                    cached = pair_cache.emplace(key,generateSccMorph(original_start->wave,
-                        end_node->wave,settings.intermediate_count,settings.curve)).first;
-                const auto& generated = cached->second;
-                std::uint32_t previous = start_event.count;
-                for (std::size_t i = 0; i < generated.intermediate.size(); ++i) {
-                    const auto divisions = std::uint64_t(settings.intermediate_count)+1;
+                // Preserve the existing rounded/clamped event positions;
+                // use these exact intervals for connection velocity scoring.
+                std::vector<std::uint32_t> counts{start_event.count};
+                const auto divisions = std::uint64_t(settings.intermediate_count)+1;
+                for (std::size_t i = 0; i < settings.intermediate_count; ++i) {
                     const auto numerator = std::uint64_t(duration)*(i+1);
                     const auto rounded = start_event.count + static_cast<std::uint32_t>(
                         (numerator+divisions/2)/divisions);
                     const auto latest = end_event.count
-                        - static_cast<std::uint32_t>(generated.intermediate.size()-i);
-                    const auto count = std::clamp(rounded,previous+1,latest);
+                        - static_cast<std::uint32_t>(settings.intermediate_count-i);
+                    counts.push_back(std::clamp(rounded,counts.back()+1,latest));
+                }
+                counts.push_back(end_event.count);
+                const PairKey key{original_start->wave,end_node->wave,
+                    settings.intermediate_count,settings.curve,duration};
+                auto cached = pair_cache.find(key);
+                if (cached == pair_cache.end()) {
+                    const auto intervals = playbackIntervals(counts);
+                    cached = pair_cache.emplace(key,generateSccMorphImpl(original_start->wave,
+                        end_node->wave,settings.intermediate_count,settings.curve,nullptr,&intervals)).first;
+                }
+                const auto& generated = cached->second;
+                for (std::size_t i = 0; i < generated.intermediate.size(); ++i) {
                     Node node;
                     node.wave = generated.intermediate[i];
                     node.diagnostic = generated.diagnostics[i];
-                    node.diagnostic.count = count;
+                    node.diagnostic.count = counts[i+1];
                     node.diagnostic.layer_index = layer_index;
                     nodes.push_back(node);
-                    previous = count;
                 }
                 nodes.push_back(*end_node);
             }
@@ -884,12 +1162,15 @@ std::shared_ptr<const SccMorphCompileResult> compileSccMorphCached(
     const CompositeTimbre& input) {
     struct Cache {
         CompositeTimbre input;
+        std::uint32_t algorithm_version{};
         std::shared_ptr<const SccMorphCompileResult> result;
     };
     thread_local Cache cache;
-    if (!cache.result || cache.input != input) {
+    if (!cache.result || cache.input != input
+        || cache.algorithm_version != kSccMorphAlgorithmVersion) {
         auto result = std::make_shared<const SccMorphCompileResult>(compileSccMorph(input));
         cache.input = input;
+        cache.algorithm_version = kSccMorphAlgorithmVersion;
         cache.result = std::move(result);
     }
     return cache.result;

@@ -67,13 +67,14 @@ constexpr int registerAutoLaneH = 44;
 constexpr int compositeMixLaneH = 104;
 constexpr int compositeEditLaneH = 520;
 constexpr int registerAutoLanePairExtra = 44 * 2;
-constexpr int compositeInspectorLabelW = 144;
-constexpr int compositeOverviewLabelW = 240;
+constexpr int compositeInspectorLabelW = 112;
+constexpr int compositeOverviewLabelW = 188;
 constexpr int compositeFocusW = 132;
 constexpr int compositeSelectorW = 144;
 constexpr int compositeInspectorContentH = 800;
 constexpr int compositeAuditionW = 112;
 constexpr int compositeSetupColumnW = 500;
+constexpr int compositeInspectorColumnW = 320;
 constexpr int compositeAddPsgW = 70;
 constexpr int compositeAddSccW = 70;
 constexpr int compositeAddOpllW = 76;
@@ -99,7 +100,7 @@ constexpr int compositeTimbrePickW = 360;
 constexpr int compositeTimbrePickH = 600;
 constexpr int editVolumeLaneShare = 1;
 constexpr int editPitchLaneShare = 3;
-constexpr int editVolumeLaneH = 265; // 100%; quiet steps round to ≥1px
+constexpr int editVolumeLaneH = 132; // 100%; compact 0–15 volume lane
 constexpr int compositeOpllYParamW = 900;
 constexpr int compositeOpllYParamH = 680;
 constexpr int compositeLfoDialogW = 500;
@@ -194,6 +195,7 @@ inline int compositeMixLaneH = Base::compositeMixLaneH;
 inline int compositeEditLaneH = Base::compositeEditLaneH;
 inline int compositeEditLaneOpllExtraH = Base::registerAutoLanePairExtra;
 inline int compositeSetupColumnW = Base::compositeSetupColumnW;
+inline int compositeInspectorColumnW = Base::compositeInspectorColumnW;
 inline int compositeLaneLabelW = Base::compositeSetupColumnW;
 inline int compositeAddPsgW = Base::compositeAddPsgW;
 inline int compositeAddSccW = Base::compositeAddSccW;
@@ -283,7 +285,7 @@ inline void recomputeDerived() {
     rateEnvelopeDialogPsgExtraH = fieldH + sm;
     rateEnvelopeDialogH =
         panelPad * 2 + titleH + sm + rateEnvelopeBarColumnH + sm + textButtonH;
-    // Volume is the scaled 100% token `editVolumeLaneH` (265px). Pitch keeps
+    // Volume is the scaled 100% token `editVolumeLaneH` (132px). Pitch keeps
     // the 0.231 remainder (share 3/4 of that pre-growth value area).
     // `compositeEditLaneH` still holds the scaled 0.231 fallback here.
     const int legacy_value_h = juce::jmax(
@@ -376,6 +378,7 @@ inline void applyScale(float factor) {
     compositeInspectorContentH = s(Base::compositeInspectorContentH);
     compositeAuditionW = s(Base::compositeAuditionW);
     compositeSetupColumnW = s(Base::compositeSetupColumnW);
+    compositeInspectorColumnW = s(Base::compositeInspectorColumnW);
     compositeAddPsgW = s(Base::compositeAddPsgW);
     compositeAddSccW = s(Base::compositeAddSccW);
     compositeAddOpllW = s(Base::compositeAddOpllW);

@@ -171,7 +171,7 @@ bool compileCompositeProgram(
             continue;
         }
         const auto& layer = timbre.layers[index];
-        if (layer.volume_envelope.kind != EnvelopeKind::Sequence) {
+        if (!layerUsesSequenceEnvelope(layer)) {
             continue;
         }
         if (!formatMgsCompositeEnvelope(

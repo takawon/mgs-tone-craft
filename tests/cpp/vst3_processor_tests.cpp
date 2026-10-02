@@ -3,6 +3,7 @@
 #include "plugin_processor.hpp"
 #include "plugin_editor.hpp"
 #include "plugin_editor_context.hpp"
+#include "mgstc_editor_view.hpp"
 
 #include <algorithm>
 #include <array>
@@ -29,6 +30,65 @@
 #include "mgstc/engine/register_write.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/sinc_rate_conv.hpp"
+
+namespace mgstc::app {
+
+struct CompositeEditorComponentTestAccess {
+    static void start(CompositeEditorComponent& editor, std::uint8_t note,
+        bool one_second = false) {
+        editor.startCompositeNote(note, one_second);
+    }
+    static void release(CompositeEditorComponent& editor, std::uint8_t note,
+        double time) {
+        editor.releaseCompositeNote(note, time);
+    }
+    static void dispatch(CompositeEditorComponent& editor, double time) {
+        editor.dispatchScheduledLayerNotes(time);
+    }
+    static double onset(const CompositeEditorComponent& editor) {
+        return editor.scheduled_layer_notes_.front().start_time_ms
+            - editor.scheduled_layer_notes_.front().delay_ms;
+    }
+    static std::size_t scheduled(const CompositeEditorComponent& editor) {
+        return editor.scheduled_layer_notes_.size();
+    }
+    static std::size_t sounding(const CompositeEditorComponent& editor) {
+        return editor.sounding_tracks_.size();
+    }
+    static std::size_t voices(const CompositeEditorComponent& editor) {
+        return editor.voice_allocator_.activeVoiceCount();
+    }
+    static void stop(CompositeEditorComponent& editor) {
+        editor.silenceAuditionNotes();
+    }
+    static bool rebuild(CompositeEditorComponent& editor) {
+        return editor.configureEngine();
+    }
+    static void setPolyphonic(CompositeEditorComponent& editor, bool enabled) {
+        editor.performance_keyboard_.setPolyphonic(enabled);
+    }
+    static bool startsAndStopsShiftedEqually(
+        const CompositeEditorComponent& editor, double hold_ms) {
+        const auto origin = onset(editor);
+        return std::all_of(editor.scheduled_layer_notes_.begin(),
+            editor.scheduled_layer_notes_.end(),
+            [origin, hold_ms](const auto& layer) {
+                return layer.stop_time_ms
+                    && std::fabs(layer.start_time_ms - origin - layer.delay_ms)
+                        < 1.0e-6
+                    && std::fabs(*layer.stop_time_ms - layer.start_time_ms
+                            - hold_ms) < 1.0e-6;
+            });
+    }
+    static bool containsNote(const CompositeEditorComponent& editor,
+        std::uint8_t note) {
+        return std::any_of(editor.scheduled_layer_notes_.begin(),
+            editor.scheduled_layer_notes_.end(),
+            [note](const auto& layer) { return layer.base_note == note; });
+    }
+};
+
+}  // namespace mgstc::app
 
 namespace mgstc::plugin {
 
@@ -1160,19 +1220,20 @@ void feedMidiTimeline(
 void testBlockSizeInvarianceAt44100() {
     const auto message =
         juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100));
-    MgstcAudioProcessor small;
-    MgstcAudioProcessor large;
-    small.prepareToPlay(44'100.0, 64);
-    large.prepareToPlay(44'100.0, 512);
+    MgstcAudioProcessor small_blocks;
+    MgstcAudioProcessor large_blocks;
+    small_blocks.prepareToPlay(44'100.0, 64);
+    large_blocks.prepareToPlay(44'100.0, 512);
     const auto* psg =
-        layerOf(Access::plan(small), mgstc::engine::TimbreSource::Psg);
+        layerOf(Access::plan(small_blocks), mgstc::engine::TimbreSource::Psg);
     require(psg != nullptr, "PSG layer");
-    const auto track = Access::plan(small).physicalTrack(*psg, 0);
+    const auto track = Access::plan(small_blocks).physicalTrack(*psg, 0);
 
-    feedMidiTimeline(small, 64, message, 441, 1'024);
-    feedMidiTimeline(large, 512, message, 441, 1'024);
+    feedMidiTimeline(small_blocks, 64, message, 441, 1'024);
+    feedMidiTimeline(large_blocks, 512, message, 441, 1'024);
     require(
-        Access::logHas(small, 480, track) && Access::logHas(large, 480, track),
+        Access::logHas(small_blocks, 480, track)
+            && Access::logHas(large_blocks, 480, track),
         "block size must not change mapped MIDI engine time");
 }
 
@@ -3388,7 +3449,9 @@ void testSccMorphPluginStateCompatibility() {
         const auto parsed = mgstc::plugin::parsePluginState(blob.data(), blob.size());
         require(parsed.status == mgstc::plugin::PluginStateStatus::Ok,
                 "legacy v1/v2 plugin sound payload readable");
-        require(soundBytes(parsed.document.sound) == soundBytes(document.sound),
+        auto expected_legacy_sound = document.sound;
+        expected_legacy_sound.scc_morph_algorithm_version = 1;
+        require(soundBytes(parsed.document.sound) == soundBytes(expected_legacy_sound),
                 "legacy plugin payload defaults preserve sound");
     }
     auto arrival = *layer.base_timbre;
@@ -3863,6 +3926,120 @@ void testCompositePlaybackWaveform() {
         "no composite waveform frames after the editor closes");
 }
 
+void testCompositeEditorDelayedKeyOff() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    auto sound = mgstc::engine::defaultCompositeTimbre();
+    sound.layers[1].start_delay_form = mgstc::engine::StartDelayForm::NoteLength;
+    sound.layers[1].start_delay_value = 10; // r10 = 200 ms at tempo 120
+    sound.layers[2].start_delay_form = mgstc::engine::StartDelayForm::AbsoluteTicks;
+    sound.layers[2].start_delay_value = 24; // r%24 = 250 ms at tempo 120
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {},
+        [] {}, [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, sound);
+    require(EditorAccess::rebuild(editor),
+        "submit the three-layer test program before checking voice capacity");
+    // Let the audio side consume the submitted program, as a running host
+    // does, so the later rebuild can reuse the retired program slot.
+    juce::AudioBuffer<float> initial_audio(2, 512);
+    juce::MidiBuffer initial_midi;
+    processor.processBlock(initial_audio, initial_midi);
+
+    EditorAccess::start(editor, 60);
+    const auto key_on = EditorAccess::onset(editor);
+    require(EditorAccess::scheduled(editor) == 3
+            && EditorAccess::sounding(editor) == 1,
+        "editor initially starts only the undelayed layer");
+    EditorAccess::release(editor, 60, key_on + 50.0);
+    require(EditorAccess::scheduled(editor) == 2
+            && EditorAccess::sounding(editor) == 0
+            && EditorAccess::voices(editor) == 1,
+        "early release keeps delayed layers and their allocated voice");
+    require(EditorAccess::startsAndStopsShiftedEqually(editor, 50.0),
+        "r and r% shift key-on and key-off equally");
+    EditorAccess::dispatch(editor, key_on + 199.0);
+    require(EditorAccess::sounding(editor) == 0,
+        "released key still waits for delayed onset");
+    EditorAccess::dispatch(editor, key_on + 200.0);
+    require(EditorAccess::sounding(editor) == 1,
+        "r delayed layer sounds after physical key release");
+    EditorAccess::dispatch(editor, key_on + 250.0);
+    require(EditorAccess::scheduled(editor) == 1
+            && EditorAccess::sounding(editor) == 1
+            && EditorAccess::voices(editor) == 1,
+        "r layer releases while r% layer starts with original held duration");
+    EditorAccess::dispatch(editor, key_on + 300.0);
+    require(EditorAccess::scheduled(editor) == 0
+            && EditorAccess::sounding(editor) == 0
+            && EditorAccess::voices(editor) == 0,
+        "last delayed release frees the voice");
+
+    EditorAccess::start(editor, 60, true);
+    const auto preview_on = EditorAccess::onset(editor);
+    require(EditorAccess::startsAndStopsShiftedEqually(editor, 1000.0),
+        "one-second preview holds every layer for one second after its onset");
+    EditorAccess::dispatch(editor, preview_on + 1000.0);
+    require(EditorAccess::scheduled(editor) == 2
+            && EditorAccess::sounding(editor) == 2,
+        "preview ends undelayed layer before delayed layers");
+    EditorAccess::dispatch(editor, preview_on + 1200.0);
+    require(EditorAccess::scheduled(editor) == 1,
+        "preview r layer lasts exactly one second");
+    EditorAccess::dispatch(editor, preview_on + 1250.0);
+    require(EditorAccess::scheduled(editor) == 0
+            && EditorAccess::voices(editor) == 0,
+        "preview r% layer lasts exactly one second");
+
+    EditorAccess::setPolyphonic(editor, true);
+    EditorAccess::start(editor, 60);
+    EditorAccess::release(editor, 60, EditorAccess::onset(editor) + 50.0);
+    EditorAccess::start(editor, 60);
+    require(EditorAccess::scheduled(editor) == 3
+            && EditorAccess::voices(editor) == 1,
+        "same-note retrigger cancels the previous delayed release");
+    EditorAccess::start(editor, 62);
+    EditorAccess::start(editor, 64);
+    EditorAccess::start(editor, 65);
+    const auto voice_diagnostic = "voice stealing capacity: expected 3, got "
+        + std::to_string(EditorAccess::voices(editor));
+    require(EditorAccess::voices(editor) == 3, voice_diagnostic.c_str());
+    const auto schedule_diagnostic = "voice stealing schedules: expected 9, got "
+        + std::to_string(EditorAccess::scheduled(editor));
+    require(EditorAccess::scheduled(editor) == 9, schedule_diagnostic.c_str());
+    require(!EditorAccess::containsNote(editor, 60),
+        "voice stealing leaves an old scheduled base note");
+    EditorAccess::release(editor, 60, EditorAccess::onset(editor) + 10.0);
+    require(EditorAccess::scheduled(editor) == 9,
+        "late note-off for a stolen note cannot release its replacement");
+    EditorAccess::stop(editor);
+    require(EditorAccess::scheduled(editor) == 0
+            && EditorAccess::sounding(editor) == 0
+            && EditorAccess::voices(editor) == 0,
+        "all-stop cancels sounding notes and future delayed starts/releases");
+
+    EditorAccess::start(editor, 60);
+    EditorAccess::release(editor, 60, EditorAccess::onset(editor) + 50.0);
+    EditorAccess::setPolyphonic(editor, false);
+    require(EditorAccess::scheduled(editor) == 0
+            && EditorAccess::voices(editor) == 0,
+        "mode change cancels delayed starts/releases before voice reuse");
+
+    EditorAccess::start(editor, 60);
+    EditorAccess::release(editor, 60, EditorAccess::onset(editor) + 50.0);
+    require(EditorAccess::rebuild(editor), "editor rebuild succeeds");
+    require(EditorAccess::scheduled(editor) == 0
+            && EditorAccess::sounding(editor) == 0
+            && EditorAccess::voices(editor) == 0,
+        "program rebuild cancels previous delayed starts and releases");
+    EditorAccess::start(editor, 62);
+    require(EditorAccess::scheduled(editor) == 3
+            && !EditorAccess::containsNote(editor, 60),
+        "rebuilt program does not inherit an old release on a reused voice");
+}
+
 void testTemporaryCompositePreviewPreservesState() {
     MgstcAudioProcessor processor;
     const auto before = stateBytes(processor);
@@ -4032,6 +4209,7 @@ int main() {
         testPluginProjectRestore();
         testPluginEditor();
         testCompositePlaybackWaveform();
+        testCompositeEditorDelayedKeyOff();
         testPluginSoundAuthority();
         testTemporaryCompositePreviewPreservesState();
     } catch (const std::exception& error) {

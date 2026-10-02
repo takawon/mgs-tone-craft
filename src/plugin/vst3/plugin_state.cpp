@@ -161,7 +161,8 @@ bool validatePluginSoundSnapshot(const mgstc::engine::CompositeTimbre& timbre) {
     if (!metadataFits(timbre) || timbre.layers.size() > kMaxPluginStateLayers
         || timbre.embedded_timbres.size() > kMaxPluginStateLayers
         || (timbre.scc_morph_bank_base != 0 && timbre.scc_morph_bank_base != 16)
-        || timbre.scc_morph_algorithm_version != mgstc::engine::kSccMorphAlgorithmVersion) {
+        || !mgstc::engine::isSupportedSccMorphAlgorithmVersion(
+            timbre.scc_morph_algorithm_version)) {
         return false;
     }
     for (const auto& layer : timbre.layers) {

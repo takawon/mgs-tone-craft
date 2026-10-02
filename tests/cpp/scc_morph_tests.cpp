@@ -16,11 +16,15 @@
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <map>
 #include <numbers>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -318,6 +322,118 @@ void testSilenceDcAndPhaseOnlyInputs() {
                         "phase-only morph preserves harmonic magnitudes");
         }
     }
+}
+
+void testSccMorphPhaseBMatrixAndTiming() {
+    const auto pulse = generateSccPreset(SccWavePreset::Pulse25, SccHarmonic::One);
+    const auto square = generateSccPreset(SccWavePreset::Square, SccHarmonic::One);
+    const auto triangle = generateSccPreset(SccWavePreset::Triangle, SccHarmonic::One);
+    const auto sine = generateSccPreset(SccWavePreset::Sine, SccHarmonic::One);
+    const auto silence = SccWaveform{};
+    const auto phase_only = rotateSccWaveform(sine, 9);
+    SccWaveform dc_positive{}, dc_negative{}, sparse_a{}, sparse_b{};
+    for (std::size_t i = 0; i < 32; ++i) {
+        dc_positive[i] = static_cast<std::int8_t>(48 + (i % 2 ? 2 : -2));
+        dc_negative[i] = static_cast<std::int8_t>(-48 + (i % 2 ? 3 : -3));
+        const double phase = 2.0 * std::numbers::pi * double(i) / 32.0;
+        sparse_a[i] = static_cast<std::int8_t>(std::lround(
+            80.0 * std::sin(2.0 * phase) + 28.0 * std::sin(7.0 * phase)));
+        sparse_b[i] = static_cast<std::int8_t>(std::lround(
+            56.0 * std::sin(3.0 * phase) + 20.0 * std::sin(11.0 * phase)));
+    }
+    struct Pair { const char* name; SccWaveform first, second; };
+    const std::array<Pair, 12> pairs{{
+        {"Pulse25 -> Sine", pulse, sine}, {"Sine -> Pulse25", sine, pulse},
+        {"Square -> Sine", square, sine}, {"Sine -> Square", sine, square},
+        {"Triangle -> Sine", triangle, sine}, {"same", sine, sine},
+        {"phase only", sine, phase_only}, {"silence -> Sine", silence, sine},
+        {"Sine -> silence", sine, silence}, {"large bipolar DC", dc_positive, dc_negative},
+        {"large RMS difference", silence, pulse}, {"sparse harmonics", sparse_a, sparse_b},
+    }};
+    for (const auto& pair : pairs) {
+        const auto first = generateSccMorph(pair.first, pair.second, 11, 1.0);
+        const auto repeated = generateSccMorph(pair.first, pair.second, 11, 1.0);
+        require(first.intermediate.size() == 11
+                    && first.diagnostics.size() == first.intermediate.size(),
+                "Phase B pair matrix keeps the requested intermediate count");
+        require(first.intermediate == repeated.intermediate,
+                "Phase B pair matrix remains byte deterministic");
+        for (std::size_t i = 0; i < first.intermediate.size(); ++i) {
+            for (const auto sample : first.intermediate[i])
+                require(sample >= -128 && sample <= 127,
+                        "Phase B pair matrix remains in signed SCC sample range");
+            require(allFinite(first.diagnostics[i].target)
+                        && allFinite(first.diagnostics[i].result)
+                        && std::isfinite(first.diagnostics[i].post_quantization_error),
+                    "Phase B pair matrix diagnostics remain finite");
+        }
+        std::cout << "SCC morph Phase B matrix verified: " << pair.name << '\n';
+    }
+
+    const auto extreme_started = std::chrono::steady_clock::now();
+    const auto extreme = generateSccMorph(pulse, sine, 255, kSccMorphGammaMax);
+    const auto extreme_elapsed = std::chrono::steady_clock::now() - extreme_started;
+    SccMorphPairTrace extreme_trace;
+    const auto extreme_trace_started = std::chrono::steady_clock::now();
+    const auto extreme_repeat = generateSccMorphTraced(
+        pulse, sine, 255, kSccMorphGammaMax, extreme_trace);
+    const auto extreme_trace_elapsed = std::chrono::steady_clock::now()
+        - extreme_trace_started;
+    require(extreme.intermediate.size() == 255
+                && extreme.intermediate == extreme_repeat.intermediate,
+            "maximum intermediate count and gamma remain finite and deterministic");
+    for (const auto& diagnostic : extreme.diagnostics)
+        require(std::isfinite(diagnostic.pre_quantization_error)
+                    && std::isfinite(diagnostic.post_quantization_error)
+                    && allFinite(diagnostic.target) && allFinite(diagnostic.result),
+                "gamma-8 high-density morph diagnostics remain finite");
+    double endpoint_sum{};
+    for (std::size_t i = 0; i < extreme_trace.aligned_second.size(); ++i) {
+        const double difference = double(extreme_trace.aligned_second[i])
+            - double(extreme_repeat.intermediate.back()[i]);
+        endpoint_sum += difference * difference;
+    }
+    const auto max_trace_storage = sizeof(SccMorphPairTrace)
+        + extreme_trace.steps.capacity() * sizeof(SccMorphStepTrace);
+    std::cout << "SCC morph N=255 gamma=8 ordinary_us="
+              << std::chrono::duration<double, std::micro>(extreme_elapsed).count()
+              << " traced_us="
+              << std::chrono::duration<double, std::micro>(extreme_trace_elapsed).count()
+              << " max_trace_capacity_bytes=" << max_trace_storage
+              << " final_to_aligned_endpoint_sample_rms="
+              << std::sqrt(endpoint_sum / 32.0) << '\n';
+
+    const auto short_program = morphProgram(pulse, sine, 0, 5, 3, 0, 1.0);
+    const auto short_compiled = compileSccMorph(short_program);
+    require(short_compiled.valid, "short rounded-time morph compiles");
+    std::vector<std::uint32_t> playback_counts{0};
+    for (const auto& diagnostic : short_compiled.diagnostics)
+        if (diagnostic.generated && diagnostic.count > 0 && diagnostic.count < 5)
+            playback_counts.push_back(diagnostic.count);
+    playback_counts.push_back(5);
+    require(playback_counts == std::vector<std::uint32_t>{0, 1, 3, 4, 5},
+            "three intermediate states retain compiler-rounded event counts");
+    SccMorphPairTrace playback_trace;
+    const auto playback_pair = generateSccMorphTraced(
+        pulse, sine, 3, 1.0, playback_trace, playback_counts);
+    require(playback_pair.intermediate.size() == 3
+                && playback_trace.steps.size() == 3,
+            "actual-time scoring keeps all three requested waves");
+    for (std::size_t i = 0; i < playback_trace.steps.size(); ++i) {
+        const auto& step = playback_trace.steps[i];
+        const auto& selected = step.candidates[step.selected_candidate];
+        const auto& edge = selected.incoming[selected.predecessor];
+        const double expected_dt = i == 1 ? 0.4 : 0.2;
+        requireNear(edge.dt, expected_dt, 1e-12,
+                    "transition scoring uses rounded playback interval duration");
+        requireNear(step.u, morphPosition(double(i + 1) / 4.0, 1.0), 1e-12,
+                    "uneven playback counts do not reposition authored interpolation t/u");
+    }
+    SccMorphPairTrace repeat_trace;
+    const auto repeated_playback = generateSccMorphTraced(
+        pulse, sine, 3, 1.0, repeat_trace, playback_counts);
+    require(playback_pair.intermediate == repeated_playback.intermediate,
+            "rounded-time transition optimization remains deterministic");
 }
 
 void testGlobalPhaseOptimizationAndTransitionCost() {
@@ -714,6 +830,57 @@ void testCacheInvalidationAndSaveRoundTrips() {
     const auto first = sawWave();
     const auto last = sawWave(3, 8);
     auto input = morphProgram(first, last, 0, 20, 2, 0, 1.5);
+    auto legacy_input = input;
+    legacy_input.scc_morph_algorithm_version = 1;
+    auto future_input = input;
+    future_input.scc_morph_algorithm_version = 3;
+    const auto legacy_compiled = compileSccMorph(legacy_input);
+    const auto current_compiled = compileSccMorph(input);
+    require(legacy_compiled.valid && current_compiled.valid,
+            "stored SCC morph algorithms 1 and 2 remain supported");
+    require(legacy_input.scc_morph_algorithm_version == 1
+                && input.scc_morph_algorithm_version == kSccMorphAlgorithmVersion,
+            "compilation does not rewrite authored algorithm-version metadata");
+    require(legacy_compiled.timbre.scc_morph_algorithm_version
+                == kSccMorphAlgorithmVersion
+                && current_compiled.timbre.scc_morph_algorithm_version
+                    == kSccMorphAlgorithmVersion,
+            "derived SCC morph result is stamped with the current generator version");
+    const auto generatedSequence = [](const SccMorphCompileResult& result) {
+        std::vector<std::pair<std::uint32_t, SccWaveform>> sequence;
+        for (const auto& diagnostic : result.diagnostics) {
+            if (!diagnostic.generated) continue;
+            sequence.emplace_back(diagnostic.count,
+                materializedWaveFor(result.timbre, diagnostic));
+        }
+        return sequence;
+    };
+    require(generatedSequence(legacy_compiled) == generatedSequence(current_compiled),
+            "algorithm 1 and current metadata use the same deterministic current generator");
+    const auto unsupported = compileSccMorph(future_input);
+    require(!unsupported.valid
+                && unsupported.timbre == future_input
+                && future_input.scc_morph_algorithm_version == 3,
+            "unknown future morph algorithm version is rejected without mutating input");
+
+    for (const auto* authored : {&legacy_input, &input}) {
+        std::string compatibility_error;
+        const auto old_format = CompositeTimbreLibrary::serializeTimbreFile(
+            *authored, 1);
+        const auto old_round_trip = CompositeTimbreLibrary::deserializeTimbreFile(
+            old_format, &compatibility_error);
+        require(old_round_trip.has_value()
+                    && old_round_trip->scc_morph_algorithm_version
+                        == authored->scc_morph_algorithm_version,
+                "portable project round-trip preserves legacy and current morph versions");
+        const auto payload_round_trip = deserializeCompositeSoundPayload(
+            serializeCompositeSoundPayload(*authored),
+            kCompositeSoundPayloadVersion, &compatibility_error);
+        require(payload_round_trip.has_value()
+                    && payload_round_trip->scc_morph_algorithm_version
+                        == authored->scc_morph_algorithm_version,
+                "persistent payload round-trip preserves legacy and current morph versions");
+    }
     auto saved = input;
     saved.scc_morph_materialized = true;
 
@@ -1101,12 +1268,16 @@ void printSccMorphDigest() {
               << std::setfill('0') << digest.value << std::dec << '\n';
 }
 
+// Opt-in Phase A/B waveform and playback-timing comparisons.
+#include "scc_morph_diagnostics.inc"
+
 } // namespace
 
 int main() {
     try {
         testCurveAndQuantizedGeneration();
         testSilenceDcAndPhaseOnlyInputs();
+        testSccMorphPhaseBMatrixAndTiming();
         testGlobalPhaseOptimizationAndTransitionCost();
         testCompositeCompilationBoundariesAndAllocation();
         testMorphBlockBoundaryAnchors();
@@ -1115,6 +1286,7 @@ int main() {
         testDormantRateMorph();
         testCacheInvalidationAndSaveRoundTrips();
         testMaterializedMgscOutput();
+        testSccMorphDiagnosticFixture();
         printSccMorphDigest();
         return 0;
     } catch (const std::exception& error) {

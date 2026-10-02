@@ -3725,6 +3725,7 @@ private:
 class CompositeEditorComponent final
     : public juce::Component,
       private juce::Timer {
+    friend struct CompositeEditorComponentTestAccess;
 public:
     explicit CompositeEditorComponent(
         EditorSession& session,
@@ -4386,6 +4387,7 @@ public:
             });
         performance_keyboard_.setModeCallback(
             [this](bool polyphonic) {
+                silenceAuditionNotes();
                 voice_allocator_.setPolyphonic(polyphonic);
             });
         performance_keyboard_.setSuppressPcInputCallback(
@@ -4435,6 +4437,12 @@ public:
             });
         }
         hydrating_ = false;
+        if (hydrate_from_host_) {
+            const auto plan = mgstc::engine::buildCompositePlaybackPlan(timbre_);
+            voice_allocator_.setChannelCount(plan.voice_capacity);
+            voice_allocator_.setPolyphonic(
+                performance_keyboard_.polyphonic());
+        }
         engine_ready_ = session_.snapshot().audio_running;
         composite_program_stale_ = !hydrate_from_host_;
         applyHostCapabilities();
@@ -6648,6 +6656,11 @@ private:
         request.library = &timbre_library_;
         const auto result = session_.audition().submitComposite(request);
         if (result.update_allocator) {
+            if (result.ok) {
+                // The new program resets physical voice ownership. No start
+                // or release from the preceding program may reuse its tracks.
+                silenceAuditionNotes();
+            }
             voice_allocator_.setChannelCount(result.voice_capacity);
             voice_allocator_.setPolyphonic(
                 performance_keyboard_.polyphonic());
@@ -6695,7 +6708,7 @@ private:
             }
         }
         sounding_tracks_.clear();
-        pending_notes_.clear();
+        scheduled_layer_notes_.clear();
         static_cast<void>(voice_allocator_.allNotesOff());
         performance_keyboard_.clearPreviewNote();
     }
@@ -6781,16 +6794,31 @@ private:
             const double delay_ms = binding.start_delay_ms;
             maximum_delay_ms =
                 juce::jmax(maximum_delay_ms, delay_ms);
+            // Keep the complete layer lifetime on the UI thread. Releasing
+            // the input key shifts key-off by the same delay as key-on,
+            // including when the key is released before this layer starts.
+            scheduled_layer_notes_.push_back({
+                .voice = assignment.channel,
+                .base_note = base_note,
+                .track = track,
+                .note = *note,
+                .delay_ms = delay_ms,
+                .start_time_ms = now + delay_ms,
+                .stop_time_ms = stop_after_one_second
+                    ? std::optional<double>(now + delay_ms + 1000.0)
+                    : std::nullopt,
+                .started = delay_ms <= 0.0,
+            });
             if (delay_ms <= 0.0) {
                 startLayerNote(track, *note);
-            } else {
-                pending_notes_.push_back(
-                    {
-                        .track = track,
-                        .note = *note,
-                        .start_time_ms = now + delay_ms,
-                    });
             }
+        }
+        if (std::none_of(scheduled_layer_notes_.begin(),
+                scheduled_layer_notes_.end(),
+                [voice = assignment.channel](const ScheduledLayerNote& layer) {
+                    return layer.voice == voice;
+                })) {
+            static_cast<void>(voice_allocator_.noteOff(base_note));
         }
         if (stop_after_one_second) {
             audition_stop_time_ms_ =
@@ -6826,30 +6854,69 @@ private:
     }
 
     void stopCompositeVoice(std::uint8_t voice) {
-        const auto plan = mgstc::engine::buildCompositePlaybackPlan(
-            manual_y_preview_timbre_ ? *manual_y_preview_timbre_ : timbre_);
-        for (const auto& binding : plan.audible_layers) {
-            const auto track = plan.physicalTrack(binding, voice);
-            static_cast<void>(session_.audition().noteOff(track));
-            if (track >= kOpllTrack) {
-                session_.audition().armOpllKeyOffSilence(track);
-            }
-            std::erase(sounding_tracks_, track);
-            std::erase_if(
-                pending_notes_,
-                [track](const PendingNote& pending) {
-                    return pending.track == track;
-                });
-        }
+        // Force-stop for retrigger/voice stealing uses the captured physical
+        // tracks, even if the edited layer plan has changed since key-on.
+        std::erase_if(scheduled_layer_notes_,
+            [this, voice](const ScheduledLayerNote& layer) {
+                if (layer.voice != voice) {
+                    return false;
+                }
+                if (layer.started) {
+                    stopLayerNote(layer.track);
+                }
+                return true;
+            });
     }
 
     void stopCompositeNote(std::uint8_t note) {
         audition_stop_time_ms_.reset();
-        const auto voice = voice_allocator_.noteOff(note);
-        if (!voice) {
-            return;
+        releaseCompositeNote(note, juce::Time::getMillisecondCounterHiRes());
+        ensureCompositeTimerRate();
+    }
+
+    void releaseCompositeNote(std::uint8_t note, double now) {
+        for (auto& layer : scheduled_layer_notes_) {
+            if (layer.base_note == note && !layer.stop_time_ms) {
+                layer.stop_time_ms = now + layer.delay_ms;
+            }
         }
-        stopCompositeVoice(*voice);
+        dispatchScheduledLayerNotes(now);
+    }
+
+    void stopLayerNote(std::uint8_t track) {
+        static_cast<void>(session_.audition().noteOff(track));
+        if (track >= kOpllTrack) {
+            session_.audition().armOpllKeyOffSilence(track);
+        }
+        std::erase(sounding_tracks_, track);
+    }
+
+    void dispatchScheduledLayerNotes(double now) {
+        for (auto layer = scheduled_layer_notes_.begin();
+             layer != scheduled_layer_notes_.end();) {
+            if (!layer->started && now >= layer->start_time_ms) {
+                startLayerNote(layer->track, layer->note);
+                layer->started = true;
+            }
+            if (!layer->stop_time_ms || now < *layer->stop_time_ms) {
+                ++layer;
+                continue;
+            }
+            if (layer->started) {
+                stopLayerNote(layer->track);
+            }
+            const auto voice = layer->voice;
+            const auto note = layer->base_note;
+            layer = scheduled_layer_notes_.erase(layer);
+            const bool voice_pending = std::any_of(
+                scheduled_layer_notes_.begin(), scheduled_layer_notes_.end(),
+                [voice](const ScheduledLayerNote& other) {
+                    return other.voice == voice;
+                });
+            if (!voice_pending) {
+                static_cast<void>(voice_allocator_.noteOff(note));
+            }
+        }
     }
 
     void startLayerNote(std::uint8_t track, std::uint8_t note) {
@@ -6923,14 +6990,10 @@ private:
             master_volume_, master_volume_revision_, session_);
         const double now =
             juce::Time::getMillisecondCounterHiRes();
-        for (auto pending = pending_notes_.begin();
-             pending != pending_notes_.end();) {
-            if (now < pending->start_time_ms) {
-                ++pending;
-                continue;
-            }
-            startLayerNote(pending->track, pending->note);
-            pending = pending_notes_.erase(pending);
+        dispatchScheduledLayerNotes(now);
+        if ((library_manager_performance_id_ || library_manager_imported_)
+            && voice_allocator_.activeVoiceCount() == 0) {
+            restoreLibraryManagerTimbre();
         }
         if (++settings_poll_ticks_ >= 30) {
             settings_poll_ticks_ = 0;
@@ -6982,7 +7045,11 @@ private:
 
     void ensureCompositeTimerRate() {
         const bool needs_fast_timer =
-            !pending_notes_.empty()
+            std::any_of(scheduled_layer_notes_.begin(),
+                scheduled_layer_notes_.end(),
+                [](const ScheduledLayerNote& layer) {
+                    return !layer.started || layer.stop_time_ms.has_value();
+                })
             || timeline_preview_pending_
             || audition_stop_time_ms_.has_value();
         const int interval_ms = needs_fast_timer ? 16 : 100;
@@ -7103,13 +7170,18 @@ private:
         timbre_library_ids_;
     juce::InterProcessLock library_lock_{
         "MgsToneCraftTimbreLibraryV1"};
-    struct PendingNote {
+    struct ScheduledLayerNote {
+        std::uint8_t voice{};
+        std::uint8_t base_note{};
         std::uint8_t track{};
         std::uint8_t note{};
+        double delay_ms{};
         double start_time_ms{};
+        std::optional<double> stop_time_ms;
+        bool started{};
     };
     std::vector<std::uint8_t> sounding_tracks_;
-    std::vector<PendingNote> pending_notes_;
+    std::vector<ScheduledLayerNote> scheduled_layer_notes_;
     std::uint8_t last_audition_note_{kPreviewNote};
     int settings_poll_ticks_{};
     int last_composite_timer_ms_{100};

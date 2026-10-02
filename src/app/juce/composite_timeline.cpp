@@ -2186,7 +2186,8 @@ void paintRateEnvelopeGraph(
     bool draw_labels,
     const mgstc::engine::RateEnvelopeHandleLayout* handles = nullptr,
     int hover_index = -1,
-    int active_index = -1) {
+    int active_index = -1,
+    bool draw_handles = true) {
     const auto graph = rateEnvelopePlotRect(bounds);
     graphics.setColour(juce::Colour(0xFF111920));
     graphics.fillRoundedRectangle(graph, 5.0F);
@@ -2262,7 +2263,7 @@ void paintRateEnvelopeGraph(
                     juce::PathStrokeType::butt));
         }
     }
-    if (handles != nullptr) {
+    if (handles != nullptr && draw_handles) {
         paintRateEnvelopeHandles(
             graphics, graph, *handles, hover_index, active_index);
     }
@@ -2938,10 +2939,9 @@ public:
     CompositeLayerSetupView() {
         source_.setFont(UiFonts::heading());
         addAndMakeVisible(source_);
-        enabled_.setButtonText(juce::String::fromUTF8("有効"));
         mute_.setButtonText(juce::String::fromUTF8("ミュート"));
         solo_.setButtonText(juce::String::fromUTF8("ソロ"));
-        for (auto* toggle : {&enabled_, &mute_, &solo_}) {
+        for (auto* toggle : {&mute_, &solo_}) {
             toggle->setLookAndFeel(&switch_look_and_feel_);
             toggle->onClick = [this] {
                 if (changed_) {
@@ -3059,17 +3059,11 @@ public:
             }
         };
         addAndMakeVisible(duplicate_);
-        remove_.setButtonText(juce::String::fromUTF8("その他"));
+        remove_.setButtonText(juce::String::fromUTF8("削除"));
         remove_.setTooltip(juce::String::fromUTF8(
             "このチャンネルとその独立エンベロープを削除します"));
         remove_.onClick = [this] {
-            juce::PopupMenu menu;
-            menu.addItem(1, juce::String::fromUTF8("チャンネルを削除…"));
-            menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&remove_),
-                [safe = juce::Component::SafePointer<CompositeLayerSetupView>(this)](int result) {
-                    if (safe != nullptr && result == 1 && safe->remove_callback_)
-                        safe->remove_callback_();
-                });
+            if (remove_callback_) remove_callback_();
         };
         addAndMakeVisible(remove_);
         number_mode_.addItem(juce::String::fromUTF8("自動"), 1);
@@ -3120,19 +3114,23 @@ public:
         };
         addAndMakeVisible(edit_);
         h_.setButtonText(juce::String::fromUTF8("LFO h"));
-        h_.setClickingTogglesState(false);
+        h_.setClickingTogglesState(true);
+        h_.setLookAndFeel(&switch_look_and_feel_);
         h_.setTooltip(juce::String::fromUTF8(
             "MGSDRV ソフトウェア LFO（発音前 h）。"
-            "クリックで設定窓を開きます"));
+            "クリックで有効／無効を切り替えます"));
         h_.onClick = [this] {
+            if (h_.getToggleState()) p_.setToggleState(false, juce::dontSendNotification);
+            syncPitchCommandVisuals();
             if (changed_) {
                 changed_(true);
             }
-            if (lfo_) {
-                lfo_();
-            }
         };
         addAndMakeVisible(h_);
+        h_edit_.setButtonText(juce::String::fromUTF8("編集"));
+        h_edit_.setTooltip(juce::String::fromUTF8("LFO h の値を編集します"));
+        h_edit_.onClick = [this] { if (lfo_) lfo_(); };
+        addAndMakeVisible(h_edit_);
         p_.setButtonText("p");
         p_.setClickingTogglesState(true);
         p_.setTooltip(juce::String::fromUTF8(
@@ -3178,6 +3176,10 @@ public:
         configureValueSlider(detune_, -127.0, 127.0, "");
         configureValueSlider(micro_detune_, -32768.0, 32767.0, "");
         configureValueSlider(delay_, 0.0, 256.0, "");
+        configureFineDrag(pitch_, -24.0, 24.0);
+        configureFineDrag(detune_, -127.0, 127.0);
+        configureFineDrag(micro_detune_, -32768.0, 32767.0);
+        configureFineDrag(delay_, 0.0, 256.0);
         configureValueSlider(volume_, 0.0, 15.0, "");
         configureValueSlider(key_off_hang_, 0.0, 255.0, "");
         configureValueSlider(mixer_noise_, 0.0, 31.0, "");
@@ -3276,7 +3278,7 @@ public:
     }
 
     ~CompositeLayerSetupView() override {
-        for (auto* toggle : {&enabled_, &mute_, &solo_, &rate_kind_}) {
+        for (auto* toggle : {&mute_, &solo_, &rate_kind_, &h_}) {
             toggle->setLookAndFeel(nullptr);
         }
     }
@@ -3340,14 +3342,15 @@ public:
                 : layer.source == mgstc::engine::TimbreSource::Scc
                     ? juce::Colour(0xFF53E3A6)
                     : juce::Colour(0xFFFFA75E));
-        enabled_.setToggleState(layer.enabled, juce::dontSendNotification);
-        mute_.setToggleState(layer.muted, juce::dontSendNotification);
+        mute_.setToggleState(layer.muted || !layer.enabled, juce::dontSendNotification);
         solo_.setToggleState(layer.solo, juce::dontSendNotification);
         name_.setText(juce::String::fromUTF8(layer.name.c_str()), false);
         envelope_number_.setValue(
             layer.envelope_number, juce::dontSendNotification);
         const bool rate =
             layer.volume_envelope.kind == mgstc::engine::EnvelopeKind::Rate;
+        envelope_number_.setEnabled(
+            rate || mgstc::engine::layerUsesSequenceEnvelope(layer));
         rate_kind_.setToggleState(rate, juce::dontSendNotification);
         rate_edit_.setEnabled(rate);
         const int channel_count =
@@ -3445,6 +3448,7 @@ public:
         pitch_.setValue(layer.relative_semitones, juce::dontSendNotification);
         h_.setToggleState(
             layer.software_lfo.enabled, juce::dontSendNotification);
+        h_edit_.setEnabled(layer.software_lfo.enabled);
         const bool psg_scc =
             layer.source != mgstc::engine::TimbreSource::Opll;
         p_.setVisible(psg_scc);
@@ -3496,7 +3500,7 @@ public:
     }
 
     void applyToLayer(mgstc::engine::CompositeLayer& layer) const {
-        layer.enabled = enabled_.getToggleState();
+        layer.enabled = true;
         layer.muted = mute_.getToggleState();
         layer.solo = solo_.getToggleState();
         layer.name = name_.getText().toStdString();
@@ -3515,6 +3519,7 @@ public:
         layer.channel = static_cast<std::uint8_t>(
             juce::jmax(1, channel_.getSelectedId()) - 1);
         layer.relative_semitones = static_cast<std::int8_t>(pitch_.getValue());
+        layer.software_lfo.enabled = h_.getToggleState();
         layer.detune = static_cast<std::int16_t>(detune_.getValue());
         {
             const int micro = static_cast<int>(micro_detune_.getValue());
@@ -3595,7 +3600,7 @@ public:
         source_.setBounds(title.removeFromLeft(setupSourceLabelW));
         channel_.setBounds(title);
         auto switches = row();
-        for (auto* toggle : {&enabled_, &mute_, &solo_}) {
+        for (auto* toggle : {&mute_, &solo_}) {
             toggle->setBounds(switches.removeFromLeft(switchControlWidth(toggle->getButtonText(), fieldH)));
             switches.removeFromLeft(controlGap);
         }
@@ -3623,7 +3628,8 @@ public:
         layoutValue(row(), micro_detune_label_, micro_detune_, UiLayout::compositeInspectorLabelW);
         section(section_bounds_[2]);
         auto delay = row();
-        delay_label_.setBounds(delay.removeFromLeft(UiLayout::compositeInspectorLabelW));
+        delay_label_.setBounds(delay.removeFromLeft(
+            UiLayout::compositeInspectorLabelW - setupSustainComboW));
         delay_form_.setBounds(delay.removeFromLeft(setupSustainComboW));
         delay.removeFromLeft(controlGap);
         delay_.setBounds(delay);
@@ -3638,8 +3644,11 @@ public:
         auto modulation = row();
         h_.setBounds(modulation.removeFromLeft(UiLayout::compositeInspectorLabelW));
         modulation.removeFromLeft(controlGap);
-        p_.setBounds(modulation.removeFromLeft(fieldH));
-        p_value_.setBounds(modulation);
+        h_edit_.setBounds(modulation);
+        auto bend = row();
+        p_.setBounds(bend.removeFromLeft(fieldH));
+        bend.removeFromLeft(controlGap);
+        p_value_.setBounds(bend);
         if (mixer_mode_.isVisible()) {
             auto mixer = row();
             mixer_mode_label_.setBounds(mixer.removeFromLeft(UiLayout::compositeInspectorLabelW));
@@ -3667,14 +3676,17 @@ private:
             0.0,
             note_length ? 192.0 : 256.0,
             1.0);
+        configureFineDrag(delay_, 0.0, note_length ? 192.0 : 256.0);
         delay_.setTextValueSuffix(note_length ? "" : "");
     }
 
     void updateMicroDetuneRange(mgstc::engine::TimbreSource source) {
         if (source == mgstc::engine::TimbreSource::Opll) {
             micro_detune_.setRange(0.0, 255.0, 1.0);
+            configureFineDrag(micro_detune_, 0.0, 255.0);
         } else {
             micro_detune_.setRange(-32768.0, 32767.0, 1.0);
+            configureFineDrag(micro_detune_, -32768.0, 32767.0);
         }
     }
 
@@ -3688,6 +3700,7 @@ private:
     void syncPitchCommandVisuals() {
         const bool p_on = p_.isVisible() && p_.getToggleState();
         const bool h_on = h_.getToggleState();
+        h_edit_.setEnabled(h_on);
         p_.setAlpha(h_on ? 0.45F : 1.0F);
         h_.setAlpha(p_on ? 0.45F : 1.0F);
         p_value_.setEnabled(p_on && !h_on);
@@ -3720,6 +3733,13 @@ private:
         addAndMakeVisible(slider);
     }
 
+    static void configureFineDrag(
+        juce::Slider& slider, double minimum, double maximum) {
+        slider.setVelocityBasedMode(true);
+        slider.setVelocityModeParameters(
+            5.0 / (maximum - minimum), 0, 0.5, false);
+    }
+
     static void layoutValue(
         juce::Rectangle<int> area,
         juce::Label& label,
@@ -3741,7 +3761,6 @@ private:
     bool assigning_{};
     SwitchLookAndFeel switch_look_and_feel_;
     juce::Label source_;
-    juce::ToggleButton enabled_;
     juce::ToggleButton mute_;
     juce::ToggleButton solo_;
     juce::TextEditor name_;
@@ -3757,7 +3776,8 @@ private:
     juce::Label timbre_number_label_;
     juce::Slider timbre_number_;
     juce::TextButton edit_;
-    juce::TextButton h_;
+    juce::ToggleButton h_;
+    juce::TextButton h_edit_;
     juce::TextButton p_;
     juce::Slider p_value_;
     std::array<juce::Rectangle<int>, 3> section_bounds_;
@@ -4218,6 +4238,20 @@ public:
         mml_toggle_.setTooltip(juce::String::fromUTF8("選択チャンネルの定義と発音前MML。読取専用・範囲コピー可能"));
         mml_toggle_.onClick = [this] { resized(); repaint(); };
         addAndMakeVisible(mml_toggle_);
+        pitch_lane_toggle_.setButtonText(juce::String::fromUTF8("音程"));
+        pitch_lane_toggle_.setLookAndFeel(&modulation_switch_look_and_feel_);
+        pitch_lane_toggle_.setTooltip(juce::String::fromUTF8(
+            "音程編集を展開します。Pitch LFOまたはLFO hが有効な間は自動で展開します"));
+        pitch_lane_toggle_.onClick = [this] {
+            if (selected_layer_ < 0
+                || selected_layer_ >= static_cast<int>(pitch_lane_expanded_.size()))
+                return;
+            const auto index = static_cast<std::size_t>(selected_layer_);
+            pitch_lane_expanded_[index] = pitch_lane_toggle_.getToggleState();
+            resized();
+            repaint();
+        };
+        addAndMakeVisible(pitch_lane_toggle_);
         morph_bank_label_.setText("SCC Morph Bank", juce::dontSendNotification);
         morph_bank_label_.setFont(UiFonts::body());
         addAndMakeVisible(morph_bank_label_);
@@ -4279,7 +4313,7 @@ public:
             label.setFont(UiFonts::body());
             inspector_content_.addAndMakeVisible(label);
             auto& toggle = modulation_toggles_[index];
-            toggle.setButtonText("ON");
+            toggle.setButtonText(modulation_labels[index]);
             toggle.setLookAndFeel(&modulation_switch_look_and_feel_);
             toggle.onClick = [this, index] {
                 setTimelineModulationEnabled(
@@ -4352,6 +4386,7 @@ public:
         for (auto& toggle : modulation_toggles_) {
             toggle.setLookAndFeel(nullptr);
         }
+        pitch_lane_toggle_.setLookAndFeel(nullptr);
         horizontal_scroll_.removeListener(this);
         vertical_scroll_.removeListener(this);
     }
@@ -4422,9 +4457,9 @@ public:
             compact_overview_.onClick();
             check(overviewRowHeight() < normal_height, "compact overview did not shrink rows");
             for (int i = 0; i < overview_select_.size(); ++i) {
-                check(!overview_select_[i]->getBounds().intersects(overview_enabled_[i]->getBounds()),
-                    "compact channel name overlaps ON");
-                check(overview_enabled_[i]->getHeight() >= UiLayout::fieldH,
+                check(!overview_select_[i]->getBounds().intersects(overview_mute_[i]->getBounds()),
+                    "compact channel name overlaps mute");
+                check(overview_mute_[i]->getHeight() >= UiLayout::fieldH,
                     "compact controls lost their minimum height");
             }
             const auto compact_editor = graphArea();
@@ -5039,7 +5074,24 @@ public:
     void setTimbre(
         const mgstc::engine::CompositeTimbre& timbre,
         bool reset_scroll_extent = false) {
+        const auto previous_pitch_expanded = pitch_lane_expanded_;
         timbre_ = timbre;
+        envelope_number_active_.resize(timbre_.layers.size());
+        for (std::size_t index = 0; index < timbre_.layers.size(); ++index) {
+            const auto& layer = timbre_.layers[index];
+            envelope_number_active_[index] =
+                layer.volume_envelope.kind == mgstc::engine::EnvelopeKind::Rate
+                || mgstc::engine::layerUsesSequenceEnvelope(layer);
+        }
+        pitch_lane_expanded_.resize(timbre_.layers.size(), false);
+        for (std::size_t index = 0; index < timbre_.layers.size(); ++index) {
+            pitch_lane_expanded_[index] = index < previous_pitch_expanded.size()
+                ? previous_pitch_expanded[index]
+                : !timbre_.layers[index].pitch_envelope.events.empty();
+            if (timbre_.layers[index].software_lfo.enabled
+                || timbre_.layers[index].pitch_modulation.enabled)
+                pitch_lane_expanded_[index] = true;
+        }
         static_cast<void>(
             mgstc::engine::enforceOpllRegisterAutoExclusivity(timbre_));
         playback_tempo_ = juce::jlimit(
@@ -5142,6 +5194,8 @@ public:
         header.removeFromLeft(controlGap);
         compact_overview_.setBounds(header.removeFromLeft(compositeFocusW));
         compact_overview_.setEnabled(!empty && !focus_.getToggleState());
+        header.removeFromLeft(controlGap);
+        mml_toggle_.setBounds(header.removeFromLeft(compositeSelectorW));
         auto side = inspectorArea();
         setup_tab_.setVisible(inspector_visible_);
         count_tab_.setVisible(inspector_visible_);
@@ -5154,7 +5208,7 @@ public:
         inspector_content_.setSize(juce::jmax(1, side.getWidth() - kScrollBarSize),
             count_inspector_ ? UiLayout::compositeInspectorContentH
                 + (UiLayout::fieldH + UiLayout::sm) * 5
-                : panelPad * 2 + (fieldH + sm) * 17 + (libraryTitleH + sm) * 3);
+                : panelPad * 2 + (fieldH + sm) * 18 + (libraryTitleH + sm) * 3);
         overview_view_.setVisible(!focus_.getToggleState());
         overview_view_.setBounds(overviewArea());
         layoutOverview();
@@ -5163,16 +5217,12 @@ public:
         parameter_.setBounds(edit_header.removeFromRight(UiLayout::compositeSelectorW));
         edit_header.removeFromRight(controlGap);
         edit_mode_.setBounds(edit_header.removeFromRight(UiLayout::compositeSelectorW));
+        morph_bank_label_.setBounds(edit_header.removeFromLeft(compositeInspectorLabelW));
+        morph_bank_.setBounds(edit_header.removeFromLeft(libraryButtonMinW));
+        edit_header.removeFromLeft(controlGap);
+        morph_bank_usage_.setBounds(edit_header);
         auto preview_area = workspaceArea();
         preview_area.setTop(graph.getBottom() + kScrollBarSize + sm);
-        auto preview_header = preview_area.removeFromTop(fieldH);
-        mml_toggle_.setBounds(preview_header.removeFromLeft(compositeOverviewLabelW));
-        preview_header.removeFromLeft(controlGap);
-        morph_bank_label_.setBounds(preview_header.removeFromLeft(compositeInspectorLabelW));
-        morph_bank_.setBounds(preview_header.removeFromLeft(libraryButtonMinW));
-        preview_header.removeFromLeft(controlGap);
-        morph_bank_usage_.setBounds(preview_header);
-        preview_area.removeFromTop(sm);
         envelope_mml_preview_.setBounds(preview_area);
         vertical_scroll_.setBounds(graph.getRight(), graph.getY(), kScrollBarSize, graph.getHeight());
         horizontal_scroll_.setBounds(graph.getX(), graph.getBottom(), graph.getWidth(), kScrollBarSize);
@@ -5322,7 +5372,7 @@ public:
             promptVolumeNumeric(event.getPosition());
             return;
         }
-        if (!slots.pitch.isEmpty()
+        if (pitchLaneExpanded() && !slots.pitch.isEmpty()
             && slots.pitch.contains(event.getPosition())) {
             drawing_ = false;
             promptPitchNumeric(event.getPosition());
@@ -5519,7 +5569,6 @@ private:
             }
             modulation_toggles_[index].setToggleState(
                 active, juce::dontSendNotification);
-            modulation_toggles_[index].setButtonText(active ? "ON" : "OFF");
             modulation_toggles_[index].setEnabled(supported);
             modulation_settings_[index].setEnabled(supported);
             modulation_labels_[index].setEnabled(supported);
@@ -5570,6 +5619,10 @@ private:
         syncTimelineModulationControls();
         syncRegisterAutoEditors();
         updateEnvelopeMmlPreview();
+        if (target == TimelineModulationTarget::Pitch) {
+            lane_layout_dirty_ = true;
+            resized();
+        }
         repaint();
         if (edit_callback_) edit_callback_(timbre_, true, true);
     }
@@ -5624,12 +5677,12 @@ private:
     juce::Rectangle<int> inspectorArea() const {
         auto a = getLocalBounds().reduced(UiLayout::panelPad);
         a.removeFromTop(timelineChromeHeight());
-        return inspector_visible_ ? a.removeFromRight(UiLayout::libraryWidth) : juce::Rectangle<int>{};
+        return inspector_visible_ ? a.removeFromRight(UiLayout::compositeInspectorColumnW) : juce::Rectangle<int>{};
     }
     juce::Rectangle<int> workspaceArea() const {
         auto a = getLocalBounds().reduced(UiLayout::panelPad);
         a.removeFromTop(timelineChromeHeight());
-        if (inspector_visible_) a.removeFromRight(UiLayout::libraryWidth + UiLayout::panelGap);
+        if (inspector_visible_) a.removeFromRight(UiLayout::compositeInspectorColumnW + UiLayout::panelGap);
         return a;
     }
     int overviewRowHeight() const {
@@ -5656,7 +5709,7 @@ private:
     void layoutOverview() {
         const int count = static_cast<int>(timbre_.layers.size());
         while (overview_select_.size() > count) {
-            overview_select_.removeLast(); overview_enabled_.removeLast();
+            overview_select_.removeLast();
             overview_mute_.removeLast(); overview_solo_.removeLast();
         }
         while (overview_select_.size() < count) {
@@ -5664,14 +5717,16 @@ private:
             auto* select = overview_select_.add(new juce::TextButton());
             select->onClick = [this, i] { selectOverviewLayer(i); };
             overview_content_.addAndMakeVisible(select);
-            for (auto* buttons : {&overview_enabled_, &overview_mute_, &overview_solo_}) {
+            for (auto* buttons : {&overview_mute_, &overview_solo_}) {
                 auto* button = buttons->add(new juce::TextButton());
                 button->setClickingTogglesState(true);
                 button->onClick = [this, i, buttons] {
                     auto& layer = timbre_.layers[static_cast<std::size_t>(i)];
                     const bool on = (*buttons)[i]->getToggleState();
-                    if (buttons == &overview_enabled_) layer.enabled = on;
-                    else if (buttons == &overview_mute_) layer.muted = on;
+                    if (buttons == &overview_mute_) {
+                        layer.enabled = true;
+                        layer.muted = on;
+                    }
                     else layer.solo = on;
                     layer_setups_[i]->syncFromLayer(layer);
                     repaint();
@@ -5687,21 +5742,21 @@ private:
             auto label = juce::Rectangle<int>(0, i * overviewRowHeight(), UiLayout::compositeOverviewLabelW, overviewRowHeight()).reduced(UiLayout::xs);
             const bool compact = compact_overview_.getToggleState();
             overview_select_[i]->setBounds(compact
-                ? label.removeFromLeft(label.getWidth() - UiLayout::fieldH * 3 - UiLayout::sm * 2)
+                ? label.removeFromLeft(label.getWidth() - UiLayout::fieldH * 2 - UiLayout::sm * 2)
                 : label.removeFromTop(UiLayout::fieldH));
             overview_select_[i]->setButtonText(juce::String::fromUTF8(layer.name.c_str()));
             overview_select_[i]->setTooltip(juce::String::fromUTF8(layer.name.c_str())
                 + juce::String::fromUTF8(" — チャンネルを選択（音色・命令は変更しません）"));
             overview_select_[i]->setToggleState(i == selected_layer_, juce::dontSendNotification);
             overview_select_[i]->setColour(juce::TextButton::buttonOnColourId, sourceColour(layer.source).withAlpha(0.3F));
-            const int button_w = label.getWidth() / 3;
+            const int button_w = label.getWidth() / 2;
             int n = 0;
-            for (auto* button : {overview_enabled_[i], overview_mute_[i], overview_solo_[i]}) {
+            for (auto* button : {overview_mute_[i], overview_solo_[i]}) {
                 button->setBounds(label.removeFromLeft(compact
                     ? UiLayout::fieldH + (n == 0 ? UiLayout::sm * 2 : 0) : button_w));
-                button->setButtonText(n == 0 ? "ON" : n == 1 ? "M" : "S");
-                button->setTooltip(juce::String::fromUTF8(n == 0 ? "有効" : n == 1 ? "ミュート" : "ソロ"));
-                button->setToggleState(n == 0 ? layer.enabled : n == 1 ? layer.muted : layer.solo, juce::dontSendNotification);
+                button->setButtonText(n == 0 ? "M" : "S");
+                button->setTooltip(juce::String::fromUTF8(n == 0 ? "ミュート" : "ソロ"));
+                button->setToggleState(n == 0 ? layer.muted || !layer.enabled : layer.solo, juce::dontSendNotification);
                 ++n;
             }
         }
@@ -5732,7 +5787,8 @@ private:
             paintStartDelay(g, plot, i);
             if (layer.volume_envelope.kind == mgstc::engine::EnvelopeKind::Rate) {
                 const auto handles = rateEnvelopeHandlesForLayer(layer);
-                paintRateEnvelopeGraph(g, plot, cachedLayerRateTrace(i), colour, layer.source, false, &handles);
+                paintRateEnvelopeGraph(g, plot, cachedLayerRateTrace(i), colour,
+                    layer.source, false, &handles, -1, -1, false);
             } else {
                 drawVolumeBars(g, plot, i, colour, 0.12F);
                 drawAutomation(g, plot, i, colour.withAlpha(0.7F), Parameter::Pitch);
@@ -6029,6 +6085,18 @@ private:
         repaint();
     }
 
+    [[nodiscard]] bool pitchLaneExpanded() const noexcept {
+        if (selected_layer_ < 0
+            || selected_layer_ >= static_cast<int>(timbre_.layers.size()))
+            return false;
+        const auto index = static_cast<std::size_t>(selected_layer_);
+        const auto& layer = timbre_.layers[index];
+        return layer.volume_envelope.kind == mgstc::engine::EnvelopeKind::Rate
+            || layer.software_lfo.enabled || layer.pitch_modulation.enabled
+            || (index < pitch_lane_expanded_.size()
+                && pitch_lane_expanded_[index]);
+    }
+
     [[nodiscard]] int laneHeightForIndex(int lane_index) const noexcept {
         if (lane_index == static_cast<int>(timbre_.layers.size())) {
             return UiLayout::compositeMixLaneH;
@@ -6039,9 +6107,13 @@ private:
                 && timbre_.layers[static_cast<std::size_t>(lane_index)].source
                     == mgstc::engine::TimbreSource::Opll) {
                 return UiLayout::compositeEditLaneH - UiLayout::envelopePreviewH
-                    + UiLayout::compositeEditLaneOpllExtraH;
+                    + UiLayout::compositeEditLaneOpllExtraH
+                    - (pitchLaneExpanded() ? 0
+                        : UiLayout::editPitchLaneMinH - UiLayout::fieldH);
             }
-            return UiLayout::compositeEditLaneH - UiLayout::envelopePreviewH;
+            return UiLayout::compositeEditLaneH - UiLayout::envelopePreviewH
+                - (pitchLaneExpanded() ? 0
+                    : UiLayout::editPitchLaneMinH - UiLayout::fieldH);
         }
         return UiLayout::compositeChannelLaneH;
     }
@@ -6538,6 +6610,10 @@ private:
         if (!mgstc::engine::removeCompositeLayer(timbre_, layer_index)) {
             return;
         }
+        if (layer_index < envelope_number_active_.size())
+            envelope_number_active_.erase(
+                envelope_number_active_.begin()
+                    + static_cast<std::ptrdiff_t>(layer_index));
         if (timbre_.layers.empty()) {
             selected_layer_ = -1;
         } else if (selected_layer_ == removed) {
@@ -6956,7 +7032,7 @@ private:
                 bool drawable;
             } hits[] = {
                 {Parameter::Volume, slots.volume, true},
-                {Parameter::Pitch, slots.pitch, true},
+                {Parameter::Pitch, slots.pitch, pitchLaneExpanded()},
                 {Parameter::Timbre, slots.timbre, false},
                 {Parameter::RegisterWrite, slots.register_write, false},
                 {Parameter::OpllTlAuto, slots.tl_auto, true},
@@ -7227,7 +7303,7 @@ private:
         if (!focus_.getToggleState()) area.removeFromTop(overviewHeight() + UiLayout::fieldH + UiLayout::sm);
         area.removeFromTop(UiLayout::fieldH + UiLayout::sm);
         area.removeFromRight(kScrollBarSize);
-        area.removeFromBottom(kScrollBarSize + UiLayout::fieldH + UiLayout::sm
+        area.removeFromBottom(kScrollBarSize + UiLayout::sm
             + (mml_toggle_.getToggleState() ? UiLayout::envelopePreviewH + UiLayout::sm : 0));
         return area;
     }
@@ -7757,28 +7833,27 @@ private:
         EditLaneSlots slots;
         slots.preview = {}; // MGSC preview is pinned below the scrolling graph.
         slots.summary = content.removeFromTop(UiLayout::commandSummaryH);
-        if (showsRegisterAutoLanes(source)) {
-            slots.fb_auto = content.removeFromBottom(UiLayout::registerAutoLaneH);
-            slots.tl_auto = content.removeFromBottom(UiLayout::registerAutoLaneH);
-        }
         const bool has_register = showsRegisterLane(source);
         const int marker_h = UiLayout::editMarkerLaneH;
-        auto value_area = content;
         if (has_register) {
-            auto markers = value_area.removeFromBottom(marker_h * 2);
-            slots.timbre = markers.removeFromTop(marker_h);
-            slots.register_write = markers;
+            slots.timbre = content.removeFromTop(marker_h);
+            slots.register_write = content.removeFromTop(marker_h);
         } else {
-            slots.timbre = value_area.removeFromBottom(marker_h);
+            slots.timbre = content.removeFromTop(marker_h);
             slots.register_write = {};
+        }
+        if (showsRegisterAutoLanes(source)) {
+            slots.tl_auto = content.removeFromTop(UiLayout::registerAutoLaneH);
+            slots.fb_auto = content.removeFromTop(UiLayout::registerAutoLaneH);
         }
         // Shared height (UiLayout::editVolumeLaneH). Quiet chip steps that
         // would be sub-pixel are rounded so each 0–15 unit still has ≥1px.
         const int volume_h = juce::jmin(
-            value_area.getHeight(),
+            content.getHeight(),
             juce::jmax(UiLayout::editMarkerLaneH, UiLayout::editVolumeLaneH));
-        slots.volume = value_area.removeFromTop(volume_h);
-        slots.pitch = value_area;
+        slots.volume = content.removeFromTop(volume_h);
+        slots.pitch = pitchLaneExpanded()
+            ? content : content.removeFromTop(UiLayout::fieldH);
         return slots;
     }
 
@@ -7814,7 +7889,7 @@ private:
             bool drawable;
         } hits[] = {
             {Parameter::Volume, slots.volume, true},
-            {Parameter::Pitch, slots.pitch, true},
+            {Parameter::Pitch, slots.pitch, pitchLaneExpanded()},
             {Parameter::Timbre, slots.timbre, false},
             {Parameter::RegisterWrite, slots.register_write, false},
             {Parameter::OpllTlAuto, slots.tl_auto, true},
@@ -8011,7 +8086,10 @@ private:
                 colour,
                 layer.source,
                 true,
-                &layout);
+                &layout,
+                -1,
+                -1,
+                false);
             {
                 auto preview = slots.preview;
                 auto preview_label = preview.removeFromLeft(
@@ -8102,6 +8180,34 @@ private:
     }
 
     void updateEnvelopeMmlPreview() {
+        envelope_number_active_.resize(timbre_.layers.size(), false);
+        if (selected_layer_ >= 0
+            && selected_layer_ < static_cast<int>(timbre_.layers.size())) {
+            const auto index = static_cast<std::size_t>(selected_layer_);
+            auto& edited = timbre_.layers[index];
+            const bool active = edited.volume_envelope.kind
+                    == mgstc::engine::EnvelopeKind::Rate
+                || mgstc::engine::layerUsesSequenceEnvelope(edited);
+            if (active && !envelope_number_active_[index]) {
+                const bool collision = std::any_of(
+                    timbre_.layers.begin(), timbre_.layers.end(),
+                    [this, index, &edited](const auto& other) {
+                        if (&other == &timbre_.layers[index]) return false;
+                        return other.envelope_number == edited.envelope_number
+                            && (other.volume_envelope.kind
+                                    == mgstc::engine::EnvelopeKind::Rate
+                                || mgstc::engine::layerUsesSequenceEnvelope(other));
+                    });
+                if (collision) {
+                    edited.envelope_number =
+                        mgstc::engine::nextFreeEnvelopeNumber(timbre_);
+                    if (selected_layer_ < layer_setups_.size())
+                        layer_setups_[selected_layer_]->syncFromLayer(edited);
+                    morph_preview_input_.reset();
+                }
+            }
+            envelope_number_active_[index] = active;
+        }
         syncMorphBank();
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
@@ -8126,7 +8232,7 @@ private:
                     layer, layer.envelope_number)
                     .c_str())
                 .trimEnd();
-        } else {
+        } else if (mgstc::engine::layerUsesSequenceEnvelope(layer)) {
             const auto formatted = mgstc::engine::formatMgsCompositeEnvelope(
                 layer,
                 layer.envelope_number,
@@ -8183,7 +8289,8 @@ private:
                 .c_str());
         const auto preview_text = validation_error.isNotEmpty()
             ? validation_error
-            : definition + "\n" + track
+            : (definition.isNotEmpty() ? definition + "\n" : juce::String{})
+                + track
                 + (output_notice.isNotEmpty() ? "\n; " + output_notice : juce::String{});
         if (preview_text == last_envelope_mml_preview_) {
             return;
@@ -8367,7 +8474,10 @@ private:
         juce::Colour colour,
         Parameter parameter,
         const juce::String& title) {
-        paintEditSubLaneChrome(graphics, slot, parameter, title);
+        paintEditSubLaneChrome(graphics, slot, parameter,
+            parameter == Parameter::Pitch ? juce::String{} : title);
+        if (parameter == Parameter::Pitch && !pitchLaneExpanded())
+            return;
         slot.removeFromLeft(UiLayout::compositeOverviewLabelW);
         drawAutomation(graphics, slot, layer_index, colour, parameter);
     }
@@ -9996,7 +10106,7 @@ private:
             }
             return;
         }
-        if (slots.pitch.contains(point)) {
+        if (pitchLaneExpanded() && slots.pitch.contains(point)) {
             auto& events = layer.pitch_envelope.events;
             int last = -1;
             for (int i = 0; i < static_cast<int>(events.size()); ++i) {
@@ -10208,6 +10318,7 @@ private:
     }
 
     void rebuildLayerSetups() {
+        pitch_lane_expanded_.resize(timbre_.layers.size(), false);
         while (layer_setups_.size()
                > static_cast<int>(timbre_.layers.size())) {
             layer_setups_.removeLast();
@@ -10402,6 +10513,7 @@ private:
         }
         auto previous_frames = lane_frames_;
         rebuildLaneFrames();
+        layoutPitchLaneToggle();
         const auto envelope_kind =
             selected_layer_ >= 0
                 && selected_layer_
@@ -10425,6 +10537,32 @@ private:
         laid_out_register_auto_ = register_auto;
         lane_layout_applied_ = true;
         lane_layout_dirty_ = false;
+    }
+
+    void layoutPitchLaneToggle() {
+        if (selected_layer_ < 0
+            || selected_layer_ >= static_cast<int>(timbre_.layers.size())
+            || selected_layer_ >= static_cast<int>(graph_bounds_.size())) {
+            pitch_lane_toggle_.setVisible(false);
+            return;
+        }
+        const auto& layer = timbre_.layers[static_cast<std::size_t>(selected_layer_)];
+        if (layer.volume_envelope.kind == mgstc::engine::EnvelopeKind::Rate) {
+            pitch_lane_toggle_.setVisible(false);
+            return;
+        }
+        auto label = makeEditLaneSlots(
+            graph_bounds_[static_cast<std::size_t>(selected_layer_)],
+            layer.source).pitch.removeFromLeft(UiLayout::compositeOverviewLabelW);
+        const auto bounds = label.withHeight(UiLayout::fieldH)
+            .reduced(UiLayout::xs, 0);
+        pitch_lane_toggle_.setBounds(bounds);
+        pitch_lane_toggle_.setToggleState(
+            pitchLaneExpanded(), juce::dontSendNotification);
+        pitch_lane_toggle_.setEnabled(
+            !layer.software_lfo.enabled && !layer.pitch_modulation.enabled);
+        pitch_lane_toggle_.setVisible(graphArea().contains(bounds));
+        pitch_lane_toggle_.toFront(false);
     }
 
     void layoutLayerSetups() {
@@ -10471,7 +10609,7 @@ private:
             modulation_issue_.setVisible(visible && !show_rate && count_inspector_
                 && modulation_issue_.getText().isNotEmpty());
             for (std::size_t i = 0; i < modulation_toggles_.size(); ++i) {
-                modulation_labels_[i].setVisible(visible && !show_rate && count_inspector_);
+                modulation_labels_[i].setVisible(false);
                 modulation_toggles_[i].setVisible(visible && !show_rate && count_inspector_);
                 modulation_settings_[i].setVisible(visible && !show_rate && count_inspector_);
             }
@@ -10515,8 +10653,7 @@ private:
         modulation_heading_.setBounds(row());
         for (std::size_t i = 0; i < modulation_toggles_.size(); ++i) {
             auto modulation_row = row();
-            modulation_labels_[i].setBounds(
-                modulation_row.removeFromLeft(UiLayout::compositeInspectorLabelW));
+            modulation_labels_[i].setBounds({});
             modulation_settings_[i].setBounds(
                 modulation_row.removeFromRight(UiLayout::libraryButtonMinW));
             modulation_row.removeFromRight(controlGap);
@@ -10568,7 +10705,7 @@ private:
     juce::Viewport inspector_view_;
     CompositeOverviewCanvas overview_content_;
     juce::Viewport overview_view_;
-    juce::OwnedArray<juce::TextButton> overview_select_, overview_enabled_, overview_mute_, overview_solo_;
+    juce::OwnedArray<juce::TextButton> overview_select_, overview_mute_, overview_solo_;
     juce::TextButton setup_tab_, count_tab_, focus_;
     bool count_inspector_{};
     bool inspector_visible_{true};
@@ -10645,6 +10782,9 @@ private:
     std::optional<std::size_t> rate_editor_layer_;
     juce::OwnedArray<CompositeLayerSetupView> layer_setups_;
     juce::TextButton mml_toggle_;
+    juce::ToggleButton pitch_lane_toggle_;
+    std::vector<bool> pitch_lane_expanded_;
+    std::vector<bool> envelope_number_active_;
     juce::Label tempo_label_;
     juce::TextEditor tempo_;
     std::vector<juce::Rectangle<int>> graph_bounds_;

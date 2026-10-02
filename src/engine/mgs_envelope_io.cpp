@@ -1060,7 +1060,8 @@ std::string formatMgsCompositeTrackSetup(
     if (const auto number = layerBasePatchNumber(layer, numbers)) {
         line += " @" + std::to_string(static_cast<unsigned>(*number));
     }
-    {
+    if (layer.volume_envelope.kind == EnvelopeKind::Rate
+        || layerUsesSequenceEnvelope(layer)) {
         const auto envelope_number = std::min<std::uint8_t>(
             layer.envelope_number, 31);
         const bool rate =

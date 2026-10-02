@@ -992,9 +992,6 @@ std::optional<ParsedTrack> parseTrackLine(
             addIssue(issues, "unknown MGSC track token");
         }
     }
-    if (!result.has_envelope) {
-        addIssue(issues, "track has no @e or @r envelope");
-    }
     return result;
 }
 
@@ -1118,7 +1115,7 @@ MgsCompositeIoResult formatMgsComposite(
         const auto number = layer.envelope_number;
         if (layer.volume_envelope.kind == EnvelopeKind::Rate) {
             output << rateDefinition(layer, number);
-        } else {
+        } else if (layerUsesSequenceEnvelope(layer)) {
             const auto formatted = formatMgsCompositeEnvelope(
                 layer, number, kMgscEnvelopeCompiledByteLimit, &numbers, library,
                 timbre.name);
@@ -1336,7 +1333,14 @@ ParsedMgsComposite parseMgsComposite(std::string_view source) {
                     }
                     const auto envelope = envelopes.find(
                         track.envelope_number);
-                    if (envelope == envelopes.end()) {
+                    if (!track.has_envelope) {
+                        // No ENV association: fixed track volume, rather than
+                        // the serializer's sparse-envelope fallback to v.
+                        track.layer.volume_envelope.events = {{
+                            .kind = EnvelopeEventKind::Volume,
+                            .value = 15,
+                        }};
+                    } else if (envelope == envelopes.end()) {
                         addIssue(
                             result.issues,
                             "track references undefined envelope");

@@ -57,6 +57,53 @@ const char* sourceName(TimbreSource source) noexcept {
 
 }  // namespace
 
+bool layerUsesSequenceEnvelope(const CompositeLayer& layer) noexcept {
+    if (layer.volume_envelope.kind != EnvelopeKind::Sequence) {
+        return false;
+    }
+    if (layer.volume_modulation.enabled || layer.pitch_modulation.enabled
+        || layer.opll_tl_modulation.enabled || layer.opll_fb_modulation.enabled
+        || layer.opll_tl_auto.active() || layer.opll_fb_auto.active()) {
+        return true;
+    }
+    const auto& timeline = layer.envelope_timeline;
+    if (timeline.loop_start_count.has_value()
+            != timeline.loop_end_count.has_value()
+        || (timeline.loop_start_count
+            && (*timeline.loop_start_count >= *timeline.loop_end_count
+                || *timeline.loop_end_count > timeline.length_counts))) {
+        return true; // Keep malformed authoring data visible to validation.
+    }
+    if (layer.source == TimbreSource::Psg) {
+        const auto mixer = sequenceEnvelopeMixer(layer.volume_envelope.rate);
+        if (mixer.tone_mode != kMgscSequenceToneModeDefault
+            || mixer.noise != kMgscSequenceNoiseDefault) {
+            return true;
+        }
+    }
+    bool initial_full_volume = false;
+    for (const auto& event : layer.volume_envelope.events) {
+        if (event.kind == EnvelopeEventKind::Volume) {
+            if (event.value != 15 || event.automatic) {
+                return true;
+            }
+            initial_full_volume = initial_full_volume || event.count == 0;
+        }
+    }
+    // The serializer seeds an absent initial volume with track v. Preserve
+    // that existing non-identity behavior for authored sparse sequences.
+    if (!initial_full_volume && layer.volume != 15) {
+        return true;
+    }
+    const auto has_commands = [](const auto& events) {
+        return std::any_of(events.begin(), events.end(), [](const auto& event) {
+            return event.kind != EnvelopeEventKind::Wait;
+        });
+    };
+    return has_commands(layer.pitch_envelope.events)
+        || has_commands(layer.timbre_automation);
+}
+
 CompositeTimbre defaultCompositeTimbre() {
     CompositeTimbre timbre;
     timbre.format_version = CompositeTimbre::kFormatVersion;
@@ -193,6 +240,10 @@ std::optional<std::uint8_t> firstAvailableChannel(
 std::uint8_t nextFreeEnvelopeNumber(const CompositeTimbre& timbre) noexcept {
     std::array<bool, 32> used{};
     for (const auto& layer : timbre.layers) {
+        if (layer.volume_envelope.kind != EnvelopeKind::Rate
+            && !layerUsesSequenceEnvelope(layer)) {
+            continue;
+        }
         if (layer.envelope_number < used.size()) {
             used[layer.envelope_number] = true;
         }
@@ -228,12 +279,14 @@ std::optional<std::size_t> duplicateCompositeLayer(
     }
     auto layer = timbre.layers[layer_index];
     layer.channel = *free_channel;
-    layer.envelope_number = nextFreeEnvelopeNumber(timbre);
     layer.name = std::string(sourceName(source)) + " Ch."
         + std::to_string(static_cast<int>(layer.channel) + 1);
     // TL/FB auto is chip-wide exclusive; the original keeps ownership.
     layer.opll_tl_auto = {};
     layer.opll_fb_auto = {};
+    layer.envelope_number = layer.volume_envelope.kind == EnvelopeKind::Rate
+            || layerUsesSequenceEnvelope(layer)
+        ? nextFreeEnvelopeNumber(timbre) : 0;
     timbre.layers.push_back(std::move(layer));
     return timbre.layers.size() - 1;
 }
@@ -304,6 +357,10 @@ CompositeValidation validateCompositeTimbre(
     }
     std::array<int, 32> envelope_users{};
     for (const auto& layer : timbre.layers) {
+        if (layer.volume_envelope.kind != EnvelopeKind::Rate
+            && !layerUsesSequenceEnvelope(layer)) {
+            continue;
+        }
         if (layer.envelope_number > 31) {
             result.warnings.push_back(
                 "Envelope number is outside 0-31");
