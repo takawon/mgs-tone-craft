@@ -4023,6 +4023,9 @@ void testToneLibrarySqliteV1RoundTripAndPortableFormat() {
 void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
     using namespace mgstc::engine;
     auto legacy = defaultCompositeTimbre();
+    // Historical payloads predate generation revision 2; keep this fixture's
+    // metadata at revision 1 while new authored timbres default to revision 2.
+    legacy.scc_morph_algorithm_version = 1;
     legacy.layers = {legacy.layers[2]};
     legacy.name = "Previous OPLL";
     legacy.memo = "keep memo";
@@ -4916,7 +4919,7 @@ void testCompositeLayerDuplicateUsesLowestFreeSameSourceChannel() {
     REQUIRE_EQ(timbre.layers[3].source, TimbreSource::Scc);
     REQUIRE_EQ(timbre.layers[3].channel, std::uint8_t{1});
     REQUIRE_EQ(timbre.layers[3].name, std::string("SCC Ch.2"));
-    REQUIRE_EQ(timbre.layers[3].envelope_number, std::uint8_t{3});
+    REQUIRE_EQ(timbre.layers[3].envelope_number, std::uint8_t{0});
     REQUIRE_EQ(timbre.layers[3].relative_semitones, std::int8_t{12});
     REQUIRE_EQ(timbre.layers[3].volume_envelope.events.front().value, 9);
     REQUIRE_EQ(timbre.layers[1].channel, std::uint8_t{0});
@@ -7720,9 +7723,67 @@ void testRuntimeSoftwareLfoWritesFrequencyDeltas() {
     REQUIRE_EQ(*second_period != *first_period, true);
 }
 
+void testUnusedSequenceEnvelopeIsOmittedWithoutReservingNumber() {
+    using namespace mgstc::engine;
+    auto composite = defaultCompositeTimbre();
+    for (auto& layer : composite.layers) {
+        layer.envelope_number = 7;
+        layer.volume = 9;
+        REQUIRE_EQ(layerUsesSequenceEnvelope(layer), false);
+        REQUIRE_EQ(formatMgsCompositeTrackSetup(layer).find("@e"),
+                   std::string::npos);
+        REQUIRE_EQ(formatMgsCompositeTrackPreview(layer).find("@e"),
+                   std::string::npos);
+    }
+    REQUIRE_EQ(nextFreeEnvelopeNumber(composite), std::uint8_t{0});
+    REQUIRE_EQ(validateCompositeTimbre(composite).valid(), true);
+    const auto output = formatMgsComposite(composite);
+    REQUIRE_EQ(output.valid(), true);
+    REQUIRE_EQ(output.source.find("@e"), std::string::npos);
+    const auto parsed = parseMgsComposite(output.source);
+    REQUIRE_EQ(parsed.valid(), true);
+    REQUIRE_EQ(parsed.timbre.layers.size(), 3U);
+    for (const auto& layer : parsed.timbre.layers) {
+        REQUIRE_EQ(layerUsesSequenceEnvelope(layer), false);
+        REQUIRE_EQ(layer.volume, std::uint8_t{9});
+    }
+    REQUIRE_EQ(formatMgsComposite(parsed.timbre).source.find("@e"),
+               std::string::npos);
+
+    auto& active = composite.layers.front();
+    active.envelope_number = 0;
+    active.volume_envelope.events.front().value = 10;
+    REQUIRE_EQ(layerUsesSequenceEnvelope(active), true);
+    REQUIRE_EQ(nextFreeEnvelopeNumber(composite), std::uint8_t{1});
+    REQUIRE_EQ(formatMgsComposite(composite).source.find("@e0")
+                   != std::string::npos, true);
+    REQUIRE_EQ(formatMgsComposite(composite).source.find("@e7"),
+               std::string::npos);
+
+    auto layer = defaultCompositeTimbre().layers.front();
+    layer.software_lfo.enabled = true; // Track h does not need @e.
+    REQUIRE_EQ(layerUsesSequenceEnvelope(layer), false);
+    layer.pitch_envelope.events = {{
+        .kind = EnvelopeEventKind::Pitch, .value = 1, .count = 3}};
+    REQUIRE_EQ(layerUsesSequenceEnvelope(layer), true);
+    layer.pitch_envelope.events.clear();
+    layer.timbre_automation = {{
+        .kind = EnvelopeEventKind::RegisterWrite, .value = 1,
+        .secondary = 2, .count = 3}};
+    REQUIRE_EQ(layerUsesSequenceEnvelope(layer), true);
+    layer.timbre_automation.clear();
+    layer.volume_envelope.rate.tone_mode = 2;
+    REQUIRE_EQ(layerUsesSequenceEnvelope(layer), true);
+    layer.volume_envelope.kind = EnvelopeKind::Rate;
+    REQUIRE_EQ(layerUsesSequenceEnvelope(layer), false);
+    REQUIRE_EQ(formatMgsCompositeTrackSetup(layer).find("@r")
+                   != std::string::npos, true);
+}
+
 void testTrackSetupEnvelopeNumberAndPreKeyOnCommands() {
     using namespace mgstc::engine;
     auto layer = defaultCompositeTimbre().layers[0];
+    layer.volume_envelope.events.front().value = 14;
     layer.envelope_number = 7;
     layer.key_off_hang = 12;
     layer.pitch_sweep.enabled = true;
@@ -7735,6 +7796,7 @@ void testTrackSetupEnvelopeNumberAndPreKeyOnCommands() {
     REQUIRE_EQ(line.find(" h") == std::string::npos, true);
 
     auto opll = defaultCompositeTimbre().layers[2];
+    opll.volume_envelope.events.front().value = 14;
     opll.envelope_number = 3;
     opll.opll_sustain = true;
     opll.key_off_hang = 9;
@@ -7747,6 +7809,8 @@ void testTrackSetupEnvelopeNumberAndPreKeyOnCommands() {
     REQUIRE_EQ(opll_line.find(" p") == std::string::npos, true);
 
     auto composite = defaultCompositeTimbre();
+    composite.layers[0].volume_envelope.events.front().value = 14;
+    composite.layers[1].volume_envelope.events.front().value = 14;
     composite.layers[0].envelope_number = 4;
     composite.layers[1].envelope_number = 4;
     const auto collision = validateCompositeTimbre(composite);
@@ -8377,6 +8441,8 @@ int main(int argc, char** argv) {
         {"AuthoredModulationLoopRejectsPhaseResetAndAcceptsAlignment", testAuthoredModulationLoopRejectsPhaseResetAndAcceptsAlignment},
         {"AllCompositeModulationOffPreservesBaseEnvelopeOutput", testAllCompositeModulationOffPreservesBaseEnvelopeOutput},
         {"RuntimeSoftwareLfoWritesFrequencyDeltas", testRuntimeSoftwareLfoWritesFrequencyDeltas},
+        {"UnusedSequenceEnvelopeIsOmittedWithoutReservingNumber",
+         testUnusedSequenceEnvelopeIsOmittedWithoutReservingNumber},
         {"TrackSetupEnvelopeNumberAndPreKeyOnCommands",
          testTrackSetupEnvelopeNumberAndPreKeyOnCommands},
         {"CompositeTrackPreviewChannelLabels",

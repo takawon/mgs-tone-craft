@@ -377,7 +377,8 @@ struct CompositeLayer {
     StartDelayForm start_delay_form{StartDelayForm::AbsoluteTicks};
     std::uint32_t start_delay_value{};
     std::uint8_t volume{15};
-    // `@e` / `@r` definition number (0–31). New layers start at 00 sequential.
+    // `@e` / `@r` definition number (0–31). Unused sequence layers do not
+    // reserve this stored authoring value.
     std::uint8_t envelope_number{};
     // Track MML `k` (PSG/SCC). Ticks per 1-volume `@e` decay after key-off.
     std::uint8_t key_off_hang{};
@@ -424,7 +425,9 @@ struct CompositeTimbre {
     // and MGSC output work without a live library entry.
     std::vector<SavedTimbreReference> embedded_timbres;
     std::uint8_t scc_morph_bank_base{};
-    std::uint32_t scc_morph_algorithm_version{1};
+    // New authoring uses generation revision 2. Readers retain legacy revision
+    // metadata; compilation upgrades only its transient derived snapshot.
+    std::uint32_t scc_morph_algorithm_version{2};
     // Transient compilation marker, deliberately omitted from all save formats.
     bool scc_morph_materialized{};
 
@@ -471,6 +474,12 @@ struct TimbreUse {
 };
 
 [[nodiscard]] CompositeTimbre defaultCompositeTimbre();
+
+// Constant full-scale sequence volume is the identity for track `v`.
+// Such a layer needs no exported @e unless it also carries sequence commands,
+// modulation, or a PSG mixer header.
+[[nodiscard]] bool layerUsesSequenceEnvelope(
+    const CompositeLayer& layer) noexcept;
 
 // Plugin 挿入直後の Current CompositeTimbre。Standalone「新規」（0 Layer）は使わない。
 [[nodiscard]] CompositeTimbre makePluginDefaultComposite();

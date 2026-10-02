@@ -61,8 +61,8 @@ inline constexpr std::size_t kMgscEnvelopeSourceLineLimit = 255;
     const CompositeLayer& layer,
     const TimbreNumberResolution* numbers = nullptr);
 
-// UI-only track setup preview. Uses display channel labels 0-2 (PSG),
-// 3-7 (SCC), and 9,A-H (OPLL); full MGSC export keeps its track syntax.
+// UI-only track setup preview. Uses display channel labels 1-3 (PSG),
+// 4-8 (SCC), and 9,A-H (OPLL); full MGSC export keeps its track syntax.
 [[nodiscard]] std::string formatMgsCompositeTrackPreview(
     const CompositeLayer& layer,
     const TimbreNumberResolution* numbers = nullptr);
