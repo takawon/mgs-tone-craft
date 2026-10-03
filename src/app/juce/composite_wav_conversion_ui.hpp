@@ -207,6 +207,7 @@ public:
         button(ab_, "A/B ▶", [this] { if (ab_result_) previewResult(); else previewSource(); ab_result_ = !ab_result_; });
         button(zoom_in_, "＋", [this] { range_.zoom(1); });
         button(zoom_out_, "−", [this] { range_.zoom(-1); });
+        button(analyze_, "範囲を解析", [this] { analyze(); });
         button(convert_, "変換 / 再変換", [this] { convert(); });
         button(apply_, "適用", [this] {
             if (!result_ || !result_->composite_tone) return;
@@ -225,7 +226,11 @@ public:
         pitch_.setText("auto", false); key_off_.setText("auto", false); budget_.setText("16", false);
         begin_.onReturnKey = begin_.onFocusLost = [this] { numericRange(true); };
         end_.onReturnKey = end_.onFocusLost = [this] { numericRange(false); };
-        pitch_.onTextChange = [this] { analysis_.reset(); };
+        pitch_.onTextChange = [this] {
+            const bool invalidated = analysis_ != nullptr;
+            analysis_.reset(); analysis_summary_.clear();
+            if (invalidated) report(juce::String::fromUTF8("基準音高を変更しました。変換前に範囲を再解析してください。"));
+        };
         configuration_.addItem(juce::String::fromUTF8("SCC単音"), 1);
         configuration_.addItem(juce::String::fromUTF8("SCC × SCC"), 2);
         configuration_.addItem(juce::String::fromUTF8("SCC × OPLL固定"), 3);
@@ -245,6 +250,8 @@ public:
         configuration_.onChange = [this] { refreshEnabled(); };
         metadata_.setFont(UiFonts::body()); metadata_.setJustificationType(juce::Justification::topLeft);
         addAndMakeVisible(metadata_);
+        metadata_detail_.setFont(UiFonts::body()); metadata_detail_.setJustificationType(juce::Justification::topLeft);
+        addAndMakeVisible(metadata_detail_);
         status_.setMultiLine(true); status_.setReadOnly(true); UiFonts::styleBodyField(status_); addAndMakeVisible(status_);
         const char* labels[] = {"開始サンプル / 秒", "終了サンプル / 秒（終端を含まない）", "基準音高 Hz（autoで推定）", "キーオフ秒（autoで推定）", "最大SCC音色数（1〜32）", "音源構成", "2ch分担", "OPLL固定音色", "最適化方針", "サステイン"};
         for (std::size_t i = 0; i < labels_.size(); ++i) {
@@ -252,18 +259,24 @@ public:
             labels_[i].setFont(UiFonts::body()); addAndMakeVisible(labels_[i]);
         }
         range_.setTooltip(juce::String::fromUTF8("開始・終了ハンドルをドラッグ。左右キーで1サンプル、Shiftで10ms調整。"));
-        range_.changed = [this](bool start) { analysis_.reset(); syncRange(); previewHandle(start); };
+        range_.changed = [this](bool start) {
+            const bool invalidated = analysis_ != nullptr;
+            analysis_.reset(); analysis_summary_.clear(); syncRange();
+            if (invalidated) report(juce::String::fromUTF8("解析範囲を変更しました。変換前に範囲を再解析してください。"));
+            previewHandle(start);
+        };
         addAndMakeVisible(range_);
         int order = 1;
         for (auto* c : std::initializer_list<juce::Component*>{&load_, &range_, &zoom_in_, &zoom_out_, &begin_, &end_,
                 &pitch_, &key_off_, &configuration_, &strategy_, &fixed_tone_, &budget_, &preference_, &sustain_,
-                &original_, &converted_, &stop_, &ab_, &level_match_, &convert_, &apply_, &cancel_}) c->setExplicitFocusOrder(order++);
+                &original_, &converted_, &stop_, &ab_, &level_match_, &analyze_, &convert_, &apply_, &cancel_}) c->setExplicitFocusOrder(order++);
         refreshEnabled();
         setSize(UiScale::sx(1080), UiScale::sx(900));
     }
     ~CompositeWavConversionContent() override {
         stopPcm();
         if (control_) control_->cancel_requested.store(true);
+        if (analysis_cancel_) analysis_cancel_->store(true, std::memory_order_release);
         // A registered plugin worker remains owned by its processor; deleting
         // the UI here cancels it without joining on editor close.
         if (background_tasks_) delete busy_dialog_.getComponent();
@@ -271,8 +284,9 @@ public:
     void paint(juce::Graphics& g) override { paintPageBackground(g, getLocalBounds()); }
     void resized() override {
         auto area = getLocalBounds().reduced(UiLayout::panelPad);
-        auto top = area.removeFromTop(UiLayout::textButtonH);
+        auto top = area.removeFromTop(UiLayout::fieldH);
         load_.setBounds(top.removeFromLeft(UiScale::sx(160))); top.removeFromLeft(UiLayout::controlGap); metadata_.setBounds(top);
+        area.removeFromTop(UiLayout::xs); metadata_detail_.setBounds(area.removeFromTop(UiLayout::fieldH));
         area.removeFromTop(UiLayout::sm); range_.setBounds(area.removeFromTop(UiScale::sx(150)));
         area.removeFromTop(UiLayout::sm);
         auto row = area.removeFromTop(UiLayout::textButtonH);
@@ -298,19 +312,22 @@ public:
         cancel_.setBounds(buttons.removeFromRight(UiScale::sx(130))); buttons.removeFromRight(UiLayout::controlGap);
         apply_.setBounds(buttons.removeFromRight(UiScale::sx(130))); buttons.removeFromRight(UiLayout::controlGap);
         convert_.setBounds(buttons.removeFromRight(UiScale::sx(190)));
+        buttons.removeFromRight(UiLayout::controlGap); analyze_.setBounds(buttons.removeFromRight(UiScale::sx(160)));
         area.removeFromBottom(UiLayout::sm); status_.setBounds(area);
-        for (auto& label : labels_) label.setFont(UiFonts::body()); metadata_.setFont(UiFonts::body());
+        for (auto& label : labels_) label.setFont(UiFonts::body()); metadata_.setFont(UiFonts::body()); metadata_detail_.setFont(UiFonts::body());
     }
 private:
     void stopPcm() { if (player_) player_->stop(); }
     void close() {
         stopPcm();
+        if (analysis_cancel_) analysis_cancel_->store(true, std::memory_order_release);
+        if (control_) control_->cancel_requested.store(true, std::memory_order_release);
         if (background_tasks_) delete busy_dialog_.getComponent();
         if (auto* d = findParentComponentOfClass<juce::DialogWindow>()) d->exitModalState(0);
     }
     void refreshEnabled() {
         const bool loaded = source_ != nullptr;
-        convert_.setEnabled(loaded); original_.setEnabled(loaded && player_ != nullptr);
+        analyze_.setEnabled(loaded); convert_.setEnabled(loaded); original_.setEnabled(loaded && player_ != nullptr);
         apply_.setEnabled(result_ && result_->composite_tone.has_value());
         converted_.setEnabled(player_ && result_pcm_ != nullptr); ab_.setEnabled(player_ && loaded && result_pcm_ != nullptr);
         stop_.setEnabled(player_ != nullptr); level_match_.setEnabled(player_ != nullptr);
@@ -334,7 +351,7 @@ private:
         const auto a = begin_.getText().getLargeIntValue(), b = end_.getText().getLargeIntValue();
         if (a < 0 || b <= a || static_cast<std::uint64_t>(b) > source_->mono_samples.size()) { syncRange(); return; }
         if (selection.begin == static_cast<std::size_t>(a) && selection.end == static_cast<std::size_t>(b)) return;
-        range_.setSelection(static_cast<std::size_t>(a), static_cast<std::size_t>(b)); analysis_.reset(); syncRange(); previewHandle(start);
+        range_.setSelection(static_cast<std::size_t>(a), static_cast<std::size_t>(b)); analysis_.reset(); analysis_summary_.clear(); syncRange(); previewHandle(start);
     }
     void play(std::shared_ptr<const mgstc::engine::SourcePcm> pcm, std::size_t begin, std::size_t end, float gain = 1.0f) {
         if (!player_) return;
@@ -354,12 +371,125 @@ private:
         if (start) play(source_, s.begin, std::min(s.end, s.begin + length));
         else play(source_, s.end > length ? std::max(s.begin, s.end - length) : s.begin, s.end);
     }
+    static juce::String describeAnalysis(const mgstc::engine::SourceAnalysis& analysis) {
+        auto summary = juce::String::fromUTF8("解析結果（変換前に確認・修正できます）\nF0 ")
+            + juce::String(analysis.reference_pitch_hz, 2) + " Hz / "
+            + juce::String::fromUTF8("信頼度 ") + juce::String(analysis.confidence, 2);
+        if (analysis.estimated_key_off) summary += juce::String::fromUTF8("\nキーオフ ")
+            + juce::String(static_cast<double>(analysis.estimated_key_off->sample_position) / analysis.source->sample_rate, 4)
+            + " s / " + juce::String::fromUTF8("信頼度 ") + juce::String(analysis.estimated_key_off->confidence, 2);
+        else summary += juce::String::fromUTF8("\nキーオフ推定なし（キーオフ欄で指定できます）");
+        summary += juce::String::fromUTF8("\n周期RMS ") + juce::String(analysis.periodic_rms, 5)
+            + juce::String::fromUTF8(" / 周期信頼度 ") + juce::String(analysis.periodic_confidence, 2)
+            + juce::String::fromUTF8("\nアタック範囲 ") + juce::String(static_cast<juce::int64>(analysis.attack_region.selection.begin))
+            + "–" + juce::String(static_cast<juce::int64>(analysis.attack_region.selection.end))
+            + juce::String::fromUTF8(" samples / confidence ") + juce::String(analysis.attack_region.confidence, 2);
+        if (analysis.sustain_region) summary += juce::String::fromUTF8("\nサステイン範囲 ")
+            + juce::String(static_cast<juce::int64>(analysis.sustain_region->selection.begin)) + "–"
+            + juce::String(static_cast<juce::int64>(analysis.sustain_region->selection.end))
+            + juce::String::fromUTF8(" samples / confidence ") + juce::String(analysis.sustain_region->confidence, 2);
+        for (const auto& warning : analysis.warnings) summary += "\n" + juce::String::fromUTF8(warning.c_str());
+        return summary;
+    }
+    mgstc::engine::SourceAnalysisOptions makeAnalysisOptions(
+        const std::shared_ptr<std::atomic<bool>>& cancellation) const {
+        mgstc::engine::SourceAnalysisOptions options;
+        const auto pitch = pitch_.getText().trim();
+        if (!pitch.equalsIgnoreCase("auto")) {
+            const auto frequency = pitch.getDoubleValue();
+            if (std::isfinite(frequency) && frequency > 0.0) options.reference_pitch_hz = frequency;
+        }
+        options.cancel_requested = cancellation;
+        return options;
+    }
+    static mgstc::engine::SourceMetadata summarizePcm(const mgstc::engine::SourcePcm& pcm,
+        const std::shared_ptr<std::atomic<bool>>& cancellation) {
+        mgstc::engine::SourceMetadata metadata;
+        if (pcm.sample_rate == 0 || pcm.channels == 0) return metadata;
+        metadata.duration_seconds = static_cast<double>(pcm.mono_samples.size()) / pcm.sample_rate;
+        double energy{};
+        const auto positive_full_scale = pcm.sample_format == mgstc::engine::SourceSampleFormat::IntegerPcm
+            && pcm.bit_depth >= 8 && pcm.bit_depth <= 32
+            ? 1.0 - std::ldexp(1.0, 1 - pcm.bit_depth) : 1.0;
+        for (std::size_t index = 0; index < pcm.interleaved_samples.size(); ++index) {
+            if ((index & 16383U) == 0 && cancellation && cancellation->load(std::memory_order_acquire)) return {};
+            const auto sample = pcm.interleaved_samples[index];
+            const auto magnitude = std::abs(static_cast<double>(sample));
+            metadata.peak = std::max(metadata.peak, magnitude);
+            energy += static_cast<double>(sample) * sample;
+            if (sample <= -1.0f || sample >= positive_full_scale) ++metadata.clipped_samples;
+        }
+        if (!pcm.interleaved_samples.empty())
+            metadata.rms = std::sqrt(energy / pcm.interleaved_samples.size());
+        constexpr double silence_threshold = 1.0e-5;
+        const auto hop = std::max<std::size_t>(1, pcm.sample_rate / 100);
+        std::optional<std::size_t> silent_begin;
+        for (std::size_t begin = 0; begin < pcm.mono_samples.size();) {
+            if ((begin & 16383U) == 0 && cancellation && cancellation->load(std::memory_order_acquire)) return {};
+            const auto end = begin + std::min(hop, pcm.mono_samples.size() - begin);
+            double window_energy{};
+            for (auto i = begin; i < end; ++i) window_energy += static_cast<double>(pcm.mono_samples[i]) * pcm.mono_samples[i];
+            if (std::sqrt(window_energy / (end - begin)) <= silence_threshold) {
+                if (!silent_begin) silent_begin = begin;
+            } else if (silent_begin) {
+                metadata.silent_ranges.push_back({*silent_begin, begin}); silent_begin.reset();
+            }
+            begin = end;
+        }
+        if (silent_begin) metadata.silent_ranges.push_back({*silent_begin, pcm.mono_samples.size()});
+        return metadata;
+    }
+    void analyze() {
+        if (!source_) return;
+        stopPcm();
+        numericRange(true); numericRange(false);
+        const auto selection = range_.selection();
+        const auto pitch = pitch_.getText().trim();
+        const auto frequency = pitch.getDoubleValue();
+        if (!pitch.equalsIgnoreCase("auto") && (!std::isfinite(frequency) || frequency <= 0.0)) {
+            report(juce::String::fromUTF8("基準音高は auto または正のHzで指定してください。")); return;
+        }
+        analysis_cancel_ = std::make_shared<std::atomic<bool>>(false);
+        const auto cancellation = analysis_cancel_;
+        const auto source = source_;
+        const auto analysis_options = makeAnalysisOptions(cancellation);
+        auto stage = std::make_shared<std::atomic<mgstc::engine::SourceAnalysisStage>>(
+            mgstc::engine::SourceAnalysisStage::PitchAndAmplitude);
+        auto staged_options = analysis_options;
+        staged_options.stage_changed = [stage](mgstc::engine::SourceAnalysisStage next) {
+            stage->store(next, std::memory_order_release);
+        };
+        auto progress = std::make_shared<ConversionProgressState>();
+        progress->custom_cancel = [cancellation] { cancellation->store(true, std::memory_order_release); };
+        progress->custom_cancelled = [cancellation] { return cancellation->load(std::memory_order_acquire); };
+        progress->custom_stage = [stage] {
+            switch (stage->load(std::memory_order_acquire)) {
+            case mgstc::engine::SourceAnalysisStage::PitchAndAmplitude: return juce::String::fromUTF8("基音・音量軌跡を解析中");
+            case mgstc::engine::SourceAnalysisStage::Harmonics: return juce::String::fromUTF8("倍音を解析中");
+            case mgstc::engine::SourceAnalysisStage::Regions: return juce::String::fromUTF8("発音領域・キーオフを推定中");
+            }
+            return juce::String::fromUTF8("範囲を解析中");
+        };
+        const juce::Component::SafePointer<CompositeWavConversionContent> safe(this);
+        busy_dialog_ = runWithConversionBusyDialog(this,
+            [source, selection, staged_options](ConversionProgressState&) {
+                return mgstc::engine::analyzeCompositeWaveSource(source, selection, staged_options);
+            }, [safe](mgstc::engine::SourceAnalysisResult result, bool cancelled) {
+                if (!safe || cancelled) return;
+                if (!result.analysis) {
+                    safe->report(juce::String::fromUTF8(result.error.c_str())); return;
+                }
+                safe->analysis_ = std::move(result.analysis);
+                safe->analysis_summary_ = describeAnalysis(*safe->analysis_);
+                safe->report(safe->analysis_summary_ + juce::String::fromUTF8("\n見積もりを確認し、必要なら基準音高／キーオフを修正してから変換してください。"));
+            }, progress, background_tasks_);
+    }
     void loadWave() {
         juce::FileChooser chooser(juce::String::fromUTF8("WAVから総合音色へ変換"), {}, "*.wav;*.wave");
         if (!chooser.browseForFileToOpen()) return;
         stopPcm();
         const auto path = std::filesystem::path(chooser.getResult().getFullPathName().toWideCharPointer());
-        struct Loaded { std::shared_ptr<const mgstc::engine::SourcePcm> pcm; std::string error; };
+        struct Loaded { std::shared_ptr<const mgstc::engine::SourcePcm> pcm; mgstc::engine::SourceMetadata metadata; std::string error; };
         const auto cancellation = std::make_shared<std::atomic<bool>>(false);
         auto progress = std::make_shared<ConversionProgressState>();
         progress->custom_cancel = [cancellation] { cancellation->store(true); };
@@ -373,19 +503,47 @@ private:
             if (!bytes) { loaded.error = "WAV file could not be read"; return loaded; }
             if (progress.cancellationRequested()) return loaded;
             auto pcm = std::make_shared<mgstc::engine::SourcePcm>();
-            if (mgstc::engine::parseCompositeWavePcm(*bytes, *pcm, &loaded.error, cancellation)) loaded.pcm = std::move(pcm);
+            if (mgstc::engine::parseCompositeWavePcm(*bytes, *pcm, &loaded.error, cancellation)) {
+                loaded.metadata = summarizePcm(*pcm, cancellation);
+                if (progress.cancellationRequested()) return loaded;
+                loaded.pcm = std::move(pcm);
+            }
             return loaded;
         }, [safe, path](Loaded loaded, bool cancelled) {
             if (!safe || cancelled) return;
             if (!loaded.pcm) { safe->report(juce::String::fromUTF8(loaded.error.c_str())); return; }
-            safe->source_ = std::move(loaded.pcm); safe->analysis_.reset(); safe->result_.reset(); safe->result_pcm_.reset();
+            safe->source_ = std::move(loaded.pcm); safe->analysis_.reset(); safe->analysis_summary_.clear(); safe->result_.reset(); safe->result_pcm_.reset();
+            safe->source_metadata_ = std::move(loaded.metadata);
             safe->range_.setSource(safe->source_); safe->syncRange(); safe->refreshEnabled();
             safe->metadata_.setText(juce::String(path.filename().wstring().c_str()) + " / " + juce::String(safe->source_->sample_rate) + " Hz / "
-                + juce::String(safe->source_->channels) + " ch / " + juce::String(safe->source_->bit_depth) + " bit", juce::dontSendNotification);
-            safe->report(juce::String::fromUTF8("範囲を選択し、変換してください。autoは基準音高とキーオフを推定します。"));
+                + juce::String(safe->source_->channels) + " ch / " + juce::String(safe->source_->bit_depth) + " bit / "
+                + juce::String::fromUTF8(safe->source_->sample_format == mgstc::engine::SourceSampleFormat::FloatPcm ? "Float PCM" : "Integer PCM"), juce::dontSendNotification);
+            auto stats = juce::String(safe->source_metadata_.duration_seconds, 3) + " s / peak "
+                + juce::String(safe->source_metadata_.peak, 3) + " / RMS "
+                + juce::String(safe->source_metadata_.rms, 3) + " / clipped "
+                + juce::String(static_cast<juce::int64>(safe->source_metadata_.clipped_samples))
+                + " / silent ranges " + juce::String(static_cast<int>(safe->source_metadata_.silent_ranges.size()));
+            for (std::size_t i = 0; i < std::min<std::size_t>(3, safe->source_metadata_.silent_ranges.size()); ++i) {
+                const auto region = safe->source_metadata_.silent_ranges[i];
+                stats += " / " + juce::String(static_cast<double>(region.begin) / safe->source_->sample_rate, 2)
+                    + "–" + juce::String(static_cast<double>(region.end) / safe->source_->sample_rate, 2) + " s";
+            }
+            safe->metadata_detail_.setText(stats, juce::dontSendNotification);
+            safe->report(juce::String::fromUTF8("範囲を選択し、「範囲を解析」でF0・キーオフの見積もりを確認できます。"));
         }, progress, background_tasks_);
     }
     void convert();
+    bool analysisMatchesInputs() const {
+        if (!analysis_ || analysis_->source != source_) return false;
+        const auto selected = range_.selection();
+        if (analysis_->selection.begin != selected.begin || analysis_->selection.end != selected.end) return false;
+        const auto pitch = pitch_.getText().trim();
+        if (!pitch.equalsIgnoreCase("auto")) {
+            const auto frequency = pitch.getDoubleValue();
+            if (!std::isfinite(frequency) || std::abs(analysis_->reference_pitch_hz - frequency) > 1.0e-6) return false;
+        }
+        return true;
+    }
     bool acceptCompletedConversion(mgstc::engine::CompositeWavConversionResult conversion,
         std::shared_ptr<const mgstc::engine::SourcePcm> pcm, bool cancelled,
         float source_gain, float result_gain) {
@@ -403,14 +561,17 @@ private:
     BackgroundTaskBoundary* background_tasks_{};
     juce::Component::SafePointer<ConversionBusyDialog> busy_dialog_;
     CompositeWavRange range_;
-    juce::TextButton load_, original_, converted_, stop_, ab_, zoom_in_, zoom_out_, convert_, apply_, cancel_;
+    juce::TextButton load_, original_, converted_, stop_, ab_, zoom_in_, zoom_out_, analyze_, convert_, apply_, cancel_;
     juce::TextEditor begin_, end_, pitch_, key_off_, budget_, status_;
     juce::ComboBox configuration_, strategy_, fixed_tone_, preference_, sustain_;
     juce::ToggleButton level_match_;
-    juce::Label metadata_;
+    juce::Label metadata_, metadata_detail_;
     std::array<juce::Label, 10> labels_;
     std::shared_ptr<const mgstc::engine::SourcePcm> source_, result_pcm_;
     std::shared_ptr<const mgstc::engine::SourceAnalysis> analysis_;
+    std::shared_ptr<std::atomic<bool>> analysis_cancel_;
+    mgstc::engine::SourceMetadata source_metadata_;
+    juce::String analysis_summary_;
     std::optional<mgstc::engine::CompositeWavConversionResult> result_;
     std::shared_ptr<mgstc::engine::CompositeWavConversionControl> control_;
     bool ab_result_{};
@@ -434,6 +595,7 @@ inline void CompositeWavConversionContent::convert() {
             || keyoff * source_->sample_rate > static_cast<double>(selection.end)))) {
         report(juce::String::fromUTF8("最大音色数、基準音高、キーオフの入力を確認してください。")); return;
     }
+    if (!analysisMatchesInputs()) { analysis_.reset(); analysis_summary_.clear(); }
     control_ = std::make_shared<mgstc::engine::CompositeWavConversionControl>();
     auto options = mgstc::engine::CompositeWavConversionOptions{};
     options.configuration = static_cast<mgstc::engine::CompositeWavConfiguration>(configuration_.getSelectedId() - 1);
@@ -445,10 +607,15 @@ inline void CompositeWavConversionContent::convert() {
         options.fixed_opll_tone = static_cast<std::uint8_t>(fixed_tone_.getSelectedId() - 2);
     if (!keyoff_auto) options.key_off_position = static_cast<std::size_t>(std::llround(keyoff * source_->sample_rate));
     options.control = control_;
+    const auto control = control_;
     mgstc::engine::SourceAnalysisOptions analysis_options;
     if (!pitch_auto) analysis_options.reference_pitch_hz = frequency;
-    analysis_options.cancel_requested = std::shared_ptr<std::atomic<bool>>(control_, &control_->cancel_requested);
-    const auto control = control_;
+    analysis_options.cancel_requested = std::shared_ptr<std::atomic<bool>>(control, &control->cancel_requested);
+    auto analysis_stage = std::make_shared<std::atomic<mgstc::engine::SourceAnalysisStage>>(
+        mgstc::engine::SourceAnalysisStage::PitchAndAmplitude);
+    analysis_options.stage_changed = [analysis_stage](mgstc::engine::SourceAnalysisStage next) {
+        analysis_stage->store(next, std::memory_order_release);
+    };
     const auto analysing = std::make_shared<std::atomic<bool>>(analysis_ == nullptr);
     auto progress = std::make_shared<ConversionProgressState>();
     progress->custom_cancel = [control] { control->cancel_requested.store(true, std::memory_order_release); };
@@ -457,17 +624,29 @@ inline void CompositeWavConversionContent::convert() {
         return control->stage.load() == mgstc::engine::CompositeWavStage::Completed ? 1.0
             : std::min(0.95, static_cast<double>(control->evaluations.load()) / 96.0);
     };
-    progress->custom_stage = [control, analysing] {
-        if (analysing->load()) return juce::String::fromUTF8("WAV・基本周波数・倍音解析中");
+    progress->custom_stage = [control, analysing, analysis_stage] {
+        if (analysing->load(std::memory_order_acquire)) {
+            switch (analysis_stage->load(std::memory_order_acquire)) {
+            case mgstc::engine::SourceAnalysisStage::PitchAndAmplitude: return juce::String::fromUTF8("基音・音量軌跡を解析中");
+            case mgstc::engine::SourceAnalysisStage::Harmonics: return juce::String::fromUTF8("倍音を解析中");
+            case mgstc::engine::SourceAnalysisStage::Regions: return juce::String::fromUTF8("発音領域・キーオフを推定中");
+            }
+            return juce::String::fromUTF8("選択範囲を解析中");
+        }
         switch (control->stage.load()) {
+        case mgstc::engine::CompositeWavStage::Idle: return juce::String::fromUTF8("変換準備中");
+        case mgstc::engine::CompositeWavStage::Candidates: return juce::String::fromUTF8("音源候補を探索中");
         case mgstc::engine::CompositeWavStage::Morph: return juce::String::fromUTF8("モーフィング生成中");
         case mgstc::engine::CompositeWavStage::Envelope: return juce::String::fromUTF8("ENV最適化中");
         case mgstc::engine::CompositeWavStage::Evaluation: return juce::String::fromUTF8("再現性評価中");
-        default: return juce::String::fromUTF8("音源候補探索中");
+        case mgstc::engine::CompositeWavStage::Completed: return juce::String::fromUTF8("完了");
+        case mgstc::engine::CompositeWavStage::Cancelled: return juce::String::fromUTF8("キャンセル中");
         }
+        return juce::String::fromUTF8("変換中");
     };
     struct Completed {
         mgstc::engine::CompositeWavConversionResult conversion;
+        std::shared_ptr<const mgstc::engine::SourceAnalysis> analysis;
         std::shared_ptr<const mgstc::engine::SourcePcm> pcm;
         float source_gain{1.0f}, result_gain{1.0f};
     };
@@ -480,7 +659,8 @@ inline void CompositeWavConversionContent::convert() {
                 if (!analysed.analysis) { completed.conversion.error = analysed.error; return completed; }
                 analysis = analysed.analysis;
             }
-            analysing->store(false);
+            completed.analysis = analysis;
+            analysing->store(false, std::memory_order_release);
             completed.conversion = mgstc::engine::convertCompositeWave(analysis, options);
             if (completed.conversion.completion == mgstc::engine::CompositeWavConversionCompletion::Completed
                 && completed.conversion.composite_tone && completed.conversion.preview.ok()) {
@@ -504,10 +684,15 @@ inline void CompositeWavConversionContent::convert() {
             return completed;
         }, [safe](Completed completed, bool cancelled) {
             if (!safe) return;
+            if (completed.analysis) {
+                safe->analysis_ = completed.analysis;
+                safe->analysis_summary_ = describeAnalysis(*completed.analysis);
+            }
             if (cancelled || !completed.pcm || !completed.conversion.composite_tone) {
-                safe->report(cancelled ? juce::String::fromUTF8("変換をキャンセルしました。前回の結果を保持しています。")
+                safe->report((cancelled ? juce::String::fromUTF8("変換をキャンセルしました。前回の結果を保持しています。")
                     : juce::String::fromUTF8(completed.conversion.error.c_str())
-                        + juce::String::fromUTF8("\n変換できませんでした。前回の結果を保持しています。"));
+                        + juce::String::fromUTF8("\n変換できませんでした。前回の結果を保持しています。"))
+                    + (safe->analysis_summary_.isNotEmpty() ? "\n" + safe->analysis_summary_ : juce::String{}));
                 return;
             }
             if (!safe->acceptCompletedConversion(std::move(completed.conversion), std::move(completed.pcm),
@@ -521,16 +706,7 @@ inline void CompositeWavConversionContent::convert() {
                 + "STFT " + juce::String(q.multi_resolution_stft, 4) + " / Harmonic " + juce::String(q.harmonic, 4)
                 + " / ERB " + juce::String(q.erb, 4) + " / Attack " + juce::String(q.attack, 4)
                 + " / ENV " + juce::String(q.volume, 4);
-            if (safe->analysis_) {
-                const auto& analysis = *safe->analysis_;
-                message += "\nF0 " + juce::String(analysis.reference_pitch_hz, 2) + " Hz / "
-                    + juce::String::fromUTF8("信頼度 ") + juce::String(analysis.confidence, 2);
-                if (analysis.estimated_key_off) message += juce::String::fromUTF8(" / キーオフ推定 ")
-                    + juce::String(static_cast<double>(analysis.estimated_key_off->sample_position) / analysis.source->sample_rate, 4)
-                    + " s / " + juce::String(analysis.estimated_key_off->confidence, 2);
-                else message += juce::String::fromUTF8(" / キーオフ推定不可・手動指定可能");
-                for (const auto& warning : analysis.warnings) message += "\n" + juce::String::fromUTF8(warning.c_str());
-            }
+            if (safe->analysis_summary_.isNotEmpty()) message += "\n" + safe->analysis_summary_;
             for (const auto& warning : result.warnings) message += "\n" + juce::String::fromUTF8(warning.c_str());
             safe->report(message); safe->refreshEnabled();
         }, progress, background_tasks_);

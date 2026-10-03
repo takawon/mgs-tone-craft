@@ -167,6 +167,107 @@ PitchTrajectoryFrame pitchFrame(
     return result;
 }
 
+// Check octave alternatives against independent harmonic evidence. A pure tone
+// has no evidence for an unheard subharmonic; a weak/missing fundamental with
+// both even and odd partials does. Continuity alone must not invent that pitch.
+PitchTrajectoryFrame correctPitchFromHarmonics(
+    std::span<const float> pcm, SampleSelection selection,
+    PitchTrajectoryFrame pitch, std::uint32_t rate,
+    const SourceAnalysisOptions& options) {
+    if (pitch.frequency_hz <= 0.0) return pitch;
+    const auto stride = std::max<std::size_t>(1, (rate + 11999U) / 12000U);
+    const auto spectral_rate = static_cast<double>(rate) / stride;
+    std::size_t length = 512;
+    while (length < spectral_rate * 8.0 / pitch.frequency_hz && length < 8192)
+        length *= 2;
+    const auto available = (selection.end - selection.begin) / stride;
+    if (available < length) return pitch;
+    const auto radius = length / 2 * stride;
+    const auto begin = std::clamp(pitch.sample_position > radius
+        ? pitch.sample_position - radius : selection.begin,
+        selection.begin, selection.end - length * stride);
+    std::vector<std::complex<double>> spectrum(length);
+    double mean{};
+    std::vector<double> samples(length);
+    for (std::size_t i = 0; i < length; ++i) {
+        for (std::size_t j = 0; j < stride; ++j) samples[i] += pcm[begin + i * stride + j];
+        samples[i] /= stride;
+        mean += samples[i];
+    }
+    mean /= length;
+    for (std::size_t i = 0; i < length; ++i) {
+        if ((i & 1023U) == 0 && cancelled(options.cancel_requested)) return pitch;
+        spectrum[i] = (samples[i] - mean)
+            * (0.5 - 0.5 * std::cos(kTau * i / static_cast<double>(length - 1)));
+    }
+    fft(spectrum);
+    double total{};
+    for (std::size_t bin = 1; bin < length / 2; ++bin) total += std::norm(spectrum[bin]);
+    if (total <= 1.0e-20) return pitch;
+    const auto support = [&](double f0) {
+        std::array<double, 2> energy{}; // all supported / odd supported power
+        std::vector<bool> distinct_peak(options.maximum_harmonics + 1, false);
+        // A candidate needs observed spectral peaks, not broadband energy that
+        // happens to fall into more subharmonic search bands.
+        for (std::size_t bin = 2; bin + 5 < length / 2; ++bin) {
+            const auto power = std::norm(spectrum[bin]);
+            if (power <= std::norm(spectrum[bin - 1])
+                || power <= std::norm(spectrum[bin + 1])) continue;
+            double background{};
+            std::size_t neighbors{};
+            for (auto offset : {3U, 4U, 5U}) {
+                if (bin > offset) { background += std::norm(spectrum[bin - offset]); ++neighbors; }
+                background += std::norm(spectrum[bin + offset]); ++neighbors;
+            }
+            if (power <= 4.0 * background / neighbors) continue;
+            const auto frequency = static_cast<double>(bin) * spectral_rate / length;
+            const auto order = static_cast<std::size_t>(std::lround(frequency / f0));
+            if (order == 0 || order > options.maximum_harmonics) continue;
+            if (std::abs(frequency - order * f0) <= std::min(f0 * 0.22,
+                    std::max(f0 * 0.04, 1.5 * spectral_rate / length)))
+                distinct_peak[order] = true;
+        }
+        for (std::size_t bin = 1; bin < length / 2; ++bin) {
+            const auto frequency = static_cast<double>(bin) * spectral_rate / length;
+            const auto order = static_cast<std::size_t>(std::lround(frequency / f0));
+            if (order == 0 || order > options.maximum_harmonics || !distinct_peak[order]) continue;
+            const auto tolerance = std::min(f0 * 0.22,
+                std::max(f0 * 0.04, 1.5 * spectral_rate / length));
+            if (std::abs(frequency - order * f0) > tolerance) continue;
+            const auto power = std::norm(spectrum[bin]);
+            energy[0] += power;
+            if ((order & 1U) != 0) energy[1] += power;
+        }
+        for (auto& value : energy) value /= total;
+        return energy;
+    };
+    const auto original = support(pitch.frequency_hz);
+    double best = original[0];
+    const auto lower = pitch.frequency_hz * 0.5;
+    if (lower >= options.minimum_pitch_hz) {
+        const auto evidence = support(lower);
+        if (evidence[1] > 0.006 && evidence[0] > best + 0.006) {
+            pitch.frequency_hz = lower;
+            best = evidence[0];
+        }
+    }
+    // Correct a subharmonic only when its odd partials are unsupported. This
+    // preserves weak fundamentals and never promotes a stronger second partial
+    // merely because it happens to carry most of the energy.
+    const auto higher = pitch.frequency_hz * 2.0;
+    if (higher <= options.maximum_pitch_hz) {
+        const auto current = support(pitch.frequency_hz);
+        const auto evidence = support(higher);
+        if (current[1] < 0.003 && evidence[0] >= current[0] - 0.003
+            && evidence[0] > 0.8) {
+            pitch.frequency_hz = higher;
+            best = evidence[0];
+        }
+    }
+    pitch.confidence *= 0.8 + 0.2 * std::clamp(best, 0.0, 1.0);
+    return pitch;
+}
+
 HarmonicTrajectoryFrame harmonicFrame(
     std::span<const float> pcm, SampleSelection selection, std::size_t centre,
     std::uint32_t rate, double f0, bool attack, const SourceAnalysisOptions& options) {
@@ -209,7 +310,6 @@ HarmonicTrajectoryFrame harmonicFrame(
         weighted_frequency += power * static_cast<double>(bin) * rate / length;
     }
     frame.spectral_centroid_hz = total_power > 1.0e-20 ? weighted_frequency / total_power : 0.0;
-    double periodic_energy{};
     if (f0 > 0.0) {
         for (std::size_t order = 1; order <= options.maximum_harmonics; ++order) {
             if (cancelled(options.cancel_requested)) return frame;
@@ -249,14 +349,38 @@ HarmonicTrajectoryFrame harmonicFrame(
                 phase *= step;
             }
             const auto amplitude = 2.0 * std::abs(projection) / weight_sum;
-            periodic_energy += amplitude * amplitude * 0.5;
             frame.harmonics.push_back({order, frequency, amplitude, std::arg(projection)});
         }
     }
-    // Diagnostic only: overlapping Hann lobes/inharmonic transients make this
-    // an energy remainder estimate, not an SMS residual waveform decomposition.
-    frame.residual_rms = std::sqrt(std::max(0.0,
-        sample_energy / weight_energy - periodic_energy));
+    // Explicit reconstruction error does not double-count overlapping Hann
+    // lobes. Detuned partials must not be silently converted into integer
+    // harmonics: only projections close to the established F0 are representable.
+    std::vector<double> periodic(length, 0.0);
+    for (const auto& harmonic : frame.harmonics) {
+        if (cancelled(options.cancel_requested)) return frame;
+        if (std::abs(harmonic.frequency_hz - harmonic.harmonic * f0) > f0 * 0.06)
+            continue;
+        const auto step = std::polar(1.0, kTau * harmonic.frequency_hz / rate);
+        auto phase = std::polar(1.0, harmonic.phase_radians
+            - kTau * harmonic.frequency_hz * (length / 2) / rate);
+        for (std::size_t i = 0; i < length; ++i) {
+            periodic[i] += harmonic.amplitude * phase.real();
+            phase *= step;
+        }
+    }
+    double residual_energy{}, periodic_energy{};
+    for (std::size_t i = 0; i < length; ++i) {
+        if (window[i] == 0.0) continue;
+        const auto sample = static_cast<double>(pcm[static_cast<std::size_t>(
+            start + static_cast<std::int64_t>(i))]) - mean;
+        const auto weight = window[i] * window[i];
+        residual_energy += (sample - periodic[i]) * (sample - periodic[i]) * weight;
+        periodic_energy += periodic[i] * periodic[i] * weight;
+    }
+    frame.residual_rms = std::sqrt(residual_energy / weight_energy);
+    frame.periodic_rms = std::sqrt(periodic_energy / weight_energy);
+    frame.periodic_confidence = sample_energy > 1.0e-20
+        ? std::clamp(1.0 - residual_energy / sample_energy, 0.0, 1.0) : 0.0;
     return frame;
 }
 } // namespace
@@ -449,6 +573,7 @@ SourceAnalysisResult analyzeCompositeWaveSource(std::shared_ptr<const SourcePcm>
     double previous_pitch{};
     std::vector<double> voiced_pitches;
     double confidence_sum{};
+    if (options.stage_changed) options.stage_changed(SourceAnalysisStage::PitchAndAmplitude);
     for (auto position = selection.begin; position < selection.end;) {
         if (cancelled(options.cancel_requested)) return stopped();
         const auto end = position + std::min(hop, selection.end - position);
@@ -466,6 +591,7 @@ SourceAnalysisResult analyzeCompositeWaveSource(std::shared_ptr<const SourcePcm>
             silence_start.reset();
         }
         auto pitch = pitchFrame(pcm, selection, centre, rate, options, previous_pitch);
+        pitch = correctPitchFromHarmonics(pcm, selection, pitch, rate, options);
         if (cancelled(options.cancel_requested)) return stopped();
         if (rms <= kSilence) pitch = {centre, 0.0, 0.0};
         if (pitch.frequency_hz > 0.0) {
@@ -482,7 +608,40 @@ SourceAnalysisResult analyzeCompositeWaveSource(std::shared_ptr<const SourcePcm>
         result->reference_pitch_hz = voiced_pitches[voiced_pitches.size() / 2];
         result->confidence = confidence_sum / result->pitch_trajectory.size();
     }
-    if (options.reference_pitch_hz) result->reference_pitch_hz = *options.reference_pitch_hz;
+    if (options.reference_pitch_hz) {
+        // A manual F0 guides harmonic numbering, not just the displayed note.
+        // Align the robust automatic median by one fixed octave factor so a
+        // missing fundamental can be declared manually without flattening
+        // vibrato/chirp or selecting a different octave on every frame.
+        // Nearby non-octave tuning differences remain measured differences;
+        // this is not an arbitrary source transposition to the typed frequency.
+        if (!voiced_pitches.empty()) {
+            double best_distance = std::numeric_limits<double>::infinity();
+            double factor = 1.0;
+            for (int octave = -10; octave <= 10; ++octave) {
+                const auto candidate_factor = std::ldexp(1.0, octave);
+                const auto median = result->reference_pitch_hz * candidate_factor;
+                if (median < options.minimum_pitch_hz || median > options.maximum_pitch_hz) continue;
+                const auto distance = std::abs(std::log2(median / *options.reference_pitch_hz));
+                if (distance < best_distance) { best_distance = distance; factor = candidate_factor; }
+            }
+            if (factor != 1.0) {
+                confidence_sum = 0.0;
+                for (auto& pitch : result->pitch_trajectory) {
+                    if (pitch.frequency_hz <= 0.0) continue;
+                    pitch.frequency_hz *= factor;
+                    if (pitch.frequency_hz < options.minimum_pitch_hz
+                        || pitch.frequency_hz > options.maximum_pitch_hz) {
+                        pitch.frequency_hz = 0.0;
+                        pitch.confidence = 0.0;
+                    }
+                    confidence_sum += pitch.confidence;
+                }
+                result->confidence = confidence_sum / result->pitch_trajectory.size();
+            }
+        }
+        result->reference_pitch_hz = *options.reference_pitch_hz;
+    }
     if (result->confidence < 0.65)
         result->warnings.emplace_back("Pitch is uncertain; check the reference pitch manually.");
     if (result->mono_strategy == AnalysisMonoStrategy::StrongestChannel)
@@ -505,6 +664,8 @@ SourceAnalysisResult analyzeCompositeWaveSource(std::shared_ptr<const SourcePcm>
         envelope[onset].sample_position > hop / 2 ? envelope[onset].sample_position - hop / 2 : selection.begin),
         std::min(selection.end, envelope[attack_end].sample_position + hop / 2 + 1)},
         peak_it->rms > kSilence ? 0.6 : 0.0};
+    if (options.stage_changed) options.stage_changed(SourceAnalysisStage::Harmonics);
+    double periodic_sum{}, explained_sum{}, source_sum{};
     for (std::size_t i = 0; i < result->pitch_trajectory.size(); ++i) {
         if (cancelled(options.cancel_requested)) return stopped();
         const auto& pitch = result->pitch_trajectory[i];
@@ -513,8 +674,18 @@ SourceAnalysisResult analyzeCompositeWaveSource(std::shared_ptr<const SourcePcm>
         result->harmonic_trajectory.push_back(harmonicFrame(pcm, selection,
             pitch.sample_position, rate, f0,
             pitch.sample_position < result->attack_region.selection.end, options));
+        const auto frames = std::min(hop, selection.end - selection.begin - i * hop);
+        const auto& harmonic = result->harmonic_trajectory.back();
+        const auto source_energy = envelope[i].rms * envelope[i].rms * frames;
+        periodic_sum += harmonic.periodic_rms * harmonic.periodic_rms * frames;
+        source_sum += source_energy;
+        explained_sum += harmonic.periodic_confidence * source_energy;
         if (cancelled(options.cancel_requested)) return stopped();
     }
+    result->periodic_rms = std::sqrt(periodic_sum / (selection.end - selection.begin));
+    result->periodic_confidence = source_sum > 1.0e-20
+        ? std::clamp(explained_sum / source_sum, 0.0, 1.0) : 0.0;
+    if (options.stage_changed) options.stage_changed(SourceAnalysisStage::Regions);
     // Hop RMS includes phase-dependent ripple when a window contains a
     // noninteger number of periods. Smooth energy only for region detection;
     // retain the original hop envelope for 60Hz control and attack analysis.

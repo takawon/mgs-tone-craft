@@ -106,13 +106,38 @@ struct CompositeWavConversionTestAccess {
     }
     static const std::optional<mgstc::engine::CompositeWavConversionResult>& result(const CompositeWavConversionContent& content) { return content.result_; }
     static void source(CompositeWavConversionContent& content, std::shared_ptr<const mgstc::engine::SourcePcm> pcm) {
-        content.source_ = std::move(pcm); content.range_.setSource(content.source_); content.syncRange(); content.refreshEnabled();
+        content.source_ = std::move(pcm); content.analysis_.reset(); content.analysis_summary_.clear();
+        content.range_.setSource(content.source_); content.syncRange(); content.refreshEnabled();
+    }
+    static void seedAnalysis(CompositeWavConversionContent& content,
+        std::shared_ptr<const mgstc::engine::SourceAnalysis> analysis) { content.analysis_ = std::move(analysis); }
+    static std::shared_ptr<const mgstc::engine::SourceAnalysis> analysis(const CompositeWavConversionContent& content) { return content.analysis_; }
+    static bool analysisMatches(const CompositeWavConversionContent& content) { return content.analysisMatchesInputs(); }
+    static void setPitch(CompositeWavConversionContent& content, const juce::String& pitch) {
+        content.pitch_.setText(pitch, true);
+        // TextEditor posts textChangeMessageId instead of invoking onTextChange inline.
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    }
+    static void setKeyOff(CompositeWavConversionContent& content, const juce::String& keyoff) { content.key_off_.setText(keyoff, true); }
+    static void setConfiguration(CompositeWavConversionContent& content, int id) {
+        content.configuration_.setSelectedId(id, juce::sendNotificationSync);
+    }
+    static void setBudget(CompositeWavConversionContent& content, int count) { content.budget_.setText(juce::String(count), false); }
+    static void clickAnalyze(CompositeWavConversionContent& content) { content.analyze_.onClick(); }
+    static void clickConvert(CompositeWavConversionContent& content) { content.convert_.onClick(); }
+    static void clickApply(CompositeWavConversionContent& content) { content.apply_.onClick(); }
+    static bool hasResult(const CompositeWavConversionContent& content) { return content.result_.has_value(); }
+    static juce::String status(const CompositeWavConversionContent& content) { return content.status_.getText(); }
+    static void setSelection(CompositeWavConversionContent& content, std::size_t begin, std::size_t end) {
+        content.range_.setSelection(begin, end);
+        if (content.range_.changed) content.range_.changed(true);
     }
     static void tab(CompositeWavRange& range) { range.active_start_ = !range.active_start_; }
     static bool matchOn(const CompositeWavConversionContent& content) { return content.level_match_.getToggleState(); }
     static bool buttonsInside(const CompositeWavConversionContent& content) {
         return content.getLocalBounds().contains(content.level_match_.getBounds())
             && content.level_match_.getWidth() >= UiScale::sx(250)
+            && content.getLocalBounds().contains(content.analyze_.getBounds())
             && content.status_.getHeight() >= UiScale::sx(100)
             && content.getLocalBounds().contains(content.apply_.getBounds());
     }
@@ -4174,10 +4199,19 @@ void testCompositeWavUiTransactions() {
     original.name = "Full original";
     original.tags = {"Preserved"};
     original.favorite = true;
+    require(processor.replacePluginState(documentFrom(original, 0, {})),
+        "seed VST3 state with the editor's initial authoring snapshot");
+    // A Live commit stays unacknowledged until the host processes an audio block.
+    processEmpty(processor, 512);
     mgstc::app::CompositeEditorComponent editor(context, link,
         [](const juce::String&, std::optional<std::uint64_t>) {}, [] {}, [](std::uint8_t) {},
         [](juce::Component*) {}, [] {}, original);
+    // Let editor hydration and its posted text-control notifications settle
+    // before taking the authoring-state baseline for this transaction test.
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
     const auto before = EditorAccess::sound(editor);
+    require(processor.copyPluginState().sound == before,
+        "editor baseline begins from the committed VST3 Plugin State");
     auto converted = sccOnlyTimbre(); converted.name = "WAV result";
     const auto history_before = EditorAccess::historySize(editor);
     require(EditorAccess::wavEnabled(editor), "VST shared editor enables WAV conversion button");
@@ -4189,6 +4223,24 @@ void testCompositeWavUiTransactions() {
         pcm->sample_rate = 48000; pcm->channels = 2;
         pcm->mono_samples.assign(128, 0.1f); pcm->interleaved_samples.assign(256, 0.1f);
         WavAccess::source(content, pcm);
+        const auto original_pcm = pcm->interleaved_samples;
+        auto analysis = std::make_shared<mgstc::engine::SourceAnalysis>();
+        analysis->source = pcm; analysis->selection = {0, 128}; analysis->reference_pitch_hz = 440.0;
+        WavAccess::seedAnalysis(content, analysis);
+        require(WavAccess::analysisMatches(content), "analysis cache matches source, selection and automatic F0 input");
+        WavAccess::setConfiguration(content, 2);
+        WavAccess::setKeyOff(content, "0.001");
+        require(WavAccess::analysis(content) == analysis && WavAccess::analysisMatches(content),
+            "conversion options and key-off override reuse immutable source analysis");
+        WavAccess::setPitch(content, "441");
+        require(!WavAccess::analysis(content) && !WavAccess::analysisMatches(content),
+            "changing reference F0 invalidates analysis before conversion");
+        WavAccess::setPitch(content, "auto");
+        WavAccess::seedAnalysis(content, analysis);
+        WavAccess::setSelection(content, 8, 120);
+        require(!WavAccess::analysis(content), "changing selected source frames invalidates analysis cache");
+        WavAccess::setSelection(content, 0, 128);
+        require(pcm->interleaved_samples == original_pcm, "inspection and control changes never mutate original preview PCM");
         mgstc::engine::CompositeWavConversionResult valid;
         valid.completion = mgstc::engine::CompositeWavConversionCompletion::Completed;
         valid.composite_tone = converted;
@@ -4213,20 +4265,32 @@ void testCompositeWavUiTransactions() {
         }
         UiScale::setActivePercent(old_scale);
     }
-    require(EditorAccess::sound(editor) == before && EditorAccess::historySize(editor) == history_before,
+    require(EditorAccess::sound(editor) == before && EditorAccess::historySize(editor) == history_before
+            && processor.copyPluginState().sound == before,
         "closing converter without Apply preserves complete authoring state and history");
     require(EditorAccess::matches(editor, before), "unchanged conversion snapshot accepted");
     EditorAccess::editName(editor, "Changed while converting");
+    processEmpty(processor, 512);
     require(!EditorAccess::matches(editor, before), "stale editor snapshot requires confirmation");
     EditorAccess::editName(editor, before.name);
+    processEmpty(processor, 512);
     EditorAccess::applyWave(editor, converted);
     require(EditorAccess::sound(editor) == converted && EditorAccess::sound(editor).layers.size() == 1,
         "WAV Apply fully replaces all old channels");
+    require(processor.copyPluginState().sound == converted,
+        "shared editor Apply publishes converted sound into VST3 Plugin State");
+    processEmpty(processor, 512);
     require(EditorAccess::historySize(editor) == history_before + 1, "WAV replacement is one history operation");
     EditorAccess::undo(editor);
     require(EditorAccess::sound(editor) == before, "Undo restores all previous authoring data");
+    require(processor.copyPluginState().sound == before,
+        "Undo republishes the previous complete sound into VST3 Plugin State");
+    processEmpty(processor, 512);
     EditorAccess::redo(editor);
     require(EditorAccess::sound(editor) == converted, "Redo restores entire converted data");
+    require(processor.copyPluginState().sound == converted,
+        "Redo republishes the converted sound into VST3 Plugin State");
+    processEmpty(processor, 512);
 }
 
 void testCompositeWavRangeInteractions() {
@@ -4254,6 +4318,77 @@ void testCompositeWavRangeInteractions() {
     require(range.selection().end == 999, "keyboard adjusts end by one original sample");
     range.setSelection(950, 900);
     require(range.selection().end > range.selection().begin, "range prevents reversed/empty selection");
+}
+
+void testCompositeWavActualUiWorkerAndApply() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    using WavAccess = mgstc::app::CompositeWavConversionTestAccess;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    auto original = mgstc::engine::defaultCompositeTimbre();
+    original.name = "Before actual conversion";
+    require(processor.replacePluginState(documentFrom(original, 0, {})),
+        "seed actual conversion test with matching VST3 program state");
+    processEmpty(processor, 512);
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {}, [] {}, [](std::uint8_t) {},
+        [](juce::Component*) {}, [] {}, original);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    const auto previous = EditorAccess::sound(editor);
+    require(processor.copyPluginState().sound == previous,
+        "actual conversion editor baseline matches committed VST3 state");
+    auto pcm = std::make_shared<mgstc::engine::SourcePcm>();
+    pcm->sample_rate = 48'000; pcm->channels = 1; pcm->bit_depth = 32;
+    pcm->sample_format = mgstc::engine::SourceSampleFormat::FloatPcm;
+    pcm->mono_samples.resize(9'600);
+    pcm->interleaved_samples.resize(9'600);
+    for (std::size_t i = 0; i < pcm->mono_samples.size(); ++i) {
+        const auto value = static_cast<float>(0.25 * std::sin(2.0 * std::numbers::pi * 220.0 * i / pcm->sample_rate));
+        pcm->mono_samples[i] = value;
+        pcm->interleaved_samples[i] = value;
+    }
+    bool applied = false;
+    mgstc::app::CompositeWavConversionContent content(
+        [&](const mgstc::engine::CompositeTimbre& converted, std::function<void()> close) {
+            applied = true;
+            EditorAccess::applyWave(editor, converted);
+            if (close) close();
+        }, context.pcmPreview(), context.backgroundTasks());
+    WavAccess::source(content, pcm);
+    WavAccess::setBudget(content, 1);
+    WavAccess::clickAnalyze(content);
+    for (int wait = 0; wait < 400 && !WavAccess::analysis(content); ++wait)
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    require(WavAccess::analysis(content) != nullptr, "Analyze button completes bounded source analysis on worker");
+    require(WavAccess::analysisMatches(content)
+            && WavAccess::status(content).contains("解析結果")
+            && WavAccess::status(content).contains("信頼度"),
+        "worker completion exposes inspectable F0/key-off confidence before conversion");
+    WavAccess::setKeyOff(content, "0.200");
+    require(WavAccess::analysisMatches(content), "manual key-off correction keeps pitch/source analysis reusable");
+    WavAccess::clickConvert(content);
+    // Unoptimized Debug PCM candidate evaluation can exceed 30 seconds.
+    // Keep a finite worker-completion wait without imposing a Release-speed
+    // requirement on this functional transaction test.
+    for (int wait = 0; wait < 15000 && !WavAccess::hasResult(content); ++wait)
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    require(WavAccess::hasResult(content), "Convert button runs actual optimizer and publishes its completed result");
+    WavAccess::clickApply(content);
+    require(applied && EditorAccess::sound(editor) != previous,
+        "Apply control sends actual converted result through shared editor transaction");
+    require(processor.copyPluginState().sound == EditorAccess::sound(editor),
+        "actual WAV conversion is reflected in VST3 Plugin State");
+    processEmpty(processor, 512);
+    EditorAccess::undo(editor);
+    require(EditorAccess::sound(editor) == previous && processor.copyPluginState().sound == previous,
+        "Undo restores pre-conversion authoring and VST3 program state");
+    processEmpty(processor, 512);
+    EditorAccess::redo(editor);
+    require(processor.copyPluginState().sound == EditorAccess::sound(editor),
+        "Redo restores actual converted sound in VST3 Plugin State");
+    processEmpty(processor, 512);
 }
 
 void testTemporaryCompositePreviewPreservesState() {
@@ -4437,6 +4572,7 @@ int main() {
         testConversionCompletionCancellation();
         testCompositeWavUiTransactions();
         testCompositeWavRangeInteractions();
+        testCompositeWavActualUiWorkerAndApply();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
