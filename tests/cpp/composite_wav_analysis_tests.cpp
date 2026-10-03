@@ -219,6 +219,95 @@ void selectionAndFailureTests() {
     require(silent.analysis && silent.analysis->reference_pitch_hz == 0.0 && silent.analysis->confidence == 0.0,
         "pitch invented for silence");
     require(!silent.analysis->sustain_region && !silent.analysis->estimated_key_off, "regions invented for silence");
+    require(silent.analysis->periodic_rms == 0.0 && silent.analysis->periodic_confidence == 0.0,
+        "silence assigned periodic evidence");
+}
+
+void harmonicPitchCorrectionAndResidualTests() {
+    auto weak = tone(0.4, 220.0);
+    for (std::size_t i = 0; i < weak->mono_samples.size(); ++i) {
+        const auto phase = tau * 220.0 * i / weak->sample_rate;
+        // The YIN first-dip threshold can accept the strong second partial's
+        // half period. Odd harmonic evidence must recover the true period.
+        weak->mono_samples[i] = static_cast<float>(0.015 * std::sin(phase)
+            + 0.7 * std::sin(phase * 2.0) + 0.12 * std::sin(phase * 3.0));
+    }
+    weak->interleaved_samples = weak->mono_samples;
+    std::vector<SourceAnalysisStage> stages;
+    SourceAnalysisOptions options;
+    options.stage_changed = [&](SourceAnalysisStage stage) { stages.push_back(stage); };
+    const auto corrected = analyzeCompositeWaveSource(weak, {0, weak->mono_samples.size()}, options);
+    require(corrected.analysis && std::abs(corrected.analysis->reference_pitch_hz - 220.0) < 3.0,
+        "spectral odd harmonics did not correct weak-fundamental octave ambiguity");
+    require(stages == std::vector<SourceAnalysisStage>{SourceAnalysisStage::PitchAndAmplitude,
+        SourceAnalysisStage::Harmonics, SourceAnalysisStage::Regions}, "analysis stage order wrong");
+    for (std::size_t frame = 4; frame + 4 < corrected.analysis->pitch_trajectory.size(); ++frame)
+        require(std::abs(corrected.analysis->pitch_trajectory[frame].frequency_hz - 220.0) < 3.0,
+            "weak-fundamental correction unstable between frames");
+
+    // A visible fundamental with a much stronger second must remain the pitch.
+    for (std::size_t i = 0; i < weak->mono_samples.size(); ++i) {
+        const auto phase = tau * 220.0 * i / weak->sample_rate;
+        weak->mono_samples[i] = static_cast<float>(0.12 * std::sin(phase)
+            + 0.7 * std::sin(phase * 2.0) + 0.06 * std::sin(phase * 3.0));
+    }
+    weak->interleaved_samples = weak->mono_samples;
+    const auto visible = analyzeCompositeWaveSource(weak, {0, weak->mono_samples.size()});
+    require(visible.analysis && std::abs(visible.analysis->reference_pitch_hz - 220.0) < 3.0,
+        "stronger second partial displaced supported fundamental");
+
+    auto chirp = tone(0.4, 220.0);
+    double chirp_phase{};
+    for (std::size_t i = 0; i < chirp->mono_samples.size(); ++i) {
+        chirp_phase += tau * (220.0 + 220.0 * i / chirp->mono_samples.size()) / chirp->sample_rate;
+        chirp->mono_samples[i] = static_cast<float>(0.6 * std::sin(chirp_phase));
+    }
+    chirp->interleaved_samples = chirp->mono_samples;
+    const auto swept = analyzeCompositeWaveSource(chirp, {0, chirp->mono_samples.size()});
+    require(static_cast<bool>(swept.analysis), "chirp analysis failed");
+    double previous{}, first{}, last{};
+    for (const auto& pitch : swept.analysis->pitch_trajectory) {
+        if (pitch.frequency_hz <= 0.0) continue;
+        if (first == 0.0) first = pitch.frequency_hz;
+        if (previous > 0.0)
+            require(std::abs(std::log2(pitch.frequency_hz / previous)) < 0.2,
+                "harmonic correction caused chirp octave discontinuity");
+        previous = last = pitch.frequency_hz;
+    }
+    require(last - first > 90.0, "chirp pitch motion was flattened");
+
+    const auto pure = tone(0.4, 440.0);
+    const auto periodic = analyzeCompositeWaveSource(pure, {0, pure->mono_samples.size()});
+    require(periodic.analysis && std::abs(periodic.analysis->reference_pitch_hz - 440.0) < 3.0,
+        "unheard pure-tone subharmonic invented");
+    const auto& clean_frame = periodic.analysis->harmonic_trajectory[20];
+    require(clean_frame.periodic_confidence > 0.9 && clean_frame.periodic_rms > 0.35
+        && clean_frame.residual_rms < 0.08, "coherent periodic reconstruction inaccurate");
+    require(periodic.analysis->periodic_confidence > 0.9 && periodic.analysis->periodic_rms > 0.35,
+        "periodic selection summary inaccurate");
+
+    for (bool inharmonic : {false, true}) {
+        auto mixture = tone(0.4, 440.0);
+        std::uint32_t random_state = 123456789U;
+        for (std::size_t i = 0; i < mixture->mono_samples.size(); ++i) {
+            random_state = random_state * 1664525U + 1013904223U;
+            const auto component = inharmonic
+                ? 0.35 * std::sin(tau * 440.0 * std::sqrt(2.0) * i / mixture->sample_rate)
+                : 0.7 * (static_cast<double>(random_state >> 8) / 16777215.0 * 2.0 - 1.0);
+            mixture->mono_samples[i] = static_cast<float>(mixture->mono_samples[i] * 0.6 + component);
+        }
+        mixture->interleaved_samples = mixture->mono_samples;
+        SourceAnalysisOptions manual;
+        manual.reference_pitch_hz = 440.0;
+        const auto analyzed = analyzeCompositeWaveSource(mixture, {0, mixture->mono_samples.size()}, manual);
+        require(static_cast<bool>(analyzed.analysis), "residual fixture analysis failed");
+        const auto& frame = analyzed.analysis->harmonic_trajectory[20];
+        require(frame.residual_rms > 0.12
+            && frame.periodic_confidence < clean_frame.periodic_confidence - 0.15,
+            "noise/inharmonic energy was misclassified as representable periodic energy");
+        require(std::isfinite(frame.periodic_rms) && frame.periodic_confidence >= 0.0
+            && frame.periodic_confidence <= 1.0, "residual confidence invalid");
+    }
 }
 
 void variedSignalTests() {
@@ -289,11 +378,68 @@ void variedSignalTests() {
         {0, excessive_source->mono_samples.size()}).completion == SourceAnalysisCompletion::InvalidInput,
         "duration resource bound ignored");
 }
+
+void manualPitchGuideTests() {
+    const auto source = tone(0.4, 220.0);
+    const auto automatic = analyzeCompositeWaveSource(source, {0, source->mono_samples.size()});
+    SourceAnalysisOptions manual;
+    manual.reference_pitch_hz = 110.0;
+    const auto guided = analyzeCompositeWaveSource(source, {0, source->mono_samples.size()}, manual);
+    require(automatic.analysis && guided.analysis && guided.analysis->reference_pitch_hz == 110.0,
+        "manual reference summary incorrect");
+    const auto& harmonics = guided.analysis->harmonic_trajectory[20].harmonics;
+    require(harmonics.size() >= 2 && harmonics[0].amplitude < 0.05
+        && std::abs(harmonics[1].frequency_hz - 220.0) < 4.0
+        && std::abs(harmonics[1].amplitude - 0.6) < 0.05,
+        "manual missing fundamental did not change source220 into harmonic2");
+    for (std::size_t i = 0; i < guided.analysis->pitch_trajectory.size(); ++i)
+        require(std::abs(guided.analysis->pitch_trajectory[i].frequency_hz
+            - automatic.analysis->pitch_trajectory[i].frequency_hz * 0.5) < 1.0e-10,
+            "manual octave guide not reflected consistently in source trajectory");
+
+    manual.reference_pitch_hz = 230.0;
+    const auto nearby = analyzeCompositeWaveSource(source, {0, source->mono_samples.size()}, manual);
+    require(static_cast<bool>(nearby.analysis), "nearby manual reference analysis failed");
+    for (std::size_t i = 0; i < nearby.analysis->pitch_trajectory.size(); ++i)
+        require(nearby.analysis->pitch_trajectory[i].frequency_hz
+            == automatic.analysis->pitch_trajectory[i].frequency_hz,
+            "non-octave manual guide transposed measured source pitch");
+
+    auto moving = tone(0.4, 220.0);
+    double phase{};
+    for (std::size_t i = 0; i < moving->mono_samples.size(); ++i) {
+        const auto time = static_cast<double>(i) / moving->sample_rate;
+        const auto f0 = 220.0 + 330.0 * i / moving->mono_samples.size()
+            + 8.0 * std::sin(tau * 4.0 * time);
+        phase += tau * f0 / moving->sample_rate;
+        moving->mono_samples[i] = static_cast<float>(0.6 * std::sin(phase));
+    }
+    moving->interleaved_samples = moving->mono_samples;
+    const auto measured = analyzeCompositeWaveSource(moving, {0, moving->mono_samples.size()});
+    manual.reference_pitch_hz = 190.0;
+    const auto aligned = analyzeCompositeWaveSource(moving, {0, moving->mono_samples.size()}, manual);
+    require(measured.analysis && aligned.analysis, "manual chirp/vibrato guide analysis failed");
+    double previous{}, minimum = 1.0e9, maximum{};
+    for (std::size_t i = 0; i < aligned.analysis->pitch_trajectory.size(); ++i) {
+        const auto actual = measured.analysis->pitch_trajectory[i].frequency_hz;
+        const auto adjusted = aligned.analysis->pitch_trajectory[i].frequency_hz;
+        require(std::abs(adjusted - actual * 0.5) < 1.0e-10,
+            "manual guide factor changed across chirp/vibrato");
+        if (adjusted <= 0.0) continue;
+        minimum = std::min(minimum, adjusted); maximum = std::max(maximum, adjusted);
+        if (previous > 0.0)
+            require(std::abs(std::log2(adjusted / previous)) < 0.2,
+                "manual guide introduced an octave discontinuity");
+        previous = adjusted;
+    }
+    require(maximum - minimum > 100.0, "manual guide flattened measured pitch variation");
+}
 } // namespace
 
 int main() {
     try {
-        decoderTests(); selectionLocalStereoTests(); pitchAndHarmonicTests(); selectionAndFailureTests(); variedSignalTests();
+        decoderTests(); selectionLocalStereoTests(); pitchAndHarmonicTests(); selectionAndFailureTests();
+        harmonicPitchCorrectionAndResidualTests(); variedSignalTests(); manualPitchGuideTests();
         std::cout << "Composite WAV analysis tests passed.\n";
         return 0;
     } catch (const std::exception& error) {

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -70,6 +71,14 @@ struct CompositeWavQualityWeights {
 
 enum class CompositeWavConversionCompletion { Completed, Cancelled, InvalidInput, NoValidCandidate };
 
+// Offline search diagnostics, never part of timbre/plugin persistence. A trial
+// is counted only when its complete candidate reaches the actual Engine.
+enum class CompositeWavSearchFamily { MorphInterval, KeyTime, WaveShape, Envelope, Loop, Reduction, Count };
+struct CompositeWavSearchDiagnostics {
+    std::array<std::size_t, static_cast<std::size_t>(CompositeWavSearchFamily::Count)> trials{};
+    std::array<std::size_t, static_cast<std::size_t>(CompositeWavSearchFamily::Count)> accepted{};
+};
+
 struct CompositeWavConversionResult {
     CompositeWavConversionCompletion completion{CompositeWavConversionCompletion::InvalidInput};
     std::optional<CompositeTimbre> composite_tone;
@@ -77,10 +86,12 @@ struct CompositeWavConversionResult {
     CompositeWavRenderResult preview;
     std::shared_ptr<const SourceAnalysis> analysis_reference;
     std::size_t evaluations{};
+    std::size_t loop_probe_renders{}; // Bounded held-note renders, separate from candidate evaluations.
     double elapsed_seconds{};
     double initial_loss{};
     double best_loss{};
     CompositeWavQualityMetrics quality;
+    CompositeWavSearchDiagnostics search;
     std::vector<std::string> warnings;
     std::string error;
 };

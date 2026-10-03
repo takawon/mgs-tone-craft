@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -58,6 +59,11 @@ struct HarmonicTrajectoryFrame {
     std::vector<HarmonicComponent> harmonics;
     double residual_rms{};
     double spectral_centroid_hz{};
+    // Weighted coherent reconstruction and its explained source-energy fraction.
+    // Residual includes noise, detuned partials and harmonics beyond the limit;
+    // these are analysis/evaluation hints, never an additional sound-chip voice.
+    double periodic_rms{};
+    double periodic_confidence{}; // [0,1]; zero for silence/unresolved pitch.
 };
 
 struct AmplitudeEnvelopeFrame {
@@ -96,6 +102,10 @@ struct SourceAnalysis {
     std::optional<EstimatedKeyOff> estimated_key_off;
     double confidence{};
     std::vector<std::string> warnings;
+    // Selection summaries: time-weighted RMS and source-energy-weighted
+    // explained fraction. Silence never acquires periodic confidence.
+    double periodic_rms{};
+    double periodic_confidence{};
 
     [[nodiscard]] std::span<const float> analysisPcm() const noexcept {
         return !analysis_mono_override.empty() ? std::span<const float>(analysis_mono_override)
@@ -103,13 +113,19 @@ struct SourceAnalysis {
     }
 };
 
+enum class SourceAnalysisStage { PitchAndAmplitude, Harmonics, Regions };
+
 struct SourceAnalysisOptions {
+    // F0 guide: align the measured trajectory by one median-based octave
+    // factor; retain within-octave pitch fluctuation and unknown-frame status.
     std::optional<double> reference_pitch_hz;
     double minimum_pitch_hz{40.0};
     double maximum_pitch_hz{2000.0};
     double hop_seconds{0.01};
     std::size_t maximum_harmonics{16};
     std::shared_ptr<std::atomic<bool>> cancel_requested;
+    // Called on the analysis worker; clients must publish UI progress safely.
+    std::function<void(SourceAnalysisStage)> stage_changed;
 };
 
 enum class SourceAnalysisCompletion { Completed, Cancelled, InvalidInput };
