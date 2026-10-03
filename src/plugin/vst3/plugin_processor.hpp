@@ -7,12 +7,15 @@
 #include <cstdint>
 #include <mutex>
 #include <span>
+#include <vector>
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "host_engine_timeline.hpp"
 #include "layer_delay_scheduler.hpp"
 #include "plugin_state.hpp"
+#include "plugin_pcm_preview.hpp"
+#include "editor_session.hpp"
 #include "vst3_diagnostic.hpp"
 #include "mgstc/audio/stereo_sample_rate_converter.hpp"
 #include "mgstc/engine/composite_program_compiler.hpp"
@@ -85,6 +88,12 @@ public:
     [[nodiscard]] bool editorNoteOff(std::uint8_t track);
     void editorSilenceTrack(std::uint8_t track);
     void editorFlushPending();
+    [[nodiscard]] bool editorPlayPcmPreview(
+        std::shared_ptr<const mgstc::engine::SourcePcm> pcm,
+        std::size_t begin, std::size_t end, float gain);
+    void editorStopPcmPreview() noexcept;
+    [[nodiscard]] bool editorRegisterBackgroundTask(
+        std::shared_ptr<mgstc::app::EditorBackgroundTask> task);
     void editorSetMasterVolumePercent(int percent);
     [[nodiscard]] int editorMasterVolumePercent() const noexcept;
     [[nodiscard]] std::uint64_t editorMasterVolumeRevision() const noexcept;
@@ -235,6 +244,11 @@ private:
     [[nodiscard]] bool hostIsEngineRate() const noexcept;
 
     mgstc::engine::RealtimeEngineHost engine_{};
+    PluginPcmPreview pcm_preview_{};
+    // Message/background control only. Never accessed by processBlock.
+    std::mutex background_tasks_mu_;
+    std::vector<std::shared_ptr<mgstc::app::EditorBackgroundTask>> background_tasks_;
+    bool background_tasks_shutdown_{};
     mgstc::engine::SequentialVoiceAllocator voices_{kMaxVoices};
     std::array<mgstc::engine::CompositePlaybackPlan, 3> plan_slots_{};
     std::atomic<std::uint8_t> published_plan_{0};

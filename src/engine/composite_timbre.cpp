@@ -35,6 +35,8 @@ CompositeLayer makeLayer(
     layer.name = std::move(name);
     layer.source = source;
     layer.channel = channel;
+    if (source == TimbreSource::Scc)
+        layer.scc_output_allocation = SccOutputAllocationMode::Contiguous;
     layer.volume_envelope = defaultEnvelope();
     return layer;
 }
@@ -159,6 +161,7 @@ void seedDefaultLayerTimbre(
     CompositeTimbre& dest, CompositeLayer& layer) noexcept {
     seedDefaultLayerTimbre(layer);
     if (layer.source == TimbreSource::Scc && layer.base_timbre) {
+        layer.scc_output_allocation = SccOutputAllocationMode::Contiguous;
         layer.base_timbre->library_id =
             allocateCompositeOwnedTimbreId(dest);
     }

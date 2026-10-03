@@ -34,6 +34,16 @@
 namespace mgstc::app {
 
 struct CompositeEditorComponentTestAccess {
+    static const mgstc::engine::CompositeTimbre& sound(const CompositeEditorComponent& editor) { return editor.timbre_; }
+    static bool wavEnabled(const CompositeEditorComponent& editor) { return editor.import_wave_.isEnabled(); }
+    static std::size_t historySize(const CompositeEditorComponent& editor) { return editor.history_.size(); }
+    static void applyWave(CompositeEditorComponent& editor, const mgstc::engine::CompositeTimbre& sound) { editor.applyWaveConversion(sound); }
+    static void undo(CompositeEditorComponent& editor) { editor.undo(); }
+    static void redo(CompositeEditorComponent& editor) { editor.redo(); }
+    static bool matches(const CompositeEditorComponent& editor, const mgstc::engine::CompositeTimbre& snapshot) {
+        return editor.waveConversionSnapshotMatches(snapshot, {});
+    }
+    static void editName(CompositeEditorComponent& editor, const std::string& name) { editor.timbre_.name = name; }
     static void start(CompositeEditorComponent& editor, std::uint8_t note,
         bool one_second = false) {
         editor.startCompositeNote(note, one_second);
@@ -85,6 +95,26 @@ struct CompositeEditorComponentTestAccess {
         return std::any_of(editor.scheduled_layer_notes_.begin(),
             editor.scheduled_layer_notes_.end(),
             [note](const auto& layer) { return layer.base_note == note; });
+    }
+};
+
+struct CompositeWavConversionTestAccess {
+    static bool accept(CompositeWavConversionContent& content,
+        mgstc::engine::CompositeWavConversionResult result,
+        std::shared_ptr<const mgstc::engine::SourcePcm> pcm, bool cancelled = false) {
+        return content.acceptCompletedConversion(std::move(result), std::move(pcm), cancelled, 0.5f, 0.25f);
+    }
+    static const std::optional<mgstc::engine::CompositeWavConversionResult>& result(const CompositeWavConversionContent& content) { return content.result_; }
+    static void source(CompositeWavConversionContent& content, std::shared_ptr<const mgstc::engine::SourcePcm> pcm) {
+        content.source_ = std::move(pcm); content.range_.setSource(content.source_); content.syncRange(); content.refreshEnabled();
+    }
+    static void tab(CompositeWavRange& range) { range.active_start_ = !range.active_start_; }
+    static bool matchOn(const CompositeWavConversionContent& content) { return content.level_match_.getToggleState(); }
+    static bool buttonsInside(const CompositeWavConversionContent& content) {
+        return content.getLocalBounds().contains(content.level_match_.getBounds())
+            && content.level_match_.getWidth() >= UiScale::sx(250)
+            && content.status_.getHeight() >= UiScale::sx(100)
+            && content.getLocalBounds().contains(content.apply_.getBounds());
     }
 };
 
@@ -3428,14 +3458,19 @@ void testSccMorphPluginStateCompatibility() {
     layer.opll_tl_modulation = {};
     layer.opll_fb_modulation = {};
     document.sound.embedded_timbres.clear();
+    // One event-free layer: v22 adds two allocation bytes before the embedded
+    // count; no manual start is present in this legacy-mode fixture.
+    layer.scc_output_allocation = SccOutputAllocationMode::LegacyBank;
+    layer.scc_output_start.reset();
     const auto original = toBytes(soundBytes(document.sound));
     const auto framed = mgstc::plugin::serializePluginState(document);
-    // One event-free layer: v21 adds only the five global morph bytes.
+    // v21 adds only the five global morph bytes.
     // v20 adds four six-byte modulation settings before the embedded count.
-    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}}) {
+    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3}}) {
         auto legacy = original;
         require(legacy.size() >= 33, "legacy sound fixture tail exists");
-        legacy.resize(legacy.size() - 5);
+        legacy.erase(legacy.end() - 11, legacy.end() - 9);
+        if (version <= 2) legacy.resize(legacy.size() - 5);
         if (version == 1) {
             legacy.erase(legacy.end() - 28, legacy.end() - 4);
         }
@@ -3448,9 +3483,9 @@ void testSccMorphPluginStateCompatibility() {
         blob[at - 7] = blob[at - 6] = blob[at - 5] = 0;
         const auto parsed = mgstc::plugin::parsePluginState(blob.data(), blob.size());
         require(parsed.status == mgstc::plugin::PluginStateStatus::Ok,
-                "legacy v1/v2 plugin sound payload readable");
+                "legacy v1/v2/v3 plugin sound payload readable");
         auto expected_legacy_sound = document.sound;
-        expected_legacy_sound.scc_morph_algorithm_version = 1;
+        if (version <= 2) expected_legacy_sound.scc_morph_algorithm_version = 1;
         require(soundBytes(parsed.document.sound) == soundBytes(expected_legacy_sound),
                 "legacy plugin payload defaults preserve sound");
     }
@@ -3469,6 +3504,9 @@ void testSccMorphPluginStateCompatibility() {
          .scc_morph = {.enabled = true, .intermediate_count = 3, .curve = 2.0}},
     };
     document.sound.scc_morph_bank_base = 16;
+    layer.scc_output_allocation = SccOutputAllocationMode::Contiguous;
+    layer.scc_output_start = 20;
+    layer.timbre_automation.back().scc_morph.curve = 0.5;
     requireSoundRoundTrip(document);
     MgstcAudioProcessor processor;
     require(processor.replacePluginState(document), "morph plugin state compiles");
@@ -4040,6 +4078,155 @@ void testCompositeEditorDelayedKeyOff() {
         "rebuilt program does not inherit an old release on a reused voice");
 }
 
+#include "vst3_pcm_preview_tests.inc"
+
+void testConversionOwnerClose() {
+    auto owner = std::make_unique<juce::Component>();
+    auto progress = std::make_shared<mgstc::app::ConversionProgressState>();
+    auto finish = std::make_shared<std::atomic_bool>(false);
+    bool done = false, cancelled = false;
+    mgstc::app::runWithConversionBusyDialog(owner.get(),
+        [finish](mgstc::app::ConversionProgressState&) {
+            while (!finish->load(std::memory_order_acquire)) juce::Thread::sleep(1);
+            return 42;
+        }, [&](int result, bool was_cancelled) {
+            require(result == 42, "owner close retains worker result");
+            cancelled = was_cancelled; done = true;
+        }, progress);
+    owner.reset();
+    for (int wait = 0; wait < 100 && !progress->cancellationRequested(); ++wait)
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    const bool cancellation_requested = progress->cancellationRequested();
+    const bool dialog_hidden = juce::Component::getNumCurrentlyModalComponents() == 0;
+    const bool worker_retained = !done;
+    finish->store(true, std::memory_order_release);
+    for (int wait = 0; wait < 100 && !done; ++wait)
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    require(cancellation_requested && dialog_hidden && worker_retained,
+            "owner close cancels and hides dialog without waiting for worker");
+    require(done && cancelled, "closed owner cannot publish successful conversion");
+}
+void testConversionCompletionCancellation() {
+    for (const bool cancel : {false, true}) {
+        auto progress = std::make_shared<mgstc::app::ConversionProgressState>();
+        auto ready = std::make_shared<std::atomic_bool>(false);
+        bool done = false;
+        bool observed_cancel = false;
+        mgstc::app::runWithConversionBusyDialog(nullptr,
+            [ready](mgstc::app::ConversionProgressState&) {
+                ready->store(true, std::memory_order_release);
+                return 42;
+            }, [&done, &observed_cancel](int result, bool cancelled) {
+                require(result == 42, "busy completion result preserved");
+                observed_cancel = cancelled;
+                done = true;
+            }, progress);
+        for (int wait = 0; wait < 500 && !ready->load(std::memory_order_acquire); ++wait)
+            juce::Thread::sleep(10);
+        require(ready->load(), "conversion worker finishes within timeout");
+        // Keep message dispatch paused until the worker has posted completion.
+        juce::Thread::sleep(20);
+        if (cancel) progress->requestCancellation();
+        for (int wait = 0; wait < 100 && !done; ++wait)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+        require(done && observed_cancel == cancel,
+                "late cancellation checked before publication; normal completion remains successful");
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    }
+}
+void testCompositeWavUiTransactions() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    using WavAccess = mgstc::app::CompositeWavConversionTestAccess;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    auto original = mgstc::engine::defaultCompositeTimbre();
+    original.name = "Full original";
+    original.tags = {"Preserved"};
+    original.favorite = true;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {}, [] {}, [](std::uint8_t) {},
+        [](juce::Component*) {}, [] {}, original);
+    const auto before = EditorAccess::sound(editor);
+    auto converted = sccOnlyTimbre(); converted.name = "WAV result";
+    const auto history_before = EditorAccess::historySize(editor);
+    require(EditorAccess::wavEnabled(editor), "VST shared editor enables WAV conversion button");
+    require(context.pcmPreview() != nullptr, "VST converter uses host PCM boundary");
+    {
+        mgstc::app::CompositeWavConversionContent content(
+            [&](const mgstc::engine::CompositeTimbre&, std::function<void()>) { throw std::runtime_error("Apply must be explicit"); }, context.pcmPreview(), context.backgroundTasks());
+        auto pcm = std::make_shared<mgstc::engine::SourcePcm>();
+        pcm->sample_rate = 48000; pcm->channels = 2;
+        pcm->mono_samples.assign(128, 0.1f); pcm->interleaved_samples.assign(256, 0.1f);
+        WavAccess::source(content, pcm);
+        mgstc::engine::CompositeWavConversionResult valid;
+        valid.completion = mgstc::engine::CompositeWavConversionCompletion::Completed;
+        valid.composite_tone = converted;
+        require(WavAccess::accept(content, valid, pcm), "UI accepts completed conversion");
+        require(WavAccess::matchOn(content), "comparison level matching defaults ON");
+        require(!WavAccess::accept(content, {}, {}), "failed reconversion rejected");
+        require(WavAccess::result(content)->composite_tone == converted, "failed reconversion retains old full tone");
+        require(!WavAccess::accept(content, valid, pcm, true), "cancelled reconversion rejected");
+        require(WavAccess::result(content)->composite_tone == converted, "cancelled reconversion retains old full tone");
+        const auto old_scale = UiScale::active_percent;
+        for (const int scale : {75, 100, 125}) {
+            UiScale::setActivePercent(scale);
+            content.setSize(UiScale::sx(900), UiScale::sx(900)); content.resized();
+            require(WavAccess::buttonsInside(content), "converter minimum layout preserves comparison and result controls");
+            auto image = content.createComponentSnapshot(content.getLocalBounds());
+            const auto folder = juce::File::getCurrentWorkingDirectory().getChildFile("build/composite-wav-ui-captures");
+            require(folder.createDirectory().wasOk(), "converter capture directory");
+            const auto stream = folder.getChildFile("converter-" + juce::String(scale) + ".png").createOutputStream();
+            require(stream && stream->openedOk(), "converter capture output");
+            stream->setPosition(0); stream->truncate();
+            require(juce::PNGImageFormat().writeImageToStream(image, *stream), "converter UI capture PNG");
+        }
+        UiScale::setActivePercent(old_scale);
+    }
+    require(EditorAccess::sound(editor) == before && EditorAccess::historySize(editor) == history_before,
+        "closing converter without Apply preserves complete authoring state and history");
+    require(EditorAccess::matches(editor, before), "unchanged conversion snapshot accepted");
+    EditorAccess::editName(editor, "Changed while converting");
+    require(!EditorAccess::matches(editor, before), "stale editor snapshot requires confirmation");
+    EditorAccess::editName(editor, before.name);
+    EditorAccess::applyWave(editor, converted);
+    require(EditorAccess::sound(editor) == converted && EditorAccess::sound(editor).layers.size() == 1,
+        "WAV Apply fully replaces all old channels");
+    require(EditorAccess::historySize(editor) == history_before + 1, "WAV replacement is one history operation");
+    EditorAccess::undo(editor);
+    require(EditorAccess::sound(editor) == before, "Undo restores all previous authoring data");
+    EditorAccess::redo(editor);
+    require(EditorAccess::sound(editor) == converted, "Redo restores entire converted data");
+}
+
+void testCompositeWavRangeInteractions() {
+    using WavAccess = mgstc::app::CompositeWavConversionTestAccess;
+    auto pcm = std::make_shared<mgstc::engine::SourcePcm>();
+    pcm->sample_rate = 48000; pcm->channels = 2;
+    pcm->mono_samples.assign(1000, 0); pcm->interleaved_samples.assign(2000, 0.25f);
+    mgstc::app::CompositeWavRange range; range.setSize(1000, 150); range.setSource(pcm);
+    require(range.selection().begin == 0 && range.selection().end == 1000, "range end is original frame count exclusive");
+    range.setSelection(100, 900);
+    int callbacks = 0; bool last_start = false;
+    range.changed = [&](bool start) { ++callbacks; last_start = start; };
+    auto event = [&](float x, bool pressed, bool dragged) {
+        return juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(), {x, 60.0f},
+            juce::ModifierKeys(pressed ? juce::ModifierKeys::leftButtonModifier : 0), 1, 0, 0, 0, 0,
+            &range, &range, juce::Time::getCurrentTime(), {100.0f, 60.0f}, juce::Time::getCurrentTime(), 1, dragged);
+    };
+    range.mouseDown(event(100, true, false)); range.mouseDrag(event(200, true, true));
+    require(callbacks == 0 && range.selection().begin == 200, "handle dragging changes sample range without preview retrigger");
+    range.mouseUp(event(200, false, true));
+    require(callbacks == 1 && last_start, "start release triggers exactly one preview request");
+    range.mouseDown(event(900, true, false)); range.mouseDrag(event(1000, true, true)); range.mouseUp(event(1000, false, true));
+    require(callbacks == 2 && !last_start && range.selection().end == 1000, "end release preserves exclusive final frame");
+    require(range.keyPressed(juce::KeyPress(juce::KeyPress::leftKey)), "range handles support keyboard adjustment");
+    require(range.selection().end == 999, "keyboard adjusts end by one original sample");
+    range.setSelection(950, 900);
+    require(range.selection().end > range.selection().begin, "range prevents reversed/empty selection");
+}
+
 void testTemporaryCompositePreviewPreservesState() {
     MgstcAudioProcessor processor;
     const auto before = stateBytes(processor);
@@ -4212,6 +4399,15 @@ int main() {
         testCompositeEditorDelayedKeyOff();
         testPluginSoundAuthority();
         testTemporaryCompositePreviewPreservesState();
+        testVstPcmPreviewStereoRangeGainAndHostRate();
+        testVstPcmPreviewMuteClampAndInvalidRequests();
+        testVstPcmPreviewReplaceStopAndLifecycle();
+        testVstSharedSccMorphHostAudio();
+        testVstConverterWorkerQuiescesAtProcessorTeardown();
+        testConversionOwnerClose();
+        testConversionCompletionCancellation();
+        testCompositeWavUiTransactions();
+        testCompositeWavRangeInteractions();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

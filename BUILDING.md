@@ -167,6 +167,13 @@ WAV 2秒122,088.9ms（hash `7ca5239c56a82f02`）を測定済み。
 .\tools\build.cmd -SkipTests
 ```
 
+変更箇所の回帰を先に確認する場合は、同じラッパーへCTest名の正規表現を渡せる。
+指定を省略すると全試験を実行し、指定した試験が存在しない場合は失敗する。
+
+```powershell
+.\tools\build.cmd -Configuration Release -TestRegex "composite_wav"
+```
+
 並列数を変更する場合:
 
 ```powershell

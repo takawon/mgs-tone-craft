@@ -19,6 +19,7 @@ inline constexpr std::uint32_t kSccMorphAlgorithmVersion = 2;
     return version == 1 || version == kSccMorphAlgorithmVersion;
 }
 inline constexpr double kSccMorphGammaMax = 8.0;
+inline constexpr double kSccMorphGammaMin = 1.0 / kSccMorphGammaMax;
 
 struct SccMorphDescriptors {
     double centroid{}, spread{}, slope{}, odd_even{}, irregularity{}, flatness{};
@@ -98,6 +99,12 @@ struct SccMorphPairTrace {
     std::vector<SccMorphStepTrace> steps;
 };
 
+struct SccMorphChannelAllocation {
+    std::size_t layer_index{};
+    std::uint8_t start{}, count{};
+    bool manual{};
+};
+
 struct SccMorphCompileResult {
     CompositeTimbre timbre;
     bool valid{true};
@@ -106,6 +113,7 @@ struct SccMorphCompileResult {
     // slots already occupied in the selected 0..31 / 16..31 range.
     std::size_t used{}, capacity{}, required{};
     std::vector<SccMorphWaveDiagnostic> diagnostics;
+    std::vector<SccMorphChannelAllocation> channel_allocations;
 };
 
 [[nodiscard]] double morphPosition(double time, double gamma) noexcept;

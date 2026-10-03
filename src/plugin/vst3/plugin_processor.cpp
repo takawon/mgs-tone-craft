@@ -79,6 +79,16 @@ MgstcAudioProcessor::MgstcAudioProcessor()
 }
 
 MgstcAudioProcessor::~MgstcAudioProcessor() {
+    std::vector<std::shared_ptr<mgstc::app::EditorBackgroundTask>> tasks;
+    {
+        std::lock_guard<std::mutex> lock(background_tasks_mu_);
+        background_tasks_shutdown_ = true;
+        tasks.swap(background_tasks_);
+    }
+    // Cancel every worker before waiting for any one worker. The editor can
+    // close immediately; processor destruction is the off-audio DLL-unload gate.
+    for (const auto& task : tasks) task->cancel();
+    for (const auto& task : tasks) task->join();
     writeDiagnosticSnapshot("destructor");
 }
 
@@ -269,6 +279,7 @@ void MgstcAudioProcessor::resetProgramState() noexcept {
 void MgstcAudioProcessor::prepareToPlay(
     double sampleRate,
     int samplesPerBlock) {
+    pcm_preview_.stop();
     diag_prepare_to_play_.fetch_add(1, std::memory_order_relaxed);
     diag_last_samples_per_block_.store(
         samplesPerBlock, std::memory_order_relaxed);
@@ -331,6 +342,7 @@ void MgstcAudioProcessor::prepareToPlay(
 }
 
 void MgstcAudioProcessor::releaseResources() {
+    pcm_preview_.stop();
     diag_release_resources_.fetch_add(1, std::memory_order_relaxed);
     resetPlaybackState(true);
     engine_frame_position_ = 0;
@@ -345,6 +357,7 @@ void MgstcAudioProcessor::releaseResources() {
 }
 
 void MgstcAudioProcessor::reset() {
+    pcm_preview_.stop();
     diag_reset_.fetch_add(1, std::memory_order_relaxed);
     juce::AudioProcessor::reset();
 }
@@ -436,6 +449,7 @@ void MgstcAudioProcessor::processBlock(
     } else {
         processDirectBlock(buffer, midi, num_samples);
     }
+    pcm_preview_.render(buffer, static_cast<double>(host_rate_hz_));
     applyMasterVolume(buffer, num_samples);
     host_frame_position_ += static_cast<std::uint64_t>(num_samples);
     midi_it_ = {};
@@ -1333,6 +1347,8 @@ bool MgstcAudioProcessor::commitPluginState(
         return false;
     }
 
+    pcm_preview_.stop();
+
     if (mode == CommitMode::Offline) {
         std::array<float, 64> drain{};
         engine_.drainPendingCommands(drain, 32, true);
@@ -1463,6 +1479,32 @@ void MgstcAudioProcessor::editorFlushPending() {
     }
     std::array<float, 256> drain{};
     engine_.drainPendingCommands(drain, 250, true);
+}
+
+bool MgstcAudioProcessor::editorPlayPcmPreview(
+    std::shared_ptr<const mgstc::engine::SourcePcm> pcm,
+    std::size_t begin, std::size_t end, float gain) {
+    if (onAudioThread() || !host_prepared_.load(std::memory_order_acquire)) return false;
+    return pcm_preview_.play(std::move(pcm), begin, end, gain);
+}
+
+void MgstcAudioProcessor::editorStopPcmPreview() noexcept {
+    pcm_preview_.stop();
+}
+
+bool MgstcAudioProcessor::editorRegisterBackgroundTask(
+    std::shared_ptr<mgstc::app::EditorBackgroundTask> task) {
+    if (!task || onAudioThread()) return false;
+    std::lock_guard<std::mutex> lock(background_tasks_mu_);
+    if (background_tasks_shutdown_) return false;
+    std::erase_if(background_tasks_, [](const auto& previous) {
+        return previous->completed();
+    });
+    // One modal conversion per editor. The extra slots allow reopen while a
+    // cancelled old operation reaches its next bounded cancellation point.
+    if (background_tasks_.size() >= 4) return false;
+    background_tasks_.push_back(std::move(task));
+    return true;
 }
 
 void MgstcAudioProcessor::editorSetMasterVolumePercent(int percent) {

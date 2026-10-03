@@ -198,7 +198,7 @@ bool allFinite(const SccMorphDescriptors& d) {
 }
 
 void testCurveAndQuantizedGeneration() {
-    for (const double gamma : {1.0, kSccMorphGammaMax}) {
+    for (const double gamma : {kSccMorphGammaMin, 1.0, kSccMorphGammaMax}) {
         requireNear(morphPosition(0.0, gamma), 0.0, 1e-12,
                     "morph curve starts at source");
         requireNear(morphPosition(1.0, gamma), 1.0, 1e-12,
@@ -219,6 +219,8 @@ void testCurveAndQuantizedGeneration() {
     }
     require(morphPosition(0.25, kSccMorphGammaMax) > 0.25,
             "front-loaded curve advances faster near the start");
+    require(morphPosition(0.75, kSccMorphGammaMin) < 0.75,
+            "back-loaded curve advances slower before its endpoint");
 
     const auto first = sawWave();
     const auto last = sawWave(3, 8);
@@ -502,9 +504,79 @@ void testGlobalPhaseOptimizationAndTransitionCost() {
             "internal keyframe may use a phase-shifted derived waveform");
 }
 
+void testContiguousChannelAllocation() {
+    auto tone = morphProgram(sawWave(), sawWave(3), 0, 20, 0);
+    tone.layers.front().scc_output_allocation = SccOutputAllocationMode::Contiguous;
+    tone.layers.front().scc_output_start.reset();
+    auto second = tone.layers.front();
+    second.channel = 1;
+    second.scc_output_start = 0;
+    tone.layers.push_back(second);
+    const auto allocated = compileSccMorph(tone);
+    require(allocated.valid && allocated.channel_allocations.size() == 2,
+            "two SCC channels receive distinct contiguous ranges");
+    const auto a = allocated.channel_allocations[0];
+    const auto b = allocated.channel_allocations[1];
+    require(b.start == 0 && b.manual && a.start >= b.count,
+            "manual range reserved before automatic regardless of layer order");
+    require(allocated.used == a.count + b.count && allocated.capacity == 32,
+            "global capacity includes both complete channel ranges");
+    const auto saved = CompositeTimbreLibrary::serializeTimbreFile(tone, 0);
+    require(CompositeTimbreLibrary::deserializeTimbreFile(saved) == tone,
+            "manual and automatic starts survive portable save");
+    tone.layers.front().scc_output_start = 0;
+    const auto conflict = compileSccMorph(tone);
+    require(!conflict.valid && conflict.timbre == tone, "overlapping manual ranges fail atomically");
+    tone.layers.resize(1);
+    tone.layers.front().scc_output_start = 31;
+    require(!compileSccMorph(tone).valid, "multi-wave range cannot extend beyond @31");
+    tone.layers.front().timbre_automation.clear();
+    const auto lastSlot = compileSccMorph(tone);
+    require(lastSlot.valid && lastSlot.channel_allocations.front().start == 31
+            && lastSlot.channel_allocations.front().count == 1,
+            "single static waveform may occupy final slot");
+    require(formatMgsComposite(tone).valid(), "ordinary MGSC export shares final-slot allocation");
+    tone.layers.front().scc_output_start = 0;
+    tone.layers.front().envelope_timeline.length_counts = 64;
+    for (std::size_t i = 0; i < 32; ++i) {
+        SccWaveform wave{};
+        wave.fill(static_cast<std::int8_t>(i));
+        auto ref = sccTone(2000 + i, static_cast<std::uint8_t>(i), wave);
+        tone.embedded_timbres.push_back(ref);
+        tone.layers.front().timbre_automation.push_back(toneEvent(ref.library_id, static_cast<std::uint32_t>(i + 1)));
+        if (i == 30) {
+            const auto full = compileSccMorph(tone);
+            require(full.valid && full.used == 32, "exact global 32-wave capacity accepted");
+        }
+    }
+    require(!compileSccMorph(tone).valid, "33 distinct output waves rejected");
+    tone.layers.front().timbre_automation.clear();
+    auto legacy = tone.layers.front();
+    legacy.channel = 1;
+    legacy.scc_output_allocation = SccOutputAllocationMode::LegacyBank;
+    legacy.scc_output_start.reset();
+    legacy.base_timbre = sccTone(3000, 0, sawWave(5));
+    tone.layers.push_back(legacy);
+    require(!compileSccMorph(tone).valid, "contiguous range cannot overwrite ordinary channel waveform");
+}
 void testCompositeCompilationBoundariesAndAllocation() {
     const auto first = sawWave();
     const auto last = sawWave(3, 8);
+    const auto arbitrary_bank = morphProgram(first, last, 0, 20, 2, 7, kSccMorphGammaMin);
+    const auto arbitrary_compiled = compileSccMorph(arbitrary_bank);
+    require(arbitrary_compiled.valid, "arbitrary SCC start and back-loaded curve compile");
+    for (const auto& diagnostic : arbitrary_compiled.diagnostics)
+        if (diagnostic.generated)
+            require(diagnostic.output_number >= 7 && diagnostic.output_number <= 31,
+                    "arbitrary bank respects requested available region");
+    for (const auto& round_trip : {
+             CompositeTimbreLibrary::deserializeTimbreFile(
+                 CompositeTimbreLibrary::serializeTimbreFile(arbitrary_bank, 1)),
+             deserializeCompositeSoundPayload(serializeCompositeSoundPayload(arbitrary_bank),
+                                               kCompositeSoundPayloadVersion)}) {
+        require(round_trip.has_value() && serializeCompositeSoundPayload(*round_trip) == serializeCompositeSoundPayload(arbitrary_bank),
+                "arbitrary bank and back-loaded curve survive ordinary saving");
+    }
     auto input = morphProgram(first, last, 0, 20, 2, 16, 6.25);
     const auto output = compileSccMorph(input);
     require(output.valid, "valid SCC transition compiles");
@@ -1279,6 +1351,7 @@ int main() {
         testSilenceDcAndPhaseOnlyInputs();
         testSccMorphPhaseBMatrixAndTiming();
         testGlobalPhaseOptimizationAndTransitionCost();
+        testContiguousChannelAllocation();
         testCompositeCompilationBoundariesAndAllocation();
         testMorphBlockBoundaryAnchors();
         testMorphAcrossEnvelopeLoopBrackets();

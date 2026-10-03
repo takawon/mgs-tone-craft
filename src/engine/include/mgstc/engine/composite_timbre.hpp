@@ -46,6 +46,11 @@ enum class TimbreNumberMode : std::uint8_t {
     Manual,
 };
 
+enum class SccOutputAllocationMode : std::uint8_t {
+    LegacyBank,
+    Contiguous,
+};
+
 struct SavedTimbreReference {
     std::uint64_t library_id{};
     std::uint32_t revision{1};
@@ -364,6 +369,10 @@ struct CompositeLayer {
     std::string name;
     TimbreSource source{TimbreSource::Psg};
     std::uint8_t channel{};
+    // Rev.2 channel-owned contiguous output range. Null start means first-fit
+    // automatic allocation; legacy files retain the original bank allocator.
+    SccOutputAllocationMode scc_output_allocation{SccOutputAllocationMode::LegacyBank};
+    std::optional<std::uint8_t> scc_output_start;
     // Library snapshot for SCC / OPLL original. Mutually exclusive with
     // `base_opll_rom` on OPLL layers.
     std::optional<SavedTimbreReference> base_timbre;
@@ -409,7 +418,7 @@ struct CompositeLayer {
 struct CompositeTimbre {
     // Portable .mgstc / clipboard layout (name, tags, memo, favorite, then
     // sound body). Independent of SQLite kCompositeSoundPayloadVersion.
-    static constexpr std::uint32_t kFormatVersion = 21;
+    static constexpr std::uint32_t kFormatVersion = 22;
     static constexpr std::uint32_t kMinimumReadableFormatVersion = 5;
 
     std::uint32_t format_version{kFormatVersion};

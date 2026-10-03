@@ -4054,6 +4054,7 @@ void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
     REQUIRE_EQ(current_blob[current_blob.size() - 2], '\0');
     REQUIRE_EQ(current_blob[current_blob.size() - 1], '\0');
     auto previous_v1_blob = current_blob;
+    previous_v1_blob.erase(previous_v1_blob.size() - 11, 2); // v4 per-layer allocation bytes
     previous_v1_blob.erase(previous_v1_blob.size() - 5, 5);
     previous_v1_blob.erase(previous_v1_blob.size() - 28, 24);
     std::string error;
@@ -4074,6 +4075,7 @@ void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
     };
     auto current_blob_with_modulation = serializeCompositeSoundPayload(current);
     auto previous_v2_blob = current_blob_with_modulation;
+    previous_v2_blob.erase(previous_v2_blob.size() - 11, 2); // v4 per-layer allocation bytes
     previous_v2_blob.erase(previous_v2_blob.size() - 5, 5);
     const auto decoded_v2 = deserializeCompositeSoundPayload(
         previous_v2_blob, 2, &error);
@@ -4789,6 +4791,8 @@ void testMgsCompositeSourceRoundTrip() {
             return bytes;
         }(),
     };
+    // This fixture verifies the historical manual-number roundtrip.
+    scc.scc_output_allocation = SccOutputAllocationMode::LegacyBank;
     scc.relative_semitones = -5;
     scc.detune = 2;
     scc.micro_detune = -12;
