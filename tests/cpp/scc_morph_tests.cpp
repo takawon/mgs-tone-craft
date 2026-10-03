@@ -116,6 +116,7 @@ CompositeTimbre morphProgram(const SccWaveform& first,
                       .enabled = true,
                       .intermediate_count = intermediate_count,
                       .curve = curve,
+                      .distribution_mode = SccMorphDistributionMode::ToneDistribution,
                   }),
     };
     timbre.layers.push_back(std::move(layer));
@@ -144,11 +145,13 @@ CompositeTimbre blockProgram(const SccWaveform& x, const SccWaveform& a,
         toneEvent(tones[2].library_id, 8,
                   SccMorphTransition{.enabled = true,
                                      .intermediate_count = 0,
-                                     .curve = 1.0}),
+                                     .curve = 1.0,
+                                     .distribution_mode = SccMorphDistributionMode::ToneDistribution}),
         toneEvent(tones[3].library_id, 14,
                   SccMorphTransition{.enabled = true,
                                      .intermediate_count = 0,
-                                     .curve = 1.0}),
+                                     .curve = 1.0,
+                                     .distribution_mode = SccMorphDistributionMode::ToneDistribution}),
         toneEvent(tones[4].library_id, 20),
     };
     timbre.layers.push_back(std::move(layer));
@@ -384,6 +387,19 @@ void testSccMorphPhaseBMatrixAndTiming() {
     require(extreme.intermediate.size() == 255
                 && extreme.intermediate == extreme_repeat.intermediate,
             "maximum intermediate count and gamma remain finite and deterministic");
+    const auto maximum_tone_plan = planSccMorph(pulse, sine, 255,
+        kSccMorphGammaMax, 256,
+        SccMorphDistributionMode::ToneDistribution);
+    require(maximum_tone_plan.valid
+                && maximum_tone_plan.plan.points.size() == 257
+                && maximum_tone_plan.generated.intermediate == extreme.intermediate,
+            "maximum-count planned Tone generation remains byte-identical to the legacy wrapper");
+    for (std::size_t i = 1; i < maximum_tone_plan.plan.points.size(); ++i)
+        require(maximum_tone_plan.plan.points[i - 1].morph_position
+                    < maximum_tone_plan.plan.points[i].morph_position
+                    && maximum_tone_plan.plan.points[i - 1].event_count
+                        < maximum_tone_plan.plan.points[i].event_count,
+                "maximum-count gamma-8 legacy plan stays strictly ordered");
     for (const auto& diagnostic : extreme.diagnostics)
         require(std::isfinite(diagnostic.pre_quantization_error)
                     && std::isfinite(diagnostic.post_quantization_error)
@@ -436,6 +452,471 @@ void testSccMorphPhaseBMatrixAndTiming() {
         pulse, sine, 3, 1.0, repeat_trace, playback_counts);
     require(playback_pair.intermediate == repeated_playback.intermediate,
             "rounded-time transition optimization remains deterministic");
+}
+
+void testSccMorphDistributionPlans() {
+    require(SccMorphTransition{}.distribution_mode
+                == SccMorphDistributionMode::AdaptiveDistribution,
+            "new SCC transitions default to adaptive distribution");
+    const auto pulse = generateSccPreset(SccWavePreset::Pulse25, SccHarmonic::One);
+    const auto square = generateSccPreset(SccWavePreset::Square, SccHarmonic::One);
+    const auto triangle = generateSccPreset(SccWavePreset::Triangle, SccHarmonic::One);
+    const auto sine = generateSccPreset(SccWavePreset::Sine, SccHarmonic::One);
+    const SccWaveform silence{};
+    const auto phase_sine = rotateSccWaveform(sine, 7);
+    SccWaveform dc_a{}, dc_b{}, sparse_a{}, sparse_b{};
+    dc_a.fill(46);
+    dc_b.fill(-50);
+    for (std::size_t i = 0; i < 32; ++i) {
+        const double angle = 2.0 * std::numbers::pi * double(i) / 32.0;
+        sparse_a[i] = static_cast<std::int8_t>(std::lround(
+            80.0 * std::sin(2.0 * angle) + 26.0 * std::sin(7.0 * angle)));
+        sparse_b[i] = static_cast<std::int8_t>(std::lround(
+            52.0 * std::sin(3.0 * angle) + 21.0 * std::sin(11.0 * angle)));
+    }
+    struct Pair { const char* name; SccWaveform first, second; };
+    const std::array<Pair, 12> matrix{{
+        {"Pulse25 -> Sine", pulse, sine}, {"Sine -> Pulse25", sine, pulse},
+        {"Square -> Sine", square, sine}, {"Sine -> Square", sine, square},
+        {"Triangle -> Sine", triangle, sine}, {"same", sine, sine},
+        {"phase only", sine, phase_sine}, {"silence -> Sine", silence, sine},
+        {"Sine -> silence", sine, silence}, {"large DC", dc_a, dc_b},
+        {"large RMS", silence, pulse}, {"sparse", sparse_a, sparse_b},
+    }};
+    const std::array<SccMorphDistributionMode, 3> modes{
+        SccMorphDistributionMode::AdaptiveDistribution,
+        SccMorphDistributionMode::TimeDistribution,
+        SccMorphDistributionMode::ToneDistribution,
+    };
+    const auto verify_plan = [](const SccMorphPlanResult& result,
+                                std::uint8_t count, std::uint32_t duration) {
+        require(result.valid, "distribution plan is feasible");
+        require(result.plan.points.size() == std::size_t(count) + 2,
+                "MorphPlan includes both endpoints and every requested intermediate");
+        require(result.plan.points.front().morph_position == 0.0
+                    && result.plan.points.front().event_count == 0
+                    && result.plan.points.back().morph_position == 1.0
+                    && result.plan.points.back().event_count == duration,
+                "MorphPlan holds both endpoints exactly fixed");
+        for (std::size_t i = 1; i < result.plan.points.size(); ++i) {
+            require(result.plan.points[i - 1].morph_position
+                        < result.plan.points[i].morph_position,
+                    "MorphPlan positions are strictly increasing");
+            require(result.plan.points[i - 1].event_count
+                        < result.plan.points[i].event_count,
+                    "MorphPlan integer counts are strictly increasing");
+        }
+        require(result.generated.intermediate.size() == count,
+                "planned generation keeps the requested intermediate count");
+        require(std::isfinite(result.evaluation.total)
+                    && std::isfinite(result.evaluation.curve)
+                    && std::isfinite(result.evaluation.transition)
+                    && std::isfinite(result.evaluation.fidelity)
+                    && std::isfinite(result.evaluation.concentration)
+                    && std::isfinite(result.evaluation.max_wave_gap)
+                    && std::isfinite(result.evaluation.max_spectral_gap)
+                    && std::isfinite(result.evaluation.spectral_travel),
+                "plan diagnostics report finite quality values");
+        for (const auto& wave : result.generated.intermediate)
+            for (const auto sample : wave)
+                require(sample >= -128 && sample <= 127,
+                        "planned waveform remains in SCC signed-byte range");
+    };
+
+    // Exercise every pair boundary in every mode. N=8 cases below also check
+    // that each mode keeps a meaningful multi-step trajectory.
+    for (const auto& pair : matrix) {
+        for (const auto mode : modes) {
+            const auto result = planSccMorph(pair.first, pair.second, 1, 1.0,
+                12, mode);
+            verify_plan(result, 1, 12);
+            const auto regenerated = generateSccMorphPlanned(
+                pair.first, pair.second, result.plan);
+            require(regenerated.intermediate == result.generated.intermediate,
+                    "stored MorphPlan deterministically regenerates its wave sequence");
+        }
+    }
+
+    const std::array<std::size_t, 6> quality_pair_indices{0, 1, 2, 4, 9, 11};
+    for (const auto pair_index : quality_pair_indices) {
+        const auto& pair = matrix[pair_index];
+        for (const auto mode : modes) {
+            const auto result = planSccMorph(pair.first, pair.second, 8, 1.0,
+                72, mode);
+            verify_plan(result, 8, 72);
+            require(result.evaluation_available,
+                    "N=8 quality comparison uses a shared quantized evaluation");
+            std::cout << "SCC morph quality N=8 gamma=1 pair=" << pair.name
+                      << " mode=" << static_cast<int>(mode)
+                      << " fallback=" << result.fallback
+                      << " curve=" << result.evaluation.curve
+                      << " transition=" << result.evaluation.transition
+                      << " fidelity=" << result.evaluation.fidelity
+                      << " concentration=" << result.evaluation.concentration
+                      << " total=" << result.evaluation.total
+                      << " max_wave_gap=" << result.evaluation.max_wave_gap
+                      << " max_spectral_gap=" << result.evaluation.max_spectral_gap
+                      << " spectral_travel=" << result.evaluation.spectral_travel
+                      << '\n';
+        }
+    }
+
+    // At gamma=1 both fixed distributions describe exactly the same plan.
+    const auto uniform_time = planSccMorph(pulse, sine, 3, 1.0, 120,
+        SccMorphDistributionMode::TimeDistribution);
+    const auto uniform_tone = planSccMorph(pulse, sine, 3, 1.0, 120,
+        SccMorphDistributionMode::ToneDistribution);
+    verify_plan(uniform_time, 3, 120);
+    verify_plan(uniform_tone, 3, 120);
+    require(uniform_time.plan == uniform_tone.plan,
+            "uniform time and timbre distributions produce the same plan");
+    require(uniform_time.generated.intermediate == uniform_tone.generated.intermediate,
+            "uniform time and timbre distributions produce identical waves");
+
+    const auto gamma = kSccMorphGammaMax;
+    const auto time_fast = planSccMorph(pulse, sine, 3, gamma, 120,
+        SccMorphDistributionMode::TimeDistribution);
+    const auto tone_fast = planSccMorph(pulse, sine, 3, gamma, 120,
+        SccMorphDistributionMode::ToneDistribution);
+    verify_plan(time_fast, 3, 120);
+    verify_plan(tone_fast, 3, 120);
+    for (std::size_t i = 1; i <= 3; ++i) {
+        requireNear(time_fast.plan.points[i].morph_position,
+                    double(i) / 4.0, 1e-12,
+                    "time distribution keeps uniformly spaced morph positions");
+        requireNear(tone_fast.plan.points[i].event_count,
+                    double(120 * i) / 4.0, 0.0,
+                    "timbre distribution keeps uniformly spaced event counts");
+        requireNear(tone_fast.plan.points[i].morph_position,
+                    morphPosition(double(i) / 4.0, gamma), 1e-12,
+                    "timbre distribution applies the shared curve to position once");
+    }
+    require(time_fast.plan.points[1].event_count
+                < tone_fast.plan.points[1].event_count
+                && time_fast.plan.points[3].event_count
+                    < tone_fast.plan.points[3].event_count,
+            "time distribution moves event times along the requested ease-out curve");
+
+    const auto maximum_adaptive_started = std::chrono::steady_clock::now();
+    const auto maximum_adaptive = planSccMorph(sine, sine, 255, gamma, 256,
+        SccMorphDistributionMode::AdaptiveDistribution);
+    const auto maximum_adaptive_elapsed = std::chrono::steady_clock::now()
+        - maximum_adaptive_started;
+    verify_plan(maximum_adaptive, 255, 256);
+    require(maximum_adaptive.reference_points <= 128
+                && maximum_adaptive.evaluated_plans <= 128
+                && maximum_adaptive.working_set_bytes <= 64U * 1024U * 1024U,
+            "maximum-count adaptive search remains within reported bounds");
+    std::cout << "SCC morph distribution N=255 gamma=" << gamma
+              << " mode=adaptive elapsed_us="
+              << std::chrono::duration<double, std::micro>(maximum_adaptive_elapsed).count()
+              << " evaluated_plans=" << maximum_adaptive.evaluated_plans
+              << " reference_points=" << maximum_adaptive.reference_points
+              << " working_set_bytes=" << maximum_adaptive.working_set_bytes
+              << " fallback=" << maximum_adaptive.fallback << '\n';
+
+    const auto legacy = generateSccMorph(pulse, sine, 3, gamma);
+    const auto tone_regenerated = generateSccMorphPlanned(
+        pulse, sine, tone_fast.plan);
+    require(tone_regenerated.intermediate == legacy.intermediate,
+            "legacy generator wrapper preserves Tone Distribution bytes");
+
+    // Adaptive selection is scored against both fixed plans using one shared
+    // objective, then returns an ordered plan and bounded search diagnostics.
+    const std::array<std::size_t, 3> stress_counts{1, 8, 27};
+    for (const auto count_size : stress_counts) {
+        const auto count = static_cast<std::uint8_t>(count_size);
+        const auto duration = static_cast<std::uint32_t>((count_size + 1) * 8);
+        const auto legacy_started = std::chrono::steady_clock::now();
+        const auto legacy_wrapper = generateSccMorph(pulse, sine, count, gamma);
+        const auto legacy_elapsed = std::chrono::steady_clock::now() - legacy_started;
+        for (const auto mode : modes) {
+            const auto diagnostic_started = std::chrono::steady_clock::now();
+            const auto diagnostic_result = planSccMorph(pulse, sine, count, gamma,
+                duration, mode);
+            const auto diagnostic_elapsed = std::chrono::steady_clock::now()
+                - diagnostic_started;
+            SccMorphPlanResult production_result;
+            std::chrono::steady_clock::duration production_elapsed{};
+            if (mode == SccMorphDistributionMode::AdaptiveDistribution) {
+                production_result = diagnostic_result;
+                production_elapsed = diagnostic_elapsed;
+            } else {
+                const auto production_started = std::chrono::steady_clock::now();
+                production_result = planSccMorph(pulse, sine, count, gamma,
+                    duration, mode, std::nullopt, {}, false);
+                production_elapsed = std::chrono::steady_clock::now()
+                    - production_started;
+            }
+            verify_plan(diagnostic_result, count, duration);
+            verify_plan(production_result, count, duration);
+            require(diagnostic_result.evaluation_available,
+                    "public planning API returns the shared plan evaluation");
+            require(diagnostic_result.reference_points <= 128
+                        && diagnostic_result.evaluated_plans <= 128
+                        && production_result.working_set_bytes <= 64U * 1024U * 1024U,
+                    "distribution search reports bounded points, plans and memory");
+            require(production_result.plan == diagnostic_result.plan
+                        && production_result.generated.intermediate
+                            == diagnostic_result.generated.intermediate,
+                    "production and diagnostic planning choose the same plan and waves");
+            require(production_result.evaluation_available
+                        == (mode == SccMorphDistributionMode::AdaptiveDistribution),
+                    "production Tone/Time path skips the reference-only quality evaluation");
+            if (mode == SccMorphDistributionMode::ToneDistribution)
+                require(production_result.generated.intermediate
+                            == legacy_wrapper.intermediate,
+                        "production Tone output matches the legacy wrapper at equal normalized dt");
+            if (mode == SccMorphDistributionMode::AdaptiveDistribution) {
+                const auto time = planSccMorph(pulse, sine, count, gamma,
+                    duration, SccMorphDistributionMode::TimeDistribution);
+                const auto tone = planSccMorph(pulse, sine, count, gamma,
+                    duration, SccMorphDistributionMode::ToneDistribution);
+                verify_plan(time, count, duration);
+                verify_plan(tone, count, duration);
+                require(diagnostic_result.evaluation.total
+                            <= std::min(time.evaluation.total, tone.evaluation.total) + 1e-9,
+                        "adaptive plan scores no worse than either fixed fallback");
+                require(!diagnostic_result.considered.empty()
+                            && diagnostic_result.considered.size()
+                                == diagnostic_result.evaluated_plans,
+                        "adaptive diagnostics retain every bounded plan evaluation");
+                for (std::size_t candidate_index = 0;
+                     candidate_index < diagnostic_result.considered.size(); ++candidate_index) {
+                    const auto& candidate = diagnostic_result.considered[candidate_index];
+                    require(std::isfinite(candidate.evaluation.curve)
+                                && std::isfinite(candidate.evaluation.transition)
+                                && std::isfinite(candidate.evaluation.fidelity)
+                                && std::isfinite(candidate.evaluation.concentration)
+                                && std::isfinite(candidate.evaluation.total),
+                            "candidate plan reports each normalized score component");
+                    std::cout << "SCC morph candidate N=" << count_size
+                              << " gamma=" << gamma
+                              << " index=" << candidate_index
+                              << " mode=" << static_cast<int>(candidate.distribution)
+                              << " reason=" << candidate.reason
+                              << " curve=" << candidate.evaluation.curve
+                              << " transition=" << candidate.evaluation.transition
+                              << " fidelity=" << candidate.evaluation.fidelity
+                              << " concentration=" << candidate.evaluation.concentration
+                              << " total=" << candidate.evaluation.total
+                              << " max_wave_gap=" << candidate.evaluation.max_wave_gap
+                              << " max_spectral_gap=" << candidate.evaluation.max_spectral_gap
+                              << " spectral_travel=" << candidate.evaluation.spectral_travel
+                              << '\n';
+                }
+            }
+            std::ostringstream plan_points;
+            plan_points << std::setprecision(17);
+            for (std::size_t point_index = 0;
+                 point_index < production_result.plan.points.size(); ++point_index) {
+                if (point_index) plan_points << ',';
+                const auto& point = production_result.plan.points[point_index];
+                plan_points << point.morph_position << '@' << point.event_count;
+            }
+            std::cout << "SCC morph distribution N=" << count_size
+                      << " gamma=" << gamma
+                      << " mode=" << static_cast<int>(mode)
+                      << " production_elapsed_us="
+                      << std::chrono::duration<double, std::micro>(production_elapsed).count()
+                      << " diagnostic_elapsed_us="
+                      << std::chrono::duration<double, std::micro>(diagnostic_elapsed).count()
+                      << " evaluated_plans=" << production_result.evaluated_plans
+                      << " reference_points=" << production_result.reference_points
+                      << " logical_working_set_bytes=" << production_result.working_set_bytes
+                      << " plan_points=" << plan_points.str()
+                      << " fallback=" << production_result.fallback
+                      << " total=" << diagnostic_result.evaluation.total
+                      << " max_wave_gap=" << diagnostic_result.evaluation.max_wave_gap
+                      << " max_spectral_gap=" << diagnostic_result.evaluation.max_spectral_gap
+                      << " spectral_travel=" << diagnostic_result.evaluation.spectral_travel
+                      << '\n';
+        }
+        std::cout << "SCC morph legacy-wrapper N=" << count_size
+                  << " gamma=" << gamma
+                  << " elapsed_us="
+                  << std::chrono::duration<double, std::micro>(legacy_elapsed).count()
+                  << " normalized_dt=" << 1.0 / double(count_size + 1)
+                  << '\n';
+    }
+
+    for (const auto count_size : {std::size_t{8}, std::size_t{27}}) {
+        const auto count = static_cast<std::uint8_t>(count_size);
+        const auto duration = static_cast<std::uint32_t>((count_size + 1) * 8);
+        const auto result = planSccMorph(pulse, sine, count, 1.0, duration,
+            SccMorphDistributionMode::AdaptiveDistribution);
+        verify_plan(result, count, duration);
+        require(result.evaluation_available && !result.considered.empty(),
+                "uniform adaptive reference and its candidate scores are exposed");
+        for (std::size_t candidate_index = 0;
+             candidate_index < result.considered.size(); ++candidate_index) {
+            const auto& candidate = result.considered[candidate_index];
+            std::cout << "SCC morph candidate N=" << count_size
+                      << " gamma=1 index=" << candidate_index
+                      << " mode=" << static_cast<int>(candidate.distribution)
+                      << " curve=" << candidate.evaluation.curve
+                      << " transition=" << candidate.evaluation.transition
+                      << " fidelity=" << candidate.evaluation.fidelity
+                      << " concentration=" << candidate.evaluation.concentration
+                      << " total=" << candidate.evaluation.total
+                      << " max_wave_gap=" << candidate.evaluation.max_wave_gap
+                      << " max_spectral_gap=" << candidate.evaluation.max_spectral_gap
+                      << " spectral_travel=" << candidate.evaluation.spectral_travel
+                      << '\n';
+        }
+    }
+
+    const auto impossible = planSccMorph(pulse, sine, 3, 1.0, 3,
+        SccMorphDistributionMode::AdaptiveDistribution);
+    require(!impossible.valid && !impossible.error.empty(),
+            "duration shorter than the minimum holds fails explicitly");
+    SccMorphPlan malformed;
+    malformed.points = {{0.0, 0}, {0.8, 2}, {0.7, 4}, {1.0, 6}};
+    const auto invalid_explicit = planSccMorph(pulse, sine, 2, 1.0, 6,
+        SccMorphDistributionMode::AdaptiveDistribution, malformed);
+    require(!invalid_explicit.valid,
+            "explicit plan with nonmonotonic positions is rejected, not repaired");
+
+    auto repeated_pair = morphProgram(pulse, sine, 0, 10, 2, 0, 1.0);
+    const auto first_id = repeated_pair.layers[0].timbre_automation[0].target_library_id;
+    const auto second_id = repeated_pair.layers[0].timbre_automation[1].target_library_id;
+    auto valid_external = planSccMorph(pulse, sine, 2, 1.0, 10,
+        SccMorphDistributionMode::ToneDistribution);
+    require(valid_external.valid, "reference explicit plan is valid");
+    auto invalid_after_cache_seed = valid_external.plan;
+    invalid_after_cache_seed.points[1].morph_position =
+        std::numeric_limits<double>::quiet_NaN();
+    repeated_pair.layers[0].timbre_automation[1].scc_morph.explicit_plan =
+        valid_external.plan;
+    repeated_pair.layers[0].timbre_automation.push_back(toneEvent(first_id, 20));
+    auto second_transition = SccMorphTransition{
+        .enabled = true,
+        .intermediate_count = 2,
+        .curve = 1.0,
+        .distribution_mode = SccMorphDistributionMode::ToneDistribution,
+        .explicit_plan = invalid_after_cache_seed,
+    };
+    repeated_pair.layers[0].timbre_automation.push_back(
+        toneEvent(second_id, 30, std::move(second_transition)));
+    repeated_pair.layers[0].envelope_timeline.length_counts = 31;
+    const auto invalid_sequential_plan = compileSccMorph(repeated_pair);
+    require(!invalid_sequential_plan.valid
+                && invalid_sequential_plan.error.find("explicit plan") != std::string::npos,
+            "invalid second explicit plan cannot reuse the preceding pair cache entry");
+
+    auto adaptive_program = morphProgram(pulse, sine, 0, 120, 3, 0, gamma);
+    auto& adaptive_transition = adaptive_program.layers[0].timbre_automation[1].scc_morph;
+    adaptive_transition.distribution_mode = SccMorphDistributionMode::AdaptiveDistribution;
+    const auto authored_adaptive_program = adaptive_program;
+    const auto adaptive_compiled = compileSccMorph(adaptive_program);
+    require(adaptive_compiled.valid && adaptive_compiled.plans.size() == 1,
+            "composite compilation exposes the plan used by preview and export");
+    require(adaptive_compiled.plans.front().layer_index == 0
+                && adaptive_compiled.plans.front().destination_event_index == 1,
+            "compiled plan identifies its authored transition");
+    verify_plan(adaptive_compiled.plans.front().result, 3, 120);
+    require(adaptive_program == authored_adaptive_program,
+            "planning and compilation preserve the authored adaptive model");
+    std::vector<std::uint32_t> materialized_counts;
+    for (const auto& event : adaptive_compiled.timbre.layers[0].timbre_automation)
+        if (event.kind == EnvelopeEventKind::Timbre
+            && event.count > 0 && event.count < 120)
+            materialized_counts.push_back(event.count);
+    const auto& adaptive_points = adaptive_compiled.plans.front().result.plan.points;
+    require(materialized_counts.size() == 3,
+            "adaptive compilation materializes each planned intermediate once");
+    for (std::size_t i = 0; i < materialized_counts.size(); ++i)
+        require(materialized_counts[i] == adaptive_points[i + 1].event_count,
+                "MGSC preparation uses the exposed MorphPlan event counts");
+    if (adaptive_compiled.plans.front().result.fallback) {
+        require(adaptive_compiled.plans.front().result.selected_distribution
+                    != SccMorphDistributionMode::AdaptiveDistribution,
+                "adaptive compile records its fixed-mode fallback");
+    } else {
+        require(adaptive_compiled.plans.front().result.selected_distribution
+                    == SccMorphDistributionMode::AdaptiveDistribution,
+                "adaptive compile records its selected adaptive plan");
+    }
+
+    auto multi_channel_program = adaptive_program;
+    multi_channel_program.layers[0].scc_output_allocation =
+        SccOutputAllocationMode::Contiguous;
+    multi_channel_program.layers[0].scc_output_start = 0;
+    auto second_channel = multi_channel_program.layers.front();
+    second_channel.channel = 1;
+    second_channel.envelope_number = 1;
+    second_channel.scc_output_start = 16;
+    multi_channel_program.layers.push_back(std::move(second_channel));
+    multi_channel_program.layers[1].scc_output_allocation =
+        SccOutputAllocationMode::Contiguous;
+    multi_channel_program.layers[1].timbre_automation[1].scc_morph.distribution_mode =
+        SccMorphDistributionMode::TimeDistribution;
+    const auto multi_channel_started = std::chrono::steady_clock::now();
+    const auto multi_channel_compiled = compileSccMorph(multi_channel_program);
+    const auto multi_channel_elapsed = std::chrono::steady_clock::now()
+        - multi_channel_started;
+    require(multi_channel_compiled.valid,
+            multi_channel_compiled.error.c_str());
+    require(multi_channel_compiled.plans.size() == 2
+                && multi_channel_compiled.channel_allocations.size() == 2
+                && multi_channel_compiled.channel_allocations[0].start == 0
+                && multi_channel_compiled.channel_allocations[1].start == 16
+                && multi_channel_compiled.channel_allocations[0].manual
+                && multi_channel_compiled.channel_allocations[1].manual,
+            "separate SCC channels compile independent MorphPlans and allocations");
+    std::size_t multi_channel_working_set{};
+    for (const auto& segment : multi_channel_compiled.plans)
+        multi_channel_working_set += segment.result.working_set_bytes;
+    std::cout << "SCC morph multi_channel segments="
+              << multi_channel_compiled.plans.size()
+              << " elapsed_us="
+              << std::chrono::duration<double, std::micro>(multi_channel_elapsed).count()
+              << " logical_working_set_bytes=" << multi_channel_working_set << '\n';
+
+    auto mode_changed = adaptive_program;
+    mode_changed.layers[0].timbre_automation[1].scc_morph.distribution_mode =
+        SccMorphDistributionMode::TimeDistribution;
+    const auto adaptive_cache = compileSccMorphCached(adaptive_program);
+    const auto timed_cache = compileSccMorphCached(mode_changed);
+    require(adaptive_cache != timed_cache,
+            "distribution mode changes invalidate immutable morph cache entries");
+
+    const auto worker_result = std::make_shared<const SccMorphCompileResult>(
+        compileSccMorph(adaptive_program));
+    require(worker_result->valid && seedSccMorphCache(adaptive_program, worker_result),
+            "exact worker result may seed the preparation cache");
+    require(compileSccMorphCached(adaptive_program) == worker_result,
+            "cache accepts only the exact authored worker snapshot");
+    auto foreign_program = adaptive_program;
+    foreign_program.scc_morph_bank_base = 16;
+    require(!seedSccMorphCache(foreign_program, worker_result)
+                && compileSccMorphCached(adaptive_program) == worker_result,
+            "foreign authored settings cannot seed or evict the matching cache");
+
+    std::stop_source cancellation;
+    cancellation.request_stop();
+    const auto cancelled_plan = planSccMorph(pulse, sine, 3, gamma, 120,
+        SccMorphDistributionMode::AdaptiveDistribution, std::nullopt,
+        cancellation.get_token());
+    require(!cancelled_plan.valid,
+            "cancelled plan search exits with an explicit invalid result");
+    const auto cancelled_compile = compileSccMorph(
+        adaptive_program, cancellation.get_token());
+    require(!cancelled_compile.valid && cancelled_compile.cancelled,
+            "cancelled composite preparation is reported distinctly");
+    require(!seedSccMorphCache(adaptive_program,
+                std::make_shared<const SccMorphCompileResult>(cancelled_compile))
+                && compileSccMorphCached(adaptive_program) == worker_result,
+            "cancelled worker result cannot seed or replace the cache");
+    bool cancelled_generation_threw{};
+    try {
+        (void)generateSccMorphPlanned(pulse, sine, tone_fast.plan, nullptr,
+            cancellation.get_token());
+    } catch (const std::runtime_error&) {
+        cancelled_generation_threw = true;
+    }
+    require(cancelled_generation_threw,
+            "planned DSP checks cancellation before generation");
 }
 
 void testGlobalPhaseOptimizationAndTransitionCost() {
@@ -613,7 +1094,12 @@ void testCompositeCompilationBoundariesAndAllocation() {
         no_previous.layers[0].timbre_automation.begin());
     const auto first_event_id = no_previous.embedded_timbres.front().library_id;
     no_previous.layers[0].timbre_automation[0] =
-        toneEvent(first_event_id, 0, SccMorphTransition{true, 1, 1.0});
+        toneEvent(first_event_id, 0, SccMorphTransition{
+            .enabled = true,
+            .intermediate_count = 1,
+            .curve = 1.0,
+            .distribution_mode = SccMorphDistributionMode::ToneDistribution,
+        });
     const auto no_previous_result = compileSccMorph(no_previous);
     require(!no_previous_result.valid,
             "enabled incoming morph without a previous tone is rejected");
@@ -826,18 +1312,31 @@ void testSeparateMorphBlocksKeepNormalTransition() {
         toneEvent(tones[2].library_id, 8,
                   SccMorphTransition{.enabled = true,
                                      .intermediate_count = 1,
-                                     .curve = 1.0}),
+                                     .curve = 1.0,
+                                     .distribution_mode = SccMorphDistributionMode::ToneDistribution}),
         toneEvent(tones[3].library_id, 14),
         toneEvent(tones[4].library_id, 22,
                   SccMorphTransition{.enabled = true,
                                      .intermediate_count = 1,
-                                     .curve = 1.0}),
+                                     .curve = 1.0,
+                                     .distribution_mode = SccMorphDistributionMode::ToneDistribution}),
     };
+    layer.timbre_automation[2].scc_morph.distribution_mode =
+        SccMorphDistributionMode::TimeDistribution;
+    layer.timbre_automation[4].scc_morph.distribution_mode =
+        SccMorphDistributionMode::AdaptiveDistribution;
     input.layers.push_back(std::move(layer));
     input.embedded_timbres.assign(tones.begin() + 1, tones.end());
 
     const auto compiled = compileSccMorph(input);
     require(compiled.valid, "two isolated morph transitions compile");
+    require(compiled.plans.size() == 2
+                && compiled.plans[0].result.selected_distribution
+                    == SccMorphDistributionMode::TimeDistribution
+                && (compiled.plans[1].result.selected_distribution
+                    == SccMorphDistributionMode::AdaptiveDistribution
+                    || compiled.plans[1].result.fallback),
+            "separate Morph Blocks retain their independent distribution settings");
     const auto& events = compiled.timbre.layers[0].timbre_automation;
     require(events.size() == 7,
             "only the two enabled transitions receive intermediate events");
@@ -905,7 +1404,7 @@ void testCacheInvalidationAndSaveRoundTrips() {
     auto legacy_input = input;
     legacy_input.scc_morph_algorithm_version = 1;
     auto future_input = input;
-    future_input.scc_morph_algorithm_version = 3;
+    future_input.scc_morph_algorithm_version = kSccMorphAlgorithmVersion + 1;
     const auto legacy_compiled = compileSccMorph(legacy_input);
     const auto current_compiled = compileSccMorph(input);
     require(legacy_compiled.valid && current_compiled.valid,
@@ -932,7 +1431,7 @@ void testCacheInvalidationAndSaveRoundTrips() {
     const auto unsupported = compileSccMorph(future_input);
     require(!unsupported.valid
                 && unsupported.timbre == future_input
-                && future_input.scc_morph_algorithm_version == 3,
+                && future_input.scc_morph_algorithm_version == kSccMorphAlgorithmVersion + 1,
             "unknown future morph algorithm version is rejected without mutating input");
 
     for (const auto* authored : {&legacy_input, &input}) {
@@ -1350,6 +1849,7 @@ int main() {
         testCurveAndQuantizedGeneration();
         testSilenceDcAndPhaseOnlyInputs();
         testSccMorphPhaseBMatrixAndTiming();
+        testSccMorphDistributionPlans();
         testGlobalPhaseOptimizationAndTransitionCost();
         testContiguousChannelAllocation();
         testCompositeCompilationBoundariesAndAllocation();

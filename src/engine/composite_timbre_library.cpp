@@ -137,6 +137,16 @@ public:
         boolean(value.scc_morph.enabled);
         unsignedInteger(value.scc_morph.intermediate_count, 1);
         unsignedInteger(std::bit_cast<std::uint64_t>(value.scc_morph.curve), 8);
+        enumeration(value.scc_morph.distribution_mode);
+        boolean(value.scc_morph.explicit_plan.has_value());
+        if (value.scc_morph.explicit_plan) {
+            const auto& points = value.scc_morph.explicit_plan->points;
+            unsignedInteger(points.size(), 4);
+            for (const auto& point : points) {
+                unsignedInteger(std::bit_cast<std::uint64_t>(point.morph_position), 8);
+                unsignedInteger(point.event_count, 4);
+            }
+        }
     }
 
     void timeline(const EnvelopeTimeline& value) {
@@ -363,6 +373,8 @@ public:
     }
 
     bool event(EnvelopeEvent& value) {
+        value.scc_morph = {};
+        value.scc_morph.distribution_mode = SccMorphDistributionMode::ToneDistribution;
         if (!enumeration(value.kind, 6)
             || !integer(value.value, 4)
             || !integer(value.secondary, 4)
@@ -406,7 +418,6 @@ public:
         if (!value.automatic) {
             value.precise = false;
         }
-        value.scc_morph = {};
         if (format_version_ >= 21) {
             std::uint64_t curve{};
             if (!boolean(value.scc_morph.enabled)
@@ -419,6 +430,26 @@ public:
                 || value.scc_morph.curve < kSccMorphGammaMin
                 || value.scc_morph.curve > kSccMorphGammaMax) {
                 return false;
+            }
+        }
+        if (format_version_ >= 23) {
+            bool has_plan{};
+            if (!enumeration(value.scc_morph.distribution_mode, 2)
+                || !boolean(has_plan)) return false;
+            if (has_plan) {
+                std::uint32_t size{};
+                if (!integer(size, 4)
+                    || size != static_cast<std::uint32_t>(value.scc_morph.intermediate_count) + 2)
+                    return false;
+                SccMorphPlan plan;
+                plan.points.resize(size);
+                for (auto& point : plan.points) {
+                    std::uint64_t position{};
+                    if (!integer(position, 8) || !integer(point.event_count, 4)) return false;
+                    point.morph_position = std::bit_cast<double>(position);
+                }
+                if (!isValidSccMorphPlan(plan, value.scc_morph.intermediate_count)) return false;
+                value.scc_morph.explicit_plan = std::move(plan);
             }
         }
         return true;
@@ -553,15 +584,16 @@ public:
     bool soundPayload(
         CompositeTimbre& value,
         std::uint32_t payload_version) {
-        if (payload_version != 1 && payload_version != 2 && payload_version != 3
+        if (payload_version != 1 && payload_version != 2 && payload_version != 3 && payload_version != 4
             && payload_version != kCompositeSoundPayloadVersion) {
             return false;
         }
         // Each SQLite payload version names a fixed portable sound layout:
-        // v1=v19, v2=v20 modulation, v3=v21 morphing, v4=v22 channel ranges.
+        // v1=v19, v2=v20 modulation, v3=v21 morphing, v4=v22 channel ranges, v5=v23 distribution/plans.
         // The DB schema version and the portable file header are separate.
         format_version_ = payload_version == 1 ? 19
-            : payload_version == 2 ? 20 : payload_version == 3 ? 21 : 22;
+            : payload_version == 2 ? 20 : payload_version == 3 ? 21
+            : payload_version == 4 ? 22 : 23;
         return soundBody(value);
     }
 
@@ -806,6 +838,7 @@ public:
                 || !integer(value.scc_morph_algorithm_version, 4))) {
             return false;
         }
+        if (!isSupportedSccMorphAlgorithmVersion(value.scc_morph_algorithm_version)) return false;
         value.format_version = CompositeTimbre::kFormatVersion;
         return position_ == data_.size();
     }

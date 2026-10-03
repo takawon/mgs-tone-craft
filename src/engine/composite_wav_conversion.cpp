@@ -360,6 +360,7 @@ CompositeTimbre generateCandidate(const SourceAnalysis& analysis,
             event.count = keyframes[i];
             event.target_library_id = ref.library_id;
             event.scc_morph = {morph_enabled || intermediates > 0, intermediates, curve};
+            event.scc_morph.distribution_mode = SccMorphDistributionMode::ToneDistribution;
             dest.timbre_automation.push_back(event);
         }
         for (std::uint32_t tick = 0; tick < keyoff; ++tick) {

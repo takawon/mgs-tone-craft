@@ -443,6 +443,11 @@ double sccMorphTransitionCost(const SccWaveform& first,
 
 namespace {
 
+struct MorphCancelled {};
+void checkCancellation(std::stop_token token) {
+    if (token.stop_requested()) throw MorphCancelled{};
+}
+
 std::vector<double> playbackIntervals(const std::vector<std::uint32_t>& counts) {
     std::vector<double> intervals;
     intervals.reserve(counts.size()-1);
@@ -454,8 +459,10 @@ std::vector<double> playbackIntervals(const std::vector<std::uint32_t>& counts) 
 
 SccMorphPairResult generateSccMorphImpl(const SccWaveform& first,
     const SccWaveform& second, std::uint8_t count, double gamma,
-    SccMorphPairTrace* trace, const std::vector<double>* intervals = nullptr) {
+    SccMorphPairTrace* trace, const std::vector<double>* intervals = nullptr,
+    const SccMorphPlan* plan = nullptr, std::stop_token cancellation = {}) {
     SccMorphPairResult result;
+    checkCancellation(cancellation);
     if (trace) {
         *trace = {};
         trace->first = first; trace->second = second;
@@ -482,14 +489,17 @@ SccMorphPairResult generateSccMorphImpl(const SccWaveform& first,
     targets.reserve(count); choices.reserve(count);
     mixture_bases.reserve(count);
     for (unsigned index = 1; index <= count; ++index) {
-        const double u = morphPosition(double(index) / (double(count)+1.0), gamma);
+        checkCancellation(cancellation);
+        const double u = plan ? plan->points[index].morph_position
+            : morphPosition(double(index) / (double(count)+1.0), gamma);
         Target target{};
         target.descriptors = interpolate(a.descriptors,b.descriptors,u);
         for (std::size_t n = 0; n < 32; ++n)
             target.shape[n] = (1-u)*fa[n] + u*fb[n];
         auto* step = trace ? &trace->steps[index-1] : nullptr;
         if (step) {
-            step->t = double(index) / (double(count)+1.0);
+            step->t = plan ? double(plan->points[index].event_count)/plan->points.back().event_count
+                : double(index) / (double(count)+1.0);
             step->u = u; step->target = target.descriptors;
             step->target_shape = target.shape;
         }
@@ -630,7 +640,8 @@ SccMorphPairResult generateSccMorphImpl(const SccWaveform& first,
         return (interval(index+1)+interval(index+2))/2.0;
     };
     const auto position = [&](std::size_t index) {
-        return morphPosition(double(index)/(double(count)+1.0),gamma);
+        return plan ? plan->points[index].morph_position
+            : morphPosition(double(index)/(double(count)+1.0),gamma);
     };
     const auto connect = [&](const Candidate& left, const Candidate& right,
                              std::size_t arrival, SccMorphConnectionTrace* edge = nullptr) {
@@ -668,6 +679,7 @@ SccMorphPairResult generateSccMorphImpl(const SccWaveform& first,
     }
     for (std::size_t index = 1; index < count; ++index)
         for (std::size_t c = 0; c < kSccMorphCandidateCount; ++c) {
+            checkCancellation(cancellation);
             cost[index][c] = std::numeric_limits<double>::infinity();
             for (std::size_t p = 0; p < kSccMorphCandidateCount; ++p) {
                 auto* edge = trace ? &trace->steps[index].candidates[c].incoming[p] : nullptr;
@@ -709,6 +721,7 @@ SccMorphPairResult generateSccMorphImpl(const SccWaveform& first,
     if (first != aligned)
         for (int pass = 0; pass < Config::quantization_passes; ++pass)
             for (std::size_t index = 0; index < count; ++index) {
+                checkCancellation(cancellation);
                 auto& current = trajectory[index];
                 const auto& left = index ? trajectory[index-1] : start;
                 const auto& right = index+1 < count ? trajectory[index+1] : end;
@@ -743,7 +756,8 @@ SccMorphPairResult generateSccMorphImpl(const SccWaveform& first,
         }
         result.intermediate.push_back(candidate.wave);
         SccMorphWaveDiagnostic diagnostic;
-        diagnostic.u = morphPosition(double(index+1)/(double(count)+1.0),gamma);
+        diagnostic.u = position(index+1);
+        if (plan) diagnostic.count = plan->points[index+1].event_count;
         diagnostic.candidate = candidate.method;
         diagnostic.candidate_weights = candidate.weights;
         diagnostic.pre_quantization_error = candidate.pre_error;
@@ -754,6 +768,265 @@ SccMorphPairResult generateSccMorphImpl(const SccWaveform& first,
         result.diagnostics.push_back(diagnostic);
     }
     return result;
+}
+
+
+// Integer-placement search is bounded independently of timeline duration. For
+// short timelines it examines every feasible count; otherwise each node has
+// at most 84 ordered candidates (target-neighborhood, uniform and boundaries).
+constexpr std::size_t kPlanReferenceIntervals = 64;
+constexpr std::size_t kPlanMaximumEvaluations = 6;
+constexpr std::size_t kPlanHoldSamples = 256;
+
+SccMorphPlan tonePlan(std::uint8_t count, double gamma, std::uint32_t duration) {
+    SccMorphPlan plan;
+    plan.points.push_back({0.0,0});
+    const auto divisions = std::uint64_t(count)+1;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto rounded = static_cast<std::uint32_t>(
+            (std::uint64_t(duration)*(i+1)+divisions/2)/divisions);
+        const auto latest = duration-static_cast<std::uint32_t>(count-i);
+        plan.points.push_back({morphPosition(double(i+1)/double(divisions),gamma),
+            std::clamp(rounded,plan.points.back().event_count+1,latest)});
+    }
+    plan.points.push_back({1.0,duration});
+    for (std::size_t i = plan.points.size()-1; i-- > 1;)
+        if (plan.points[i].morph_position >= plan.points[i+1].morph_position)
+            plan.points[i].morph_position = std::nextafter(plan.points[i+1].morph_position,0.0);
+    return plan;
+}
+
+double inversePosition(double u, double gamma) {
+    if (u <= 0.0) return 0.0;
+    if (u >= 1.0) return 1.0;
+    return -std::expm1(std::log1p(-u)/gamma);
+}
+
+// The public legacy wrapper preserves its original floating math. New plans
+// stabilize unrepresentable gamma tails by minimal adjacent double steps.
+bool validGeneratedPlan(const SccMorphPlan& plan) {
+    if (plan.points.size() < 2 || plan.points.size() > 257
+        || plan.points.front() != SccMorphPoint{0.0,0}
+        || plan.points.back().morph_position != 1.0) return false;
+    for (std::size_t i = 1; i < plan.points.size(); ++i)
+        if (!std::isfinite(plan.points[i].morph_position)
+            || plan.points[i].morph_position <= plan.points[i-1].morph_position
+            || plan.points[i].morph_position > 1.0
+            || plan.points[i].event_count <= plan.points[i-1].event_count) return false;
+    return true;
+}
+
+std::vector<std::uint32_t> planCounts(const SccMorphPlan& plan) {
+    std::vector<std::uint32_t> counts;
+    counts.reserve(plan.points.size());
+    for (const auto& point : plan.points) counts.push_back(point.event_count);
+    return counts;
+}
+
+SccMorphPairResult generatePlan(const SccWaveform& first, const SccWaveform& second,
+    const SccMorphPlan& plan, SccMorphPairTrace* trace, std::stop_token cancellation) {
+    const auto counts = planCounts(plan);
+    const auto intervals = playbackIntervals(counts);
+    return generateSccMorphImpl(first,second,
+        static_cast<std::uint8_t>(plan.points.size()-2),1.0,trace,&intervals,&plan,cancellation);
+}
+
+SccMorphPlan integerPlan(const std::vector<double>& positions, double gamma,
+    std::uint32_t duration, bool centered, std::stop_token cancellation) {
+    const std::size_t count = positions.size()-2;
+    if (count == 0) return {{{0.0,0},{1.0,duration}}};
+    const auto uniform = tonePlan(static_cast<std::uint8_t>(count),1.0,duration);
+    std::vector<std::vector<std::uint32_t>> candidates(count);
+    std::vector<std::vector<std::size_t>> back(count);
+    std::vector<double> previous;
+    for (std::size_t i = 0; i < count; ++i) {
+        checkCancellation(cancellation);
+        const std::uint32_t first = static_cast<std::uint32_t>(i+1);
+        const std::uint32_t last = duration-static_cast<std::uint32_t>(count-i);
+        const double target = centered ? (positions[i]+positions[i+1])/2.0 : positions[i+1];
+        const double ideal = inversePosition(target,gamma)*duration;
+        auto& choices = candidates[i];
+        if (duration <= 512) {
+            for (auto c = first; c <= last; ++c) choices.push_back(c);
+        } else {
+            const auto add = [&](std::int64_t c) {
+                choices.push_back(static_cast<std::uint32_t>(std::clamp<std::int64_t>(c,first,last)));
+            };
+            const auto rounded = static_cast<std::int64_t>(std::floor(ideal+0.5));
+            for (int offset = -16; offset <= 16; ++offset) add(rounded+offset);
+            for (std::size_t grid = 0; grid <= 32; ++grid)
+                add(first+std::uint64_t(last-first)*grid/32);
+            add(uniform.points[i+1].event_count); add(first); add(last);
+            std::sort(choices.begin(),choices.end());
+            choices.erase(std::unique(choices.begin(),choices.end()),choices.end());
+        }
+        std::vector<double> current(choices.size(),std::numeric_limits<double>::infinity());
+        back[i].resize(choices.size());
+        std::size_t cursor{}, best_predecessor{};
+        double best_prefix = std::numeric_limits<double>::infinity();
+        for (std::size_t j = 0; j < choices.size(); ++j) {
+            if (i) {
+                const auto& before = candidates[i-1];
+                while (cursor < before.size() && before[cursor] < choices[j]) {
+                    // Later count wins exact ties, matching half-up legacy
+                    // rounding for a uniform target when there is no collision.
+                    if (previous[cursor] <= best_prefix) {
+                        best_prefix = previous[cursor]; best_predecessor = cursor;
+                    }
+                    ++cursor;
+                }
+            } else best_prefix = 0.0;
+            const double deviation = morphPosition(double(choices[j])/duration,gamma)-target;
+            current[j] = best_prefix+deviation*deviation;
+            back[i][j] = best_predecessor;
+        }
+        previous = std::move(current);
+    }
+    std::size_t selected{};
+    for (std::size_t j = 1; j < previous.size(); ++j)
+        if (previous[j] <= previous[selected]) selected = j;
+    SccMorphPlan plan;
+    plan.points.resize(count+2);
+    plan.points.front() = {0.0,0}; plan.points.back() = {1.0,duration};
+    for (std::size_t i = count; i-- > 0;) {
+        plan.points[i+1] = {positions[i+1],candidates[i][selected]};
+        selected = back[i][selected];
+    }
+    return plan;
+}
+
+double featureDistance(const SccMorphAnalysis& a, const SccMorphAnalysis& b) {
+    double harmonic{};
+    for (std::size_t k = 0; k <= 16; ++k) {
+        const double d = a.magnitude[k]-b.magnitude[k];
+        harmonic += (k == 0 || k == 16 ? 1.0 : 2.0)*d*d;
+    }
+    return 0.6*harmonic + 0.3*std::pow(a.descriptors.rms-b.descriptors.rms,2)
+        + 0.1*descriptorDistance(a.descriptors,b.descriptors)/Config::descriptor_weight_sum;
+}
+
+struct PlanReference {
+    std::vector<SccWaveform> waves;
+    std::vector<SccMorphAnalysis> analyses;
+    std::vector<double> arc;
+    double scale{}, travel{};
+};
+
+PlanReference makeReference(const SccWaveform& first, const SccWaveform& second,
+    std::uint8_t count, std::stop_token cancellation) {
+    PlanReference reference;
+    const auto divisions = std::min(kPlanReferenceIntervals,
+        std::max<std::size_t>(16,2*(std::size_t(count)+1)));
+    reference.waves.push_back(first);
+    const auto generated = generateSccMorphImpl(first,second,
+        static_cast<std::uint8_t>(divisions-1),1.0,nullptr,nullptr,nullptr,cancellation);
+    reference.waves.insert(reference.waves.end(),generated.intermediate.begin(),generated.intermediate.end());
+    reference.waves.push_back(shifted(second,align(first,second)));
+    for (const auto& wave : reference.waves) reference.analyses.push_back(analyzeSccMorphWaveform(wave));
+    reference.arc.push_back(0.0);
+    for (std::size_t i = 1; i < reference.analyses.size(); ++i) {
+        const Candidate a{reference.waves[i-1],reference.analyses[i-1],SccMorphCandidate::Source,0,0};
+        const Candidate b{reference.waves[i],reference.analyses[i],SccMorphCandidate::Source,0,0};
+        SccMorphConnectionTrace edge;
+        (void)connection(a,b,1.0,1.0,reference.analyses.front().descriptors,
+            reference.analyses.back().descriptors,&edge);
+        reference.arc.push_back(reference.arc.back()+std::sqrt(edge.distance));
+        double spectral{};
+        for (std::size_t k = 1; k <= 16; ++k)
+            spectral += std::pow(reference.analyses[i].magnitude[k]-reference.analyses[i-1].magnitude[k],2);
+        reference.travel += std::sqrt(spectral);
+        reference.scale = std::max(reference.scale,featureDistance(reference.analyses.front(),reference.analyses[i]));
+    }
+    reference.scale = std::max(reference.scale,1.0/(128.0*128.0));
+    return reference;
+}
+
+SccMorphAnalysis referenceAt(const PlanReference& reference, double u) {
+    const double index = std::clamp(u,0.0,1.0)*(reference.analyses.size()-1);
+    const auto left = std::min(static_cast<std::size_t>(index),reference.analyses.size()-2);
+    const double mix = index-left;
+    SccMorphAnalysis result;
+    result.descriptors = interpolate(reference.analyses[left].descriptors,
+        reference.analyses[left+1].descriptors,mix);
+    for (std::size_t k = 0; k <= 16; ++k)
+        result.magnitude[k] = (1-mix)*reference.analyses[left].magnitude[k]
+            + mix*reference.analyses[left+1].magnitude[k];
+    return result;
+}
+
+SccMorphPlanEvaluation evaluatePlan(const SccMorphPlan& plan,
+    const SccMorphPairResult& generated, const PlanReference& reference,
+    double gamma, std::stop_token cancellation) {
+    SccMorphPlanEvaluation score;
+    std::vector<SccWaveform> waves{reference.waves.front()};
+    waves.insert(waves.end(),generated.intermediate.begin(),generated.intermediate.end());
+    waves.push_back(reference.waves.back());
+    std::vector<SccMorphAnalysis> analyses;
+    for (const auto& wave : waves) analyses.push_back(analyzeSccMorphWaveform(wave));
+    const auto duration = plan.points.back().event_count;
+    // Exact count integration for <=256 counts; larger durations use 256
+    // equal-width cells subdivided at every actual event boundary. Therefore
+    // even one-count holds receive their exact duration, with bounded samples.
+    const auto samples = std::min<std::uint32_t>(duration,kPlanHoldSamples);
+    for (std::size_t i = 0; i+1 < waves.size(); ++i) {
+        checkCancellation(cancellation);
+        const double begin = double(plan.points[i].event_count)/duration;
+        const double end = double(plan.points[i+1].event_count)/duration;
+        double t = begin;
+        while (t < end) {
+            const double next = std::min(end,(std::floor(t*samples+1e-9)+1)/samples);
+            const double midpoint = (t+next)/2;
+            score.curve += (next-t)*featureDistance(analyses[i],referenceAt(reference,morphPosition(midpoint,gamma)));
+            t = next;
+        }
+        const double expected = inversePosition(plan.points[i+1].morph_position,gamma)
+            - inversePosition(plan.points[i].morph_position,gamma);
+        const double deviation = ((end-begin)-expected)/((end-begin)+expected+1.0/duration);
+        score.concentration += (end-begin)*deviation*deviation;
+        score.fidelity += (end-begin)*featureDistance(analyses[i],referenceAt(reference,plan.points[i].morph_position));
+        const Candidate a{waves[i],analyses[i],SccMorphCandidate::Source,0,0};
+        const Candidate b{waves[i+1],analyses[i+1],SccMorphCandidate::Source,0,0};
+        SccMorphConnectionTrace edge;
+        (void)connection(a,b,end-begin,
+            plan.points[i+1].morph_position-plan.points[i].morph_position,
+            reference.analyses.front().descriptors,reference.analyses.back().descriptors,&edge);
+        score.transition += edge.distance;
+        score.max_wave_gap = std::max(score.max_wave_gap,std::sqrt(edge.phase_wave*4.0)*128.0);
+        double spectral{};
+        for (std::size_t k = 1; k <= 16; ++k)
+            spectral += std::pow(analyses[i+1].magnitude[k]-analyses[i].magnitude[k],2);
+        score.max_spectral_gap = std::max(score.max_spectral_gap,std::sqrt(spectral));
+        score.spectral_travel += std::sqrt(spectral);
+    }
+    score.curve /= reference.scale;
+    score.transition /= reference.scale;
+    score.fidelity /= reference.scale;
+    // Preserve the whole path as well as endpoints. Fewer spectral changes
+    // cannot improve the score merely by discarding the intended trajectory.
+    if (reference.travel > 1.0/128.0)
+        score.fidelity += std::pow(score.spectral_travel/reference.travel-1.0,2);
+    // Fixture sweeps (N=8/27, gamma=1 and 8) found 0.15 could accept a
+    // 122% larger worst jump for only 1.83% improvement in total score.
+    // 0.30 favors the tested Time fallback there, improves gamma=1 gaps,
+    // and retains N=8 selections. Fidelity/hold concentration stay bounded.
+    score.total = score.curve+0.30*score.transition+0.25*score.fidelity+0.025*score.concentration;
+    return score;
+}
+
+std::vector<double> strictPositions(std::vector<double> positions) {
+    // Only newly searched adaptive points are stabilized. Legacy Tone math
+    // and public wrapper outputs must not be changed by numerical cleanup.
+    double last = 1.0;
+    for (std::size_t i = positions.size()-1; i-- > 1;) {
+        positions[i] = std::min(positions[i],std::nextafter(last,0.0));
+        last = positions[i];
+    }
+    last = 0.0;
+    for (std::size_t i = 1; i+1 < positions.size(); ++i) {
+        positions[i] = std::max(positions[i],std::nextafter(last,1.0));
+        last = positions[i];
+    }
+    return positions;
 }
 
 } // namespace
@@ -780,8 +1053,131 @@ SccMorphPairResult generateSccMorphTraced(const SccWaveform& first,
     return generateSccMorphImpl(first,second,count,gamma,&trace,&intervals);
 }
 
-std::vector<std::size_t> optimizeSccMorphBlockPhases(
-    std::vector<SccWaveform>& waves, bool fixed_start, bool fixed_end) {
+
+SccMorphPairResult generateSccMorphPlanned(const SccWaveform& first,
+    const SccWaveform& second, const SccMorphPlan& plan, SccMorphPairTrace* trace,
+    std::stop_token cancellation) {
+    if (!validGeneratedPlan(plan))
+        throw std::invalid_argument("SCC morph plan must include ordered positions/counts and both endpoints");
+    try { return generatePlan(first,second,plan,trace,cancellation); }
+    catch (const MorphCancelled&) { throw std::runtime_error("SCC morph generation cancelled"); }
+}
+
+SccMorphPlanResult planSccMorph(const SccWaveform& first, const SccWaveform& second,
+    std::uint8_t count, double gamma, std::uint32_t duration, SccMorphDistributionMode mode,
+    const std::optional<SccMorphPlan>& explicit_plan, std::stop_token cancellation, bool evaluate) {
+    SccMorphPlanResult result;
+    const auto fail = [&](const char* error) {
+        result.valid = false; result.error = error; return result;
+    };
+    if (!isValidSccMorphDistributionMode(mode)) return fail("SCC morph distribution mode is invalid");
+    if (duration < std::uint32_t(count)+1 || duration > EnvelopeTimeline::kMaximumLengthCounts)
+        return fail("SCC morph intermediate count exceeds available time slots");
+    if (!std::isfinite(gamma) || gamma < kSccMorphGammaMin || gamma > kSccMorphGammaMax)
+        return fail("SCC morph curve is out of range");
+    if (explicit_plan && (!isValidSccMorphPlan(*explicit_plan,count)
+        || explicit_plan->points.back().event_count != duration))
+        return fail("SCC morph explicit plan does not match segment duration/count");
+    try {
+        checkCancellation(cancellation);
+        if (!evaluate && mode != SccMorphDistributionMode::AdaptiveDistribution) {
+            result.plan = explicit_plan ? *explicit_plan : tonePlan(count,gamma,duration);
+            if (!explicit_plan && mode == SccMorphDistributionMode::TimeDistribution && gamma != 1.0) {
+                std::vector<double> positions(count+2);
+                for (std::size_t i = 0; i < positions.size(); ++i) positions[i] = double(i)/(count+1.0);
+                result.plan = integerPlan(positions,gamma,duration,false,cancellation);
+            }
+            result.generated = generatePlan(first,second,result.plan,nullptr,cancellation);
+            result.selected_distribution = mode;
+            result.evaluated_plans = 1;
+            result.selection_reason = explicit_plan ? "Confirmed external plan retained"
+                : "Formal distribution plan; quality assessment not requested";
+            result.working_set_bytes = std::size_t(count)*(sizeof(Target)+12*sizeof(Candidate)
+                +3*sizeof(Harmonics)+12*(sizeof(double)+sizeof(std::size_t)));
+            return result;
+        }
+        const auto reference = makeReference(first,second,count,cancellation);
+        result.reference_points = reference.waves.size();
+        result.evaluation_available = true;
+        // Logical owned-data upper estimate (no diagnostic traces): reference
+        // + one generator's 12 Candidate/Target rows + DP + bounded count rows.
+        result.working_set_bytes = reference.waves.size()*(sizeof(SccWaveform)+sizeof(SccMorphAnalysis)+sizeof(double))
+            + std::size_t(count)*(sizeof(Target)+12*sizeof(Candidate)+3*sizeof(Harmonics)+12*(sizeof(double)+sizeof(std::size_t)))
+            + std::size_t(count)*512*(sizeof(std::uint32_t)+sizeof(std::size_t)+sizeof(double));
+        const auto consider = [&](const SccMorphPlan& plan, SccMorphDistributionMode candidate_mode,
+                                  const char* reason) {
+            checkCancellation(cancellation);
+            auto generated = generatePlan(first,second,plan,nullptr,cancellation);
+            const auto score = evaluatePlan(plan,generated,reference,gamma,cancellation);
+            ++result.evaluated_plans;
+            result.considered.push_back({plan,score,candidate_mode,reason});
+            if (result.evaluated_plans == 1 || score.total+Config::tolerance < result.evaluation.total) {
+                result.plan = plan; result.generated = std::move(generated);
+                result.evaluation = score; result.selected_distribution = candidate_mode;
+                result.selection_reason = reason;
+            }
+        };
+        if (explicit_plan) {
+            consider(*explicit_plan,mode,"Confirmed external plan retained");
+            return result;
+        }
+        const auto tone = tonePlan(count,gamma,duration);
+        std::vector<double> uniform(count+2);
+        for (std::size_t i = 0; i < uniform.size(); ++i) uniform[i] = double(i)/(count+1.0);
+        const auto time = gamma == 1.0 ? tone : integerPlan(uniform,gamma,duration,false,cancellation);
+        if (mode == SccMorphDistributionMode::ToneDistribution) {
+            consider(tone,mode,"Legacy tone distribution retained"); return result;
+        }
+        if (mode == SccMorphDistributionMode::TimeDistribution) {
+            consider(time,mode,"Uniform positions with bounded integer timing optimization"); return result;
+        }
+        consider(tone,SccMorphDistributionMode::ToneDistribution,"Tone baseline minimizes common score");
+        if (time != tone)
+            consider(time,SccMorphDistributionMode::TimeDistribution,"Time baseline minimizes common score");
+        std::vector<double> acoustic(count+2);
+        acoustic.back() = 1.0;
+        for (std::size_t i = 1; i <= count; ++i) {
+            const double target = reference.arc.back()*double(i)/(count+1.0);
+            if (reference.arc.back() <= Config::tolerance) acoustic[i] = uniform[i];
+            else {
+                const auto found = std::lower_bound(reference.arc.begin(),reference.arc.end(),target);
+                const auto right = std::clamp<std::size_t>(found-reference.arc.begin(),1,reference.arc.size()-1);
+                const double mix = (target-reference.arc[right-1])
+                    /std::max(reference.arc[right]-reference.arc[right-1],Config::tolerance);
+                acoustic[i] = (double(right-1)+mix)/(reference.arc.size()-1);
+            }
+        }
+        acoustic = strictPositions(std::move(acoustic));
+        consider(integerPlan(acoustic,gamma,duration,true,cancellation),mode,
+            "Acoustic position and hold-centered count search");
+        std::vector<double> tone_positions;
+        for (const auto& point : tone.points) tone_positions.push_back(point.morph_position);
+        tone_positions = strictPositions(std::move(tone_positions));
+        consider(integerPlan(tone_positions,gamma,duration,true,cancellation),mode,
+            "Curve positions with hold-centered count search");
+        for (std::size_t i = 1; i <= count; ++i) acoustic[i] = (acoustic[i]+tone_positions[i])/2.0;
+        consider(integerPlan(strictPositions(std::move(acoustic)),gamma,duration,true,cancellation),mode,
+            "Mixed acoustic/curve positions with hold-centered count search");
+        if (count && result.evaluated_plans < kPlanMaximumEvaluations) {
+            std::vector<double> refined{0.0};
+            for (std::size_t i = 1; i <= count; ++i) {
+                const double begin = double(result.plan.points[i].event_count)/duration;
+                const double end = double(result.plan.points[i+1].event_count)/duration;
+                refined.push_back((result.plan.points[i].morph_position+morphPosition((begin+end)/2,gamma))/2.0);
+            }
+            refined.push_back(1.0);
+            consider(integerPlan(strictPositions(std::move(refined)),gamma,duration,true,cancellation),mode,
+                "One bounded joint position/count refinement");
+        }
+        result.fallback = result.selected_distribution != mode;
+        return result;
+    } catch (const MorphCancelled&) { return fail("SCC morph generation cancelled"); }
+}
+
+namespace {
+std::vector<std::size_t> optimizeBlockPhases(
+    std::vector<SccWaveform>& waves, bool fixed_start, bool fixed_end,
+    std::stop_token cancellation) {
     std::vector<std::size_t> shifts(waves.size());
     if (waves.empty()) return shifts;
     std::vector<std::array<std::size_t,32>> back(waves.size());
@@ -790,6 +1186,7 @@ std::vector<std::size_t> optimizeSccMorphBlockPhases(
         previous[shift] = fixed_start && shift != 0
             ? std::numeric_limits<double>::infinity() : 0.0;
     for (std::size_t index = 1; index < waves.size(); ++index) {
+        checkCancellation(cancellation);
         // Cost depends only on relative phase: precompute 32 correlations,
         // then solve all 32 x 32 DP edges without repeated sample work.
         std::array<double,32> relative{};
@@ -816,9 +1213,22 @@ std::vector<std::size_t> optimizeSccMorphBlockPhases(
     return shifts;
 }
 
-SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
+} // namespace
+
+std::vector<std::size_t> optimizeSccMorphBlockPhases(
+    std::vector<SccWaveform>& waves, bool fixed_start, bool fixed_end) {
+    return optimizeBlockPhases(waves,fixed_start,fixed_end,{});
+}
+
+SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
+    std::stop_token cancellation) {
     SccMorphCompileResult result;
+    result.authored_input = std::make_shared<const CompositeTimbre>(input);
     result.timbre = input;
+    if (cancellation.stop_requested()) {
+        result.valid = false; result.cancelled = true;
+        result.error = "SCC morph generation cancelled"; return result;
+    }
     const auto contiguous = [](const CompositeLayer& layer) {
         return layer.source == TimbreSource::Scc
             && layer.scc_output_allocation == SccOutputAllocationMode::Contiguous;
@@ -980,8 +1390,10 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
     // Integer event placement below is translation-invariant in start count:
     // rounded and clamp bounds are all start + an integer relative count.
     // Duration therefore uniquely determines the normalized interval vector.
-    using PairKey = std::tuple<SccWaveform,SccWaveform,std::uint8_t,double,std::uint32_t>;
-    std::map<PairKey,SccMorphPairResult> pair_cache;
+    using PlanKey = std::vector<std::pair<double,std::uint32_t>>;
+    using PairKey = std::tuple<SccWaveform,SccWaveform,std::uint8_t,double,std::uint32_t,
+        SccMorphDistributionMode,PlanKey>;
+    std::map<PairKey,SccMorphPlanResult> pair_cache;
     for (std::size_t layer_index = 0; layer_index < input.layers.size(); ++layer_index) {
         const auto& layer = input.layers[layer_index];
         // Rate mode retains the authored @e lane for switching back, but
@@ -1006,6 +1418,9 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
         if (layer.timbre_automation[tones.front()].scc_morph.enabled)
             return fail("SCC morph destination has no preceding tone event");
         for (std::size_t arrival = 1; arrival < tones.size();) {
+            if (cancellation.stop_requested()) {
+                result.cancelled = true; return fail("SCC morph generation cancelled");
+            }
             if (!layer.timbre_automation[tones[arrival]].scc_morph.enabled) {
                 ++arrival; continue;
             }
@@ -1053,33 +1468,38 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
                 const auto original_start = sourceNode(position-1);
                 if (!end_node || !original_start)
                     return fail("SCC morph source waveform snapshot is unavailable");
-                // Preserve the existing rounded/clamped event positions;
-                // use these exact intervals for connection velocity scoring.
-                std::vector<std::uint32_t> counts{start_event.count};
-                const auto divisions = std::uint64_t(settings.intermediate_count)+1;
-                for (std::size_t i = 0; i < settings.intermediate_count; ++i) {
-                    const auto numerator = std::uint64_t(duration)*(i+1);
-                    const auto rounded = start_event.count + static_cast<std::uint32_t>(
-                        (numerator+divisions/2)/divisions);
-                    const auto latest = end_event.count
-                        - static_cast<std::uint32_t>(settings.intermediate_count-i);
-                    counts.push_back(std::clamp(rounded,counts.back()+1,latest));
-                }
-                counts.push_back(end_event.count);
+                if (!isValidSccMorphDistributionMode(settings.distribution_mode))
+                    return fail("SCC morph distribution mode is invalid");
+                if (settings.explicit_plan
+                    && (!isValidSccMorphPlan(*settings.explicit_plan,settings.intermediate_count)
+                        || settings.explicit_plan->points.back().event_count != duration))
+                    return fail("SCC morph explicit plan does not match segment duration/count");
+                PlanKey explicit_key;
+                if (settings.explicit_plan)
+                    for (const auto& point : settings.explicit_plan->points)
+                        explicit_key.emplace_back(point.morph_position,point.event_count);
                 const PairKey key{original_start->wave,end_node->wave,
-                    settings.intermediate_count,settings.curve,duration};
+                    settings.intermediate_count,settings.curve,duration,
+                    settings.distribution_mode,std::move(explicit_key)};
                 auto cached = pair_cache.find(key);
                 if (cached == pair_cache.end()) {
-                    const auto intervals = playbackIntervals(counts);
-                    cached = pair_cache.emplace(key,generateSccMorphImpl(original_start->wave,
-                        end_node->wave,settings.intermediate_count,settings.curve,nullptr,&intervals)).first;
+                    auto planned = planSccMorph(original_start->wave,end_node->wave,
+                        settings.intermediate_count,settings.curve,duration,
+                        settings.distribution_mode,settings.explicit_plan,cancellation,false);
+                    if (!planned.valid) {
+                        result.cancelled = cancellation.stop_requested();
+                        return fail(planned.error);
+                    }
+                    cached = pair_cache.emplace(key,std::move(planned)).first;
                 }
-                const auto& generated = cached->second;
+                const auto& planned = cached->second;
+                result.plans.push_back({layer_index,tones[position],planned});
+                const auto& generated = planned.generated;
                 for (std::size_t i = 0; i < generated.intermediate.size(); ++i) {
                     Node node;
                     node.wave = generated.intermediate[i];
                     node.diagnostic = generated.diagnostics[i];
-                    node.diagnostic.count = counts[i+1];
+                    node.diagnostic.count = start_event.count+planned.plan.points[i+1].event_count;
                     node.diagnostic.layer_index = layer_index;
                     nodes.push_back(node);
                 }
@@ -1088,8 +1508,13 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
             std::vector<SccWaveform> waves;
             waves.reserve(nodes.size());
             for (const auto& node : nodes) waves.push_back(node.wave);
-            const auto shifts = optimizeSccMorphBlockPhases(waves,
-                block_start != 0,block_end+1 != tones.size());
+            std::vector<std::size_t> shifts;
+            try {
+                shifts = optimizeBlockPhases(waves,block_start != 0,
+                    block_end+1 != tones.size(),cancellation);
+            } catch (const MorphCancelled&) {
+                result.cancelled = true; return fail("SCC morph generation cancelled");
+            }
             for (std::size_t i = 0; i < nodes.size(); ++i) {
                 nodes[i].wave = waves[i];
                 nodes[i].diagnostic.phase_shift = shifts[i];
@@ -1318,14 +1743,37 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
     return result;
 }
 
+SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
+    return compileSccMorph(input,{});
+}
+
+namespace {
+struct MorphCache {
+    CompositeTimbre input;
+    std::uint32_t algorithm_version{};
+    std::shared_ptr<const SccMorphCompileResult> result;
+};
+MorphCache& morphCache() {
+    thread_local MorphCache cache;
+    return cache;
+}
+} // namespace
+
+bool seedSccMorphCache(const CompositeTimbre& input,
+    std::shared_ptr<const SccMorphCompileResult> result) {
+    if (!result || result->cancelled || result->algorithm_version != kSccMorphAlgorithmVersion
+        || !result->authored_input
+        || *result->authored_input != input) return false;
+    auto& cache = morphCache();
+    cache.input = input;
+    cache.algorithm_version = kSccMorphAlgorithmVersion;
+    cache.result = std::move(result);
+    return true;
+}
+
 std::shared_ptr<const SccMorphCompileResult> compileSccMorphCached(
     const CompositeTimbre& input) {
-    struct Cache {
-        CompositeTimbre input;
-        std::uint32_t algorithm_version{};
-        std::shared_ptr<const SccMorphCompileResult> result;
-    };
-    thread_local Cache cache;
+    auto& cache = morphCache();
     if (!cache.result || cache.input != input
         || cache.algorithm_version != kSccMorphAlgorithmVersion) {
         auto result = std::make_shared<const SccMorphCompileResult>(compileSccMorph(input));
