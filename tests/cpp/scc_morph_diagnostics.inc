@@ -530,7 +530,12 @@ void testSccMorphDiagnosticFixture() {
             sccTone(1001, 16, start), sccTone(1002, 17, sine)};
         source_layer.timbre_automation = {
             toneEvent(1001, 0),
-            toneEvent(1002, 60, SccMorphTransition{true, 27, 1.0})};
+            toneEvent(1002, 60, SccMorphTransition{
+                .enabled = true,
+                .intermediate_count = 27,
+                .curve = 1.0,
+                .distribution_mode = SccMorphDistributionMode::ToneDistribution,
+            })};
         input.layers.push_back(std::move(source_layer));
         const auto compiled = compileSccMorph(input);
         if (!compiled.valid) continue;
@@ -617,7 +622,12 @@ void testSccMorphDiagnosticFixture() {
     canonical_layer.envelope_timeline.length_counts = 61;
     canonical_layer.timbre_automation = {
         toneEvent(1001, 0),
-        toneEvent(1002, 60, SccMorphTransition{true, 27, 1.0})};
+        toneEvent(1002, 60, SccMorphTransition{
+            .enabled = true,
+            .intermediate_count = 27,
+            .curve = 1.0,
+            .distribution_mode = SccMorphDistributionMode::ToneDistribution,
+        })};
     canonical_input.embedded_timbres = {
         sccTone(1001, 16, best_start), sccTone(1002, 17, sine)};
     canonical_input.layers.push_back(std::move(canonical_layer));

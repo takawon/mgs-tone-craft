@@ -5,12 +5,15 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -298,6 +301,30 @@ private:
     juce::Viewport viewport_;
 };
 
+// Radio semantics retain JUCE's keyboard/accessibility handling. The circle
+// uses the same font, scaled geometry, hover and enabled-state tokens as chrome.
+class MorphDistributionButton final : public juce::ToggleButton {
+    void paintButton(juce::Graphics& graphics, bool highlighted, bool) override {
+        auto area = getLocalBounds().reduced(UiLayout::controlGap, 0);
+        const int diameter = UiLayout::switchTrackH;
+        const auto circle = juce::Rectangle<float>(static_cast<float>(area.getX()),
+            static_cast<float>(area.getCentreY()) - static_cast<float>(diameter) * 0.5F,
+            static_cast<float>(diameter), static_cast<float>(diameter));
+        const auto text = findColour(juce::ToggleButton::textColourId);
+        graphics.setColour((highlighted || hasKeyboardFocus(true) ? uiHoverAccent() : text)
+            .withMultipliedAlpha(isEnabled() ? 1.0F : 0.5F));
+        graphics.drawEllipse(circle, 1.5F);
+        if (getToggleState()) graphics.fillEllipse(circle.reduced(static_cast<float>(UiLayout::xs)));
+        area.removeFromLeft(diameter + UiLayout::controlGap);
+        graphics.setFont(UiFonts::body());
+        graphics.drawFittedText(getButtonText(), area, juce::Justification::centredLeft, 1);
+        if (hasKeyboardFocus(true)) {
+            graphics.setColour(uiHoverAccent());
+            graphics.drawRect(getLocalBounds().toFloat().reduced(1.0F), 1.5F);
+        }
+    }
+};
+
 class EnvelopeTimbrePickContent final : public juce::Component {
 public:
     using MorphSettings = decltype(mgstc::engine::EnvelopeEvent{}.scc_morph);
@@ -328,16 +355,36 @@ public:
         morph_endpoints_.setFont(UiFonts::body());
         morph_endpoints_.setTooltip(morph_endpoints_.getText());
         addAndMakeVisible(morph_endpoints_);
+        morph_distribution_label_.setText(juce::String::fromUTF8("変化方式"), juce::dontSendNotification);
+        morph_distribution_label_.setFont(UiFonts::body());
+        addAndMakeVisible(morph_distribution_label_);
+        const std::array<juce::String, 3> distribution_names{
+            juce::String::fromUTF8("適応型（標準）"),
+            juce::String::fromUTF8("時間配分型"),
+            juce::String::fromUTF8("音色配分型")};
+        for (std::size_t index = 0; index < morph_distribution_.size(); ++index) {
+            auto& button = morph_distribution_[index];
+            button.setButtonText(distribution_names[index]);
+            button.setRadioGroupId(1);
+            button.setClickingTogglesState(true);
+            button.setWantsKeyboardFocus(true);
+            button.setExplicitFocusOrder(221 + static_cast<int>(index));
+            button.onClick = [this] { changeMorph(true); };
+            addAndMakeVisible(button);
+        }
+        syncMorphDistribution();
         morph_count_label_.setText(juce::String::fromUTF8("中間音色数"), juce::dontSendNotification);
         morph_count_label_.setFont(UiFonts::body());
         addAndMakeVisible(morph_count_label_);
         morph_count_.setSliderStyle(juce::Slider::LinearBar);
-        morph_count_.setRange(0, juce::jmax(1, maximum_intermediates), 1);
+        // Keep an impossible loaded N visible until the user explicitly edits
+        // it; changing mode must never silently shorten a morph's tone count.
+        morph_count_max_ = juce::jmax(juce::jmax(0, maximum_intermediates),
+                                    static_cast<int>(settings.intermediate_count));
+        morph_count_.setRange(0, juce::jmax(1, morph_count_max_), 1);
         morph_count_.setNumDecimalPlacesToDisplay(0);
-        morph_count_.setValue(juce::jmin(static_cast<int>(settings.intermediate_count),
-                                      juce::jmax(0, maximum_intermediates)), juce::dontSendNotification);
-        morph_count_max_ = juce::jmax(0, maximum_intermediates);
-        morph_count_.setExplicitFocusOrder(221);
+        morph_count_.setValue(settings.intermediate_count, juce::dontSendNotification);
+        morph_count_.setExplicitFocusOrder(224);
         morph_count_.setWantsKeyboardFocus(true);
         morph_count_.onDragStart = [this] { morph_dragging_ = true; morph_drag_rejected_ = false; };
         morph_count_.onValueChange = [this] { changeMorph(!morph_dragging_); };
@@ -351,7 +398,7 @@ public:
         morph_curve_.setRange(-1, 1, 0.001);
         morph_curve_.setValue(-std::log(settings.curve) / std::log(mgstc::engine::kSccMorphGammaMax), juce::dontSendNotification);
         morph_curve_.setTooltip(juce::String::fromUTF8("左: 前半速い / 中央: 均一 / 右: 後半速い"));
-        morph_curve_.setExplicitFocusOrder(222);
+        morph_curve_.setExplicitFocusOrder(225);
         morph_curve_.setWantsKeyboardFocus(true);
         morph_curve_.onDragStart = [this] { morph_dragging_ = true; morph_drag_rejected_ = false; };
         morph_curve_.onValueChange = [this] { changeMorph(!morph_dragging_); };
@@ -369,7 +416,7 @@ public:
             juce::String::fromUTF8("直前に音色イベントが必要です。同じカウントではモーフィングできません。"),
             juce::dontSendNotification);
         syncMorphEnabled();
-        setSize(getWidth(), getHeight() + (UiLayout::fieldH + UiLayout::sm) * 6);
+        setSize(getWidth(), getHeight() + (UiLayout::fieldH + UiLayout::sm) * 10);
         if (focus_morph) juce::MessageManager::callAsync(
             [safe = juce::Component::SafePointer<EnvelopeTimbrePickContent>(this)] {
                 if (safe != nullptr && safe->morph_enabled_.isEnabled())
@@ -378,19 +425,43 @@ public:
     }
 
     [[nodiscard]] juce::String verifyMorphControls() {
-        if (morph_count_.getExplicitFocusOrder() != 221 || morph_curve_.getExplicitFocusOrder() != 222)
+        if (morph_count_.getExplicitFocusOrder() != 224 || morph_curve_.getExplicitFocusOrder() != 225)
             return "unexpected morph control Tab order";
+        if (morph_settings_.distribution_mode != mgstc::engine::SccMorphDistributionMode::AdaptiveDistribution
+            || !morph_distribution_[0].getToggleState())
+            return "new morph interval does not default to Adaptive";
+        for (std::size_t index = 0; index < morph_distribution_.size(); ++index) {
+            const auto& button = morph_distribution_[index];
+            if (button.getExplicitFocusOrder() != 221 + static_cast<int>(index))
+                return "unexpected distribution mode Tab order";
+            if (button.isEnabled()) return "Morph OFF leaves distribution mode enabled";
+            if (button.getBounds().isEmpty() || !getLocalBounds().contains(button.getBounds()))
+                return "distribution mode lies outside picker bounds";
+        }
         if (morph_count_.isEnabled()) return "Morph OFF leaves intermediate count enabled";
         if (morph_curve_.isEnabled()) return "Morph OFF leaves curve enabled";
         if (morph_curve_.getWidth() < UiLayout::libraryButtonMinW * 2) return "curve track is too narrow";
         for (const auto* control : std::initializer_list<const juce::Component*>{
-                 &morph_enabled_, &morph_endpoints_, &morph_count_, &morph_curve_, &morph_error_})
+                 &morph_enabled_, &morph_endpoints_, &morph_distribution_label_,
+                 &morph_count_, &morph_curve_, &morph_error_})
             if (control->getBounds().isEmpty() || !getLocalBounds().contains(control->getBounds()))
                 return "morph control lies outside picker bounds";
         morph_enabled_.setToggleState(true, juce::dontSendNotification);
         morph_enabled_.onClick();
         if (!morph_count_.isEnabled()) return "Morph ON leaves intermediate count disabled";
         if (!morph_curve_.isEnabled()) return "Morph ON leaves curve disabled";
+        for (std::size_t index = 0; index < morph_distribution_.size(); ++index) {
+            auto& button = morph_distribution_[index];
+            if (!button.isEnabled() || !button.getWantsKeyboardFocus())
+                return "enabled distribution mode cannot receive keyboard focus";
+            button.setToggleState(true, juce::dontSendNotification);
+            button.onClick();
+            if (morph_settings_.distribution_mode != distributionMode(index))
+                return "distribution mode button did not apply interval state";
+            for (std::size_t other = 0; other < morph_distribution_.size(); ++other)
+                if (morph_distribution_[other].getToggleState() != (other == index))
+                    return "distribution mode radio selection is not exclusive";
+        }
         // JUCE getWantsKeyboardFocus() returns false for disabled components;
         // test focusability only once Morph ON has enabled both sliders.
         if (!morph_count_.getWantsKeyboardFocus()) return "enabled intermediate count cannot receive keyboard focus";
@@ -407,7 +478,28 @@ public:
         morph_enabled_.setToggleState(false, juce::dontSendNotification);
         morph_enabled_.onClick();
         if (morph_count_.isEnabled() || morph_curve_.isEnabled()) return "Morph OFF did not disable settings after editing";
+        for (const auto& button : morph_distribution_)
+            if (button.isEnabled()) return "Morph OFF did not disable distribution mode after editing";
         return {};
+    }
+
+    void completeMorphChange(MorphSettings settings, const MorphChangeResult& result) {
+        morph_settings_ = std::move(settings);
+        morph_enabled_.setToggleState(morph_settings_.enabled, juce::dontSendNotification);
+        morph_count_.setValue(morph_settings_.intermediate_count, juce::dontSendNotification);
+        morph_curve_.setValue(-std::log(morph_settings_.curve) / std::log(mgstc::engine::kSccMorphGammaMax), juce::dontSendNotification);
+        syncMorphDistribution();
+        morph_error_.setText(result.error, juce::dontSendNotification);
+        morph_error_.setTooltip(result.error);
+        syncMorphEnabled();
+    }
+
+    [[nodiscard]] bool verifyUnavailableMorphCount() {
+        if (morph_count_.getValue() != morph_settings_.intermediate_count) return false;
+        const auto count = morph_settings_.intermediate_count;
+        morph_distribution_[1].setToggleState(true, juce::dontSendNotification);
+        morph_distribution_[1].onClick();
+        return morph_settings_.intermediate_count == count;
     }
 
     EnvelopeTimbrePickContent(
@@ -687,6 +779,12 @@ public:
             area.removeFromTop(sm);
             morph_endpoints_.setBounds(area.removeFromTop(fieldH));
             area.removeFromTop(sm);
+            morph_distribution_label_.setBounds(area.removeFromTop(fieldH));
+            area.removeFromTop(sm);
+            for (auto& button : morph_distribution_) {
+                button.setBounds(area.removeFromTop(fieldH));
+                area.removeFromTop(sm);
+            }
             auto count_row = area.removeFromTop(fieldH);
             morph_count_label_.setBounds(count_row.removeFromLeft(compositeInspectorLabelW));
             morph_count_.setBounds(count_row);
@@ -736,6 +834,20 @@ public:
     }
 
 private:
+    [[nodiscard]] static mgstc::engine::SccMorphDistributionMode distributionMode(std::size_t index) {
+        constexpr std::array modes{
+            mgstc::engine::SccMorphDistributionMode::AdaptiveDistribution,
+            mgstc::engine::SccMorphDistributionMode::TimeDistribution,
+            mgstc::engine::SccMorphDistributionMode::ToneDistribution};
+        return modes[index];
+    }
+
+    void syncMorphDistribution() {
+        for (std::size_t index = 0; index < morph_distribution_.size(); ++index)
+            morph_distribution_[index].setToggleState(
+                morph_settings_.distribution_mode == distributionMode(index), juce::dontSendNotification);
+    }
+
     void finishMorphDrag() {
         const bool rejected = morph_drag_rejected_;
         const auto error = morph_error_.getText();
@@ -751,6 +863,8 @@ private:
         morph_enabled_.setEnabled(morph_available_ || morph_enabled_.getToggleState());
         morph_count_.setEnabled(morph_available_ && morph_enabled_.getToggleState() && morph_count_max_ > 0);
         morph_curve_.setEnabled(morph_available_ && morph_enabled_.getToggleState());
+        for (auto& button : morph_distribution_)
+            button.setEnabled(morph_available_ && morph_enabled_.getToggleState());
     }
 
     void changeMorph(bool commit) {
@@ -759,6 +873,12 @@ private:
         settings.intermediate_count = static_cast<std::uint8_t>(juce::jlimit(
             0, morph_count_max_, juce::roundToInt(morph_count_.getValue())));
         settings.curve = std::pow(mgstc::engine::kSccMorphGammaMax, -morph_curve_.getValue());
+        for (std::size_t index = 0; index < morph_distribution_.size(); ++index)
+            if (morph_distribution_[index].getToggleState()) settings.distribution_mode = distributionMode(index);
+        if (settings.distribution_mode != morph_settings_.distribution_mode
+            || settings.intermediate_count != morph_settings_.intermediate_count
+            || settings.curve != morph_settings_.curve)
+            settings.explicit_plan.reset();
         const auto result = morph_change_ ? morph_change_(settings, commit) : MorphChangeResult{};
         const auto& error = result.error;
         if (morph_dragging_) morph_drag_rejected_ = !result.accepted;
@@ -769,6 +889,7 @@ private:
             morph_enabled_.setToggleState(morph_settings_.enabled, juce::dontSendNotification);
             morph_count_.setValue(morph_settings_.intermediate_count, juce::dontSendNotification);
             morph_curve_.setValue(-std::log(morph_settings_.curve) / std::log(mgstc::engine::kSccMorphGammaMax), juce::dontSendNotification);
+            syncMorphDistribution();
         }
         syncMorphEnabled();
     }
@@ -1136,6 +1257,8 @@ private:
     bool morph_drag_rejected_{};
     int morph_count_max_{};
     juce::ToggleButton morph_enabled_;
+    juce::Label morph_distribution_label_;
+    std::array<MorphDistributionButton, 3> morph_distribution_;
     juce::Label morph_endpoints_, morph_count_label_, morph_curve_label_;
     juce::Label morph_front_, morph_uniform_, morph_back_, morph_error_;
     juce::Slider morph_count_, morph_curve_;
@@ -3988,7 +4111,8 @@ public:
 
 class mgstc::app::CompositeTimeline::Impl final
     : public juce::Component,
-      private juce::ScrollBar::Listener {
+      private juce::ScrollBar::Listener,
+      private juce::Timer {
 public:
     using EditCallback = std::function<void(
         const mgstc::engine::CompositeTimbre&, bool, bool)>;
@@ -4417,6 +4541,13 @@ public:
     }
 
     ~Impl() override {
+        stopTimer();
+        cancelMorphGeneration();
+        if (morph_worker_.joinable()) {
+            morph_worker_.request_stop();
+            morph_worker_wakeup_.notify_all();
+            morph_worker_.join();
+        }
         closeRateEditor(false);
         for (auto& toggle : modulation_toggles_) {
             toggle.setLookAndFeel(nullptr);
@@ -4702,7 +4833,9 @@ public:
                 UiScale::setActivePercent(percent);
                 EnvelopeTimbrePickContent picker(mgstc::engine::TimbreSource::Scc,
                     {}, {}, [](auto) {}, {}, {});
-                picker.configureMorph({}, "A", "B", 2,
+                EnvelopeTimbrePickContent::MorphSettings picker_settings;
+                picker_settings.intermediate_count = 2;
+                picker.configureMorph(picker_settings, "A", "B", 2,
                     [](auto settings, bool) {
                         return EnvelopeTimbrePickContent::MorphChangeResult{
                             settings.intermediate_count <= 2,
@@ -4727,8 +4860,67 @@ public:
                     [](auto, bool) { return EnvelopeTimbrePickContent::MorphChangeResult{}; }, false);
                 ScrollableTimbrePickerContent scroll(tall_picker, UiLayout::fieldH * 10);
                 check(scroll.verifyGeometry(), "tall morph picker does not scroll to all controls");
+                EnvelopeTimbrePickContent impossible_picker(mgstc::engine::TimbreSource::Scc,
+                    {}, {}, [](auto) {}, {}, {});
+                auto impossible_settings = picker_settings;
+                impossible_settings.enabled = true;
+                impossible_settings.intermediate_count = 6;
+                impossible_picker.configureMorph(impossible_settings, "A", "B", 2,
+                    [](auto, bool) { return EnvelopeTimbrePickContent::MorphChangeResult{}; }, false);
+                check(impossible_picker.verifyUnavailableMorphCount(),
+                    "changing distribution mode silently reduced an impossible authored count");
             }
             UiScale::setActivePercent(picker_scale);
+            auto apply_verified_morph = [&](std::size_t layer_index, int count, auto settings) {
+                std::optional<EnvelopeTimbrePickContent::MorphChangeResult> completed;
+                auto result = applyIncomingMorph(layer_index, count, settings, true,
+                    [&](auto, auto outcome) { completed = std::move(outcome); });
+                const auto deadline = juce::Time::getMillisecondCounterHiRes() + 120000.0;
+                while (!completed && result.accepted && juce::Time::getMillisecondCounterHiRes() < deadline) {
+                    timerCallback();
+                    juce::Thread::sleep(1);
+                }
+                if (completed) return *completed;
+                return EnvelopeTimbrePickContent::MorphChangeResult{false, "morph worker did not complete"};
+            };
+            const auto saved_edit_callback = edit_callback_;
+            std::vector<mgstc::engine::CompositeTimbre> mode_history{timbre_};
+            edit_callback_ = [&](const auto& edited, bool commit, bool) {
+                if (commit) mode_history.push_back(edited);
+            };
+            auto mode_settings = arrival.scc_morph;
+            mode_settings.intermediate_count = 2;
+            mode_settings.distribution_mode = mgstc::engine::SccMorphDistributionMode::TimeDistribution;
+            check(apply_verified_morph(1, 12, mode_settings).accepted,
+                "Time Distribution change was not committed from shared timeline");
+            mode_settings.distribution_mode = mgstc::engine::SccMorphDistributionMode::ToneDistribution;
+            check(apply_verified_morph(1, 12, mode_settings).accepted,
+                "Tone Distribution change was not committed from shared timeline");
+            check(mode_history.size() == 3, "mode changes did not create independent Undo transactions");
+            if (mode_history.size() == 3) {
+                setTimbre(mode_history[1]);
+                check(timbreEventAt(timbre_.layers[1], 12)->scc_morph.distribution_mode
+                        == mgstc::engine::SccMorphDistributionMode::TimeDistribution,
+                    "Undo snapshot did not restore per-interval distribution mode");
+                setTimbre(mode_history[2]);
+                check(timbreEventAt(timbre_.layers[1], 12)->scc_morph.distribution_mode
+                        == mgstc::engine::SccMorphDistributionMode::ToneDistribution,
+                    "Redo snapshot did not restore per-interval distribution mode");
+            }
+            std::size_t latest_commits{};
+            edit_callback_ = [&](const auto&, bool commit, bool) { if (commit) ++latest_commits; };
+            mode_settings.distribution_mode = mgstc::engine::SccMorphDistributionMode::TimeDistribution;
+            static_cast<void>(applyIncomingMorph(1, 12, mode_settings, true));
+            mode_settings.distribution_mode = mgstc::engine::SccMorphDistributionMode::AdaptiveDistribution;
+            check(apply_verified_morph(1, 12, mode_settings).accepted && latest_commits == 1,
+                "superseded morph generation published an old setting or extra Undo transaction");
+            const auto restored_model = timbre_;
+            static_cast<void>(applyIncomingMorph(1, 12, mode_settings, true));
+            setTimbre(restored_model);
+            timerCallback();
+            check(timbre_ == restored_model && latest_commits == 1 && !morph_pending_edit_,
+                "model reload did not cancel pending morph generation");
+            edit_callback_ = saved_edit_callback;
             auto recovery_model = morph_model;
             for (auto& event : recovery_model.layers[1].timbre_automation) {
                 event.scc_morph.enabled = event.count != 22;
@@ -4739,25 +4931,25 @@ public:
             EnvelopeTimbrePickContent::MorphSettings reduced;
             reduced.enabled = true;
             reduced.intermediate_count = 1;
-            const auto reduced_result = applyIncomingMorph(1, 2, reduced, true);
+            const auto reduced_result = apply_verified_morph(1, 2, reduced);
             check(reduced_result.accepted && reduced_result.error.isNotEmpty(),
                 "invalid morph state cannot reduce one interval while another error remains");
             auto increased = reduced;
             increased.intermediate_count = 2;
             const auto before_increase = timbre_;
-            const auto increase_result = applyIncomingMorph(1, 2, increased, true);
+            const auto increase_result = apply_verified_morph(1, 2, increased);
             check(!increase_result.accepted && timbre_ == before_increase,
                 "invalid morph recovery accepted an increased intermediate count");
             reduced.enabled = false;
-            const auto first_disabled = applyIncomingMorph(1, 2, reduced, true);
+            const auto first_disabled = apply_verified_morph(1, 2, reduced);
             check(first_disabled.accepted && first_disabled.error.isNotEmpty() && !morph_preview_.valid,
                 "disabling one invalid transition lost error or failed to retain the edit");
-            const auto second_disabled = applyIncomingMorph(1, 12, reduced, true);
+            const auto second_disabled = apply_verified_morph(1, 12, reduced);
             check(second_disabled.accepted && second_disabled.error.isEmpty() && morph_preview_.valid,
                 "disabling the remaining invalid transition did not repair the morph state");
             reduced.enabled = true;
             const auto repaired = timbre_;
-            const auto invalid_new = applyIncomingMorph(1, 2, reduced, true);
+            const auto invalid_new = apply_verified_morph(1, 2, reduced);
             check(!invalid_new.accepted && timbre_ == repaired,
                 "valid model accepted a new invalid morph proposal");
             setTimbre(morph_model, true);
@@ -5111,6 +5303,7 @@ public:
         bool reset_scroll_extent = false) {
         const auto previous_pitch_expanded = pitch_lane_expanded_;
         timbre_ = timbre;
+        cancelMorphGeneration(true);
         envelope_number_active_.resize(timbre_.layers.size());
         for (std::size_t index = 0; index < timbre_.layers.size(); ++index) {
             const auto& layer = timbre_.layers[index];
@@ -8894,6 +9087,7 @@ private:
     }
 
     void notifyLayerEdit(int timeline_count, int shown_value, bool commit) {
+        cancelMorphGeneration(true);
         maybeExpandScrollExtent(timeline_count);
         if (commit
             && selected_layer_ >= 0
@@ -9314,9 +9508,121 @@ private:
         return std::nullopt;
     }
 
+    using MorphCompletion = std::function<void(
+        EnvelopeTimbrePickContent::MorphSettings,
+        EnvelopeTimbrePickContent::MorphChangeResult)>;
+
+    struct MorphWorkerRequest {
+        std::uint64_t generation{};
+        mgstc::engine::CompositeTimbre candidate;
+        std::shared_ptr<std::stop_source> cancellation;
+    };
+
+    struct MorphPendingEdit {
+        std::uint64_t generation{};
+        std::size_t layer_index{};
+        int count{};
+        mgstc::engine::CompositeTimbre source, candidate;
+        EnvelopeTimbrePickContent::MorphSettings previous, settings;
+        bool reduces_invalid_transition{};
+        MorphCompletion completion;
+    };
+
+    void cancelMorphGeneration(bool restore_picker = false) {
+        ++morph_generation_;
+        auto pending = std::move(morph_pending_edit_);
+        morph_pending_edit_.reset();
+        {
+            std::lock_guard lock(morph_worker_mutex_);
+            if (morph_active_cancellation_) morph_active_cancellation_->request_stop();
+            if (morph_worker_request_) morph_worker_request_->cancellation->request_stop();
+            morph_worker_request_.reset();
+            morph_worker_result_.reset();
+        }
+        if (restore_picker && pending && pending->completion) {
+            auto settings = pending->previous;
+            if (pending->layer_index < timbre_.layers.size()) {
+                if (const auto* event = timbreEventAt(timbre_.layers[pending->layer_index],
+                    static_cast<std::uint32_t>(pending->count))) settings = event->scc_morph;
+            }
+            pending->completion(std::move(settings), {false, juce::String::fromUTF8("設定変更により生成を中止しました")});
+        }
+    }
+
+    void ensureMorphWorker() {
+        if (morph_worker_.joinable()) return;
+        morph_worker_ = std::jthread([this](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                std::optional<MorphWorkerRequest> request;
+                {
+                    std::unique_lock lock(morph_worker_mutex_);
+                    if (!morph_worker_wakeup_.wait(lock, stop, [this] { return morph_worker_request_.has_value(); }))
+                        break;
+                    request = std::move(morph_worker_request_);
+                    morph_worker_request_.reset();
+                    morph_active_cancellation_ = request->cancellation;
+                }
+                const auto token = request->cancellation->get_token();
+                auto result = std::make_shared<const mgstc::engine::SccMorphCompileResult>(
+                    mgstc::engine::compileSccMorph(request->candidate, token));
+                {
+                    std::lock_guard lock(morph_worker_mutex_);
+                    if (!token.stop_requested() && !stop.stop_requested()) {
+                        morph_worker_result_ = std::move(result);
+                        morph_result_generation_ = request->generation;
+                    }
+                    if (morph_active_cancellation_ == request->cancellation)
+                        morph_active_cancellation_.reset();
+                }
+            }
+        });
+    }
+
+    void timerCallback() override {
+        std::shared_ptr<const mgstc::engine::SccMorphCompileResult> result;
+        std::uint64_t generation{};
+        {
+            std::lock_guard lock(morph_worker_mutex_);
+            result = std::move(morph_worker_result_);
+            morph_worker_result_.reset();
+            generation = morph_result_generation_;
+        }
+        if (!morph_pending_edit_) { stopTimer(); return; }
+        if (morph_pending_edit_->source != timbre_) {
+            cancelMorphGeneration(true);
+            stopTimer();
+            return;
+        }
+        if (!result || generation != morph_generation_ || generation != morph_pending_edit_->generation) return;
+        auto pending = std::move(*morph_pending_edit_);
+        morph_pending_edit_.reset();
+        stopTimer();
+        const auto error = result->valid ? juce::String{}
+            : juce::String::fromUTF8(result->error.c_str())
+                + juce::String::fromUTF8(" 必要: ") + juce::String(static_cast<int>(result->required))
+                + juce::String::fromUTF8(" / 使用可能: ") + juce::String(static_cast<int>(result->capacity));
+        const bool accepted = result->valid || pending.reduces_invalid_transition || pending.candidate == timbre_;
+        if (accepted) {
+            if (!mgstc::engine::seedSccMorphCache(pending.candidate, result)) {
+                const auto failure = juce::String::fromUTF8("モーフィング生成結果が設定と一致しません");
+                if (pending.completion) pending.completion(pending.previous, {false, failure});
+                reportStatus(failure);
+                return;
+            }
+            timbre_ = std::move(pending.candidate);
+            morph_preview_ = *result;
+            morph_preview_input_ = timbre_;
+            notifyLayerEdit(pending.count, 0, true);
+        }
+        if (pending.completion) pending.completion(accepted ? pending.settings : pending.previous, {accepted, error});
+        if (error.isNotEmpty()) reportStatus(error);
+    }
+
     EnvelopeTimbrePickContent::MorphChangeResult applyIncomingMorph(
         std::size_t layer_index, int count,
-        EnvelopeTimbrePickContent::MorphSettings settings, bool commit) {
+        EnvelopeTimbrePickContent::MorphSettings settings, bool commit,
+        MorphCompletion completion = {}) {
+        cancelMorphGeneration();
         auto candidate = timbre_;
         if (layer_index >= candidate.layers.size()) return {false, juce::String::fromUTF8("チャンネルがありません")};
         auto& events = candidate.layers[layer_index].timbre_automation;
@@ -9325,28 +9631,31 @@ private:
         });
         if (event == events.end()) return {false, juce::String::fromUTF8("音色イベントがありません")};
         const auto previous = event->scc_morph;
+        if (settings.distribution_mode != previous.distribution_mode
+            || settings.intermediate_count != previous.intermediate_count
+            || settings.curve != previous.curve)
+            settings.explicit_plan.reset();
         event->scc_morph = settings;
-        const auto prior = mgstc::engine::compileSccMorphCached(timbre_);
-        const auto result = mgstc::engine::compileSccMorphCached(candidate);
-        const bool reduces_invalid_transition = !prior->valid
+        // A slider drag only changes picker state. Its final commit schedules
+        // one immutable preparation job and one existing Undo transaction.
+        if (!commit) return {};
+        const bool prior_valid = morph_preview_input_ && *morph_preview_input_ == timbre_ && morph_preview_.valid;
+        const bool reduces_invalid_transition = !prior_valid
             && ((previous.enabled && !settings.enabled)
                 || (settings.enabled == previous.enabled && settings.curve == previous.curve
+                    && settings.distribution_mode == previous.distribution_mode
                     && settings.intermediate_count < previous.intermediate_count));
-        // A final drag commit may equal the last accepted state. Preserve its
-        // undo transaction even when other invalid intervals still remain.
-        const bool unchanged = candidate == timbre_;
-        const auto error = result->valid ? juce::String{}
-            : juce::String::fromUTF8(result->error.c_str())
-                + juce::String::fromUTF8(" 必要: ") + juce::String(static_cast<int>(result->required))
-                + juce::String::fromUTF8(" / 使用可能: ") + juce::String(static_cast<int>(result->capacity));
-        if (!result->valid && !reduces_invalid_transition && !unchanged) {
-            reportStatus(error);
-            return {false, error};
+        morph_pending_edit_ = MorphPendingEdit{morph_generation_, layer_index, count, timbre_, candidate,
+            previous, settings, reduces_invalid_transition, std::move(completion)};
+        ensureMorphWorker();
+        {
+            std::lock_guard lock(morph_worker_mutex_);
+            morph_worker_request_ = MorphWorkerRequest{morph_generation_, std::move(candidate),
+                std::make_shared<std::stop_source>()};
         }
-        timbre_ = std::move(candidate);
-        notifyLayerEdit(count, 0, commit);
-        if (error.isNotEmpty()) reportStatus(error);
-        return {true, error};
+        morph_worker_wakeup_.notify_one();
+        startTimerHz(30);
+        return {true, juce::String::fromUTF8("モーフィングを生成中…")};
     }
 
     [[nodiscard]] std::optional<int> timbreMarkerCountAt(
@@ -9483,8 +9792,13 @@ private:
                 content->configureMorph(arrival->scc_morph,
                     previous ? timbreCommandLabel(*previous) : juce::String::fromUTF8("（なし）"),
                     timbreCommandLabel(*arrival), maximum,
-                    [this, count, layer_index](EnvelopeTimbrePickContent::MorphSettings settings, bool commit) {
-                        return applyIncomingMorph(layer_index, count, settings, commit);
+                    [this, count, layer_index,
+                     safe = juce::Component::SafePointer<EnvelopeTimbrePickContent>(content)](
+                        EnvelopeTimbrePickContent::MorphSettings settings, bool commit) {
+                        return applyIncomingMorph(layer_index, count, settings, commit,
+                            [safe](auto confirmed, auto result) {
+                                if (safe != nullptr) safe->completeMorphChange(std::move(confirmed), result);
+                            });
                     }, focus_morph);
             }
         }
@@ -10799,6 +11113,15 @@ private:
     juce::ComboBox morph_bank_;
     std::optional<mgstc::engine::CompositeTimbre> morph_preview_input_;
     mgstc::engine::SccMorphCompileResult morph_preview_;
+    std::uint64_t morph_generation_{};
+    std::optional<MorphPendingEdit> morph_pending_edit_;
+    std::mutex morph_worker_mutex_;
+    std::condition_variable_any morph_worker_wakeup_;
+    std::optional<MorphWorkerRequest> morph_worker_request_;
+    std::shared_ptr<std::stop_source> morph_active_cancellation_;
+    std::shared_ptr<const mgstc::engine::SccMorphCompileResult> morph_worker_result_;
+    std::uint64_t morph_result_generation_{};
+    std::jthread morph_worker_;
     juce::ScrollBar horizontal_scroll_;
     juce::ScrollBar vertical_scroll_;
     EditCallback edit_callback_;

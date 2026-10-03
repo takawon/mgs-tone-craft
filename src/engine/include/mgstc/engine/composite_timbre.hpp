@@ -66,12 +66,56 @@ struct SavedTimbreReference {
         const SavedTimbreReference&) = default;
 };
 
+enum class SccMorphDistributionMode : std::uint8_t {
+    AdaptiveDistribution,
+    TimeDistribution,
+    ToneDistribution,
+};
+
+struct SccMorphPoint {
+    double morph_position{};
+    std::uint32_t event_count{};
+
+    friend bool operator==(const SccMorphPoint&, const SccMorphPoint&) = default;
+};
+
+// Relative counts include both source endpoints. A confirmed external plan may
+// be authored here; ordinary plans are regenerated from settings and sources.
+struct SccMorphPlan {
+    std::vector<SccMorphPoint> points;
+
+    friend bool operator==(const SccMorphPlan&, const SccMorphPlan&) = default;
+};
+
+[[nodiscard]] inline bool isValidSccMorphPlan(
+    const SccMorphPlan& plan, std::uint8_t intermediate_count) noexcept {
+    if (plan.points.size() != static_cast<std::size_t>(intermediate_count) + 2
+        || plan.points.front().morph_position != 0.0
+        || plan.points.front().event_count != 0
+        || plan.points.back().morph_position != 1.0) return false;
+    for (std::size_t i = 1; i < plan.points.size(); ++i) {
+        if (!std::isfinite(plan.points[i].morph_position)
+            || plan.points[i].morph_position <= plan.points[i - 1].morph_position
+            || plan.points[i].event_count <= plan.points[i - 1].event_count) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] inline bool isValidSccMorphDistributionMode(
+    SccMorphDistributionMode mode) noexcept {
+    return mode == SccMorphDistributionMode::AdaptiveDistribution
+        || mode == SccMorphDistributionMode::TimeDistribution
+        || mode == SccMorphDistributionMode::ToneDistribution;
+}
+
 // Incoming SCC transition, owned by its destination `@` event. Derived
 // waveforms are compiled outside audio processing and are never saved here.
 struct SccMorphTransition {
     bool enabled{};
     std::uint8_t intermediate_count{6};
     double curve{1.0};
+    SccMorphDistributionMode distribution_mode{SccMorphDistributionMode::AdaptiveDistribution};
+    std::optional<SccMorphPlan> explicit_plan;
 
     friend bool operator==(const SccMorphTransition&,
                            const SccMorphTransition&) = default;
@@ -418,7 +462,7 @@ struct CompositeLayer {
 struct CompositeTimbre {
     // Portable .mgstc / clipboard layout (name, tags, memo, favorite, then
     // sound body). Independent of SQLite kCompositeSoundPayloadVersion.
-    static constexpr std::uint32_t kFormatVersion = 22;
+    static constexpr std::uint32_t kFormatVersion = 23;
     static constexpr std::uint32_t kMinimumReadableFormatVersion = 5;
 
     std::uint32_t format_version{kFormatVersion};
@@ -434,9 +478,9 @@ struct CompositeTimbre {
     // and MGSC output work without a live library entry.
     std::vector<SavedTimbreReference> embedded_timbres;
     std::uint8_t scc_morph_bank_base{};
-    // New authoring uses generation revision 2. Readers retain legacy revision
+    // New authoring uses generation revision 3. Readers retain legacy revision
     // metadata; compilation upgrades only its transient derived snapshot.
-    std::uint32_t scc_morph_algorithm_version{2};
+    std::uint32_t scc_morph_algorithm_version{3};
     // Transient compilation marker, deliberately omitted from all save formats.
     bool scc_morph_materialized{};
 

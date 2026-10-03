@@ -3449,6 +3449,7 @@ void testPluginStateFoundation() {
 void testSccMorphPluginStateCompatibility() {
     using namespace mgstc::engine;
     auto document = documentFrom(sccOnlyTimbre(), 0, {});
+    document.sound.scc_morph_algorithm_version = 2;
     auto& layer = document.sound.layers.front();
     layer.volume_envelope.events.clear();
     layer.pitch_envelope.events.clear();
@@ -3466,10 +3467,10 @@ void testSccMorphPluginStateCompatibility() {
     const auto framed = mgstc::plugin::serializePluginState(document);
     // v21 adds only the five global morph bytes.
     // v20 adds four six-byte modulation settings before the embedded count.
-    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3}}) {
+    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3}, std::uint8_t{4}}) {
         auto legacy = original;
         require(legacy.size() >= 33, "legacy sound fixture tail exists");
-        legacy.erase(legacy.end() - 11, legacy.end() - 9);
+        if (version <= 3) legacy.erase(legacy.end() - 11, legacy.end() - 9);
         if (version <= 2) legacy.resize(legacy.size() - 5);
         if (version == 1) {
             legacy.erase(legacy.end() - 28, legacy.end() - 4);
@@ -3483,7 +3484,7 @@ void testSccMorphPluginStateCompatibility() {
         blob[at - 7] = blob[at - 6] = blob[at - 5] = 0;
         const auto parsed = mgstc::plugin::parsePluginState(blob.data(), blob.size());
         require(parsed.status == mgstc::plugin::PluginStateStatus::Ok,
-                "legacy v1/v2/v3 plugin sound payload readable");
+                "legacy v1/v2/v3/v4 plugin sound payload readable");
         auto expected_legacy_sound = document.sound;
         if (version <= 2) expected_legacy_sound.scc_morph_algorithm_version = 1;
         require(soundBytes(parsed.document.sound) == soundBytes(expected_legacy_sound),
@@ -3507,7 +3508,35 @@ void testSccMorphPluginStateCompatibility() {
     layer.scc_output_allocation = SccOutputAllocationMode::Contiguous;
     layer.scc_output_start = 20;
     layer.timbre_automation.back().scc_morph.curve = 0.5;
+    document.sound.scc_morph_algorithm_version = 3;
+    const SccMorphDistributionMode modes[] = {
+        SccMorphDistributionMode::AdaptiveDistribution,
+        SccMorphDistributionMode::TimeDistribution,
+        SccMorphDistributionMode::ToneDistribution};
+    for (const auto mode : modes) {
+        layer.timbre_automation.back().scc_morph.distribution_mode = mode;
+        requireSoundRoundTrip(document);
+    }
+    layer.timbre_automation.back().scc_morph.distribution_mode =
+        SccMorphDistributionMode::AdaptiveDistribution;
+    layer.timbre_automation.back().scc_morph.explicit_plan =
+        SccMorphPlan{{{0.0, 0}, {0.1, 2}, {0.3, 7}, {0.8, 13}, {1.0, 20}}};
     requireSoundRoundTrip(document);
+    const auto rejects = [&](const mgstc::plugin::PluginStateDocument& invalid) {
+        return !mgstc::plugin::validatePluginSoundSnapshot(invalid.sound)
+            && mgstc::plugin::serializePluginState(invalid).empty();
+    };
+    auto invalid = document;
+    invalid.sound.layers.front().timbre_automation.back().scc_morph.distribution_mode =
+        static_cast<SccMorphDistributionMode>(255);
+    require(rejects(invalid), "plugin state rejects unknown distribution mode");
+    invalid = document;
+    invalid.sound.layers.front().timbre_automation.back().scc_morph.explicit_plan->points[1].morph_position =
+        std::numeric_limits<double>::infinity();
+    require(rejects(invalid), "plugin state rejects non-finite explicit plan");
+    invalid = document;
+    invalid.sound.layers.front().timbre_automation.back().scc_morph.explicit_plan->points[1].event_count = 0;
+    require(rejects(invalid), "plugin state rejects duplicate explicit counts");
     MgstcAudioProcessor processor;
     require(processor.replacePluginState(document), "morph plugin state compiles");
     requireSoundRoundTrip(processor.copyPluginState());

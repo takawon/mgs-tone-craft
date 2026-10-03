@@ -2,6 +2,7 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -4018,6 +4019,204 @@ void testToneLibrarySqliteV1RoundTripAndPortableFormat() {
     }
 
     std::filesystem::remove(db_path, remove_error);
+}
+
+void testSccMorphDistributionPersistence() {
+    using namespace mgstc::engine;
+    REQUIRE_EQ(SccMorphTransition{}.distribution_mode,
+        SccMorphDistributionMode::AdaptiveDistribution);
+    auto original = defaultCompositeTimbre();
+    original.layers = {original.layers[1]};
+    auto& layer = original.layers.front();
+    seedDefaultLayerTimbre(original, layer);
+    REQUIRE_EQ(layer.base_timbre.has_value(), true);
+    layer.volume_envelope.events.clear();
+    layer.pitch_envelope.events.clear();
+    layer.timbre_automation.clear();
+    const SccMorphDistributionMode modes[] = {
+        SccMorphDistributionMode::AdaptiveDistribution,
+        SccMorphDistributionMode::TimeDistribution,
+        SccMorphDistributionMode::ToneDistribution};
+    for (std::size_t i = 0; i < 3; ++i) {
+        layer.timbre_automation.push_back({
+            .kind = EnvelopeEventKind::Timbre,
+            .count = static_cast<std::uint32_t>((i + 1) * 20),
+            .target_library_id = layer.base_timbre->library_id,
+            .scc_morph = {.enabled = true, .intermediate_count = 2,
+                .curve = 2.0, .distribution_mode = modes[i]}});
+    }
+    layer.timbre_automation[0].scc_morph.explicit_plan =
+        SccMorphPlan{{{0.0, 0}, {0.2, 7}, {0.7, 14}, {1.0, 20}}};
+    std::string error;
+    const auto payload = serializeCompositeSoundPayload(original);
+    const auto decoded = deserializeCompositeSoundPayload(
+        payload, kCompositeSoundPayloadVersion, &error);
+    REQUIRE_EQ(decoded.has_value(), true);
+    REQUIRE_EQ(decoded->layers, original.layers);
+    REQUIRE_EQ(decoded->scc_morph_algorithm_version, 3U);
+    const auto file = CompositeTimbreLibrary::serializeTimbreFile(original, 1);
+    const auto loaded = CompositeTimbreLibrary::deserializeTimbreFile(file, &error);
+    REQUIRE_EQ(loaded.has_value(), true);
+    REQUIRE_EQ(*loaded, original);
+    const auto db_path = std::filesystem::temp_directory_path()
+        / "mgstc_morph_distribution_payload_test.sqlite";
+    std::error_code remove_error;
+    std::filesystem::remove(db_path, remove_error);
+    CompositeTimbreLibrary saved_library;
+    const auto id = saved_library.add(original, 1);
+    TimbreLibrary singles;
+    {
+        ToneLibraryDatabase database;
+        REQUIRE_EQ(database.open(db_path.string(), &error), true);
+        REQUIRE_EQ(database.replaceAll(singles, saved_library, &error), true);
+        CompositeTimbreLibrary restored_library;
+        REQUIRE_EQ(database.load(singles, restored_library, &error), true);
+        REQUIRE_EQ(database.userVersion(), 1);
+        REQUIRE_EQ(restored_library.find(id) != nullptr, true);
+        REQUIRE_EQ(restored_library.find(id)->timbre, original);
+    }
+    std::filesystem::remove(db_path, remove_error);
+
+    // A single controlled event permits stripping exactly the two v23 fields
+    // without relying on changing arbitrary bytes in the historical layout.
+    auto old = original;
+    old.scc_morph_algorithm_version = 2;
+    old.layers[0].scc_output_allocation = SccOutputAllocationMode::LegacyBank;
+    old.layers[0].scc_output_start.reset();
+    old.layers[0].timbre_automation.resize(1);
+    auto& event = old.layers[0].timbre_automation[0];
+    event.scc_morph.explicit_plan.reset();
+    event.scc_morph.distribution_mode = SccMorphDistributionMode::ToneDistribution;
+    std::string marker;
+    const auto append = [&](std::uint64_t value, std::size_t size) {
+        for (std::size_t i = 0; i < size; ++i)
+            marker.push_back(static_cast<char>((value >> (i * 8)) & 255));
+    };
+    append(static_cast<std::uint8_t>(event.kind), 1);
+    append(static_cast<std::uint32_t>(event.value), 4);
+    append(static_cast<std::uint32_t>(event.secondary), 4);
+    append(event.count, 4);
+    append(event.target_library_id, 8);
+    append(static_cast<std::uint8_t>(event.timbre_pick), 1);
+    append(event.after_loop_start, 1);
+    append(event.automatic, 1);
+    append(event.precise, 1);
+    append(event.scc_morph.enabled, 1);
+    append(event.scc_morph.intermediate_count, 1);
+    append(std::bit_cast<std::uint64_t>(event.scc_morph.curve), 8);
+    const auto current_old = serializeCompositeSoundPayload(old);
+    const auto at = current_old.find(marker);
+    REQUIRE_EQ(at != std::string::npos, true);
+    REQUIRE_EQ(current_old.find(marker, at + 1), std::string::npos);
+    REQUIRE_EQ(static_cast<unsigned char>(current_old[at + marker.size()]), 2U);
+    REQUIRE_EQ(current_old[at + marker.size() + 1], '\0');
+    auto old_payload = current_old;
+    old_payload.erase(at + marker.size(), 2);
+    const auto hex = [](std::string_view value) {
+        std::string result;
+        constexpr char digits[] = "0123456789ABCDEF";
+        for (const unsigned char byte : value) {
+            result += digits[byte >> 4];
+            result += digits[byte & 15];
+        }
+        return result;
+    };
+    const auto current_file = CompositeTimbreLibrary::serializeTimbreFile(old, 1);
+    const auto line = current_file.find("\nC\t");
+    REQUIRE_EQ(line != std::string::npos, true);
+    const auto blob_at = current_file.rfind('\t') + 1;
+    const auto blob_end = current_file.find_first_of("\r\n", blob_at);
+    auto encoded = current_file.substr(blob_at, blob_end - blob_at);
+    const auto encoded_at = encoded.find(hex(marker));
+    REQUIRE_EQ(encoded_at != std::string::npos, true);
+    encoded.erase(encoded_at + marker.size() * 2, 4);
+    for (const auto version : {21U, 22U}) {
+        auto legacy_payload = old_payload;
+        auto legacy_encoded = encoded;
+        // Little-endian format version: 21=15, 22=16 (hex).
+        legacy_encoded.replace(0, 8, version == 21 ? "15000000" : "16000000");
+        if (version == 21) {
+            legacy_payload.erase(legacy_payload.size() - 11, 2);
+            legacy_encoded.erase(legacy_encoded.size() - 22, 4);
+        }
+        const auto old_decoded = deserializeCompositeSoundPayload(
+            legacy_payload, version == 21 ? 3 : 4, &error);
+        REQUIRE_EQ(old_decoded.has_value(), true);
+        REQUIRE_EQ(old_decoded->layers, old.layers);
+        REQUIRE_EQ(old_decoded->scc_morph_algorithm_version, 2U);
+        auto legacy_file = current_file;
+        legacy_file.replace(blob_at, blob_end - blob_at, legacy_encoded);
+        const auto old_loaded = CompositeTimbreLibrary::deserializeTimbreFile(legacy_file, &error);
+        REQUIRE_EQ(old_loaded.has_value(), true);
+        REQUIRE_EQ(old_loaded->layers, old.layers);
+        REQUIRE_EQ(old_loaded->scc_morph_algorithm_version, 2U);
+        if (version == 22) {
+            // Exercise the SQLite reader's version gate, not only the decoder.
+            const auto legacy_db_path = std::filesystem::temp_directory_path()
+                / "mgstc_morph_legacy_v4_payload_test.sqlite";
+            std::filesystem::remove(legacy_db_path, remove_error);
+            CompositeTimbreLibrary legacy_library;
+            const auto legacy_id = legacy_library.add(old, 1);
+            {
+                ToneLibraryDatabase database;
+                REQUIRE_EQ(database.open(legacy_db_path.string(), &error), true);
+                REQUIRE_EQ(database.replaceAll(singles, legacy_library, &error), true);
+            }
+            sqlite3* raw = nullptr;
+            REQUIRE_EQ(sqlite3_open(legacy_db_path.string().c_str(), &raw), SQLITE_OK);
+            sqlite3_stmt* update = nullptr;
+            REQUIRE_EQ(sqlite3_prepare_v2(raw,
+                "UPDATE composite_timbres SET payload_version = 4, payload = ? WHERE id = ?;",
+                -1, &update, nullptr), SQLITE_OK);
+            REQUIRE_EQ(sqlite3_bind_blob(update, 1, legacy_payload.data(),
+                static_cast<int>(legacy_payload.size()), SQLITE_TRANSIENT), SQLITE_OK);
+            REQUIRE_EQ(sqlite3_bind_int64(update, 2,
+                static_cast<sqlite3_int64>(legacy_id)), SQLITE_OK);
+            REQUIRE_EQ(sqlite3_step(update), SQLITE_DONE);
+            sqlite3_finalize(update);
+            sqlite3_close(raw);
+            {
+                ToneLibraryDatabase database;
+                CompositeTimbreLibrary restored;
+                REQUIRE_EQ(database.open(legacy_db_path.string(), &error), true);
+                REQUIRE_EQ(database.load(singles, restored, &error), true);
+                REQUIRE_EQ(restored.find(legacy_id) != nullptr, true);
+                REQUIRE_EQ(restored.find(legacy_id)->timbre.layers, old.layers);
+            }
+            std::filesystem::remove(legacy_db_path, remove_error);
+        }
+    }
+    // Existing disabled events also read Tone when no distribution field exists.
+    auto disabled = current_old;
+    disabled[at + marker.size() - 10] = 0;
+    disabled.erase(at + marker.size(), 2);
+    const auto disabled_decoded = deserializeCompositeSoundPayload(disabled, 4, &error);
+    REQUIRE_EQ(disabled_decoded.has_value(), true);
+    REQUIRE_EQ(disabled_decoded->layers[0].timbre_automation[0].scc_morph.enabled, false);
+    REQUIRE_EQ(disabled_decoded->layers[0].timbre_automation[0].scc_morph.distribution_mode,
+        SccMorphDistributionMode::ToneDistribution);
+
+    const auto rejects = [&](const CompositeTimbre& invalid) {
+        return !deserializeCompositeSoundPayload(serializeCompositeSoundPayload(invalid),
+            kCompositeSoundPayloadVersion).has_value();
+    };
+    auto invalid = original;
+    invalid.layers[0].timbre_automation[0].scc_morph.distribution_mode =
+        static_cast<SccMorphDistributionMode>(255);
+    REQUIRE_EQ(rejects(invalid), true);
+    invalid = original;
+    invalid.layers[0].timbre_automation[0].scc_morph.explicit_plan->points[1].morph_position =
+        std::numeric_limits<double>::quiet_NaN();
+    REQUIRE_EQ(rejects(invalid), true);
+    invalid = original;
+    invalid.layers[0].timbre_automation[0].scc_morph.explicit_plan->points[1].event_count = 0;
+    REQUIRE_EQ(rejects(invalid), true);
+    invalid = original;
+    invalid.layers[0].timbre_automation[0].scc_morph.explicit_plan->points.pop_back();
+    REQUIRE_EQ(rejects(invalid), true);
+    invalid = original;
+    invalid.scc_morph_algorithm_version = 99;
+    REQUIRE_EQ(rejects(invalid), true);
 }
 
 void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
@@ -8388,6 +8587,7 @@ int main(int argc, char** argv) {
         {"TimbreTagsNormalizeMatchAndCollectUsage", testTimbreTagsNormalizeMatchAndCollectUsage},
         {"TimbreLibrarySelectedExportAndNonDestructiveImport", testTimbreLibrarySelectedExportAndNonDestructiveImport},
         {"ToneLibrarySqliteV1RoundTripAndPortableFormat", testToneLibrarySqliteV1RoundTripAndPortableFormat},
+        {"SccMorphDistributionPersistence", testSccMorphDistributionPersistence},
         {"PreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave", testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave},
         {"WavePcmCycleConvertsToScc", testWavePcmCycleConvertsToScc},
         {"WaveCycleProducesValidOpllApproximation", testWaveCycleProducesValidOpllApproximation},

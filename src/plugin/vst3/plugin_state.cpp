@@ -187,7 +187,10 @@ bool validatePluginSoundSnapshot(const mgstc::engine::CompositeTimbre& timbre) {
         for (const auto* events : event_lanes) {
             for (const auto& event : *events) {
                 const auto& morph = event.scc_morph;
-                if (!std::isfinite(morph.curve) || morph.curve < mgstc::engine::kSccMorphGammaMin
+                if (!mgstc::engine::isValidSccMorphDistributionMode(morph.distribution_mode)
+                    || (morph.explicit_plan
+                        && !mgstc::engine::isValidSccMorphPlan(*morph.explicit_plan, morph.intermediate_count))
+                    || !std::isfinite(morph.curve) || morph.curve < mgstc::engine::kSccMorphGammaMin
                     || morph.curve > mgstc::engine::kSccMorphGammaMax
                     || (morph.enabled
                         && (events != &layer.timbre_automation
@@ -322,6 +325,7 @@ PluginStateParseResult parsePluginState(const void* data, std::size_t size) {
         return fail(PluginStateStatus::Truncated);
     }
     if (*payload_version != 1 && *payload_version != 2 && *payload_version != 3
+        && *payload_version != 4
         && *payload_version != mgstc::engine::kCompositeSoundPayloadVersion) {
         return fail(PluginStateStatus::UnsupportedVersion);
     }
