@@ -159,13 +159,16 @@ private:
 
 bool validatePluginSoundSnapshot(const mgstc::engine::CompositeTimbre& timbre) {
     if (!metadataFits(timbre) || timbre.layers.size() > kMaxPluginStateLayers
-        || timbre.embedded_timbres.size() > kMaxPluginStateLayers
-        || (timbre.scc_morph_bank_base != 0 && timbre.scc_morph_bank_base != 16)
+        || timbre.embedded_timbres.size() > 64
+        || timbre.scc_morph_bank_base > 31
         || !mgstc::engine::isSupportedSccMorphAlgorithmVersion(
             timbre.scc_morph_algorithm_version)) {
         return false;
     }
     for (const auto& layer : timbre.layers) {
+        if ((layer.scc_output_allocation != mgstc::engine::SccOutputAllocationMode::LegacyBank
+                && layer.scc_output_allocation != mgstc::engine::SccOutputAllocationMode::Contiguous)
+            || (layer.scc_output_start && *layer.scc_output_start > 31)) return false;
         const auto capacity = channelCapacity(layer.source);
         if (capacity == 0 || layer.channel >= capacity) {
             return false;
@@ -184,7 +187,7 @@ bool validatePluginSoundSnapshot(const mgstc::engine::CompositeTimbre& timbre) {
         for (const auto* events : event_lanes) {
             for (const auto& event : *events) {
                 const auto& morph = event.scc_morph;
-                if (!std::isfinite(morph.curve) || morph.curve < 1.0
+                if (!std::isfinite(morph.curve) || morph.curve < mgstc::engine::kSccMorphGammaMin
                     || morph.curve > mgstc::engine::kSccMorphGammaMax
                     || (morph.enabled
                         && (events != &layer.timbre_automation
@@ -318,7 +321,7 @@ PluginStateParseResult parsePluginState(const void* data, std::size_t size) {
     if (!payload_version || !payload_size) {
         return fail(PluginStateStatus::Truncated);
     }
-    if (*payload_version != 1 && *payload_version != 2
+    if (*payload_version != 1 && *payload_version != 2 && *payload_version != 3
         && *payload_version != mgstc::engine::kCompositeSoundPayloadVersion) {
         return fail(PluginStateStatus::UnsupportedVersion);
     }

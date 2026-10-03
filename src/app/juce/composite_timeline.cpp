@@ -348,9 +348,9 @@ public:
         addAndMakeVisible(morph_curve_label_);
         morph_curve_.setSliderStyle(juce::Slider::LinearHorizontal);
         morph_curve_.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-        morph_curve_.setRange(0, mgstc::engine::kSccMorphGammaMax - 1, 0.01);
-        morph_curve_.setValue(mgstc::engine::kSccMorphGammaMax - settings.curve, juce::dontSendNotification);
-        morph_curve_.setTooltip(juce::String::fromUTF8("左: 前半速い / 右: 均一"));
+        morph_curve_.setRange(-1, 1, 0.001);
+        morph_curve_.setValue(-std::log(settings.curve) / std::log(mgstc::engine::kSccMorphGammaMax), juce::dontSendNotification);
+        morph_curve_.setTooltip(juce::String::fromUTF8("左: 前半速い / 中央: 均一 / 右: 後半速い"));
         morph_curve_.setExplicitFocusOrder(222);
         morph_curve_.setWantsKeyboardFocus(true);
         morph_curve_.onDragStart = [this] { morph_dragging_ = true; morph_drag_rejected_ = false; };
@@ -359,7 +359,8 @@ public:
         addAndMakeVisible(morph_curve_);
         morph_front_.setText(juce::String::fromUTF8("前半速い"), juce::dontSendNotification);
         morph_uniform_.setText(juce::String::fromUTF8("均一"), juce::dontSendNotification);
-        for (auto* label : {&morph_front_, &morph_uniform_, &morph_error_}) {
+        morph_back_.setText(juce::String::fromUTF8("後半速い"), juce::dontSendNotification);
+        for (auto* label : {&morph_front_, &morph_uniform_, &morph_back_, &morph_error_}) {
             label->setFont(UiFonts::body());
             addAndMakeVisible(*label);
         }
@@ -397,10 +398,12 @@ public:
         morph_count_.setValue(0, juce::sendNotificationSync);
         if (!morph_count_.keyPressed(juce::KeyPress(juce::KeyPress::rightKey))) return "intermediate count ignores right arrow";
         if (morph_settings_.intermediate_count != 1) return "right arrow did not apply one intermediate tone";
-        morph_curve_.setValue(0, juce::sendNotificationSync);
+        morph_curve_.setValue(-1, juce::sendNotificationSync);
         if (morph_settings_.curve != mgstc::engine::kSccMorphGammaMax) return "left curve endpoint is not gamma maximum";
-        morph_curve_.setValue(mgstc::engine::kSccMorphGammaMax - 1, juce::sendNotificationSync);
-        if (morph_settings_.curve != 1) return "right curve endpoint is not uniform";
+        morph_curve_.setValue(0, juce::sendNotificationSync);
+        if (morph_settings_.curve != 1) return "centre curve is not uniform";
+        morph_curve_.setValue(1, juce::sendNotificationSync);
+        if (morph_settings_.curve != mgstc::engine::kSccMorphGammaMin) return "right curve endpoint is not back-loaded";
         morph_enabled_.setToggleState(false, juce::dontSendNotification);
         morph_enabled_.onClick();
         if (morph_count_.isEnabled() || morph_curve_.isEnabled()) return "Morph OFF did not disable settings after editing";
@@ -691,7 +694,8 @@ public:
             auto curve_row = area.removeFromTop(fieldH);
             morph_curve_label_.setBounds(curve_row.removeFromLeft(compositeInspectorLabelW));
             morph_front_.setBounds(curve_row.removeFromLeft(libraryButtonMinW));
-            morph_uniform_.setBounds(curve_row.removeFromRight(libraryButtonMinW));
+            morph_back_.setBounds(curve_row.removeFromRight(libraryButtonMinW));
+            morph_uniform_.setBounds(curve_row);
             area.removeFromTop(sm);
             morph_curve_.setBounds(area.removeFromTop(fieldH));
             area.removeFromTop(sm);
@@ -754,7 +758,7 @@ private:
         settings.enabled = morph_enabled_.getToggleState();
         settings.intermediate_count = static_cast<std::uint8_t>(juce::jlimit(
             0, morph_count_max_, juce::roundToInt(morph_count_.getValue())));
-        settings.curve = mgstc::engine::kSccMorphGammaMax - morph_curve_.getValue();
+        settings.curve = std::pow(mgstc::engine::kSccMorphGammaMax, -morph_curve_.getValue());
         const auto result = morph_change_ ? morph_change_(settings, commit) : MorphChangeResult{};
         const auto& error = result.error;
         if (morph_dragging_) morph_drag_rejected_ = !result.accepted;
@@ -764,7 +768,7 @@ private:
         else {
             morph_enabled_.setToggleState(morph_settings_.enabled, juce::dontSendNotification);
             morph_count_.setValue(morph_settings_.intermediate_count, juce::dontSendNotification);
-            morph_curve_.setValue(mgstc::engine::kSccMorphGammaMax - morph_settings_.curve, juce::dontSendNotification);
+            morph_curve_.setValue(-std::log(morph_settings_.curve) / std::log(mgstc::engine::kSccMorphGammaMax), juce::dontSendNotification);
         }
         syncMorphEnabled();
     }
@@ -1133,7 +1137,7 @@ private:
     int morph_count_max_{};
     juce::ToggleButton morph_enabled_;
     juce::Label morph_endpoints_, morph_count_label_, morph_curve_label_;
-    juce::Label morph_front_, morph_uniform_, morph_error_;
+    juce::Label morph_front_, morph_uniform_, morph_back_, morph_error_;
     juce::Slider morph_count_, morph_curve_;
     SwitchLookAndFeel switch_look_and_feel_;
     juce::Label current_label_;
@@ -3072,6 +3076,7 @@ public:
         number_mode_.setTooltip(juce::String::fromUTF8(
             "MGSC音色番号の割り付け。自動＝空き番号、手動＝右の音色番号を使用"));
         number_mode_.onChange = [this] {
+            if (!assigning_) scc_number_edited_ = true;
             syncTimbreNumberEnabled();
             if (!assigning_ && changed_) {
                 changed_(true);
@@ -3096,6 +3101,7 @@ public:
             UiLayout::fieldH - UiLayout::panelPad);
         timbre_number_.setTooltip(timbre_number_label_.getTooltip());
         timbre_number_.onValueChange = [this] {
+            if (!assigning_) scc_number_edited_ = true;
             if (!assigning_ && changed_) {
                 changed_(false);
             }
@@ -3329,6 +3335,7 @@ public:
 
     void syncFromLayer(const mgstc::engine::CompositeLayer& layer) {
         assigning_ = true;
+        scc_number_edited_ = false;
         const char* source_name =
             layer.source == mgstc::engine::TimbreSource::Psg
                 ? "PSG"
@@ -3443,6 +3450,23 @@ public:
                 "ライブラリ音色を割り当てると音色番号を設定できます"));
             timbre_number_label_.setTooltip(number_mode_.getTooltip());
             timbre_number_.setTooltip(number_mode_.getTooltip());
+        }
+        if (layer.source == mgstc::engine::TimbreSource::Scc) {
+            number_mode_.setEnabled(true);
+            timbre_number_.setRange(0.0, 31.0, 1.0);
+            const bool contiguous = layer.scc_output_allocation
+                == mgstc::engine::SccOutputAllocationMode::Contiguous;
+            const auto start = contiguous ? layer.scc_output_start
+                : layer.base_timbre ? layer.base_timbre->manual_number : std::nullopt;
+            number_mode_.setSelectedId(start ? 2 : 1, juce::dontSendNotification);
+            timbre_number_.setValue(start.value_or(0), juce::dontSendNotification);
+            timbre_number_label_.setText(juce::String::fromUTF8("開始 @"), juce::dontSendNotification);
+            number_mode_.setTooltip(juce::String::fromUTF8(
+                "SCCチャンネルの連番音色領域。自動＝空き連続領域、手動＝開始@0～@31。競合時は出力できません"));
+            timbre_number_.setTooltip(number_mode_.getTooltip());
+            timbre_number_label_.setTooltip(number_mode_.getTooltip());
+        } else {
+            timbre_number_label_.setText(juce::String::fromUTF8("音色番号"), juce::dontSendNotification);
         }
         syncTimbreNumberEnabled();
         pitch_.setValue(layer.relative_semitones, juce::dontSendNotification);
@@ -3564,6 +3588,16 @@ public:
             if (layer.pitch_sweep.enabled) {
                 layer.software_lfo.enabled = false;
             }
+        }
+        if (layer.source == mgstc::engine::TimbreSource::Scc) {
+            if (scc_number_edited_ || layer.scc_output_allocation
+                    == mgstc::engine::SccOutputAllocationMode::Contiguous) {
+                layer.scc_output_allocation = mgstc::engine::SccOutputAllocationMode::Contiguous;
+                layer.scc_output_start = number_mode_.getSelectedId() == 2
+                    ? std::optional<std::uint8_t>{static_cast<std::uint8_t>(timbre_number_.getValue())}
+                    : std::nullopt;
+            }
+            return;
         }
         if (!layer.base_timbre) {
             return;
@@ -3759,6 +3793,7 @@ private:
     RemoveCallback remove_callback_;
     AuditionCallback audition_callback_;
     bool assigning_{};
+    bool scc_number_edited_{};
     SwitchLookAndFeel switch_look_and_feel_;
     juce::Label source_;
     juce::ToggleButton mute_;
@@ -4255,17 +4290,17 @@ public:
         morph_bank_label_.setText("SCC Morph Bank", juce::dontSendNotification);
         morph_bank_label_.setFont(UiFonts::body());
         addAndMakeVisible(morph_bank_label_);
-        morph_bank_.addItem("@0", 1);
-        morph_bank_.addItem("@16", 2);
+        for (int number = 0; number < 32; ++number)
+            morph_bank_.addItem("@" + juce::String(number), number + 1);
         morph_bank_.setSelectedId(1, juce::dontSendNotification);
         morph_bank_.setExplicitFocusOrder(223);
         morph_bank_.setTooltip(juce::String::fromUTF8("生成・派生したSCC波形の割当開始位置"));
         morph_bank_.onChange = [this] {
             auto candidate = timbre_;
-            candidate.scc_morph_bank_base = morph_bank_.getSelectedId() == 2 ? 16 : 0;
+            candidate.scc_morph_bank_base = static_cast<std::uint8_t>(juce::jlimit(0, 31, morph_bank_.getSelectedId() - 1));
             const auto result = *mgstc::engine::compileSccMorphCached(candidate);
             if (!result.valid) {
-                morph_bank_.setSelectedId(timbre_.scc_morph_bank_base == 16 ? 2 : 1, juce::dontSendNotification);
+                morph_bank_.setSelectedId(timbre_.scc_morph_bank_base + 1, juce::dontSendNotification);
                 const auto error = juce::String::fromUTF8(result.error.c_str())
                     + juce::String::fromUTF8(" 必要: ") + juce::String(static_cast<int>(result.required))
                     + juce::String::fromUTF8(" / 使用可能: ") + juce::String(static_cast<int>(result.capacity));
@@ -4660,7 +4695,7 @@ public:
             timbre_.layers[1].timbre_automation[0].scc_morph.enabled = false;
             check(!morphLineArrivalAt(timbre_.layers[1], lane, middle),
                 "normal tone interval has morph hit target");
-            check(morph_bank_.isVisible() && morph_bank_usage_.isVisible(),
+            check(morph_bank_usage_.isVisible(),
                 "Morph Bank usage is not always visible");
             const auto picker_scale = UiScale::active_percent;
             for (const int percent : {75, 100, 125}) {
@@ -8165,11 +8200,20 @@ private:
             morph_preview_ = *mgstc::engine::compileSccMorphCached(timbre_);
             morph_preview_input_ = timbre_;
         }
-        morph_bank_.setSelectedId(timbre_.scc_morph_bank_base == 16 ? 2 : 1, juce::dontSendNotification);
-        const auto usage = "@" + juce::String(static_cast<int>(timbre_.scc_morph_bank_base))
+        morph_bank_.setSelectedId(timbre_.scc_morph_bank_base + 1, juce::dontSendNotification);
+        const bool contiguous = std::any_of(timbre_.layers.begin(), timbre_.layers.end(), [](const auto& layer) {
+            return layer.source == mgstc::engine::TimbreSource::Scc
+                && layer.scc_output_allocation == mgstc::engine::SccOutputAllocationMode::Contiguous;
+        });
+        morph_bank_.setVisible(!contiguous);
+        morph_bank_label_.setText(contiguous ? "SCC Bank" : "SCC Morph Bank", juce::dontSendNotification);
+        const auto usage = contiguous
+            ? juce::String::fromUTF8("@0～@31  使用 ")
+                + juce::String(static_cast<int>(morph_preview_.used)) + " / 32"
+            : "@" + juce::String(static_cast<int>(timbre_.scc_morph_bank_base))
             + juce::String::fromUTF8("～@31  使用 ")
             + juce::String(static_cast<int>(morph_preview_.used)) + " / "
-            + juce::String(timbre_.scc_morph_bank_base == 16 ? 16 : 32)
+            + juce::String(32 - timbre_.scc_morph_bank_base)
             + juce::String::fromUTF8("  空き ") + juce::String(static_cast<int>(morph_preview_.capacity - std::min(morph_preview_.capacity, morph_preview_.used)));
         const auto text = morph_bank_error_.isNotEmpty() ? morph_bank_error_
             : morph_preview_.valid ? usage : usage + "  "

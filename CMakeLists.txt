@@ -153,6 +153,9 @@ add_library(mgstc_engine STATIC
     src/engine/composite_program_compiler.cpp
     src/engine/composite_timbre.cpp
     src/engine/composite_timbre_library.cpp
+    src/engine/composite_wav_analysis.cpp
+    src/engine/composite_wav_renderer.cpp
+    src/engine/composite_wav_conversion.cpp
     src/engine/scc_morph.cpp
     src/engine/emulator_sound_output.cpp
     src/engine/engine_core.cpp
@@ -644,6 +647,19 @@ if(MGSTC_BUILD_TESTS)
         target_compile_options(mgstc_scc_morph_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME mgstc_scc_morph_tests COMMAND mgstc_scc_morph_tests)
+
+    foreach(_wav_component analysis renderer conversion)
+
+            add_executable(mgstc_composite_wav_${_wav_component}_tests
+                tests/cpp/composite_wav_${_wav_component}_tests.cpp)
+            target_link_libraries(mgstc_composite_wav_${_wav_component}_tests PRIVATE mgstc_engine)
+            target_compile_features(mgstc_composite_wav_${_wav_component}_tests PRIVATE cxx_std_20)
+            if(MSVC)
+                target_compile_options(mgstc_composite_wav_${_wav_component}_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+            endif()
+            add_test(NAME mgstc_composite_wav_${_wav_component}_tests
+                COMMAND mgstc_composite_wav_${_wav_component}_tests)
+    endforeach()
 
     add_executable(
         mgstc_realtime_engine_host_tests

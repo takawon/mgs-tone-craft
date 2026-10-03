@@ -419,7 +419,7 @@ double morphPosition(double time, double gamma) noexcept {
     if (!std::isfinite(time)) time = 0.0;
     if (!std::isfinite(gamma)) gamma = 1.0;
     time = std::clamp(time, 0.0, 1.0);
-    gamma = std::clamp(gamma, 1.0, kSccMorphGammaMax);
+    gamma = std::clamp(gamma, kSccMorphGammaMin, kSccMorphGammaMax);
     return 1.0 - std::pow(1.0 - time, gamma);
 }
 
@@ -819,13 +819,18 @@ std::vector<std::size_t> optimizeSccMorphBlockPhases(
 SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
     SccMorphCompileResult result;
     result.timbre = input;
+    const auto contiguous = [](const CompositeLayer& layer) {
+        return layer.source == TimbreSource::Scc
+            && layer.scc_output_allocation == SccOutputAllocationMode::Contiguous;
+    };
+    const bool channel_allocation = std::any_of(input.layers.begin(), input.layers.end(), contiguous);
     const bool active = std::any_of(input.layers.begin(),input.layers.end(),
         [](const CompositeLayer& layer) {
             return layer.volume_envelope.kind == EnvelopeKind::Sequence
                 && std::any_of(layer.timbre_automation.begin(),layer.timbre_automation.end(),
                 [](const EnvelopeEvent& event) { return event.scc_morph.enabled; });
         });
-    if (!active || input.scc_morph_materialized) {
+    if ((!active && !channel_allocation) || input.scc_morph_materialized) {
         const auto numbers = resolveTimbreNumbers(input);
         std::array<bool,32> reserved{};
         for (const auto& assignment : numbers.assignments) {
@@ -842,7 +847,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
                     && event.value >= 0 && event.value <= 31)
                     reserved[static_cast<std::size_t>(event.value)] = true;
         }
-        for (std::size_t number = input.scc_morph_bank_base == 16 ? 16 : 0;
+        for (std::size_t number = input.scc_morph_bank_base;
              number < 32; ++number)
             if (!reserved[number]) ++result.capacity;
         return result;
@@ -854,11 +859,21 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
         result.used = 0;
         return result;
     };
-    if (input.scc_morph_bank_base != 0 && input.scc_morph_bank_base != 16)
-        return fail("SCC Morph Bank start must be @0 or @16");
+    if (input.scc_morph_bank_base > 31)
+        return fail("SCC Morph Bank start must be @0 through @31");
     if (!isSupportedSccMorphAlgorithmVersion(input.scc_morph_algorithm_version))
         return fail("Unsupported SCC morph algorithm version");
-    const auto source_numbers = resolveTimbreNumbers(input);
+    auto legacy_input = input;
+    for (auto& layer : legacy_input.layers) {
+        if (contiguous(layer)) {
+            // Authored source @ numbers are not output reservations for an
+            // explicitly relocated channel. Keep other channels unchanged.
+            layer.base_timbre.reset();
+            layer.timbre_automation.clear();
+        }
+    }
+    const auto source_numbers = resolveTimbreNumbers(legacy_input);
+    const auto original_numbers = channel_allocation ? resolveTimbreNumbers(input) : source_numbers;
     for (const auto& warning : source_numbers.warnings) {
         // Legacy import preserves @s0..14 then falls back to automatic15..31.
         // That expected warning is safely recovered by freezing the assignment.
@@ -881,7 +896,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
             materialized[wave] = {reference->library_id,assignment.number,false};
     }
     for (const auto& layer : input.layers) {
-        if (layer.source != TimbreSource::Scc) continue;
+        if (layer.source != TimbreSource::Scc || contiguous(layer)) continue;
         if (!layer.base_timbre) occupied[0] = true;
         if (layer.volume_envelope.kind != EnvelopeKind::Sequence) continue;
         for (const auto& event : layer.timbre_automation)
@@ -911,12 +926,12 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
             return findEmbeddedTimbreSnapshot(input,event.target_library_id);
         // Imported/raw-number events can use an owned snapshot assigned to
         // that number, but must never depend on the live timbre library.
-        for (const auto& assignment : source_numbers.assignments)
+        for (const auto& assignment : original_numbers.assignments)
             if (assignment.number == event.value) {
                 const auto* reference = findEmbeddedTimbreSnapshot(input,assignment.library_id);
                 if (reference && reference->source == TimbreSource::Scc) return reference;
             }
-        for (const auto& assignment : source_numbers.assignments) {
+        for (const auto& assignment : original_numbers.assignments) {
             const auto* reference = findEmbeddedTimbreSnapshot(input,assignment.library_id);
             if (reference && reference->source == TimbreSource::Scc
                 && reference->manual_number && *reference->manual_number == event.value)
@@ -951,7 +966,8 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
             if (!reference) continue;
             auto& event = result.timbre.layers[index].timbre_automation[event_index];
             event.target_library_id = reference->library_id;
-            event.value = *assignedNumberForLibraryId(source_numbers,reference->library_id);
+            if (const auto number = assignedNumberForLibraryId(source_numbers,reference->library_id))
+                event.value = *number;
         }
     }
     struct Node {
@@ -1004,7 +1020,8 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
                 const auto& event = layer.timbre_automation[event_index];
                 const auto* source = sourceForEvent(event);
                 if (!source || source->source != TimbreSource::Scc) return std::nullopt;
-                if (!assignedNumberForLibraryId(source_numbers,source->library_id)) return std::nullopt;
+                if (!contiguous(layer)
+                    && !assignedNumberForLibraryId(source_numbers,source->library_id)) return std::nullopt;
                 Node node;
                 node.wave = sourceWave(*source);
                 node.event_index = event_index;
@@ -1029,7 +1046,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
                 const auto duration = end_event.count-start_event.count;
                 if (settings.intermediate_count > duration-1)
                     return fail("SCC morph intermediate count exceeds available time slots");
-                if (!std::isfinite(settings.curve) || settings.curve < 1.0
+                if (!std::isfinite(settings.curve) || settings.curve < kSccMorphGammaMin
                     || settings.curve > kSccMorphGammaMax)
                     return fail("SCC morph curve is out of range");
                 const auto end_node = sourceNode(position);
@@ -1086,12 +1103,14 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
     // UI can show required / available immediately, never partial success.
     std::map<SccWaveform,bool> new_waves;
     for (const auto& item : pending)
-        if (!materialized.contains(item.node.wave)) new_waves[item.node.wave] = true;
+        if (!contiguous(input.layers[item.layer]) && !materialized.contains(item.node.wave))
+            new_waves[item.node.wave] = true;
     result.required = new_waves.size();
     if (result.required > result.capacity)
         return fail("SCC Morph Bank overflow: required " + std::to_string(result.required)
             + ", available " + std::to_string(result.capacity));
     for (auto& item : pending) {
+        if (contiguous(input.layers[item.layer])) continue;
         auto& node = item.node;
         auto allocation = materialized.find(node.wave);
         if (allocation == materialized.end()) {
@@ -1143,6 +1162,147 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input) {
         }
         node.diagnostic.generated = assigned.derived;
         result.diagnostics.push_back(node.diagnostic);
+    }
+    if (channel_allocation) {
+        struct Group {
+            std::size_t layer{};
+            std::vector<SccWaveform> waves;
+            std::map<SccWaveform, std::size_t> offsets;
+            std::map<std::size_t, SccWaveform> event_waves;
+            std::optional<std::uint8_t> start;
+        };
+        std::vector<Group> groups;
+        for (std::size_t layer_index = 0; layer_index < input.layers.size(); ++layer_index) {
+            const auto& layer = input.layers[layer_index];
+            if (!contiguous(layer)) continue;
+            if (layer.scc_output_start && *layer.scc_output_start > 31)
+                return fail("SCC channel output start must be @0 through @31");
+            Group group;
+            group.layer = layer_index;
+            const auto add_wave = [&](const SccWaveform& wave) {
+                if (!group.offsets.contains(wave)) {
+                    group.offsets.emplace(wave, group.waves.size());
+                    group.waves.push_back(wave);
+                }
+            };
+            if (layer.base_timbre && layer.base_timbre->source != TimbreSource::Scc)
+                return fail("SCC channel base snapshot has a different sound source");
+            add_wave(layer.base_timbre ? sourceWave(*layer.base_timbre)
+                : generateSccPreset(SccWavePreset::Sine, SccHarmonic::One));
+            // Final phase-adjusted endpoints replace their authored event
+            // waveform. Do not reserve discarded endpoint phase variants.
+            for (const auto& item : pending) {
+                if (item.layer != layer_index) continue;
+                if (item.node.event_index)
+                    group.event_waves[*item.node.event_index] = item.node.wave;
+            }
+            if (layer.volume_envelope.kind == EnvelopeKind::Sequence) {
+                for (std::size_t index = 0; index < layer.timbre_automation.size(); ++index) {
+                    const auto& event = layer.timbre_automation[index];
+                    if (event.kind != EnvelopeEventKind::Timbre) continue;
+                    if (!group.event_waves.contains(index)) {
+                        const auto* reference = sourceForEvent(event);
+                        if (!reference || reference->source != TimbreSource::Scc)
+                            return fail("SCC channel tone waveform snapshot is unavailable");
+                        group.event_waves.emplace(index, sourceWave(*reference));
+                    }
+                    add_wave(group.event_waves.at(index));
+                }
+            }
+            for (const auto& item : pending)
+                if (item.layer == layer_index) add_wave(item.node.wave);
+            if (group.waves.size() > 32)
+                return fail("SCC channel needs more than 32 output waveforms");
+            groups.push_back(std::move(group));
+        }
+        const auto legacy_used = static_cast<std::size_t>(
+            std::count(occupied.begin(), occupied.end(), true));
+        result.required = legacy_used;
+        for (const auto& group : groups) result.required += group.waves.size();
+        result.capacity = 32;
+        if (result.required > 32)
+            return fail("SCC global output capacity exceeded: required "
+                + std::to_string(result.required) + ", available 32");
+        const auto fits = [&](std::size_t start, std::size_t count) {
+            if (start + count > 32) return false;
+            for (std::size_t n = start; n < start + count; ++n)
+                if (occupied[n]) return false;
+            return true;
+        };
+        const auto reserve = [&](std::size_t start, std::size_t count) {
+            for (std::size_t n = start; n < start + count; ++n) occupied[n] = true;
+        };
+        // A manual range never silently moves. Reserve every manual request
+        // before first-fit automatic channels, irrespective of layer order.
+        for (auto& group : groups) {
+            const auto requested = input.layers[group.layer].scc_output_start;
+            if (!requested) continue;
+            if (!fits(*requested, group.waves.size()))
+                return fail("SCC manual channel range conflicts or exceeds @31 (start @"
+                    + std::to_string(*requested) + ")");
+            group.start = requested;
+            reserve(*requested, group.waves.size());
+        }
+        for (auto& group : groups) {
+            if (group.start) continue;
+            for (std::size_t start = 0; start < 32; ++start) {
+                if (!fits(start, group.waves.size())) continue;
+                group.start = static_cast<std::uint8_t>(start);
+                reserve(start, group.waves.size());
+                break;
+            }
+            if (!group.start)
+                return fail("SCC automatic allocation has no contiguous range of "
+                    + std::to_string(group.waves.size()) + " waveforms");
+        }
+        for (const auto& group : groups) {
+            std::vector<SavedTimbreReference> references;
+            for (std::size_t offset = 0; offset < group.waves.size(); ++offset) {
+                SavedTimbreReference reference;
+                reference.library_id = allocateCompositeOwnedTimbreId(result.timbre);
+                reference.source = TimbreSource::Scc;
+                reference.number_mode = TimbreNumberMode::Manual;
+                reference.manual_number = static_cast<std::uint8_t>(*group.start + offset);
+                reference.name = "SCC channel @" + std::to_string(*reference.manual_number);
+                for (std::size_t n = 0; n < 32; ++n)
+                    reference.scc_waveform[n] = static_cast<std::uint8_t>(group.waves[offset][n]);
+                result.timbre.embedded_timbres.push_back(reference);
+                references.push_back(std::move(reference));
+            }
+            auto& layer = result.timbre.layers[group.layer];
+            layer.base_timbre = references.front();
+            for (const auto& [index, wave] : group.event_waves) {
+                const auto& reference = references[group.offsets.at(wave)];
+                auto& event = layer.timbre_automation[index];
+                event.target_library_id = reference.library_id;
+                event.value = *reference.manual_number;
+                event.timbre_pick = TimbrePick::Library;
+            }
+            for (auto& item : pending) {
+                if (item.layer != group.layer) continue;
+                const auto& reference = references[group.offsets.at(item.node.wave)];
+                auto& diagnostic = item.node.diagnostic;
+                if (!item.node.event_index) {
+                    EnvelopeEvent event;
+                    event.kind = EnvelopeEventKind::Timbre;
+                    event.count = diagnostic.count;
+                    event.target_library_id = reference.library_id;
+                    event.value = *reference.manual_number;
+                    const auto& timeline = input.layers[group.layer].envelope_timeline;
+                    event.after_loop_start =
+                        (timeline.loop_start_count && event.count == *timeline.loop_start_count)
+                        || (timeline.loop_end_count && event.count == *timeline.loop_end_count);
+                    layer.timbre_automation.push_back(event);
+                }
+                diagnostic.output_number = *reference.manual_number;
+                diagnostic.generated = !item.node.event_index || diagnostic.phase_shift != 0;
+                result.diagnostics.push_back(diagnostic);
+            }
+            result.channel_allocations.push_back({group.layer, *group.start,
+                static_cast<std::uint8_t>(group.waves.size()),
+                input.layers[group.layer].scc_output_start.has_value()});
+        }
+        result.used = result.required;
     }
     for (auto& layer : result.timbre.layers) {
         if (layer.volume_envelope.kind != EnvelopeKind::Sequence) continue;

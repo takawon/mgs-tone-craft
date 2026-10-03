@@ -8,7 +8,10 @@ param(
     [ValidateRange(1, 32)]
     [int]$Jobs = 4,
 
-    [switch]$SkipTests
+    [switch]$SkipTests,
+
+    # Optional focused regression run; the default still runs every test.
+    [string]$TestRegex = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -293,6 +296,11 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw "Clean step failed with exit code $LASTEXITCODE."
         }
+        # A successful clean removed every object with the old header ABI.
+        # This dependency stamp does not record build or test success.
+        [IO.File]::WriteAllText(
+            $headerDependencyStamp,
+            [DateTime]::UtcNow.ToString("O"))
     }
 
     & $cmakeExecutable `
@@ -331,9 +339,11 @@ try {
             )
         }
 
-        & $ctestExecutable `
-            --test-dir $resolvedBuildDirectory `
-            --output-on-failure
+        $testArguments = @("--test-dir", $resolvedBuildDirectory, "--output-on-failure")
+        if ($TestRegex) {
+            $testArguments += @("-R", $TestRegex, "--no-tests=error")
+        }
+        & $ctestExecutable @testArguments
         if ($LASTEXITCODE -ne 0) {
             throw "Tests failed with exit code $LASTEXITCODE."
         }

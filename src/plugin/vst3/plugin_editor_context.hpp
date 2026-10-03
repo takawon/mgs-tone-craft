@@ -20,11 +20,14 @@ public:
         : processor_(processor),
           output_(*this),
           midi_(*this),
-          audition_(*this) {
+          audition_(*this),
+          pcm_preview_(*this),
+          background_tasks_(*this) {
         processor_.editorRetainCompositeScope();
     }
 
     ~PluginEditorContext() override {
+        processor_.editorStopPcmPreview();
         processor_.editorReleaseCompositeScope();
         static_cast<void>(processor_.editorRestoreCommittedProgram());
     }
@@ -61,6 +64,14 @@ public:
         return audition_;
     }
 
+    [[nodiscard]] mgstc::app::PcmPreviewBoundary* pcmPreview() noexcept override {
+        return &pcm_preview_;
+    }
+
+    [[nodiscard]] mgstc::app::BackgroundTaskBoundary* backgroundTasks() noexcept override {
+        return &background_tasks_;
+    }
+
     [[nodiscard]] bool pollOpllScope(
         mgstc::engine::OpllScopeFrame& frame) override {
         return processor_.editorPollCompositeScope(frame);
@@ -72,6 +83,26 @@ public:
     }
 
 private:
+    class BackgroundTasks final : public mgstc::app::BackgroundTaskBoundary {
+    public:
+        explicit BackgroundTasks(PluginEditorContext& self) noexcept : self_(self) {}
+        bool registerTask(std::shared_ptr<mgstc::app::EditorBackgroundTask> task) override {
+            return self_.processor_.editorRegisterBackgroundTask(std::move(task));
+        }
+    private:
+        PluginEditorContext& self_;
+    };
+    class PcmPreview final : public mgstc::app::PcmPreviewBoundary {
+    public:
+        explicit PcmPreview(PluginEditorContext& self) noexcept : self_(self) {}
+        bool play(std::shared_ptr<const mgstc::engine::SourcePcm> pcm,
+            std::size_t begin, std::size_t end, float gain) override {
+            return self_.processor_.editorPlayPcmPreview(std::move(pcm), begin, end, gain);
+        }
+        void stop() noexcept override { self_.processor_.editorStopPcmPreview(); }
+    private:
+        PluginEditorContext& self_;
+    };
     class Output final : public mgstc::app::OutputBoundary {
     public:
         explicit Output(PluginEditorContext& self) noexcept : self_(self) {}
@@ -224,6 +255,8 @@ private:
     Output output_;
     Midi midi_;
     Audition audition_;
+    PcmPreview pcm_preview_;
+    BackgroundTasks background_tasks_;
 };
 
 }  // namespace mgstc::plugin

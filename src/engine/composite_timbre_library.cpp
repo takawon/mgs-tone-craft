@@ -242,6 +242,9 @@ public:
             modulation(layer.volume_modulation);
             modulation(layer.opll_tl_modulation);
             modulation(layer.opll_fb_modulation);
+            enumeration(layer.scc_output_allocation);
+            boolean(layer.scc_output_start.has_value());
+            if (layer.scc_output_start) unsignedInteger(*layer.scc_output_start, 1);
         }
         unsignedInteger(value.embedded_timbres.size(), 4);
         for (const auto& reference_value : value.embedded_timbres) {
@@ -413,7 +416,7 @@ public:
             }
             value.scc_morph.curve = std::bit_cast<double>(curve);
             if (!std::isfinite(value.scc_morph.curve)
-                || value.scc_morph.curve < 1.0
+                || value.scc_morph.curve < kSccMorphGammaMin
                 || value.scc_morph.curve > kSccMorphGammaMax) {
                 return false;
             }
@@ -550,15 +553,15 @@ public:
     bool soundPayload(
         CompositeTimbre& value,
         std::uint32_t payload_version) {
-        if (payload_version != 1 && payload_version != 2
+        if (payload_version != 1 && payload_version != 2 && payload_version != 3
             && payload_version != kCompositeSoundPayloadVersion) {
             return false;
         }
         // Each SQLite payload version names a fixed portable sound layout:
-        // v1 = portable v19, v2 = v20 modulation, v3 = v21 SCC morphing.
+        // v1=v19, v2=v20 modulation, v3=v21 morphing, v4=v22 channel ranges.
         // The DB schema version and the portable file header are separate.
         format_version_ = payload_version == 1 ? 19
-            : payload_version == 2 ? 20 : 21;
+            : payload_version == 2 ? 20 : payload_version == 3 ? 21 : 22;
         return soundBody(value);
     }
 
@@ -760,6 +763,19 @@ public:
                     || !modulation(layer.opll_fb_modulation))) {
                 return false;
             }
+            layer.scc_output_allocation = SccOutputAllocationMode::LegacyBank;
+            layer.scc_output_start.reset();
+            if (format_version_ >= 22) {
+                std::uint8_t mode{};
+                bool has_start{};
+                if (!integer(mode, 1) || mode > 1 || !boolean(has_start)) return false;
+                layer.scc_output_allocation = static_cast<SccOutputAllocationMode>(mode);
+                if (has_start) {
+                    std::uint8_t start{};
+                    if (!integer(start, 1) || start > 31) return false;
+                    layer.scc_output_start = start;
+                }
+            }
         }
         if (format_version_ < 15) {
             for (std::size_t index = 0; index < value.layers.size(); ++index) {
@@ -786,8 +802,7 @@ public:
         value.scc_morph_algorithm_version = 1;
         if (format_version_ >= 21
             && (!integer(value.scc_morph_bank_base, 1)
-                || (value.scc_morph_bank_base != 0
-                    && value.scc_morph_bank_base != 16)
+                || value.scc_morph_bank_base > 31
                 || !integer(value.scc_morph_algorithm_version, 4))) {
             return false;
         }

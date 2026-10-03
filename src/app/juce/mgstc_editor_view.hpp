@@ -18,8 +18,10 @@
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -66,6 +68,7 @@
 
 #include "mgstc/engine/chip_volume_curve.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
+#include "mgstc/engine/composite_wav_conversion.hpp"
 #include "mgstc/engine/composite_program_compiler.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/volume.hpp"
@@ -677,24 +680,32 @@ private:
     juce::TextButton cancel_;
 };
 
-inline void showOpllConversionQualityDialog(
+inline juce::Component::SafePointer<ModalDialogWindow> showOpllConversionQualityDialog(
     juce::Component* anchor,
     OpllConversionQualityContent::ConvertCallback callback);
 
 struct ConversionProgressState {
+    // Optional worker-specific hooks. Installed before the worker/UI starts.
+    std::function<void()> custom_cancel;
+    std::function<bool()> custom_cancelled;
+    std::function<double()> custom_progress;
+    std::function<juce::String()> custom_stage;
     std::shared_ptr<mgstc::engine::OpllApproximationControl> control{
         std::make_shared<
             mgstc::engine::OpllApproximationControl>()};
 
     void requestCancellation() const noexcept {
         control->requestCancel();
+        if (custom_cancel) custom_cancel();
     }
 
     [[nodiscard]] bool cancellationRequested() const noexcept {
-        return control->cancelRequested();
+        return control->cancelRequested()
+            || (custom_cancelled && custom_cancelled());
     }
 
     [[nodiscard]] double progressFraction() const noexcept {
+        if (custom_progress) return custom_progress();
         const auto current = control->progress();
         if (current.phase
             == mgstc::engine::OpllApproximationPhase::Completed) {
@@ -790,6 +801,9 @@ private:
             0.0,
             1.0,
             state_->progressFraction());
+        if (state_->custom_stage && !state_->cancellationRequested()) {
+            label_.setText(state_->custom_stage(), juce::dontSendNotification);
+        }
     }
 
     std::shared_ptr<ConversionProgressState> state_;
@@ -800,16 +814,17 @@ private:
     juce::TextButton cancel_;
 };
 
-class ConversionBusyDialog final : public juce::DialogWindow {
+class ConversionBusyDialog final : public juce::DialogWindow, private juce::Timer {
 public:
     explicit ConversionBusyDialog(
-        std::shared_ptr<ConversionProgressState> state)
+        std::shared_ptr<ConversionProgressState> state, juce::Component* owner)
         : juce::DialogWindow(
               juce::String::fromUTF8("変換中"),
               juce::Colour(0xFF1B222C),
               false,
               true),
-          state_(std::move(state)) {
+          state_(std::move(state)), owner_(owner), had_owner_(owner != nullptr) {
+        if (had_owner_) startTimerHz(30);
         setUsingNativeTitleBar(true);
         setResizable(false, false);
         auto* content = new ConversionBusyContent(state_);
@@ -819,11 +834,14 @@ public:
     }
 
     ~ConversionBusyDialog() override {
+        stopTimer();
         requestCancellation();
     }
 
-    void keepTaskAlive(std::shared_ptr<void> task) {
+    void keepTaskAlive(std::shared_ptr<EditorBackgroundTask> task, std::function<void(bool)> completed) {
         task_ = std::move(task);
+        completed_ = std::move(completed);
+        startTimerHz(30);
     }
 
     void closeButtonPressed() override {
@@ -840,11 +858,34 @@ private:
 
     std::shared_ptr<ConversionProgressState> state_;
     ConversionBusyContent* content_{};
-    std::shared_ptr<void> task_;
+    void timerCallback() override {
+        if (had_owner_ && owner_ == nullptr) {
+            requestCancellation();
+            setVisible(false);
+            // Standalone keeps the worker alive until completion. Plugin
+            // editors instead destroy this dialog while the registry retains
+            // its task; neither editor-close path joins ongoing work.
+            exitModalState(0);
+            had_owner_ = false;
+        }
+        if (task_ && task_->completed()) {
+            stopTimer();
+            const bool cancelled = state_->cancellationRequested();
+            auto completed = std::move(completed_);
+            exitModalState(1);
+            delete this;
+            if (completed) completed(cancelled);
+            return;
+        }
+    }
+    juce::Component::SafePointer<juce::Component> owner_;
+    bool had_owner_{};
+    std::shared_ptr<EditorBackgroundTask> task_;
+    std::function<void(bool)> completed_;
 };
 
 
-inline void showOpllConversionQualityDialog(
+inline juce::Component::SafePointer<ModalDialogWindow> showOpllConversionQualityDialog(
     juce::Component* anchor,
     OpllConversionQualityContent::ConvertCallback callback) {
     UiScale::forceGlobalForNonEditorUi();
@@ -864,56 +905,95 @@ inline void showOpllConversionQualityDialog(
             content->getWidth(), content->getHeight() + 32);
     }
     dialog->enterModalState(true, nullptr, true);
+    return dialog;
 }
 
 
 template <typename Work, typename OnDone>
-inline void runWithConversionBusyDialog(
+inline juce::Component::SafePointer<ConversionBusyDialog> runWithConversionBusyDialog(
     juce::Component* anchor,
     Work work,
-    OnDone on_done) {
+    OnDone on_done,
+    std::shared_ptr<ConversionProgressState> progress = {},
+    BackgroundTaskBoundary* background_tasks = nullptr) {
     using Result =
         std::invoke_result_t<Work, ConversionProgressState&>;
-    struct Task {
+    struct Task final : EditorBackgroundTask {
+        explicit Task(std::shared_ptr<ConversionProgressState> state) : progress(std::move(state)) {}
+        ~Task() override { cancel(); join(); }
+        void cancel() noexcept override { progress->requestCancellation(); }
+        void join() noexcept override {
+            std::lock_guard<std::mutex> lock(start_mu);
+            shutdown = true;
+            if (worker.joinable()) worker.join();
+        }
+        bool completed() const noexcept override { return ready.load(std::memory_order_acquire); }
+        bool start(std::function<void()> run) {
+            std::lock_guard<std::mutex> lock(start_mu);
+            if (shutdown) return false;
+            worker = std::jthread([run = std::move(run)] { run(); });
+            return true;
+        }
         std::jthread worker;
+        std::mutex start_mu;
+        bool shutdown{};
+        std::shared_ptr<ConversionProgressState> progress;
+        std::atomic<bool> ready{false};
+        Result result{};
+        std::string error;
     };
 
-    auto progress = std::make_shared<ConversionProgressState>();
-    auto* dialog = new ConversionBusyDialog(progress);
+    if (!progress) progress = std::make_shared<ConversionProgressState>();
+    auto task = std::make_shared<Task>(progress);
+    // A plugin retains this task before the first instruction on the worker.
+    // Destruction may close the registration between this call and start();
+    // Task::join prevents a late start in that interval.
+    if (background_tasks && !background_tasks->registerTask(task)) {
+        task->cancel();
+        on_done(Result{}, true);
+        return {};
+    }
+    auto* dialog = new ConversionBusyDialog(progress, anchor);
     if (anchor != nullptr) {
         dialog->centreAroundComponent(
             anchor, dialog->getWidth(), dialog->getHeight());
     }
-    dialog->enterModalState(true, nullptr, true);
+    dialog->enterModalState(true, nullptr, false);
 
     juce::Component::SafePointer<ConversionBusyDialog> safe_dialog(
         dialog);
-    auto task = std::make_shared<Task>();
-    dialog->keepTaskAlive(task);
-    std::weak_ptr<Task> weak_task(task);
-    task->worker = std::jthread(
-        [safe_dialog,
-         progress,
-         weak_task,
-         work = std::move(work),
-         on_done = std::move(on_done)]() mutable {
-            Result result = work(*progress);
-            const bool cancelled = progress->cancellationRequested();
-            if (auto task = weak_task.lock()) {
-            juce::MessageManager::callAsync(
-                [safe_dialog,
-                     task = std::move(task),
-                 result = std::move(result),
-                     on_done = std::move(on_done),
-                     cancelled]() mutable {
-                        if (safe_dialog == nullptr) {
-                            return;
-                        }
-                        safe_dialog->exitModalState(1);
-                        on_done(std::move(result), cancelled);
-                    });
-                    }
-                });
+    dialog->keepTaskAlive(task,
+        [task, on_done = std::move(on_done)](bool cancellation_requested) mutable {
+            const bool cancelled = cancellation_requested || !task->error.empty();
+            on_done(std::move(task->result), cancelled);
+            if (!task->error.empty()) {
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::MessageBoxIconType::WarningIcon,
+                    juce::String::fromUTF8("変換エラー"),
+                    juce::String::fromUTF8(task->error.c_str()));
+            }
+        });
+    auto prepared_work = std::make_shared<Work>(std::move(work));
+    const bool started = task->start(
+        [raw_task = task.get(), progress, prepared_work]() mutable {
+            try {
+                raw_task->result = (*prepared_work)(*progress);
+            } catch (const std::exception& exception) {
+                raw_task->error = exception.what();
+            } catch (...) {
+                raw_task->error = "Conversion worker failed";
+            }
+            prepared_work.reset();
+            progress.reset();
+            // No worker-side JUCE callback survives a processor/DLL teardown.
+            raw_task->ready.store(true, std::memory_order_release);
+        });
+    if (!started) {
+        task->cancel();
+        delete dialog;
+        return {};
+    }
+    return safe_dialog;
 }
 
 
@@ -940,6 +1020,8 @@ inline void configureImmediateAuditionButton(
             "即時発音。ONでは設定変更時に最後の手動音程で1秒発音します"));
     button.onClick = std::move(action);
 }
+
+#include "composite_wav_conversion_ui.hpp"
 
 class SccWaveGraph final
     : public juce::Component,
@@ -3907,6 +3989,9 @@ public:
             EditorIcon::Redo,
             juce::String::fromUTF8("Redo (Ctrl+Y)"),
             [this] { redo(); });
+        configureButton(import_wave_, "WAV",
+            juce::String::fromUTF8("WAVから総合音色へ変換"),
+            [this] { openWaveConverter(); });
         composite_filter_.setTextToShowWhenEmpty(
             juce::String::fromUTF8("名前・タグ・メモを検索"),
             juce::Colour(0xFF7F8993));
@@ -4457,6 +4542,9 @@ public:
     }
 
     ~CompositeEditorComponent() override {
+        // The comparison adapter belongs to the EditorSession. Destroy this
+        // owned modal window before the plugin editor destroys its context.
+        delete wave_converter_window_.getComponent();
         UiScale::removeGlobalListener(ui_scale_listener_);
         stopTimer();
         stopAudition();
@@ -4860,6 +4948,8 @@ public:
             button->setBounds(file_row.removeFromLeft(iconButton));
             file_row.removeFromLeft(controlGap);
         }
+        import_wave_.setBounds(file_row.removeFromLeft(UiLayout::libraryButtonMinW));
+        file_row.removeFromLeft(controlGap);
         area.removeFromTop(sm);
 
         auto keyboard_area = area.removeFromBottom(keyboardH);
@@ -5050,6 +5140,7 @@ private:
         file_menu_.setExplicitFocusOrder(70);
         undo_.setExplicitFocusOrder(71);
         redo_.setExplicitFocusOrder(72);
+        import_wave_.setExplicitFocusOrder(73);
         name_.setExplicitFocusOrder(80);
         library_toggle_.setExplicitFocusOrder(90);
         audition_.setExplicitFocusOrder(199);
@@ -5060,6 +5151,76 @@ private:
         history_.push_back(timbre_);
         history_cursor_ = 0;
         updateHistoryButtons();
+    }
+
+    void openWaveConverter() {
+        const juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+        auto open = [safe] { if (safe) safe->showWaveConverter(); };
+        if (!hasUnsavedChanges()) { open(); return; }
+        juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::WarningIcon)
+            .withTitle(juce::String::fromUTF8("未保存の変更があります"))
+            .withMessage(juce::String::fromUTF8("WAV変換結果を適用すると、現在編集中の総合音色はすべて置き換えられます。未保存の編集内容は失われます。"))
+            .withButton(juce::String::fromUTF8("続行"))
+            .withButton(juce::String::fromUTF8("キャンセル"))
+            .withAssociatedComponent(this),
+            [open = std::move(open)](int result) { if (result == 1) open(); });
+    }
+
+    void applyWaveConversion(const mgstc::engine::CompositeTimbre& converted) {
+        // Capture pending text edits before replacement, preserving the entire
+        // authoring state as the immediately preceding Undo state.
+        stopAudition();
+        recordHistory();
+        timbre_ = converted;
+        selected_composite_id_.reset();
+        composite_select_.setSelectedId(0, juce::dontSendNotification);
+        composite_program_stale_ = true;
+        recordHistory();
+        restoreHistory();
+        updateStatus(juce::String::fromUTF8("WAV変換結果を適用しました（未保存）"));
+    }
+
+    [[nodiscard]] bool waveConversionSnapshotMatches(
+        const mgstc::engine::CompositeTimbre& snapshot,
+        const std::optional<std::uint64_t>& selected) const {
+        return timbre_ == snapshot && selected_composite_id_ == selected;
+    }
+
+    void showWaveConverter() {
+        if (wave_converter_window_) { wave_converter_window_->toFront(true); return; }
+        stopAudition();
+        const auto snapshot = timbre_;
+        const auto selected = selected_composite_id_;
+        const juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+        UiScale::forceGlobalForNonEditorUi();
+        auto* dialog = new ModalDialogWindow(juce::String::fromUTF8("WAV → 複合モーフィング音色"), juce::Colour(0xFF1B222C));
+        wave_converter_window_ = dialog;
+        auto* content = new CompositeWavConversionContent(
+            [safe, snapshot, selected](const mgstc::engine::CompositeTimbre& converted, std::function<void()> close) {
+                if (!safe) return;
+                auto apply = [safe, converted, close = std::move(close)] {
+                    if (!safe) return;
+                    safe->applyWaveConversion(converted);
+                    if (close) close();
+                };
+                if (safe->waveConversionSnapshotMatches(snapshot, selected)) { apply(); return; }
+                juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::WarningIcon)
+                    .withTitle(juce::String::fromUTF8("編集中の音色が変更されました"))
+                    .withMessage(juce::String::fromUTF8("変換開始後に総合音色が変更されています。現在の編集内容をWAV変換結果へ置き換えますか？"))
+                    .withButton(juce::String::fromUTF8("置き換える"))
+                    .withButton(juce::String::fromUTF8("キャンセル"))
+                    .withAssociatedComponent(safe.getComponent()),
+                    [apply = std::move(apply)](int result) { if (result == 1) apply(); });
+            }, session_.pcmPreview(), session_.backgroundTasks());
+        dialog->setUsingNativeTitleBar(true);
+        dialog->setResizable(true, false);
+        dialog->setContentOwned(content, true);
+        dialog->setResizeLimits(UiScale::sx(900), UiScale::sx(900), UiScale::sx(1800), UiScale::sx(1400));
+        dialog->centreAroundComponent(this, content->getWidth(), content->getHeight() + UiLayout::fieldH);
+        clampWindowToDisplayWorkArea(*dialog);
+        dialog->enterModalState(true, nullptr, true);
     }
 
     void recordHistory() {
@@ -7145,6 +7306,8 @@ private:
         "undo", juce::DrawableButton::ImageOnButtonBackground};
     juce::DrawableButton redo_{
         "redo", juce::DrawableButton::ImageOnButtonBackground};
+    juce::TextButton import_wave_;
+    juce::Component::SafePointer<ModalDialogWindow> wave_converter_window_;
     std::vector<mgstc::engine::CompositeTimbre> history_;
     std::size_t history_cursor_{};
     PerformanceKeyboard performance_keyboard_;
@@ -8569,6 +8732,10 @@ public:
     }
 
     ~SccEditorComponent() override {
+        if (session_.backgroundTasks()) {
+            delete conversion_quality_dialog_.getComponent();
+            delete conversion_busy_dialog_.getComponent();
+        }
         UiScale::removeGlobalListener(ui_scale_listener_);
         if (standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
@@ -9518,7 +9685,7 @@ private:
     void convertToOpll() {
         juce::Component::SafePointer<SccEditorComponent> safe(this);
         const auto waveform = scc_wave_;
-        showOpllConversionQualityDialog(
+        conversion_quality_dialog_ = showOpllConversionQualityDialog(
             this,
             [safe, waveform](OpllConversionQuality quality) {
                 if (safe == nullptr) {
@@ -9528,7 +9695,7 @@ private:
                     "SCC音色をOPLLへ近似変換しています…"));
                 safe->session_.audition().publishSharedScc(waveform);
                 static_cast<void>(safe->configureEngine(false));
-                runWithConversionBusyDialog(
+                safe->conversion_busy_dialog_ = runWithConversionBusyDialog(
                     safe.getComponent(),
                     [waveform, quality](
                         ConversionProgressState& progress) {
@@ -9570,7 +9737,7 @@ private:
                     juce::String::fromUTF8(
                         "OPLL近似音色を生成し、"
                         "OPLLエディタへ送りました"));
-                    });
+                    }, {}, safe->session_.backgroundTasks());
             });
     }
 
@@ -10999,6 +11166,8 @@ private:
     EditorOpenCallback open_editor_;
     SpectrogramOpenCallback open_spectrogram_;
     OpllCandidateCallback open_opll_candidates_;
+    juce::Component::SafePointer<ConversionBusyDialog> conversion_busy_dialog_;
+    juce::Component::SafePointer<ModalDialogWindow> conversion_quality_dialog_;
     TagManagementCallback manage_tags_;
     LibrariesChangedCallback libraries_changed_;
     EditorSession& session_;
@@ -11943,6 +12112,10 @@ public:
     }
 
     ~OpllEditorComponent() override {
+        if (session_.backgroundTasks()) {
+            delete conversion_quality_dialog_.getComponent();
+            delete conversion_busy_dialog_.getComponent();
+        }
         UiScale::removeGlobalListener(ui_scale_listener_);
         stopTimer();
         performance_keyboard_.allNotesOff();
@@ -12818,7 +12991,7 @@ private:
         const std::vector<std::uint8_t>& bytes,
         const juce::String& source_name) {
         juce::Component::SafePointer<OpllEditorComponent> safe(this);
-        showOpllConversionQualityDialog(
+        conversion_quality_dialog_ = showOpllConversionQualityDialog(
             this,
             [safe, bytes, source_name](
                 OpllConversionQuality quality) {
@@ -12850,7 +13023,7 @@ private:
         }
                 const auto frequency_hz =
                     analysis.estimated_frequency_hz;
-        runWithConversionBusyDialog(
+        safe->conversion_busy_dialog_ = runWithConversionBusyDialog(
                     safe.getComponent(),
                     [pcm = std::move(pcm), quality](
                         ConversionProgressState& progress) {
@@ -12901,7 +13074,7 @@ private:
                     + juce::String::fromUTF8("件／約 ")
                     + juce::String(frequency_hz, 1)
                     + " Hz");
-                    });
+                    }, {}, safe->session_.backgroundTasks());
             });
         return true;
     }
@@ -14177,6 +14350,8 @@ private:
     mgstc::engine::OpllPatchParameters patch_;
     std::optional<int> ui_scale_session_override_;
     std::vector<mgstc::engine::OpllPatchParameters> history_;
+    juce::Component::SafePointer<ConversionBusyDialog> conversion_busy_dialog_;
+    juce::Component::SafePointer<ModalDialogWindow> conversion_quality_dialog_;
     std::size_t history_cursor_{};
     std::vector<mgstc::engine::OpllPatchParameters>
         wave_candidates_;

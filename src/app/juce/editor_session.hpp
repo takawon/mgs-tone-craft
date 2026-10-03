@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -17,6 +18,7 @@
 
 namespace mgstc::engine {
 struct OpllScopeFrame;
+struct SourcePcm;
 }
 
 namespace mgstc::app {
@@ -195,6 +197,33 @@ public:
     virtual void flushPending() = 0;
 };
 
+// Completed comparison PCM only. Preparation and ownership changes happen on
+// the message thread; a plugin renders the immutable range through host audio.
+class PcmPreviewBoundary {
+public:
+    virtual ~PcmPreviewBoundary() = default;
+    [[nodiscard]] virtual bool play(std::shared_ptr<const mgstc::engine::SourcePcm> pcm,
+        std::size_t begin, std::size_t end, float gain) = 0;
+    virtual void stop() noexcept = 0;
+};
+
+class EditorBackgroundTask {
+public:
+    virtual ~EditorBackgroundTask() = default;
+    virtual void cancel() noexcept = 0;
+    // Non-audio teardown only. Also prevents a registered but not yet started
+    // worker from starting after shutdown.
+    virtual void join() noexcept = 0;
+    [[nodiscard]] virtual bool completed() const noexcept = 0;
+};
+
+class BackgroundTaskBoundary {
+public:
+    virtual ~BackgroundTaskBoundary() = default;
+    // Register before starting. The processor retains ownership through shutdown.
+    [[nodiscard]] virtual bool registerTask(std::shared_ptr<EditorBackgroundTask> task) = 0;
+};
+
 // Thin composition root. No engine() accessor. Scope polls consume frames and
 // are not audition. Independent OPLL scope uses waveform_scope.
 // Composite Editor playback waveform uses composite_playback_waveform.
@@ -208,6 +237,8 @@ public:
     [[nodiscard]] virtual OutputBoundary& output() noexcept = 0;
     [[nodiscard]] virtual MidiInputBoundary& midi() noexcept = 0;
     [[nodiscard]] virtual AuditionBoundary& audition() noexcept = 0;
+    [[nodiscard]] virtual PcmPreviewBoundary* pcmPreview() noexcept { return nullptr; }
+    [[nodiscard]] virtual BackgroundTaskBoundary* backgroundTasks() noexcept { return nullptr; }
     [[nodiscard]] virtual bool pollOpllScope(
         mgstc::engine::OpllScopeFrame& frame) = 0;
     [[nodiscard]] virtual bool pollLatestOpllScope(
