@@ -29,6 +29,8 @@
 #include "mgstc/engine/opll_patch.hpp"
 #include "mgstc/engine/register_write.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
+#include "mgstc/engine/scc_morph.hpp"
+#include "mgstc/engine/mgs_composite_io.hpp"
 #include "mgstc/engine/sinc_rate_conv.hpp"
 
 namespace mgstc::app {
@@ -37,6 +39,7 @@ struct CompositeEditorComponentTestAccess {
     static const mgstc::engine::CompositeTimbre& sound(const CompositeEditorComponent& editor) { return editor.timbre_; }
     static bool wavEnabled(const CompositeEditorComponent& editor) { return editor.import_wave_.isEnabled(); }
     static std::size_t historySize(const CompositeEditorComponent& editor) { return editor.history_.size(); }
+    static std::size_t historyCursor(const CompositeEditorComponent& editor) { return editor.history_cursor_; }
     static void applyWave(CompositeEditorComponent& editor, const mgstc::engine::CompositeTimbre& sound) { editor.applyWaveConversion(sound); }
     static void undo(CompositeEditorComponent& editor) { editor.undo(); }
     static void redo(CompositeEditorComponent& editor) { editor.redo(); }
@@ -44,6 +47,9 @@ struct CompositeEditorComponentTestAccess {
         return editor.waveConversionSnapshotMatches(snapshot, {});
     }
     static void editName(CompositeEditorComponent& editor, const std::string& name) { editor.timbre_.name = name; }
+    static void pollOwned(CompositeEditorComponent& editor) { editor.timerCallback(); }
+    static void assignBase(CompositeEditorComponent& editor, std::size_t layer,
+        std::optional<std::uint64_t> id) { editor.assignLayerLibraryId(layer, id); }
     static void start(CompositeEditorComponent& editor, std::uint8_t note,
         bool one_second = false) {
         editor.startCompositeNote(note, one_second);
@@ -4391,6 +4397,177 @@ void testCompositeWavActualUiWorkerAndApply() {
     processEmpty(processor, 512);
 }
 
+void testWavMorphPlanVstStateAndReediting() {
+    using namespace mgstc::engine;
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    auto pcm = std::make_shared<SourcePcm>();
+    pcm->sample_rate = 48'000; pcm->channels = 1; pcm->bit_depth = 32;
+    pcm->sample_format = SourceSampleFormat::FloatPcm;
+    for (std::size_t i = 0; i < 14'400; ++i) {
+        const double t = static_cast<double>(i) / 48'000;
+        const double u = std::clamp((t - .018) / .234, 0.0, 1.0);
+        const double phase = 2 * std::numbers::pi * 220 * t;
+        const auto value = static_cast<float>(std::min(1.0, t / .012) * .28
+            * (.8 * std::sin(phase) + .62 * (1 - u) * std::sin(2 * phase + .2)
+                + .58 * u * std::sin(5 * phase - .3)));
+        pcm->mono_samples.push_back(value); pcm->interleaved_samples.push_back(value);
+    }
+    SourceAnalysisOptions analysis_options; analysis_options.reference_pitch_hz = 220;
+    auto analysis = analyzeCompositeWaveSource(pcm, {0, pcm->mono_samples.size()}, analysis_options);
+    require(analysis.analysis != nullptr, "WAV plan VST fixture analysis completes");
+    CompositeWavConversionOptions options;
+    options.max_scc_waveforms = 4; options.max_evaluations = 12;
+    options.loop_mode = CompositeWavLoopMode::None;
+    auto converted = convertCompositeWave(analysis.analysis, options);
+    require(converted.composite_tone.has_value() && converted.morph_search.complete_comparisons > 0,
+        "actual VST fixture conversion completes fair three-mode comparison");
+    const auto confirmed = *converted.composite_tone;
+    std::size_t confirmed_intervals{};
+    for (const auto& layer : confirmed.layers)
+        for (const auto& event : layer.timbre_automation)
+            if (event.scc_morph.enabled && event.scc_morph.explicit_plan) ++confirmed_intervals;
+    require(confirmed_intervals > 0, "actual converter freezes final mode and u/count placement in author data");
+    const auto compiled = compileSccMorph(confirmed);
+    const auto exported = formatMgsComposite(confirmed);
+    require(compiled.valid && exported.valid(), "confirmed converter plan compiles for audition and MGSC");
+    CompositeWavRenderOptions rendering;
+    rendering.midi_note = 57; rendering.frame_count = 14'400; rendering.key_off_frame = 12'000;
+    const auto original_pcm = renderCompositeWav(confirmed, rendering);
+    require(original_pcm.ok(), "confirmed converter plan uses actual Engine PCM for state parity");
+
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    const auto original = processor.copyPluginState().sound;
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {}, [] {}, [](std::uint8_t) {},
+        [](juce::Component*) {}, [] {}, original);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    EditorAccess::applyWave(editor, confirmed);
+    require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
+        "actual WAV three-mode output applies through shared editor and VST state");
+    processEmpty(processor, 512);
+    const auto stored = stateBytes(processor);
+    // Remove every original-WAV/analysis/preview owner before reopening.
+    analysis.analysis.reset(); pcm.reset(); converted = {};
+    MgstcAudioProcessor restored;
+    restored.prepareToPlay(48'000.0, 512);
+    restored.setStateInformation(stored.getData(), static_cast<int>(stored.getSize()));
+    processEmpty(restored, 512);
+    const auto restored_sound = restored.copyPluginState().sound;
+    require(restored_sound == confirmed, "VST state preserves confirmed plan without original WAV");
+    require(compileSccMorph(restored_sound).timbre == compiled.timbre
+            && formatMgsComposite(restored_sound).source == exported.source,
+        "WAV-free VST load generates bit-identical SCC waves and MGSC output");
+    require(renderCompositeWav(restored_sound, rendering).stereo_pcm == original_pcm.stereo_pcm,
+        "WAV-free VST state regenerates bit-identical actual Engine PCM");
+    {
+        std::unique_ptr<juce::AudioProcessorEditor> recreated(restored.createEditor());
+        require(recreated != nullptr, "VST editor recreation succeeds with confirmed WAV morph plan");
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+        require(restored.copyPluginState().sound == confirmed,
+            "VST editor open/close hydration preserves saved u/count plan");
+    }
+    EditorAccess::undo(editor);
+    require(EditorAccess::sound(editor) == original && processor.copyPluginState().sound == original,
+        "Undo of actual WAV mode selection restores complete prior VST author state");
+    processEmpty(processor, 512);
+    EditorAccess::redo(editor);
+    require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
+        "Redo restores converter-confirmed plans exactly");
+    processEmpty(processor, 512);
+
+    const auto original_base = *confirmed.layers.front().base_timbre;
+    const auto replacement = std::find_if(confirmed.embedded_timbres.begin(), confirmed.embedded_timbres.end(),
+        [&](const auto& snapshot) {
+            return snapshot.source == TimbreSource::Scc && snapshot.library_id != original_base.library_id;
+        });
+    require(replacement != confirmed.embedded_timbres.end(), "base reassignment fixture has a distinct existing SCC source");
+    require(std::none_of(confirmed.embedded_timbres.begin(), confirmed.embedded_timbres.end(),
+        [&](const auto& snapshot) { return snapshot.library_id == original_base.library_id; }),
+        "old WAV base exists only in its layer before the actual assignment");
+    const auto base_history = EditorAccess::historySize(editor);
+    EditorAccess::assignBase(editor, 0, replacement->library_id);
+    const auto reassigned = EditorAccess::sound(editor);
+    const auto* retained_base = findEmbeddedTimbreSnapshot(reassigned, original_base.library_id);
+    require(reassigned.layers.front().base_timbre->library_id == replacement->library_id
+            && retained_base && *retained_base == original_base,
+        "actual base picker retains the displaced snapshot still referenced by explicit @0");
+    require(reassigned.layers.front().timbre_automation == confirmed.layers.front().timbre_automation,
+        "base picker preserves explicit @ author intent and unchanged confirmed WAV plans");
+    require(compileSccMorph(reassigned).valid && formatMgsComposite(reassigned).valid()
+            && processor.copyPluginState().sound == reassigned,
+        "base reassignment keeps all WAV event sources resolvable in common DSP and VST state");
+    require(EditorAccess::historySize(editor) == base_history + 1,
+        "actual base source reassignment creates one author history transaction");
+    processEmpty(processor, 512);
+    const auto reassigned_blob = stateBytes(processor);
+    const auto reassigned_parse = mgstc::plugin::parsePluginState(
+        reassigned_blob.getData(), reassigned_blob.getSize());
+    require(reassigned_parse.status == mgstc::plugin::PluginStateStatus::Ok
+            && reassigned_parse.document.sound == reassigned,
+        "retained old base and confirmed plans survive WAV-free Plugin State serialization");
+    EditorAccess::undo(editor);
+    require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
+        "Undo of base selection removes the retained copy and restores original confirmed WAV state");
+    processEmpty(processor, 512);
+    EditorAccess::redo(editor);
+    require(EditorAccess::sound(editor) == reassigned && processor.copyPluginState().sound == reassigned,
+        "Redo restores the referenced old base snapshot and unchanged plans");
+    processEmpty(processor, 512);
+    EditorAccess::assignBase(editor, 0, replacement->library_id);
+    require(EditorAccess::sound(editor) == reassigned
+            && EditorAccess::historySize(editor) == base_history + 1,
+        "reselecting the same base neither duplicates retained sources nor adds history");
+    processEmpty(processor, 512);
+    EditorAccess::assignBase(editor, 0, {});
+    const auto reset_base = EditorAccess::sound(editor);
+    require(!reset_base.layers.front().base_timbre
+            && findEmbeddedTimbreSnapshot(reset_base, original_base.library_id)
+            && reset_base.layers.front().timbre_automation == confirmed.layers.front().timbre_automation
+            && compileSccMorph(reset_base).valid && processor.copyPluginState().sound == reset_base,
+        "base reset keeps all explicit WAV keyframe sources and confirmed plans intact in VST state");
+    processEmpty(processor, 512);
+    EditorAccess::undo(editor); // reset -> reassigned
+    processEmpty(processor, 512);
+    EditorAccess::undo(editor); // reassigned -> original confirmed conversion
+    require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
+        "Undo of base reset and reassignment restores complete WAV-free conversion state");
+    processEmpty(processor, 512);
+
+    const EnvelopeEvent* selected = nullptr;
+    for (const auto& event : confirmed.layers.front().timbre_automation)
+        if (event.scc_morph.explicit_plan) { selected = &event; break; }
+    require(selected != nullptr, "owned-wave edit test has a confirmed destination");
+    auto changed_wave = *findEmbeddedTimbreSnapshot(confirmed, selected->target_library_id);
+    changed_wave.scc_waveform[5] ^= 1;
+    const auto history_cursor_before = EditorAccess::historyCursor(editor);
+    link.publishOwned(changed_wave);
+    EditorAccess::pollOwned(editor);
+    const auto changed = EditorAccess::sound(editor);
+    std::size_t retained_intervals{};
+    for (const auto& layer : changed.layers)
+        for (const auto& event : layer.timbre_automation)
+            if (event.scc_morph.explicit_plan) ++retained_intervals;
+    require(retained_intervals < confirmed_intervals && changed != confirmed
+            && processor.copyPluginState().sound == changed,
+        "actual owned SCC waveform edit invalidates dependent WAV plans and republishes VST state");
+    require(compileSccMorph(changed).valid
+            && EditorAccess::historyCursor(editor) == history_cursor_before + 1
+            && EditorAccess::historySize(editor) == history_cursor_before + 2,
+        "edited WAV endpoints regenerate through common DSP with one Undo transaction and truncate the old Redo branch");
+    processEmpty(processor, 512);
+    EditorAccess::undo(editor);
+    require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
+        "Undo of waveform editing restores original waves and confirmed WAV plans");
+    processEmpty(processor, 512);
+    EditorAccess::redo(editor);
+    require(EditorAccess::sound(editor) == changed && processor.copyPluginState().sound == changed,
+        "Redo preserves invalidated plan state after waveform editing");
+    processEmpty(processor, 512);
+}
+
 void testTemporaryCompositePreviewPreservesState() {
     MgstcAudioProcessor processor;
     const auto before = stateBytes(processor);
@@ -4573,6 +4750,7 @@ int main() {
         testCompositeWavUiTransactions();
         testCompositeWavRangeInteractions();
         testCompositeWavActualUiWorkerAndApply();
+        testWavMorphPlanVstStateAndReediting();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

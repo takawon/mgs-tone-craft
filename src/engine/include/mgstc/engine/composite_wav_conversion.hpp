@@ -72,11 +72,56 @@ struct CompositeWavQualityWeights {
 enum class CompositeWavConversionCompletion { Completed, Cancelled, InvalidInput, NoValidCandidate };
 
 // Offline search diagnostics, never part of timbre/plugin persistence. A trial
-// is counted only when its complete candidate reaches the actual Engine.
+// is counted only when the complete candidate has valid actual Engine PCM,
+// freshly rendered or reused by exact materialized sound equality.
 enum class CompositeWavSearchFamily { MorphInterval, KeyTime, WaveShape, Envelope, Loop, Reduction, Count };
 struct CompositeWavSearchDiagnostics {
     std::array<std::size_t, static_cast<std::size_t>(CompositeWavSearchFamily::Count)> trials{};
     std::array<std::size_t, static_cast<std::size_t>(CompositeWavSearchFamily::Count)> accepted{};
+};
+
+// Worker-only evidence. A nonzero group compares exactly the same full sound,
+// changing only the indicated interval's distribution. Invalid members retain
+// their rejection reason. `selected` identifies the final complete composite;
+// `group_winner` identifies a matched three-way comparison's local winner.
+struct CompositeWavMorphCandidateDiagnostic {
+    CompositeWavConfiguration configuration{CompositeWavConfiguration::Scc};
+    std::uint64_t candidate_id{}, comparison_group{};
+    std::size_t layer_index{}, destination_event_index{};
+    std::uint32_t start_count{}, end_count{};
+    SccMorphDistributionMode distribution{SccMorphDistributionMode::AdaptiveDistribution};
+    std::uint8_t intermediate_count{};
+    double curve{1.0};
+    SccMorphPlan plan;
+    CompositeWavQualityMetrics quality;
+    std::size_t bank_waveforms{};
+    bool valid{}, accepted{}, comparison_complete{}, group_winner{}, selected{};
+    std::string reason;
+};
+
+struct CompositeWavMorphSearchDiagnostics {
+    // Mode order is Adaptive, Time, Tone. Trials include evaluations of cached
+    // real Engine PCM; cache hits never substitute ideal float waveforms.
+    std::array<std::size_t, 3> mode_trials{}, mode_accepted{};
+    std::size_t complete_comparisons{}, incomplete_comparisons{}, adaptive_plan_trials{};
+    std::size_t global_combination_trials{}, global_combination_accepted{}, retained_segment_pools{};
+    std::size_t morph_cache_hits{}, morph_cache_misses{}, render_cache_hits{}, render_cache_misses{};
+    std::size_t candidate_pool_peak{};
+    // Peak logical owned storage plus the common planner's scratch estimate;
+    // excludes allocator overhead, Engine internals and shared source analysis.
+    std::size_t working_set_bytes{};
+    // All-mode candidate Morph/cache preparation and Engine/objective time.
+    // External WAV u/count proposal preparation is outside these two scopes.
+    double planning_seconds{}, evaluation_seconds{};
+    // Initial structural Adaptive candidates and matched triplet mode 0 only;
+    // covers their evaluation's Morph preparation, real PCM/cache and objective
+    // work. Structural source acquisition/keyframe/curve fitting is excluded.
+    // Mixed-mode global combinations and ordinary six-family edits are excluded.
+    double adaptive_candidate_seconds{};
+    // External WAV-guided u/count branch, including its common planner,
+    // feature proposal, complete candidate evaluation and early-return work.
+    // Disjoint from adaptive_candidate_seconds; both are worker wall times.
+    double adaptive_refinement_seconds{};
 };
 
 struct CompositeWavConversionResult {
@@ -85,13 +130,15 @@ struct CompositeWavConversionResult {
     CompositeWavResourcePlan resource_plan;
     CompositeWavRenderResult preview;
     std::shared_ptr<const SourceAnalysis> analysis_reference;
-    std::size_t evaluations{};
+    std::size_t evaluations{}; // Candidate objectives, including exact cached real Engine PCM.
     std::size_t loop_probe_renders{}; // Bounded held-note renders, separate from candidate evaluations.
     double elapsed_seconds{};
     double initial_loss{};
     double best_loss{};
     CompositeWavQualityMetrics quality;
     CompositeWavSearchDiagnostics search;
+    CompositeWavMorphSearchDiagnostics morph_search;
+    std::vector<CompositeWavMorphCandidateDiagnostic> morph_candidates;
     std::vector<std::string> warnings;
     std::string error;
 };
@@ -104,9 +151,10 @@ struct CompositeWavConversionResult {
     const std::atomic_bool* cancel = nullptr,
     const SourceAnalysis* source_analysis = nullptr);
 
-// Worker-thread only. Each complete candidate is rendered through a fresh real
-// EngineCore; input analysis/library/editor state are never modified. Cancelled
-// results retain an already evaluated best candidate for diagnostics only.
+// Worker-thread only. Cache misses render through a fresh real EngineCore;
+// bounded exact caches reuse common Morph preparation and actual Engine PCM.
+// Input analysis/library/editor state are never modified. Cancelled results
+// retain an already evaluated best candidate for diagnostics only.
 [[nodiscard]] CompositeWavConversionResult convertCompositeWave(
     std::shared_ptr<const SourceAnalysis> analysis,
     const CompositeWavConversionOptions& options = {});

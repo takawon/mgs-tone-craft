@@ -62,6 +62,112 @@ using mgstc::app::EnvelopeTimbreChoice;
 using mgstc::app::LayerBaseTimbreAssign;
 using mgstc::app::envelopeTimbreCatalogLabel;
 
+bool mgstc::app::invalidateEditedSccMorphPlans(
+    const engine::CompositeTimbre& before, engine::CompositeTimbre& after) {
+    using namespace engine;
+    struct Endpoint {
+        std::uint64_t id{};
+        TimbrePick pick{};
+        std::int32_t raw_number{};
+        std::uint32_t count{};
+        bool after_loop{};
+        int loop_phase{}; // first pass, repeated sustain, or unreachable after ]
+        std::optional<std::array<std::uint8_t, 32>> wave;
+        bool operator==(const Endpoint&) const = default;
+    };
+    struct Dependency {
+        Endpoint source, destination, block_start, block_end;
+        bool fixed_start{}, fixed_end{}, enabled{};
+        std::uint8_t intermediates{};
+        double curve{};
+        SccMorphDistributionMode mode{};
+        std::optional<std::uint32_t> loop_start, loop_end;
+        bool operator==(const Dependency&) const = default;
+    };
+    const auto dependencies = [](const CompositeTimbre& sound, const CompositeLayer& layer) {
+        std::vector<std::size_t> tones;
+        for (std::size_t i = 0; i < layer.timbre_automation.size(); ++i)
+            if (layer.timbre_automation[i].kind == EnvelopeEventKind::Timbre) tones.push_back(i);
+        std::stable_sort(tones.begin(), tones.end(), [&](auto a, auto b) {
+            const auto& left = layer.timbre_automation[a];
+            const auto& right = layer.timbre_automation[b];
+            return left.count != right.count ? left.count < right.count
+                : left.after_loop_start < right.after_loop_start;
+        });
+        const auto numbers = resolveTimbreNumbers(sound);
+        const auto endpoint = [&](std::size_t position) {
+            const auto& event = layer.timbre_automation[tones[position]];
+            Endpoint result{event.target_library_id, event.timbre_pick,
+                event.target_library_id ? 0 : event.value, event.count, event.after_loop_start};
+            const auto& timeline = layer.envelope_timeline;
+            if (timeline.loop_end_count && (event.count > *timeline.loop_end_count
+                    || (event.count == *timeline.loop_end_count && !event.after_loop_start)))
+                result.loop_phase = 2;
+            else if (timeline.loop_start_count && (event.count > *timeline.loop_start_count
+                    || (event.count == *timeline.loop_start_count && event.after_loop_start)))
+                result.loop_phase = 1;
+            const SavedTimbreReference* reference = event.target_library_id
+                ? findEmbeddedTimbreSnapshot(sound, event.target_library_id) : nullptr;
+            if (!reference && !event.target_library_id && event.timbre_pick == TimbrePick::Library)
+                for (const auto& assignment : numbers.assignments) {
+                    const auto* candidate = findEmbeddedTimbreSnapshot(sound, assignment.library_id);
+                    if (candidate && candidate->source == TimbreSource::Scc
+                        && (assignment.number == event.value || candidate->manual_number == event.value)) {
+                        reference = candidate;
+                        break;
+                    }
+                }
+            if (reference && reference->source == TimbreSource::Scc) result.wave = reference->scc_waveform;
+            return result;
+        };
+        std::vector<std::pair<std::size_t, Dependency>> result;
+        for (std::size_t i = 1; i < tones.size(); ++i) {
+            const auto& settings = layer.timbre_automation[tones[i]].scc_morph;
+            std::size_t start = i - 1, end = i;
+            while (start > 0 && layer.timbre_automation[tones[start]].scc_morph.enabled) --start;
+            while (end + 1 < tones.size() && layer.timbre_automation[tones[end + 1]].scc_morph.enabled) ++end;
+            Dependency dependency{endpoint(i - 1), endpoint(i), endpoint(start), endpoint(end),
+                start != 0, end + 1 != tones.size(), settings.enabled, settings.intermediate_count,
+                settings.curve, settings.distribution_mode};
+            const auto boundaryWithin = [&](const std::optional<std::uint32_t>& boundary) {
+                return boundary && *boundary >= dependency.source.count && *boundary <= dependency.destination.count
+                    ? boundary : std::optional<std::uint32_t>{};
+            };
+            dependency.loop_start = boundaryWithin(layer.envelope_timeline.loop_start_count);
+            dependency.loop_end = boundaryWithin(layer.envelope_timeline.loop_end_count);
+            result.push_back({tones[i], std::move(dependency)});
+        }
+        return result;
+    };
+    bool changed = false;
+    for (std::size_t index = 0; index < after.layers.size(); ++index) {
+        auto& layer = after.layers[index];
+        if (layer.source != TimbreSource::Scc) continue;
+        if (std::none_of(layer.timbre_automation.begin(), layer.timbre_automation.end(),
+                [](const auto& event) { return event.scc_morph.explicit_plan.has_value(); })) continue;
+        const auto* previous = index < before.layers.size() ? &before.layers[index] : nullptr;
+        const bool same_context = previous && previous->source == layer.source
+            && previous->volume_envelope.kind == layer.volume_envelope.kind
+            && before.scc_morph_algorithm_version == after.scc_morph_algorithm_version;
+        const auto old = previous ? dependencies(before, *previous)
+            : std::vector<std::pair<std::size_t, Dependency>>{};
+        const auto current = dependencies(after, layer);
+        for (std::size_t event_index = 0; event_index < layer.timbre_automation.size(); ++event_index) {
+            auto& settings = layer.timbre_automation[event_index].scc_morph;
+            if (!settings.explicit_plan) continue;
+            const auto entry = std::find_if(current.begin(), current.end(),
+                [event_index](const auto& candidate) { return candidate.first == event_index; });
+            if (same_context && entry != current.end()
+                && std::any_of(old.begin(), old.end(), [&](const auto& candidate) {
+                    return candidate.second == entry->second;
+                })) continue;
+            settings.explicit_plan.reset();
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 namespace {
 
 void insertCurrentAssignmentCatalogItem(
@@ -369,6 +475,8 @@ public:
             button.setClickingTogglesState(true);
             button.setWantsKeyboardFocus(true);
             button.setExplicitFocusOrder(221 + static_cast<int>(index));
+            button.setTooltip(juce::String::fromUTF8(
+                "方式・カーブ・音色数や区間の端点を編集すると、WAV確定配置を解除して通常のモーフ配置を生成します"));
             button.onClick = [this] { changeMorph(true); };
             addAndMakeVisible(button);
         }
@@ -4437,7 +4545,7 @@ public:
             timbre_ = std::move(candidate);
             morph_bank_error_.clear();
             updateEnvelopeMmlPreview();
-            if (edit_callback_) edit_callback_(timbre_, true, true);
+            if (edit_callback_) publishEdit(true, true);
         };
         addAndMakeVisible(morph_bank_);
         morph_bank_usage_.setFont(UiFonts::body());
@@ -4921,6 +5029,56 @@ public:
             check(timbre_ == restored_model && latest_commits == 1 && !morph_pending_edit_,
                 "model reload did not cancel pending morph generation");
             edit_callback_ = saved_edit_callback;
+            // Confirmed WAV plans are author data until their actual inputs
+            // change. Exercise the same timeline commands used by both editions.
+            auto confirmed = morph_model;
+            auto& confirmed_events = confirmed.layers[1].timbre_automation;
+            for (auto& event : confirmed_events) if (event.count == 12) {
+                event.scc_morph.intermediate_count = 1;
+                event.scc_morph.explicit_plan = mgstc::engine::SccMorphPlan{{{0.0, 0}, {0.3, 4}, {1.0, 10}}};
+            }
+            auto later = *timbreEventAt(confirmed.layers[1], 12);
+            later.count = 32;
+            confirmed_events.push_back(later);
+            const auto has_plan = [&](int count) {
+                const auto* event = timbreEventAt(timbre_.layers[1], static_cast<std::uint32_t>(count));
+                return event && event->scc_morph.explicit_plan.has_value();
+            };
+            setTimbre(confirmed, true); selectOverviewLayer(1);
+            check(has_plan(12) && has_plan(32), "loading confirmed WAV plans discarded unchanged intervals");
+            applyTimbreChoice(12, {mgstc::engine::TimbrePick::Library, second_wave.library_id});
+            check(has_plan(12) && has_plan(32), "no-op source selection invalidated a confirmed WAV plan");
+            applyTimbreChoice(12, {mgstc::engine::TimbrePick::Library, first_wave.library_id});
+            check(!has_plan(12) && has_plan(32), "endpoint edit failed to invalidate only its affected WAV interval");
+            setTimbre(confirmed, true); selectOverviewLayer(1);
+            applyTimbreChoice(7, {mgstc::engine::TimbrePick::Library, first_wave.library_id});
+            check(!has_plan(12) && has_plan(32), "new keyframe retained the next interval's stale WAV plan");
+            setTimbre(confirmed, true); selectOverviewLayer(1);
+            removeTimbreAt(2);
+            check(!has_plan(12) && has_plan(32), "deleting source keyframe retained its destination WAV plan");
+            auto loop_confirmed = confirmed;
+            loop_confirmed.layers[1].envelope_timeline.loop_start_count = 12;
+            loop_confirmed.layers[1].envelope_timeline.loop_end_count = 40;
+            setTimbre(loop_confirmed, true); selectOverviewLayer(1);
+            selected_count_ = 12;
+            moveStackChipAt(0, true);
+            check(!has_plan(12) && has_plan(32), "loop phase edit invalidated the wrong WAV intervals");
+            setTimbre(loop_confirmed, true); selectOverviewLayer(1);
+            edit_mode_.setSelectedId(static_cast<int>(EditMode::LoopStart), juce::dontSendNotification);
+            setTimelineMarker(14, true);
+            check(!has_plan(12) && has_plan(32), "moving loop boundary discarded an unrelated confirmed plan");
+            auto unchanged = confirmed;
+            unchanged.name = "Metadata only";
+            unchanged.favorite = !unchanged.favorite;
+            unchanged.layers[1].volume = 10;
+            check(!mgstc::app::invalidateEditedSccMorphPlans(confirmed, unchanged)
+                    && unchanged.layers[1].timbre_automation == confirmed_events,
+                "metadata/volume-only author edit discarded confirmed WAV placement");
+            setTimbre(confirmed, true); selectOverviewLayer(1);
+            auto changed_curve = timbreEventAt(timbre_.layers[1], 12)->scc_morph;
+            changed_curve.curve = 0.5;
+            check(apply_verified_morph(1, 12, changed_curve).accepted && !has_plan(12) && has_plan(32),
+                "curve edit failed to regenerate only its confirmed WAV interval");
             auto recovery_model = morph_model;
             for (auto& event : recovery_model.layers[1].timbre_automation) {
                 event.scc_morph.enabled = event.count != 22;
@@ -4998,7 +5156,26 @@ public:
     }
 
     void setEditCallback(EditCallback callback) {
+        last_published_timbre_ = timbre_;
         edit_callback_ = std::move(callback);
+    }
+
+    void publishEdit(bool commit, bool preview) {
+        const auto plan_count = [](const auto& sound) {
+            std::size_t count{};
+            for (const auto& layer : sound.layers)
+                for (const auto& event : layer.timbre_automation)
+                    count += event.scc_morph.explicit_plan.has_value() ? 1 : 0;
+            return count;
+        };
+        const bool invalidated = mgstc::app::invalidateEditedSccMorphPlans(last_published_timbre_, timbre_)
+            || pending_plan_invalidation_
+            || plan_count(timbre_) < plan_count(last_published_timbre_);
+        pending_plan_invalidation_ = false;
+        last_published_timbre_ = timbre_;
+        if (edit_callback_) edit_callback_(timbre_, commit, preview);
+        if (invalidated) reportStatus(juce::String::fromUTF8(
+            "編集した区間はWAV確定配置を解除し、共通モーフ処理で再生成します"));
     }
 
     void setStatusCallback(StatusCallback callback) {
@@ -5082,7 +5259,7 @@ public:
                 layer);
         }
         if (edit_callback_) {
-            edit_callback_(timbre_, true, false);
+            publishEdit(true, false);
         }
         if (base_audition_) {
             base_audition_();
@@ -5132,7 +5309,7 @@ public:
                     ->syncFromLayer(layer);
             }
             if (edit_callback_) {
-                edit_callback_(timbre_, true, false);
+                publishEdit(true, false);
             }
         }
         selected_layer_ = static_cast<int>(layer_index);
@@ -5167,7 +5344,7 @@ public:
                 updateEnvelopeMmlPreview();
                 repaint();
                 if (edit_callback_) {
-                    edit_callback_(timbre_, commit, false);
+                    publishEdit(commit, false);
                 }
             },
             [this, layer_index] {
@@ -5254,7 +5431,7 @@ public:
                 }
                 repaint();
                 if (edit_callback_) {
-                    edit_callback_(timbre_, true, false);
+                    publishEdit(true, false);
                 }
             },
             [this, layer_index] {
@@ -5303,6 +5480,8 @@ public:
         bool reset_scroll_extent = false) {
         const auto previous_pitch_expanded = pitch_lane_expanded_;
         timbre_ = timbre;
+        last_published_timbre_ = timbre;
+        pending_plan_invalidation_ = false;
         cancelMorphGeneration(true);
         envelope_number_active_.resize(timbre_.layers.size());
         for (std::size_t index = 0; index < timbre_.layers.size(); ++index) {
@@ -5852,7 +6031,7 @@ private:
             resized();
         }
         repaint();
-        if (edit_callback_) edit_callback_(timbre_, true, true);
+        if (edit_callback_) publishEdit(true, true);
     }
 
     void setTimelineModulationEnabled(
@@ -5958,7 +6137,7 @@ private:
                     else layer.solo = on;
                     layer_setups_[i]->syncFromLayer(layer);
                     repaint();
-                    if (edit_callback_) edit_callback_(timbre_, true, false);
+                    if (edit_callback_) publishEdit(true, false);
                 };
                 overview_content_.addAndMakeVisible(button);
             }
@@ -6244,7 +6423,7 @@ private:
         updateEnvelopeMmlPreview();
         repaint();
         if (edit_callback_) {
-            edit_callback_(timbre_, true, true);
+            publishEdit(true, true);
         }
     }
 
@@ -6308,7 +6487,7 @@ private:
             static_cast<std::uint8_t>(parameter_value);
         syncPointEditors();
         if (commit && edit_callback_) {
-            edit_callback_(timbre_, true, true);
+            publishEdit(true, true);
         }
         repaint();
     }
@@ -6630,7 +6809,7 @@ private:
         updateScrollRanges();
         repaint();
         if (edit_callback_) {
-            edit_callback_(timbre_, true, true);
+            publishEdit(true, true);
         }
     }
 
@@ -6646,7 +6825,7 @@ private:
         syncInspector();
         repaint();
         if (edit_callback_) {
-            edit_callback_(timbre_, true, true);
+            publishEdit(true, true);
         }
     }
 
@@ -6802,7 +6981,7 @@ private:
         resized();
         repaint();
         if (edit_callback_) {
-            edit_callback_(timbre_, true, false);
+            publishEdit(true, false);
         }
     }
 
@@ -6865,7 +7044,7 @@ private:
         resized();
         repaint();
         if (edit_callback_) {
-            edit_callback_(timbre_, true, false);
+            publishEdit(true, false);
         }
     }
 
@@ -6896,7 +7075,7 @@ private:
         resized();
         repaint();
         if (edit_callback_) {
-            edit_callback_(timbre_, true, false);
+            publishEdit(true, false);
         }
     }
 
@@ -7516,7 +7695,7 @@ private:
         updateScrollRanges();
         repaint();
         if (edit_callback_) {
-            edit_callback_(timbre_, commit, commit);
+            publishEdit(commit, commit);
         }
     }
 
@@ -8417,6 +8596,8 @@ private:
     }
 
     void updateEnvelopeMmlPreview() {
+        pending_plan_invalidation_ = mgstc::app::invalidateEditedSccMorphPlans(last_published_timbre_, timbre_)
+            || pending_plan_invalidation_;
         envelope_number_active_.resize(timbre_.layers.size(), false);
         if (selected_layer_ >= 0
             && selected_layer_ < static_cast<int>(timbre_.layers.size())) {
@@ -9112,7 +9293,7 @@ private:
         updateEnvelopeMmlPreview();
         repaint();
         if (edit_callback_) {
-            edit_callback_(timbre_, commit, commit);
+            publishEdit(commit, commit);
         }
     }
 
@@ -9636,6 +9817,7 @@ private:
             || settings.curve != previous.curve)
             settings.explicit_plan.reset();
         event->scc_morph = settings;
+        static_cast<void>(mgstc::app::invalidateEditedSccMorphPlans(timbre_, candidate));
         // A slider drag only changes picker state. Its final commit schedules
         // one immutable preparation job and one existing Undo transaction.
         if (!commit) return {};
@@ -10427,7 +10609,7 @@ private:
         }
         repaint();
         if (edit_callback_) {
-            edit_callback_(timbre_, true, true);
+            publishEdit(true, true);
         }
         reportStatus(what);
     }
@@ -10718,7 +10900,7 @@ private:
                     resized();
                     repaint();
                     if (edit_callback_) {
-                        edit_callback_(timbre_, commit, false);
+                        publishEdit(commit, false);
                     }
                     syncRateEditorFromModel();
                 },
@@ -10738,7 +10920,7 @@ private:
                             mgstc::engine::allocateCompositeOwnedTimbreId(
                                 timbre_);
                         if (edit_callback_) {
-                            edit_callback_(timbre_, true, false);
+                            publishEdit(true, false);
                         }
                     }
                     open_timbre_callback_(
@@ -11055,7 +11237,7 @@ private:
         timbre_.playback_tempo = next;
         repaint();
         if (edit_callback_) {
-            edit_callback_(timbre_, true, false);
+            publishEdit(true, false);
         }
     }
 
@@ -11068,6 +11250,8 @@ private:
     bool count_inspector_{};
     bool inspector_visible_{true};
     mgstc::engine::CompositeTimbre timbre_;
+    mgstc::engine::CompositeTimbre last_published_timbre_;
+    bool pending_plan_invalidation_{};
     juce::ComboBox parameter_;
     juce::ComboBox edit_mode_;
     juce::ComboBox auto_mode_;

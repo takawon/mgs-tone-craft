@@ -699,10 +699,22 @@ inline void CompositeWavConversionContent::convert() {
                 cancelled, completed.source_gain, completed.result_gain)) return;
             const auto& result = *safe->result_;
             const auto& q = result.quality;
+            std::array<int, 3> selected_modes{};
+            for (const auto& layer : result.composite_tone->layers) {
+                if (layer.source != mgstc::engine::TimbreSource::Scc) continue;
+                for (const auto& event : layer.timbre_automation) {
+                    if (event.kind != mgstc::engine::EnvelopeEventKind::Timbre || !event.scc_morph.enabled) continue;
+                    const auto mode = static_cast<std::size_t>(event.scc_morph.distribution_mode);
+                    if (mode < selected_modes.size()) ++selected_modes[mode];
+                }
+            }
             juce::String message = juce::String::fromUTF8("変換完了。原音と変換音を比較してから適用してください。\n")
                 + "SCC: " + juce::String(static_cast<int>(result.resource_plan.scc_waveforms))
                 + juce::String::fromUTF8(" 音色 / 評価 ") + juce::String(static_cast<int>(result.evaluations))
                 + " / " + juce::String(result.elapsed_seconds, 2) + " s\n"
+                + juce::String::fromUTF8("採用区間: 適応型 ") + juce::String(selected_modes[0])
+                + juce::String::fromUTF8(" / 時間配分型 ") + juce::String(selected_modes[1])
+                + juce::String::fromUTF8(" / 音色配分型 ") + juce::String(selected_modes[2]) + "\n"
                 + "STFT " + juce::String(q.multi_resolution_stft, 4) + " / Harmonic " + juce::String(q.harmonic, 4)
                 + " / ERB " + juce::String(q.erb, 4) + " / Attack " + juce::String(q.attack, 4)
                 + " / ENV " + juce::String(q.volume, 4);
