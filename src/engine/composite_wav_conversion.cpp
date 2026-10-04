@@ -22,6 +22,16 @@ constexpr double pi = std::numbers::pi;
 constexpr std::size_t rate = CompositeWavRenderOptions::kSampleRate;
 constexpr double epsilon = 1e-9;
 
+// Offline diagnostic scope only. RAII includes bounded no-op/cancel exits and
+// never participates in search limits, ordering, scores or persistent data.
+struct ScopedWavSearchSeconds {
+    double& seconds;
+    std::chrono::steady_clock::time_point started{std::chrono::steady_clock::now()};
+    ~ScopedWavSearchSeconds() {
+        seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    }
+};
+
 bool cancelled(const std::atomic_bool* flag) {
     return flag && flag->load(std::memory_order_relaxed);
 }
@@ -379,7 +389,7 @@ CompositeTimbre generateCandidate(const SourceAnalysis& analysis,
             event.count = keyframes[i];
             event.target_library_id = ref.library_id;
             event.scc_morph = {morph_enabled || intermediates > 0, intermediates, curve};
-            event.scc_morph.distribution_mode = SccMorphDistributionMode::ToneDistribution;
+            event.scc_morph.distribution_mode = SccMorphDistributionMode::AdaptiveDistribution;
             dest.timbre_automation.push_back(event);
         }
         for (std::uint32_t tick = 0; tick < keyoff; ++tick) {
@@ -562,6 +572,76 @@ void updateLoopSides(CompositeLayer& layer) {
         event.after_loop_start = layer.envelope_timeline.loop_start_count
             && (event.count == *layer.envelope_timeline.loop_start_count
                 || event.count == layer.envelope_timeline.loop_end_count.value_or(std::numeric_limits<std::uint32_t>::max()));
+}
+
+// Only inherited confirmed plans are invalidated. A newly proposed explicit
+// plan belongs to the new settings and is subsequently validated by the common
+// planner. Compare source bytes rather than library IDs (dedup can change IDs).
+void invalidateChangedWavPlans(CompositeTimbre& candidate, const CompositeTimbre& previous) {
+    for (std::size_t l = 0; l < candidate.layers.size(); ++l) {
+        auto& events = candidate.layers[l].timbre_automation;
+        for (std::size_t e = 1; e < events.size(); ++e) {
+            auto& morph = events[e].scc_morph;
+            if (!morph.explicit_plan) continue;
+            const auto sameWave = [&](const CompositeTimbre& x, const EnvelopeEvent& a,
+                                      const CompositeTimbre& y, const EnvelopeEvent& b) {
+                const auto* first = findEmbeddedTimbreSnapshot(x, a.target_library_id);
+                const auto* second = findEmbeddedTimbreSnapshot(y, b.target_library_id);
+                return first && second && first->source == second->source
+                    && first->scc_waveform == second->scc_waveform;
+            };
+            if (l >= previous.layers.size() || e >= previous.layers[l].timbre_automation.size()) {
+                morph.explicit_plan.reset();
+                continue;
+            }
+            const auto& old = previous.layers[l].timbre_automation;
+            if (morph.explicit_plan != old[e].scc_morph.explicit_plan) continue;
+            if (morph.enabled != old[e].scc_morph.enabled
+                || morph.intermediate_count != old[e].scc_morph.intermediate_count
+                || morph.curve != old[e].scc_morph.curve
+                || morph.distribution_mode != old[e].scc_morph.distribution_mode
+                || events[e].count != old[e].count || events[e - 1].count != old[e - 1].count
+                || !sameWave(candidate, events[e], previous, old[e])
+                || !sameWave(candidate, events[e - 1], previous, old[e - 1]))
+                morph.explicit_plan.reset();
+        }
+    }
+}
+
+std::size_t wavToneStorage(const CompositeTimbre& tone) {
+    std::size_t bytes = sizeof(tone) + tone.name.capacity() + tone.memo.capacity()
+        + tone.layers.capacity() * sizeof(CompositeLayer)
+        + tone.embedded_timbres.capacity() * sizeof(SavedTimbreReference);
+    for (const auto& layer : tone.layers) {
+        bytes += layer.timbre_automation.capacity() * sizeof(EnvelopeEvent)
+            + layer.volume_envelope.events.capacity() * sizeof(EnvelopeEvent)
+            + layer.pitch_envelope.events.capacity() * sizeof(EnvelopeEvent)
+            + layer.name.capacity() + layer.opll_tl_auto.free_curve.capacity()
+            + layer.opll_fb_auto.free_curve.capacity();
+        for (const auto& event : layer.timbre_automation)
+            if (event.scc_morph.explicit_plan)
+                bytes += event.scc_morph.explicit_plan->points.capacity() * sizeof(SccMorphPoint);
+    }
+    return bytes;
+}
+
+CompositeTimbre wavRenderCacheKey(const SccMorphCompileResult& compiled) {
+    auto key = compiled.timbre;
+    // All distributions have already become quantized runtime events. Their
+    // authoring labels cannot affect PCM and must not prevent exact reuse.
+    for (auto& layer : key.layers)
+        for (auto& event : layer.timbre_automation) event.scc_morph = {};
+    return key;
+}
+
+bool sameWavModeComparison(const CompositeTimbre& first, const CompositeTimbre& second) {
+    auto a = first, b = second;
+    for (auto* tone : {&a, &b}) for (auto& layer : tone->layers)
+        for (auto& event : layer.timbre_automation) {
+            event.scc_morph.distribution_mode = SccMorphDistributionMode::AdaptiveDistribution;
+            event.scc_morph.explicit_plan.reset();
+        }
+    return a == b;
 }
 
 double loopJoinLoss(const CompositeTimbre& tone, std::span<const float> reference,
@@ -874,6 +954,8 @@ private:
 CompositeWavConversionResult convertCompositeWave(
     std::shared_ptr<const SourceAnalysis> analysis, const CompositeWavConversionOptions& options) {
     CompositeWavConversionResult result;
+    std::uint64_t finalCandidateId{};
+    bool insufficientModeBudget{}, diagnosticLimitReached{};
     result.analysis_reference = analysis;
     const auto started = std::chrono::steady_clock::now();
     const auto control = options.control;
@@ -882,6 +964,14 @@ CompositeWavConversionResult convertCompositeWave(
         if (control) control->stage.store(value, std::memory_order_relaxed);
     };
     const auto finish = [&]() {
+        for (auto& item : result.morph_candidates) {
+            item.selected = item.valid && item.candidate_id == finalCandidateId;
+            if (item.selected) item.reason = "Selected final feasible whole-composite Engine candidate";
+        }
+        if (insufficientModeBudget)
+            result.warnings.push_back("The remaining evaluation budget cannot cover a matched Adaptive/Time/Tone triplet; no winner is inferred from a partial comparison.");
+        if (diagnosticLimitReached)
+            result.warnings.push_back("Morph candidate diagnostics reached their bounded 8192-record limit.");
         result.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         if (cancelled(cancel)) { result.completion = CompositeWavConversionCompletion::Cancelled; stage(CompositeWavStage::Cancelled); }
         else stage(CompositeWavStage::Completed);
@@ -938,31 +1028,185 @@ CompositeWavConversionResult convertCompositeWave(
     CompositeWavQualityWeights qualityWeights;
     qualityWeights.complexity = options.preference == CompositeWavPreference::Compact ? 0.02
         : options.preference == CompositeWavPreference::Quality ? 0.001 : 0.003;
+    std::stop_source morphCancellation;
+    std::jthread morphCancellationBridge;
+    if (cancel) morphCancellationBridge = std::jthread([&](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            if (cancelled(cancel)) { morphCancellation.request_stop(); return; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+    struct MorphCacheEntry {
+        CompositeTimbre key;
+        std::shared_ptr<const SccMorphCompileResult> compiled;
+    };
+    struct RenderCacheEntry {
+        CompositeTimbre key;
+        std::shared_ptr<const CompositeWavRenderResult> pcm;
+        CompositeWavQualityMetrics acoustic_quality;
+    };
+    std::vector<MorphCacheEntry> morphCache;
+    std::vector<RenderCacheEntry> renderCache;
+    constexpr std::size_t renderCacheByteLimit = 24 * 1024 * 1024;
+    std::size_t plannerScratch{}, poolStorage{};
+    using Coordinate = std::pair<std::size_t, std::size_t>;
+    std::uint64_t candidateSerial{}, groupSerial{}, activeGroup{};
+    std::optional<Coordinate> activeCoordinate;
+    std::optional<std::size_t> activeDiagnostic;
+    bool comparingModes{}, preferEqual{};
+    std::optional<CompositeTimbre> lastEvaluatedTone;
+    CompositeWavQualityMetrics lastEvaluatedQuality;
+    CompositeWavResourcePlan lastEvaluatedResources;
+    std::shared_ptr<const CompositeWavRenderResult> lastEvaluatedPcm;
+    std::uint64_t lastEvaluatedId{};
+    const auto pcmStorage = [](const CompositeWavRenderResult& pcm) {
+        return (pcm.mono_pcm.capacity() + pcm.stereo_pcm.capacity()) * sizeof(float);
+    };
+    const auto recordStorage = [&](std::size_t extra = 0) {
+        std::size_t bytes = reference.capacity() * sizeof(float) + pcmStorage(result.preview)
+            + result.morph_candidates.capacity() * sizeof(CompositeWavMorphCandidateDiagnostic)
+            + plannerScratch + poolStorage + extra;
+        if (result.composite_tone) bytes += wavToneStorage(*result.composite_tone);
+        for (const auto& entry : morphCache) {
+            bytes += wavToneStorage(entry.key) + wavToneStorage(entry.compiled->timbre)
+                + sizeof(SccMorphCompileResult)
+                + entry.compiled->plans.capacity() * sizeof(SccMorphCompileResult::SegmentPlan)
+                + entry.compiled->channel_allocations.capacity() * sizeof(SccMorphChannelAllocation);
+            if (entry.compiled->authored_input) bytes += wavToneStorage(*entry.compiled->authored_input);
+            bytes += entry.compiled->diagnostics.capacity() * sizeof(SccMorphWaveDiagnostic);
+            for (const auto& plan : entry.compiled->plans) {
+                bytes += plan.result.plan.points.capacity() * sizeof(SccMorphPoint)
+                    + plan.result.generated.intermediate.capacity() * sizeof(SccWaveform)
+                    + plan.result.generated.diagnostics.capacity() * sizeof(SccMorphWaveDiagnostic);
+                for (const auto& item : plan.result.considered)
+                    bytes += sizeof(item) + item.plan.points.capacity() * sizeof(SccMorphPoint);
+            }
+        }
+        for (const auto& entry : renderCache) bytes += wavToneStorage(entry.key) + pcmStorage(*entry.pcm);
+        for (const auto& item : result.morph_candidates)
+            bytes += item.plan.points.capacity() * sizeof(SccMorphPoint) + item.reason.capacity();
+        result.morph_search.working_set_bytes = std::max(result.morph_search.working_set_bytes, bytes);
+    };
+    const auto appendDiagnostic = [&](const CompositeTimbre& tone, Coordinate coordinate) -> std::optional<std::size_t> {
+        if (result.morph_candidates.size() >= 8192) { diagnosticLimitReached = true; return std::nullopt; }
+        const auto [l, e] = coordinate;
+        const auto& events = tone.layers[l].timbre_automation;
+        const auto& morph = events[e].scc_morph;
+        CompositeWavMorphCandidateDiagnostic item;
+        item.configuration = options.configuration;
+        item.candidate_id = candidateSerial;
+        item.comparison_group = activeGroup;
+        item.layer_index = l;
+        item.destination_event_index = e;
+        item.start_count = e ? events[e - 1].count : 0;
+        item.end_count = events[e].count;
+        item.distribution = morph.distribution_mode;
+        item.intermediate_count = morph.intermediate_count;
+        item.curve = morph.curve;
+        if (morph.explicit_plan) item.plan = *morph.explicit_plan;
+        item.reason = "Not evaluated";
+        result.morph_candidates.push_back(std::move(item));
+        return result.morph_candidates.size() - 1;
+    };
     const auto budget = [&]() {
         return !cancelled(cancel) && result.evaluations < stageLimit
-            && (options.stagnation_limit == 0 || stalled < options.stagnation_limit);
+            && (comparingModes || options.stagnation_limit == 0 || stalled < options.stagnation_limit);
     };
     const auto evaluate = [&](CompositeTimbre candidate) {
+        lastEvaluatedTone.reset();
+        lastEvaluatedPcm.reset();
         if (!budget()) return false;
+        ++candidateSerial;
+        if (activeCoordinate && !activeDiagnostic) activeDiagnostic = appendDiagnostic(candidate, *activeCoordinate);
+        std::vector<std::size_t> diagnosticIndices;
+        if (activeDiagnostic) {
+            result.morph_candidates[*activeDiagnostic].candidate_id = candidateSerial;
+            diagnosticIndices.push_back(*activeDiagnostic);
+        }
+        const auto reject = [&](const std::string& reason) {
+            for (const auto index : diagnosticIndices) result.morph_candidates[index].reason = reason;
+            return false;
+        };
+        if (!comparingModes && result.composite_tone)
+            invalidateChangedWavPlans(candidate, *result.composite_tone);
+        candidate.scc_morph_algorithm_version = kSccMorphAlgorithmVersion;
         stage(CompositeWavStage::Morph);
-        const auto compiled = compileSccMorph(candidate);
-        if (!compiled.valid) return false;
-        const auto resources = resourcePlan(compiled.timbre);
-        if (!resources.scc_waveforms || resources.scc_waveforms > options.max_scc_waveforms) return false;
+        const auto planningStarted = std::chrono::steady_clock::now();
+        std::shared_ptr<const SccMorphCompileResult> compiled;
+        const auto cachedMorph = std::find_if(morphCache.begin(), morphCache.end(),
+            [&](const auto& entry) { return entry.key == candidate; });
+        if (cachedMorph != morphCache.end()) {
+            ++result.morph_search.morph_cache_hits;
+            compiled = cachedMorph->compiled;
+            if (compiled->valid && compiled->authored_input) candidate = *compiled->authored_input;
+        } else {
+            ++result.morph_search.morph_cache_misses;
+            const auto key = candidate;
+            auto preparation = compileSccMorph(candidate, morphCancellation.get_token());
+            if (preparation.valid) {
+                bool changed{};
+                for (const auto& segment : preparation.plans) {
+                    auto& settings = candidate.layers[segment.layer_index]
+                        .timbre_automation[segment.destination_event_index].scc_morph;
+                    changed = changed || settings.explicit_plan != segment.result.plan;
+                    settings.explicit_plan = segment.result.plan;
+                    plannerScratch = std::max(plannerScratch, segment.result.working_set_bytes);
+                }
+                // Seed the normal preparation cache with the *saved* authoring
+                // model. The renderer, editor and serializer then all see the
+                // exact same confirmed plan and block phase policy.
+                if (changed) preparation = compileSccMorph(candidate, morphCancellation.get_token());
+            }
+            compiled = std::make_shared<const SccMorphCompileResult>(std::move(preparation));
+            if (morphCache.size() == 8) morphCache.erase(morphCache.begin());
+            morphCache.push_back({key, compiled});
+        }
+        result.morph_search.planning_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - planningStarted).count();
+        if (!compiled->valid) return reject(compiled->error);
+        if (cancelled(cancel)) return reject("Cancelled during common Morph planning");
+        (void)seedSccMorphCache(candidate, compiled);
+        const auto resources = resourcePlan(compiled->timbre);
+        if (!resources.scc_waveforms || resources.scc_waveforms > options.max_scc_waveforms)
+            return reject("Whole-composite SCC Bank requirement exceeds the requested waveform budget");
+        if (!activeCoordinate) for (const auto& segment : compiled->plans) {
+            const auto index = appendDiagnostic(candidate, {segment.layer_index, segment.destination_event_index});
+            if (index) diagnosticIndices.push_back(*index);
+        }
+        for (const auto index : diagnosticIndices) {
+            auto& item = result.morph_candidates[index];
+            const auto& settings = candidate.layers[item.layer_index].timbre_automation[item.destination_event_index].scc_morph;
+            if (settings.explicit_plan) item.plan = *settings.explicit_plan;
+            item.bank_waveforms = resources.scc_waveforms;
+        }
         stage(CompositeWavStage::Evaluation);
-        auto rendered = renderCompositeWav(candidate, rendering);
+        const auto evaluationStarted = std::chrono::steady_clock::now();
+        const auto renderKey = wavRenderCacheKey(*compiled);
+        const auto cachedRender = std::find_if(renderCache.begin(), renderCache.end(),
+            [&](const auto& entry) { return entry.key == renderKey; });
+        std::shared_ptr<const CompositeWavRenderResult> rendered;
+        CompositeWavQualityMetrics quality;
+        const bool reusedRender = cachedRender != renderCache.end();
+        if (reusedRender) {
+            ++result.morph_search.render_cache_hits;
+            rendered = cachedRender->pcm;
+            quality = cachedRender->acoustic_quality;
+        } else {
+            ++result.morph_search.render_cache_misses;
+            rendered = std::make_shared<const CompositeWavRenderResult>(renderCompositeWav(candidate, rendering));
+        }
         ++result.evaluations;
         if (control) control->evaluations.store(result.evaluations, std::memory_order_relaxed);
-        if (!rendered.ok()) { ++stalled; return false; }
-        auto quality = evaluateCompositeWavePcmImpl(reference, rendered.mono_pcm,
+        if (!rendered->ok()) { ++stalled; return reject("Actual Engine render failed or was cancelled"); }
+        if (!reusedRender) quality = evaluateCompositeWavePcmImpl(reference, rendered->mono_pcm,
             frequency, attackFrame, resources.scc_waveforms, qualityWeights, cancel, analysis.get(), harmonicCapacity);
         std::size_t probeFrames{};
-        for (const auto& layer : candidate.layers) {
+        if (!reusedRender) for (const auto& layer : candidate.layers) {
             const auto& t = layer.envelope_timeline;
             if (!t.loop_start_count || !t.loop_end_count || *t.loop_end_count <= *t.loop_start_count) continue;
             const auto end = static_cast<std::size_t>(*t.loop_end_count) * 800;
             const auto period = static_cast<std::size_t>(*t.loop_end_count - *t.loop_start_count) * 800;
-            if (end + period + 400 >= rendered.effective_key_off_frame)
+            if (end + period + 400 >= rendered->effective_key_off_frame)
                 probeFrames = std::max(probeFrames, std::min(CompositeWavRenderOptions::kMaximumFrameCount,
                     end + 2 * period + 801));
         }
@@ -973,32 +1217,274 @@ CompositeWavConversionResult convertCompositeWave(
             probeOptions.key_off_frame = probeFrames;
             loopProbe = renderCompositeWav(candidate, probeOptions);
             ++result.loop_probe_renders;
-            if (!loopProbe->ok()) { ++stalled; return false; }
+            if (!loopProbe->ok()) { ++stalled; return reject("Held-note loop Engine probe failed or was cancelled"); }
         }
-        const auto& loopOutput = loopProbe ? *loopProbe : rendered;
-        const double loopLoss = loopJoinLoss(candidate, reference, loopOutput.mono_pcm, frequency, *analysis,
+        const auto& loopOutput = loopProbe ? *loopProbe : *rendered;
+        const double loopLoss = reusedRender ? 0 : loopJoinLoss(candidate, reference, loopOutput.mono_pcm, frequency, *analysis,
             loopOutput.effective_key_off_frame, cancel, harmonicCapacity);
         quality.transition += loopLoss;
+        quality.total += qualityWeights.transition * loopLoss;
+        recordStorage(wavToneStorage(candidate) + wavToneStorage(renderKey)
+            + (reusedRender ? 0 : pcmStorage(*rendered)) + (loopProbe ? pcmStorage(*loopProbe) : 0));
+        if (!reusedRender && std::isfinite(quality.total) && pcmStorage(*rendered) <= renderCacheByteLimit) {
+            std::size_t retained = pcmStorage(*rendered);
+            for (const auto& entry : renderCache) retained += pcmStorage(*entry.pcm);
+            while (!renderCache.empty() && (renderCache.size() >= 2 || retained > renderCacheByteLimit)) {
+                retained -= pcmStorage(*renderCache.front().pcm);
+                renderCache.erase(renderCache.begin());
+            }
+            renderCache.push_back({renderKey, rendered, quality});
+        }
         std::size_t events{};
         for (const auto& layer : candidate.layers)
             events += layer.volume_envelope.events.size() + layer.timbre_automation.size();
         quality.complexity += static_cast<double>(events) / 253;
-        quality.total += qualityWeights.transition * loopLoss
-            + qualityWeights.complexity * static_cast<double>(events) / 253;
-        if (!std::isfinite(quality.total)) { ++stalled; return false; }
+        quality.total += qualityWeights.complexity * static_cast<double>(events) / 253;
+        result.morph_search.evaluation_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - evaluationStarted).count();
+        if (!std::isfinite(quality.total)) { ++stalled; return reject("Nonfinite WAV objective or cancelled evaluation"); }
+        lastEvaluatedTone = candidate;
+        lastEvaluatedQuality = quality;
+        lastEvaluatedResources = resources;
+        lastEvaluatedPcm = rendered;
+        lastEvaluatedId = candidateSerial;
+        for (const auto index : diagnosticIndices) {
+            auto& item = result.morph_candidates[index];
+            item.valid = true;
+            item.quality = quality;
+            item.reason = "Valid full-composite Engine evaluation; not the final selected candidate";
+        }
         if (!result.composite_tone) result.initial_loss = quality.total;
-        if (!result.composite_tone || quality.total + options.minimum_improvement < result.best_loss) {
+        const double tolerance = comparingModes ? std::min(options.minimum_improvement, 1e-9) : options.minimum_improvement;
+        const bool equalDefault = preferEqual && result.composite_tone
+            && std::abs(quality.total - result.best_loss) <= 1e-9
+            && sameWavModeComparison(candidate, *result.composite_tone);
+        if (!result.composite_tone || quality.total + tolerance < result.best_loss || equalDefault) {
             result.best_loss = quality.total;
             bestStrategy = currentStrategy;
             result.quality = quality;
             result.composite_tone = std::move(candidate);
+            finalCandidateId = candidateSerial;
+            for (const auto index : diagnosticIndices) result.morph_candidates[index].accepted = true;
             result.resource_plan = resources;
-            result.preview = std::move(rendered);
+            result.preview = *rendered;
             stalled = 0;
             return true;
         }
         ++stalled;
         return false;
+    };
+    struct ModeCandidate {
+        CompositeTimbre tone;
+        double score{};
+    };
+    struct SegmentPoolKey {
+        std::size_t layer{}, event{};
+        std::uint32_t start{}, end{};
+        std::array<std::uint8_t, 32> first{}, second{};
+        bool preceding_morph{}, following_morph{}, first_after_loop{}, second_after_loop{};
+        std::optional<std::uint32_t> loop_start, loop_end;
+        bool operator==(const SegmentPoolKey&) const = default;
+    };
+    struct SegmentPool {
+        SegmentPoolKey key;
+        std::vector<SccMorphTransition> choices;
+    };
+    std::vector<SegmentPool> segmentPools;
+    const auto segmentKey = [&](const CompositeTimbre& tone, Coordinate coordinate) -> std::optional<SegmentPoolKey> {
+        const auto [l, e] = coordinate;
+        if (l >= tone.layers.size()) return std::nullopt;
+        const auto& layer = tone.layers[l];
+        const auto& events = layer.timbre_automation;
+        if (!e || e >= events.size() || !events[e].scc_morph.enabled) return std::nullopt;
+        const auto* first = findEmbeddedTimbreSnapshot(tone, events[e - 1].target_library_id);
+        const auto* second = findEmbeddedTimbreSnapshot(tone, events[e].target_library_id);
+        if (!first || !second) return std::nullopt;
+        return SegmentPoolKey{l, e, events[e - 1].count, events[e].count,
+            first->scc_waveform, second->scc_waveform, events[e - 1].scc_morph.enabled,
+            e + 1 < events.size() && events[e + 1].scc_morph.enabled,
+            events[e - 1].after_loop_start, events[e].after_loop_start,
+            layer.envelope_timeline.loop_start_count, layer.envelope_timeline.loop_end_count};
+    };
+    const auto combineRetainedSegments = [&](std::vector<ModeCandidate>* retained) {
+        if (!result.composite_tone || cancelled(cancel)) return;
+        const auto base = *result.composite_tone;
+        std::erase_if(segmentPools, [&](const auto& pool) {
+            return segmentKey(base, {pool.key.layer, pool.key.event}) != pool.key;
+        });
+        if (segmentPools.size() < 2) return;
+        // Exactly two extra global proposals per completed group. Each alters
+        // at least two intervals together, including an alternative N/curve
+        // when retained, and is never selected by stale per-interval scores.
+        for (std::size_t variant = 0; variant < 2 && budget(); ++variant) {
+            auto candidate = base;
+            std::size_t changed{};
+            for (std::size_t offset = 0; offset < segmentPools.size() && changed < 2; ++offset) {
+                const auto& pool = segmentPools[(offset + groupSerial) % segmentPools.size()];
+                auto& settings = candidate.layers[pool.key.layer].timbre_automation[pool.key.event].scc_morph;
+                for (std::size_t choice = 0; choice < pool.choices.size(); ++choice) {
+                    const auto& alternative = pool.choices[(choice + variant + offset) % pool.choices.size()];
+                    if (alternative == settings) continue;
+                    if (variant == 1 && alternative.intermediate_count > settings.intermediate_count) continue;
+                    settings = alternative;
+                    ++changed;
+                    break;
+                }
+            }
+            if (changed < 2) continue;
+            const auto before = result.evaluations;
+            const bool accepted = evaluate(std::move(candidate));
+            result.morph_search.global_combination_trials += result.evaluations - before;
+            result.morph_search.global_combination_accepted += accepted ? 1 : 0;
+            if (lastEvaluatedTone && retained) retained->push_back({*lastEvaluatedTone, lastEvaluatedQuality.total});
+        }
+    };
+    const auto compareModes = [&](const CompositeTimbre& base, Coordinate coordinate,
+                                  std::vector<ModeCandidate>* retained = nullptr) {
+        if (cancelled(cancel)) return false;
+        if (stageLimit - std::min(stageLimit, result.evaluations) < 3) {
+            insufficientModeBudget = true;
+            ++result.morph_search.incomplete_comparisons;
+            return false;
+        }
+        const auto [l, e] = coordinate;
+        const auto group = ++groupSerial;
+        activeGroup = group;
+        activeCoordinate = coordinate;
+        comparingModes = true;
+        constexpr std::array modes{SccMorphDistributionMode::AdaptiveDistribution,
+            SccMorphDistributionMode::TimeDistribution, SccMorphDistributionMode::ToneDistribution};
+        std::array<std::optional<std::size_t>, 3> records;
+        for (std::size_t i = 0; i < modes.size(); ++i) {
+            auto candidate = base;
+            auto& settings = candidate.layers[l].timbre_automation[e].scc_morph;
+            settings.distribution_mode = modes[i];
+            settings.explicit_plan.reset();
+            records[i] = appendDiagnostic(candidate, coordinate);
+            if (records[i]) result.morph_candidates[*records[i]].reason = "Not evaluated: comparison cancelled";
+        }
+        bool accepted{};
+        std::size_t attempted{};
+        std::optional<std::size_t> winner;
+        std::vector<SccMorphTransition> choices;
+        struct EvaluatedMember {
+            CompositeTimbre tone;
+            CompositeWavQualityMetrics quality;
+            CompositeWavResourcePlan resources;
+            std::shared_ptr<const CompositeWavRenderResult> pcm;
+            std::uint64_t id{};
+        };
+        std::array<std::optional<EvaluatedMember>, 3> members;
+        for (std::size_t i = 0; i < modes.size() && !cancelled(cancel); ++i) {
+            auto candidate = base;
+            auto& settings = candidate.layers[l].timbre_automation[e].scc_morph;
+            settings.distribution_mode = modes[i];
+            settings.explicit_plan.reset();
+            activeDiagnostic = records[i];
+            preferEqual = i == 0;
+            bool improved{};
+            if (i == 0) {
+                const ScopedWavSearchSeconds timer{result.morph_search.adaptive_candidate_seconds};
+                improved = evaluate(std::move(candidate));
+            } else improved = evaluate(std::move(candidate));
+            ++attempted;
+            accepted = accepted || improved;
+            if (lastEvaluatedTone) {
+                ++result.morph_search.mode_trials[i];
+                if (improved) ++result.morph_search.mode_accepted[i];
+                if (retained) retained->push_back({*lastEvaluatedTone, lastEvaluatedQuality.total});
+                choices.push_back(lastEvaluatedTone->layers[l].timbre_automation[e].scc_morph);
+                members[i] = EvaluatedMember{*lastEvaluatedTone, lastEvaluatedQuality,
+                    lastEvaluatedResources, lastEvaluatedPcm, lastEvaluatedId};
+                std::size_t retainedBytes{};
+                std::set<const CompositeWavRenderResult*> counted;
+                for (const auto& member : members) if (member) {
+                    retainedBytes += wavToneStorage(member->tone);
+                    const bool alreadyCached = std::any_of(renderCache.begin(), renderCache.end(),
+                        [&](const auto& entry) { return entry.pcm == member->pcm; });
+                    if (!alreadyCached && counted.insert(member->pcm.get()).second)
+                        retainedBytes += pcmStorage(*member->pcm);
+                }
+                recordStorage(retainedBytes);
+            }
+        }
+        const bool complete = attempted == modes.size() && !cancelled(cancel);
+        if (complete) {
+            double minimum = std::numeric_limits<double>::infinity();
+            for (const auto& member : members)
+                if (member) minimum = std::min(minimum, member->quality.total);
+            for (std::size_t i = 0; i < members.size(); ++i)
+                if (members[i] && members[i]->quality.total <= minimum + 1e-9) {
+                    winner = i;
+                    break;
+                }
+        }
+        // Resolve ties relative to the absolute group minimum, not a streaming
+        // sticky comparison (whose tolerance can otherwise chain). Adopt the
+        // chosen member's *existing real PCM* and complete plan atomically;
+        // no fourth render/evaluation or metadata-only mode substitution.
+        if (complete && winner && result.composite_tone
+            && std::any_of(members.begin(), members.end(), [&](const auto& member) {
+                return member && member->id == finalCandidateId;
+            }) && members[*winner]->quality.total <= result.best_loss + 1e-9) {
+            const auto& chosen = *members[*winner];
+            result.composite_tone = chosen.tone;
+            result.quality = chosen.quality;
+            result.best_loss = chosen.quality.total;
+            result.resource_plan = chosen.resources;
+            result.preview = *chosen.pcm;
+            finalCandidateId = chosen.id;
+            bestStrategy = currentStrategy;
+            accepted = true;
+            stalled = 0;
+            if (records[*winner] && !result.morph_candidates[*records[*winner]].accepted) {
+                result.morph_candidates[*records[*winner]].accepted = true;
+                ++result.morph_search.mode_accepted[*winner];
+            }
+        }
+        if (complete) ++result.morph_search.complete_comparisons;
+        else ++result.morph_search.incomplete_comparisons;
+        for (std::size_t i = 0; i < records.size(); ++i) if (records[i]) {
+            auto& item = result.morph_candidates[*records[i]];
+            item.comparison_complete = complete;
+            item.group_winner = complete && winner == i;
+            if (item.valid) item.reason = item.group_winner
+                ? "Lowest matched three-mode whole-composite WAV objective (Adaptive-first ties)"
+                : "Higher matched whole-composite WAV objective or deterministic tie";
+        }
+        for (auto& member : members) member.reset();
+        activeDiagnostic.reset();
+        activeCoordinate.reset();
+        activeGroup = 0;
+        preferEqual = false;
+        comparingModes = false;
+        if (complete && !choices.empty()) if (const auto key = segmentKey(base, coordinate)) {
+            auto pool = std::find_if(segmentPools.begin(), segmentPools.end(),
+                [&](const auto& item) { return item.key == *key; });
+            if (pool == segmentPools.end()) {
+                if (segmentPools.size() == 64) segmentPools.erase(segmentPools.begin());
+                segmentPools.push_back({*key, {}});
+                pool = std::prev(segmentPools.end());
+            }
+            for (const auto& old : pool->choices)
+                if (std::find(choices.begin(), choices.end(), old) == choices.end()) choices.push_back(old);
+            // Two N/curve sets, each with up to three modes, are sufficient for
+            // the bounded cross-interval proposals. Source/phase/loop changes
+            // invalidate the pool through its exact key before any reuse.
+            if (choices.size() > 6) choices.resize(6);
+            pool->choices = std::move(choices);
+            result.morph_search.retained_segment_pools = std::max(result.morph_search.retained_segment_pools, segmentPools.size());
+            std::size_t storage = segmentPools.capacity() * sizeof(SegmentPool);
+            for (const auto& item : segmentPools) {
+                storage += item.choices.capacity() * sizeof(SccMorphTransition);
+                for (const auto& settings : item.choices)
+                    if (settings.explicit_plan) storage += settings.explicit_plan->points.capacity() * sizeof(SccMorphPoint);
+            }
+            poolStorage = storage;
+            recordStorage();
+            combineRetainedSegments(retained);
+        }
+        return accepted;
     };
     stage(CompositeWavStage::Candidates);
     std::vector<CompositeWavStrategy> strategies{options.strategy};
@@ -1032,12 +1518,90 @@ CompositeWavConversionResult convertCompositeWave(
             }
             if (cancelled(cancel) || result.evaluations >= options.max_evaluations) break;
             stalled = 0;
-            evaluate(generateCandidate(*analysis, options, strategy, keyframes, 0, 1,
-                seed.rom, seed.original ? &*seed.original : nullptr, keyoff));
+            auto candidate = generateCandidate(*analysis, options, strategy, keyframes, 0, 1,
+                seed.rom, seed.original ? &*seed.original : nullptr, keyoff);
+            // Structural seeds preserve the old endpoint/keyframe extraction;
+            // only their incoming interpolation uses the common Adaptive mode.
+            for (auto& layer : candidate.layers) if (layer.source == TimbreSource::Scc)
+                for (std::size_t e = 1; e < layer.timbre_automation.size(); ++e) {
+                    auto& morph = layer.timbre_automation[e].scc_morph;
+                    morph.enabled = true;
+                    const auto duration = layer.timbre_automation[e].count - layer.timbre_automation[e - 1].count;
+                    morph.intermediate_count = duration > 1 && options.max_scc_waveforms > 2 ? 1 : 0;
+                    const auto start = layer.timbre_automation[e - 1].count;
+                    const auto a = waveAt(*analysis, start, strategy, std::nullopt).wave;
+                    const auto b = waveAt(*analysis, start + duration, strategy, std::nullopt).wave;
+                    const auto mid = waveAt(*analysis, start + duration / 2, strategy, std::nullopt).wave;
+                    const auto early = std::sqrt(shapeDistance(a, mid)), late = std::sqrt(shapeDistance(mid, b));
+                    morph.curve = early > 1.5 * late ? .5 : late > 1.5 * early ? 2 : 1;
+                }
+            {
+                const ScopedWavSearchSeconds timer{result.morph_search.adaptive_candidate_seconds};
+                evaluate(std::move(candidate));
+            }
         }
     }
     stalled = 0;
     currentStrategy = bestStrategy;
+    // A small feasible beam retains alternatives across intervals and SCC
+    // channels. Every extension is compiled by the one common allocator and
+    // evaluated as the whole sound; per-interval independent minima are never
+    // assembled without a global Bank/phase/resource check. This is bounded
+    // search, not a claim of a globally minimal solution.
+    if (result.composite_tone) {
+        const auto base = *result.composite_tone;
+        std::vector<Coordinate> coordinates;
+        for (std::size_t l = 0; l < base.layers.size(); ++l)
+            if (base.layers[l].source == TimbreSource::Scc)
+                for (std::size_t e = 1; e < base.layers[l].timbre_automation.size(); ++e)
+                    if (base.layers[l].timbre_automation[e].count < keyoff) coordinates.emplace_back(l, e);
+        std::vector<ModeCandidate> beam{{base, result.best_loss}};
+        const auto modeBudget = std::max<std::size_t>(3, options.max_evaluations / 5);
+        stageLimit = std::min(options.max_evaluations, result.evaluations + modeBudget);
+        for (const auto coordinate : coordinates) {
+            std::vector<ModeCandidate> pool;
+            for (std::size_t parent = 0; parent < beam.size(); ++parent) {
+                if (stageLimit - std::min(stageLimit, result.evaluations) < 3 || cancelled(cancel)) break;
+                auto proposal = beam[parent].tone;
+                const auto [l, e] = coordinate;
+                auto& morph = proposal.layers[l].timbre_automation[e].scc_morph;
+                const auto duration = proposal.layers[l].timbre_automation[e].count
+                    - proposal.layers[l].timbre_automation[e - 1].count;
+                // Retained parents also offer neighboring budget/curve choices.
+                // Each such choice receives its own matched three-way group.
+                if (parent == 1 && duration > morph.intermediate_count + 1U)
+                    morph.intermediate_count = static_cast<std::uint8_t>(std::min<int>(30, morph.intermediate_count + 1));
+                if (parent == 2) {
+                    if (morph.intermediate_count) --morph.intermediate_count;
+                    const auto a = waveAt(*analysis, proposal.layers[l].timbre_automation[e - 1].count,
+                        bestStrategy, std::nullopt).wave;
+                    const auto b = waveAt(*analysis, proposal.layers[l].timbre_automation[e].count,
+                        bestStrategy, std::nullopt).wave;
+                    const auto mid = waveAt(*analysis, proposal.layers[l].timbre_automation[e - 1].count + duration / 2,
+                        bestStrategy, std::nullopt).wave;
+                    const auto early = std::sqrt(shapeDistance(a, mid)), late = std::sqrt(shapeDistance(mid, b));
+                    morph.curve = early > 1.5 * late ? .5 : late > 1.5 * early ? 2 : 1;
+                }
+                compareModes(proposal, coordinate, &pool);
+            }
+            if (pool.empty()) break;
+            std::stable_sort(pool.begin(), pool.end(), [](const auto& a, const auto& b) { return a.score < b.score; });
+            beam.clear();
+            for (auto& item : pool) {
+                if (std::any_of(beam.begin(), beam.end(), [&](const auto& old) { return old.tone == item.tone; })) continue;
+                beam.push_back(std::move(item));
+                if (beam.size() == 3) break;
+            }
+            result.morph_search.candidate_pool_peak = std::max(result.morph_search.candidate_pool_peak, beam.size());
+            std::size_t storage{};
+            for (const auto& item : pool) storage += wavToneStorage(item.tone);
+            for (const auto& item : beam) storage += wavToneStorage(item.tone);
+            recordStorage(storage);
+        }
+        if (!coordinates.empty() && !result.morph_search.complete_comparisons) insufficientModeBudget = true;
+    }
+    stalled = 0;
+    stageLimit = options.max_evaluations;
     // Joint channel volume coordinates: actual combined Engine PCM selects the
     // result, including interference, chip envelope and mix-stage clipping.
     const auto volumeSearch = [&]() {
@@ -1168,7 +1732,6 @@ CompositeWavConversionResult convertCompositeWave(
     }
     stageLimit = options.max_evaluations;
     stalled = 0;
-    using Coordinate = std::pair<std::size_t, std::size_t>;
     constexpr auto familyCount = static_cast<std::size_t>(CompositeWavSearchFamily::Count);
     std::array<std::size_t, familyCount> cursors{};
     // Each round visits every family before another coordinate in that family.
@@ -1197,11 +1760,76 @@ CompositeWavConversionResult convertCompositeWave(
         switch (family) {
         case CompositeWavSearchFamily::MorphInterval: {
             if (intervals.empty()) return;
-            const auto [l, e] = intervals[(cursor / 6) % intervals.size()];
+            const auto [l, e] = intervals[(cursor / 8) % intervals.size()];
             auto& morph = candidate.layers[l].timbre_automation[e].scc_morph;
-            const auto before = morph;
+            auto before = morph;
+            before.explicit_plan.reset();
             morph.enabled = true;
-            switch (cursor % 6) {
+            if (cursor % 8 >= 6) {
+                const ScopedWavSearchSeconds timer{result.morph_search.adaptive_refinement_seconds};
+                // Refine a confirmed common plan using only WAV feature goals.
+                // The common generator validates and quantizes this proposal;
+                // final acceptance always measures the combined Engine PCM.
+                const auto& events = candidate.layers[l].timbre_automation;
+                const auto* aRef = findEmbeddedTimbreSnapshot(candidate, events[e - 1].target_library_id);
+                const auto* bRef = findEmbeddedTimbreSnapshot(candidate, events[e].target_library_id);
+                if (!aRef || !bRef || !morph.intermediate_count) return;
+                SccWaveform a{}, b{};
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    a[i] = std::bit_cast<std::int8_t>(aRef->scc_waveform[i]);
+                    b[i] = std::bit_cast<std::int8_t>(bRef->scc_waveform[i]);
+                }
+                const auto duration = events[e].count - events[e - 1].count;
+                auto planned = planSccMorph(a, b, morph.intermediate_count, morph.curve, duration,
+                    SccMorphDistributionMode::AdaptiveDistribution, morph.explicit_plan,
+                    morphCancellation.get_token(), false);
+                if (!planned.valid || cancelled(cancel)) return;
+                plannerScratch = std::max(plannerScratch, planned.working_set_bytes);
+                auto plan = planned.plan;
+                const auto index = 1 + (cursor / (8 * intervals.size())) % morph.intermediate_count;
+                auto& point = plan.points[index];
+                const auto part = options.configuration == CompositeWavConfiguration::SccScc
+                    ? std::optional<std::size_t>(l) : std::nullopt;
+                const auto targetPosition = [&](std::uint32_t tick) {
+                    const auto target = waveAt(residualAnalysis ? *residualAnalysis : *analysis,
+                        events[e - 1].count + tick, bestStrategy, part).wave;
+                    const auto from = std::sqrt(shapeDistance(a, target)), to = std::sqrt(shapeDistance(target, b));
+                    return from + to > epsilon ? from / (from + to) : point.morph_position;
+                };
+                if (cursor % 8 == 6) {
+                    const double lower = plan.points[index - 1].morph_position + 1e-6;
+                    const double upper = plan.points[index + 1].morph_position - 1e-6;
+                    if (lower >= upper) return;
+                    const auto position = std::clamp((point.morph_position + targetPosition(point.event_count)) / 2,
+                        lower, upper);
+                    if (std::abs(position - point.morph_position) < 1e-8) return;
+                    point.morph_position = position;
+                } else {
+                    std::uint32_t proposed = point.event_count;
+                    double error = std::abs(targetPosition(proposed) - point.morph_position);
+                    for (int direction : {-1, 1}) {
+                        const auto count = static_cast<std::int64_t>(point.event_count) + direction;
+                        if (count <= plan.points[index - 1].event_count || count >= plan.points[index + 1].event_count) continue;
+                        const auto distance = std::abs(targetPosition(static_cast<std::uint32_t>(count)) - point.morph_position);
+                        if (distance + 1e-9 < error) { error = distance; proposed = static_cast<std::uint32_t>(count); }
+                    }
+                    if (proposed == point.event_count) return;
+                    point.event_count = proposed;
+                }
+                morph.distribution_mode = SccMorphDistributionMode::AdaptiveDistribution;
+                morph.explicit_plan = std::move(plan);
+                ++result.morph_search.adaptive_plan_trials;
+                activeCoordinate = Coordinate{l, e};
+                const auto evaluations = result.evaluations;
+                const bool accepted = evaluate(std::move(candidate));
+                activeDiagnostic.reset();
+                activeCoordinate.reset();
+                const auto familyIndex = static_cast<std::size_t>(family);
+                result.search.trials[familyIndex] += result.evaluations - evaluations;
+                result.search.accepted[familyIndex] += accepted ? 1 : 0;
+                return;
+            }
+            switch (cursor % 8) {
             case 0: morph.curve = .5; morph.intermediate_count = std::max<std::uint8_t>(1, morph.intermediate_count); break;
             case 1: morph.curve = 2; morph.intermediate_count = std::max<std::uint8_t>(1, morph.intermediate_count); break;
             case 2: morph.curve = 1; morph.intermediate_count = static_cast<std::uint8_t>(std::min<int>(30, morph.intermediate_count + 2)); break;
@@ -1209,10 +1837,16 @@ CompositeWavConversionResult convertCompositeWave(
             case 4: if (morph.intermediate_count) --morph.intermediate_count; break;
             default: morph.curve = 1; morph.intermediate_count = 0; break;
             }
-            // Explicit plans are derived from the original coordinates; these
-            // converter intervals always use the shared automatic generator.
             morph.explicit_plan.reset();
             if (morph == before) return;
+            if (morph.enabled) {
+                const auto evaluations = result.evaluations;
+                const bool accepted = compareModes(candidate, {l, e});
+                const auto familyIndex = static_cast<std::size_t>(family);
+                result.search.trials[familyIndex] += result.evaluations - evaluations;
+                result.search.accepted[familyIndex] += accepted ? 1 : 0;
+                return;
+            }
             break;
         }
         case CompositeWavSearchFamily::KeyTime: {
@@ -1250,7 +1884,7 @@ CompositeWavConversionResult convertCompositeWave(
                 event.count = worstTick;
                 event.target_library_id = ref.library_id;
                 event.scc_morph = {true, 0, 1};
-                event.scc_morph.distribution_mode = SccMorphDistributionMode::ToneDistribution;
+                event.scc_morph.distribution_mode = SccMorphDistributionMode::AdaptiveDistribution;
                 layer.timbre_automation.push_back(event);
                 std::sort(layer.timbre_automation.begin(), layer.timbre_automation.end(),
                     [](const auto& a, const auto& b) { return a.count < b.count; });
@@ -1405,6 +2039,12 @@ CompositeWavConversionResult convertCompositeWave(
     if (result.composite_tone) {
         result.completion = CompositeWavConversionCompletion::Completed;
         result.warnings = analysis->warnings;
+        if (result.morph_search.complete_comparisons)
+            result.warnings.push_back("SCC distribution used " + std::to_string(result.morph_search.complete_comparisons)
+                + " matched Adaptive/Time/Tone whole-composite comparisons. The feasible candidate beam is bounded to three alternatives; the result is not a global minimum guarantee.");
+        else if (std::none_of(result.composite_tone->layers.begin(), result.composite_tone->layers.end(),
+            [](const auto& layer) { return layer.source == TimbreSource::Scc && layer.timbre_automation.size() > 1; }))
+            result.warnings.push_back("This selection has no SCC morph interval; three-way distribution comparison is not applicable.");
         if (result.loop_probe_renders)
             result.warnings.push_back("Loop continuity also used " + std::to_string(result.loop_probe_renders)
                 + " bounded held-note Engine probes; these are separate from complete-candidate evaluations and do not change preview key-off or duration.");
@@ -1417,6 +2057,7 @@ CompositeWavConversionResult convertCompositeWave(
         result.completion = CompositeWavConversionCompletion::NoValidCandidate;
         result.error = "No candidate fits the waveform allocation and MGSC envelope limits";
     }
+    recordStorage();
     return finish();
 }
 } // namespace mgstc::engine

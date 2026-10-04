@@ -65,6 +65,11 @@ struct LayerBaseTimbreAssign {
     std::optional<std::uint8_t> opll_rom;
 };
 
+// Author-edit boundary only. Restoring/loading a complete snapshot must not call
+// this: confirmed WAV plans remain authoritative until their inputs are edited.
+[[nodiscard]] bool invalidateEditedSccMorphPlans(
+    const engine::CompositeTimbre& before, engine::CompositeTimbre& after);
+
 class CompositeTimeline final : public juce::Component {
 public:
     using EditCallback = std::function<void(

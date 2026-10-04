@@ -6227,16 +6227,49 @@ private:
         openOwnedTimbreEditor(kind, layer.base_timbre->library_id);
     }
 
+    void preserveReferencedBaseSnapshot(std::size_t index,
+        std::optional<std::uint64_t> replacement_id = {}) {
+        const auto& current = timbre_.layers[index].base_timbre;
+        if (!current || replacement_id == current->library_id) return;
+        const auto id = current->library_id;
+        // Explicit @ commands retain their authored sources even when the
+        // note-start base changes. Keep a snapshot only when no other owner
+        // will continue to resolve that source after this assignment.
+        for (const auto& snapshot : timbre_.embedded_timbres)
+            if (snapshot.library_id == id) return;
+        for (std::size_t layer = 0; layer < timbre_.layers.size(); ++layer)
+            if (layer != index && timbre_.layers[layer].base_timbre
+                && timbre_.layers[layer].base_timbre->library_id == id) return;
+        const auto assigned = mgstc::engine::assignedNumberForLibraryId(
+            mgstc::engine::resolveTimbreNumbers(timbre_), id);
+        for (const auto& layer : timbre_.layers) {
+            for (const auto& event : layer.timbre_automation) {
+                if (event.kind != mgstc::engine::EnvelopeEventKind::Timbre
+                    || event.timbre_pick != mgstc::engine::TimbrePick::Library) continue;
+                if (event.target_library_id == id
+                    || (!event.target_library_id && layer.source == current->source
+                        && ((assigned && event.value == *assigned)
+                            || (current->manual_number && event.value == *current->manual_number)))) {
+                    timbre_.embedded_timbres.push_back(*current);
+                    return;
+                }
+            }
+        }
+    }
+
     void assignLayerLibraryId(
         std::size_t index,
         std::optional<std::uint64_t> library_id) {
         if (index >= timbre_.layers.size()) {
             return;
         }
+        const auto before = timbre_;
         composite_program_stale_ = true;
         if (!library_id) {
+            preserveReferencedBaseSnapshot(index);
             timbre_.layers[index].base_timbre.reset();
             timbre_.layers[index].base_opll_rom.reset();
+            static_cast<void>(invalidateEditedSccMorphPlans(before, timbre_));
             refreshTimbreSelectors();
             syncControlsFromModel();
             timeline_.setTimbre(timbre_);
@@ -6256,8 +6289,10 @@ private:
                 reference.number_mode = current->number_mode;
                 reference.manual_number = current->manual_number;
             }
+            preserveReferencedBaseSnapshot(index, reference.library_id);
             timbre_.layers[index].base_opll_rom.reset();
             timbre_.layers[index].base_timbre = std::move(reference);
+            static_cast<void>(invalidateEditedSccMorphPlans(before, timbre_));
             refreshTimbreSelectors();
             syncControlsFromModel();
             timeline_.setTimbre(timbre_);
@@ -6271,8 +6306,10 @@ private:
             reference.number_mode = current->number_mode;
             reference.manual_number = current->manual_number;
         }
+        preserveReferencedBaseSnapshot(index, reference.library_id);
         timbre_.layers[index].base_opll_rom.reset();
         timbre_.layers[index].base_timbre = std::move(reference);
+        static_cast<void>(invalidateEditedSccMorphPlans(before, timbre_));
         refreshTimbreSelectors();
         syncControlsFromModel();
         timeline_.setTimbre(timbre_);
@@ -6289,6 +6326,7 @@ private:
             return;
         }
         composite_program_stale_ = true;
+        preserveReferencedBaseSnapshot(index);
         timbre_.layers[index].base_timbre.reset();
         timbre_.layers[index].base_opll_rom = rom;
         refreshTimbreSelectors();
@@ -6358,13 +6396,16 @@ private:
         if (syncing_ || index >= timbre_.layers.size()) {
             return;
         }
+        const auto before = timbre_;
         const auto selected =
             timbre_select_[index].getSelectedId();
         if (selected <= 0
             || static_cast<std::size_t>(selected)
                 > timbre_library_ids_[index].size()) {
+            preserveReferencedBaseSnapshot(index);
             timbre_.layers[index].base_timbre.reset();
             timbre_.layers[index].base_opll_rom.reset();
+            static_cast<void>(invalidateEditedSccMorphPlans(before, timbre_));
             number_mode_[index].setEnabled(false);
             timbre_number_[index].setEnabled(false);
             refreshModelViews();
@@ -6384,9 +6425,11 @@ private:
             reference.number_mode = current->number_mode;
             reference.manual_number = current->manual_number;
         }
+        preserveReferencedBaseSnapshot(index, reference.library_id);
         timbre_.layers[index].base_opll_rom.reset();
         timbre_.layers[index].base_timbre =
             std::move(reference);
+        static_cast<void>(invalidateEditedSccMorphPlans(before, timbre_));
         number_mode_[index].setEnabled(true);
         syncNumberControlsFromModel(index);
         refreshModelViews();
@@ -7190,10 +7233,15 @@ private:
             applied_owned_revision_ = owned_rev;
             if (const auto& snap =
                     link_.owned_published) {
+                const auto before = timbre_;
                 if (mgstc::engine::replaceOwnedTimbreSnapshot(timbre_, *snap)) {
+                    const bool invalidated = invalidateEditedSccMorphPlans(before, timbre_);
+                    recordHistory();
                     timeline_.setTimbre(timbre_);
                     syncControlsFromModel();
                     static_cast<void>(configureEngine());
+                    if (invalidated) updateStatus(juce::String::fromUTF8(
+                        "編集した区間はWAV確定配置を解除し、共通モーフ処理で再生成します"));
                 }
             }
         }
