@@ -132,6 +132,7 @@ public:
     void setTimbre(
         const engine::CompositeTimbre& timbre,
         bool reset_scroll_extent = false);
+    void cancelPendingDialogs();
     void refreshUiScaleFonts();
     void setInspectorVisible(bool visible);
     [[nodiscard]] static juce::String verifyWorkspace(const juce::File& snapshot_directory);

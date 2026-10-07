@@ -23,6 +23,7 @@ public:
           audition_(*this),
           pcm_preview_(*this),
           background_tasks_(*this) {
+        acknowledged_restore_revision_ = processor_.editorStateRestoreRevision();
         processor_.editorRetainCompositeScope();
     }
 
@@ -34,6 +35,17 @@ public:
 
     PluginEditorContext(const PluginEditorContext&) = delete;
     PluginEditorContext& operator=(const PluginEditorContext&) = delete;
+
+    mgstc::app::EditorAuditionPreferences& auditionPreferences() noexcept override {
+        return processor_.editorAuditionPreferences();
+    }
+    std::uint64_t stateRestoreRevision() const noexcept override {
+        return processor_.editorStateRestoreRevision();
+    }
+    void acknowledgeStateRestore(std::uint64_t revision) noexcept {
+        restore_tracking_ = true;
+        acknowledged_restore_revision_ = revision;
+    }
 
     [[nodiscard]] mgstc::app::EditorSnapshot snapshot() override {
         mgstc::app::EditorSnapshot snap;
@@ -184,6 +196,9 @@ private:
 
         [[nodiscard]] mgstc::app::AuditionResult submitComposite(
             const mgstc::app::CompositeAuditionRequest& request) override {
+            if (self_.restore_tracking_
+                && self_.acknowledged_restore_revision_ != self_.stateRestoreRevision())
+                return {};
             mgstc::app::AuditionResult result;
             if (request.timbre == nullptr) {
                 return result;
@@ -193,11 +208,14 @@ private:
                     *request.timbre));
             std::uint8_t capacity = 1;
             result.update_allocator = true;
+            const auto revision = self_.restore_tracking_
+                ? std::optional<std::uint64_t>(self_.acknowledged_restore_revision_)
+                : std::nullopt;
             result.ok = request.temporary
                 ? self_.processor_.previewEditorComposite(
-                    *request.timbre, request.polyphonic, capacity)
+                    *request.timbre, request.polyphonic, capacity, revision)
                 : self_.processor_.replaceEditorComposite(
-                    *request.timbre, request.polyphonic, capacity);
+                    *request.timbre, request.polyphonic, capacity, revision);
             result.voice_capacity = capacity;
             return result;
         }
@@ -230,11 +248,11 @@ private:
         [[nodiscard]] bool noteOn(
             std::uint8_t track,
             std::uint8_t note) override {
-            return self_.processor_.editorNoteOn(track, note);
+            return self_.processor_.editorNoteOn(track, note, restoreRevision());
         }
 
         [[nodiscard]] bool noteOff(std::uint8_t track) override {
-            return self_.processor_.editorNoteOff(track);
+            return self_.processor_.editorNoteOff(track, restoreRevision());
         }
 
         void armOpllKeyOffSilence(std::uint8_t) override {}
@@ -248,10 +266,17 @@ private:
         }
 
     private:
+        std::optional<std::uint64_t> restoreRevision() const noexcept {
+            return self_.restore_tracking_
+                ? std::optional<std::uint64_t>(self_.acknowledged_restore_revision_)
+                : std::nullopt;
+        }
         PluginEditorContext& self_;
     };
 
     MgstcAudioProcessor& processor_;
+    std::uint64_t acknowledged_restore_revision_{};
+    bool restore_tracking_{};
     Output output_;
     Midi midi_;
     Audition audition_;

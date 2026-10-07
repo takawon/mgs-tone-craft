@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.25)
 
+# Keep Debug symbols in each object, avoiding MSVC compiler-PDB contention
+# observed even with /FS and serial builds. Linker PDBs remain available.
+cmake_policy(SET CMP0141 NEW)
+if(NOT DEFINED CMAKE_MSVC_DEBUG_INFORMATION_FORMAT)
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+        "$<$<CONFIG:Debug>:Embedded>$<$<CONFIG:RelWithDebInfo>:ProgramDatabase>")
+endif()
+
 include(FetchContent)
 
 # MSVC needs VsDevCmd (INCLUDE/LIB/PATH). Plain PowerShell + cmake --build
@@ -82,12 +90,16 @@ if(NOT rpclib_POPULATED)
     set(_mgstc_rpclib_format_h
         "${rpclib_SOURCE_DIR}/dependencies/include/format.h")
     file(READ "${_mgstc_rpclib_format_h}" _mgstc_rpclib_format)
+    set(_mgstc_rpclib_format_original "${_mgstc_rpclib_format}")
     string(REGEX REPLACE
         "#ifdef _SECURE_SCL\r?\n# define FMT_SECURE_SCL _SECURE_SCL"
         "#if defined(_SECURE_SCL) && defined(_MSC_VER) && _MSC_VER < 1951\n# define FMT_SECURE_SCL _SECURE_SCL"
         _mgstc_rpclib_format
         "${_mgstc_rpclib_format}")
-    file(WRITE "${_mgstc_rpclib_format_h}" "${_mgstc_rpclib_format}")
+    if(NOT _mgstc_rpclib_format STREQUAL _mgstc_rpclib_format_original)
+        file(WRITE "${_mgstc_rpclib_format_h}" "${_mgstc_rpclib_format}")
+    endif()
+    unset(_mgstc_rpclib_format_original)
     unset(_mgstc_rpclib_format)
     unset(_mgstc_rpclib_format_h)
 
@@ -1012,4 +1024,42 @@ if(WIN32 AND MSVC)
             )
         endforeach()
     endif()
+endif()
+
+# Validate compiler-discovered dependencies, including no-op builds.
+if(WIN32 AND MSVC AND CMAKE_GENERATOR STREQUAL "Ninja")
+    set(_mgstc_deps_representatives "")
+    function(_mgstc_register_deps target source header)
+        if(TARGET "${target}")
+            get_target_property(_target_binary_dir "${target}" BINARY_DIR)
+            file(RELATIVE_PATH _target_prefix "${CMAKE_BINARY_DIR}" "${_target_binary_dir}")
+            if(_target_prefix)
+                string(APPEND _target_prefix "/")
+            endif()
+            set(_record "{\"target\":\"${target}\",\"object\":\"${_target_prefix}CMakeFiles/${target}.dir/${source}.obj\",\"header\":\"${header}\"}")
+            if(_mgstc_deps_representatives)
+                set(_mgstc_deps_representatives "${_mgstc_deps_representatives},\n${_record}" PARENT_SCOPE)
+            else()
+                set(_mgstc_deps_representatives "${_record}" PARENT_SCOPE)
+            endif()
+        endif()
+    endfunction()
+    _mgstc_register_deps(rpc lib/rpc/client.cc
+        "${rpclib_SOURCE_DIR}/include/rpc/client.h")
+    _mgstc_register_deps(mgstc_engine src/engine/stereo_sample_rate_converter.cpp
+        src/engine/include/mgstc/audio/stereo_sample_rate_converter.hpp)
+    _mgstc_register_deps(mgstc src/app/juce/mgstc_editor_view.cpp
+        src/app/juce/mgstc_editor_view.hpp)
+    foreach(_target mgstc_vst3 mgstc_vst3_diag)
+        _mgstc_register_deps(${_target} src/plugin/vst3/plugin_processor.cpp
+            src/plugin/vst3/plugin_processor.hpp)
+    endforeach()
+    foreach(_kind processor diag_null diag_lat0)
+        _mgstc_register_deps(mgstc_vst3_${_kind}_tests tests/cpp/vst3_${_kind}_tests.cpp
+            src/plugin/vst3/plugin_processor.hpp)
+        _mgstc_register_deps(mgstc_vst3_${_kind}_tests src/plugin/vst3/plugin_processor.cpp
+            src/plugin/vst3/plugin_processor.hpp)
+    endforeach()
+    file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/.mgstc-deps-representatives.json"
+        CONTENT "[\n${_mgstc_deps_representatives}\n]\n")
 endif()

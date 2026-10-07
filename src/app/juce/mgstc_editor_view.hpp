@@ -3966,8 +3966,8 @@ public:
                 menu.addItem(5, juce::String::fromUTF8("MGSCソースを開く…"));
                 menu.addItem(6, juce::String::fromUTF8("MGSCソースを書き出す…"));
                 menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&file_menu_),
-                    [safe = juce::Component::SafePointer<CompositeEditorComponent>(this)](int result) {
-                        if (safe == nullptr) return;
+                    [safe = juce::Component::SafePointer<CompositeEditorComponent>(this), generation = host_restore_generation_](int result) {
+                        if (safe == nullptr || safe->host_restore_generation_ != generation) return;
                         switch (result) {
                         case 1: safe->openCompositeFile(); break;
                         case 2: safe->saveCompositeFile(); break;
@@ -4542,6 +4542,8 @@ public:
     }
 
     ~CompositeEditorComponent() override {
+        hydrating_ = true;
+        timeline_.cancelPendingDialogs();
         // The comparison adapter belongs to the EditorSession. Destroy this
         // owned modal window before the plugin editor destroys its context.
         delete wave_converter_window_.getComponent();
@@ -4560,6 +4562,70 @@ public:
     [[nodiscard]] const mgstc::engine::CompositeTimbre& workingTimbre()
         const noexcept {
         return timbre_;
+    }
+
+    // Hydrate an already committed host document without resubmitting it.
+    void restoreHostState(const mgstc::engine::CompositeTimbre& sound) {
+        const juce::ScopedValueSetter<bool> guard(hydrating_, true);
+        ++host_restore_generation_;
+        timeline_preview_pending_ = false;
+        if (wave_converter_window_) delete wave_converter_window_.getComponent();
+        timeline_.cancelPendingDialogs();
+        performance_keyboard_.allNotesOff();
+        silenceAuditionNotes();
+        import_preview_saved_.reset();
+        library_manager_saved_timbre_.reset();
+        library_manager_performance_id_.reset();
+        library_manager_imported_ = false;
+        composite_preview_.reset();
+        selected_composite_id_.reset();
+        link_.owned_target.reset();
+        link_.owned_published.reset();
+        applied_owned_revision_ = ++link_.owned_revision;
+        timbre_ = sound;
+        syncControlsFromModel();
+        timeline_.setTimbre(timbre_, true);
+        setEditorBaseline();
+        resetHistoryToCurrent();
+        const auto plan = mgstc::engine::buildCompositePlaybackPlan(timbre_);
+        voice_allocator_.setChannelCount(plan.voice_capacity);
+        voice_allocator_.setPolyphonic(performance_keyboard_.polyphonic());
+        engine_ready_ = session_.snapshot().audio_running;
+        composite_program_stale_ = false;
+    }
+
+    bool applyOpllConversionCandidate(const mgstc::engine::OpllPatchParameters& patch) {
+        recordHistory();
+        if (std::none_of(timbre_.layers.begin(), timbre_.layers.end(),
+                [](const auto& value) { return value.source == mgstc::engine::TimbreSource::Opll; })) {
+            const auto channel = mgstc::engine::firstAvailableChannel(
+                timbre_, mgstc::engine::TimbreSource::Opll);
+            if (!channel) return false;
+            auto added = mgstc::engine::defaultCompositeTimbre().layers[2];
+            added.channel = *channel;
+            added.envelope_number = mgstc::engine::nextFreeEnvelopeNumber(timbre_);
+            timbre_.layers.push_back(std::move(added));
+        }
+        const auto layer = std::find_if(timbre_.layers.begin(), timbre_.layers.end(),
+            [](const auto& value) { return value.source == mgstc::engine::TimbreSource::Opll; });
+        if (layer == timbre_.layers.end()) return false;
+        const auto index = static_cast<std::size_t>(layer - timbre_.layers.begin());
+        preserveReferencedBaseSnapshot(index);
+        mgstc::engine::SavedTimbreReference base;
+        base.library_id = mgstc::engine::allocateCompositeOwnedTimbreId(timbre_);
+        base.source = mgstc::engine::TimbreSource::Opll;
+        base.name = "SCC to OPLL";
+        base.opll_registers = mgstc::engine::encodeOpllPatch(patch);
+        layer->base_timbre = std::move(base);
+        layer->base_opll_rom.reset();
+        composite_program_stale_ = true;
+        recordHistory();
+        refreshTimbreSelectors();
+        syncControlsFromModel();
+        timeline_.setTimbre(timbre_);
+        static_cast<void>(configureEngine());
+        openOwnedLayerTimbreEditor(index);
+        return true;
     }
 
     void prepareVisualInspection() {
@@ -5155,7 +5221,10 @@ private:
 
     void openWaveConverter() {
         const juce::Component::SafePointer<CompositeEditorComponent> safe(this);
-        auto open = [safe] { if (safe) safe->showWaveConverter(); };
+        const auto generation = host_restore_generation_;
+        auto open = [safe, generation] {
+            if (safe && safe->host_restore_generation_ == generation) safe->showWaveConverter();
+        };
         if (!hasUnsavedChanges()) { open(); return; }
         juce::AlertWindow::showAsync(juce::MessageBoxOptions()
             .withIconType(juce::MessageBoxIconType::WarningIcon)
@@ -5190,6 +5259,7 @@ private:
     void showWaveConverter() {
         if (wave_converter_window_) { wave_converter_window_->toFront(true); return; }
         stopAudition();
+        const auto generation = host_restore_generation_;
         const auto snapshot = timbre_;
         const auto selected = selected_composite_id_;
         const juce::Component::SafePointer<CompositeEditorComponent> safe(this);
@@ -5197,10 +5267,10 @@ private:
         auto* dialog = new ModalDialogWindow(juce::String::fromUTF8("WAV → 複合モーフィング音色"), juce::Colour(0xFF1B222C));
         wave_converter_window_ = dialog;
         auto* content = new CompositeWavConversionContent(
-            [safe, snapshot, selected](const mgstc::engine::CompositeTimbre& converted, std::function<void()> close) {
-                if (!safe) return;
-                auto apply = [safe, converted, close = std::move(close)] {
-                    if (!safe) return;
+            [safe, snapshot, selected, generation](const mgstc::engine::CompositeTimbre& converted, std::function<void()> close) {
+                if (!safe || safe->host_restore_generation_ != generation) return;
+                auto apply = [safe, converted, generation, close = std::move(close)] {
+                    if (!safe || safe->host_restore_generation_ != generation) return;
                     safe->applyWaveConversion(converted);
                     if (close) close();
                 };
@@ -7142,7 +7212,7 @@ private:
     [[nodiscard]] bool loadCompositeImmediateAuditionSetting() const {
         if (!standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
-            return true;
+            return session_.auditionPreferences().composite_immediate;
         }
         const auto file = settingsFile();
         if (!file.existsAsFile()) {
@@ -7159,6 +7229,7 @@ private:
     void saveCompositeImmediateAuditionSetting(bool enabled) {
         if (!standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
+            session_.auditionPreferences().composite_immediate = enabled;
             return;
         }
         const auto file = settingsFile();
@@ -7176,7 +7247,7 @@ private:
     loadLastAuditionNoteSetting() const {
         if (!standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
-            return kPreviewNote;
+            return session_.auditionPreferences().last_note;
         }
         return LastAuditionNoteStore::instance().get();
     }
@@ -7184,6 +7255,7 @@ private:
     void saveLastAuditionNoteSetting(std::uint8_t note) {
         if (!standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
+            session_.auditionPreferences().last_note = note;
             return;
         }
         LastAuditionNoteStore::instance().mark(note);
@@ -7400,6 +7472,7 @@ private:
     bool syncing_{};
     bool hydrate_from_host_{};
     bool hydrating_{};
+    std::uint64_t host_restore_generation_{};
     bool engine_ready_{};
     bool composite_program_stale_{true};
     LibraryFileFingerprint composite_library_fingerprint_{};
@@ -7565,6 +7638,7 @@ class SccEditorComponent final
     : public juce::Component,
       private juce::Timer {
 public:
+    friend struct SatelliteEditorParityTestAccess;
     explicit SccEditorComponent(
         EditorSession& session,
         EditorLink& link,
@@ -9732,11 +9806,12 @@ private:
 
     void convertToOpll() {
         juce::Component::SafePointer<SccEditorComponent> safe(this);
+        const auto revision = session_.stateRestoreRevision();
         const auto waveform = scc_wave_;
         conversion_quality_dialog_ = showOpllConversionQualityDialog(
             this,
-            [safe, waveform](OpllConversionQuality quality) {
-                if (safe == nullptr) {
+            [safe, waveform, revision](OpllConversionQuality quality) {
+                if (safe == nullptr || safe->session_.stateRestoreRevision() != revision) {
                     return;
                 }
                 safe->updateStatus(juce::String::fromUTF8(
@@ -9753,10 +9828,10 @@ private:
                                 makeOpllApproximationOptions(
                                     quality, progress));
             },
-                    [safe](
+                    [safe, revision](
                         mgstc::engine::OpllApproximationResult result,
                         bool cancellation_requested) {
-                if (safe == nullptr) {
+                if (safe == nullptr || safe->session_.stateRestoreRevision() != revision) {
                     return;
                 }
                         if (cancellation_requested
@@ -9855,7 +9930,7 @@ private:
     [[nodiscard]] bool loadSccImmediateAuditionSetting() const {
         if (!standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
-            return true;
+            return session_.auditionPreferences().scc_immediate;
         }
         const auto file = settingsFile();
         if (!file.existsAsFile()) {
@@ -9871,6 +9946,10 @@ private:
     }
 
     void saveSccImmediateAuditionSetting(bool enabled) {
+        if (!standaloneHostPreferences(session_.snapshot().capabilities)) {
+            session_.auditionPreferences().scc_immediate = enabled;
+            return;
+        }
         saveApplicationSetting(
             L"SccImmediateAudition", enabled ? L"1" : L"0");
     }
@@ -9879,7 +9958,7 @@ private:
     loadLastAuditionNoteSetting() const {
         if (!standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
-            return kPreviewNote;
+            return session_.auditionPreferences().last_note;
         }
         return LastAuditionNoteStore::instance().get();
     }
@@ -9887,6 +9966,7 @@ private:
     void saveLastAuditionNoteSetting(std::uint8_t midi_note) {
         if (!standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
+            session_.auditionPreferences().last_note = midi_note;
             return;
         }
         LastAuditionNoteStore::instance().mark(midi_note);
@@ -11680,6 +11760,7 @@ class OpllEditorComponent final
     : public juce::Component,
       private juce::Timer {
 public:
+    friend struct SatelliteEditorParityTestAccess;
     explicit OpllEditorComponent(
         EditorSession& session,
         EditorLink& link,
@@ -12777,7 +12858,7 @@ private:
     [[nodiscard]] bool loadOpllImmediateAuditionSetting() const {
         if (!standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
-            return true;
+            return session_.auditionPreferences().opll_immediate;
         }
         const auto file = settingsFile();
         if (!file.existsAsFile()) {
@@ -12793,6 +12874,10 @@ private:
     }
 
     void saveOpllImmediateAuditionSetting(bool enabled) {
+        if (!standaloneHostPreferences(session_.snapshot().capabilities)) {
+            session_.auditionPreferences().opll_immediate = enabled;
+            return;
+        }
         saveApplicationSetting(
             L"OpllImmediateAudition", enabled ? L"1" : L"0");
     }
@@ -12801,7 +12886,7 @@ private:
     loadLastAuditionNoteSetting() const {
         if (!standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
-            return kPreviewNote;
+            return session_.auditionPreferences().last_note;
         }
         return LastAuditionNoteStore::instance().get();
     }
@@ -12809,6 +12894,7 @@ private:
     void saveLastAuditionNoteSetting(std::uint8_t midi_note) {
         if (!standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
+            session_.auditionPreferences().last_note = midi_note;
             return;
         }
         LastAuditionNoteStore::instance().mark(midi_note);

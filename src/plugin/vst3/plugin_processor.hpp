@@ -26,7 +26,8 @@
 
 namespace mgstc::plugin {
 
-class MgstcAudioProcessor final : public juce::AudioProcessor {
+class MgstcAudioProcessor final : public juce::AudioProcessor,
+                                 private juce::AsyncUpdater {
 public:
     static constexpr double kEngineSampleRate = 48'000.0;
     static constexpr std::uint8_t kMaxVoices = 16;
@@ -70,6 +71,15 @@ public:
     // Message thread. The editor is not the state authority.
     [[nodiscard]] PluginStateDocument copyPluginState() const;
     [[nodiscard]] bool replacePluginState(PluginStateDocument document);
+    void setEditorStateRestoredCallback(std::function<void()> callback) {
+        editor_state_restored_ = std::move(callback);
+    }
+    std::uint64_t editorStateRestoreRevision() const noexcept {
+        return state_restore_revision_.load(std::memory_order_acquire);
+    }
+    mgstc::app::EditorAuditionPreferences& editorAuditionPreferences() noexcept {
+        return audition_preferences_;
+    }
 
     // Message-thread editor delegation. Does not open OS audio, MIDI,
     // MAmidi, or the tone library. Shared-wave audition is runtime only
@@ -77,16 +87,21 @@ public:
     [[nodiscard]] bool replaceEditorComposite(
         mgstc::engine::CompositeTimbre sound,
         bool polyphonic,
-        std::uint8_t& voice_capacity);
+        std::uint8_t& voice_capacity,
+        std::optional<std::uint64_t> expected_restore_revision = {});
     [[nodiscard]] bool previewEditorComposite(
         mgstc::engine::CompositeTimbre sound,
         bool polyphonic,
-        std::uint8_t& voice_capacity);
+        std::uint8_t& voice_capacity,
+        std::optional<std::uint64_t> expected_restore_revision = {});
     [[nodiscard]] bool editorNoteOn(
         std::uint8_t track,
-        std::uint8_t note);
-    [[nodiscard]] bool editorNoteOff(std::uint8_t track);
-    void editorSilenceTrack(std::uint8_t track);
+        std::uint8_t note,
+        std::optional<std::uint64_t> expected_restore_revision = {});
+    [[nodiscard]] bool editorNoteOff(std::uint8_t track,
+        std::optional<std::uint64_t> expected_restore_revision = {});
+    void editorSilenceTrack(std::uint8_t track,
+        std::optional<std::uint64_t> expected_restore_revision = {});
     void editorFlushPending();
     [[nodiscard]] bool editorPlayPcmPreview(
         std::shared_ptr<const mgstc::engine::SourcePcm> pcm,
@@ -125,6 +140,11 @@ public:
     [[nodiscard]] std::uint64_t editorBlockedBackendCalls() const noexcept;
 
 private:
+    void notifyEditorStateRestored();
+    void handleAsyncUpdate() override;
+    std::function<void()> editor_state_restored_;
+    std::atomic<std::uint64_t> state_restore_revision_{0};
+    mgstc::app::EditorAuditionPreferences audition_preferences_;
     friend struct MgstcAudioProcessorTestAccess;
 
     enum class TrackLayerState : std::uint8_t {
@@ -232,9 +252,12 @@ private:
         PluginStateDocument document,
         CommitMode mode,
         bool polyphonic = true,
-        std::uint8_t* voice_capacity = nullptr);
+        std::uint8_t* voice_capacity = nullptr,
+        std::optional<std::uint64_t> expected_restore_revision = {},
+        bool host_restore = false);
     [[nodiscard]] bool editorSubmitEngine(
-        const mgstc::engine::EngineCommand& command);
+        const mgstc::engine::EngineCommand& command,
+        std::optional<std::uint64_t> expected_restore_revision = {});
     void applyCommittedPlaybackPlan() noexcept;
     [[nodiscard]] const mgstc::engine::CompositePlaybackPlan&
     activePlan() const noexcept;
@@ -247,6 +270,8 @@ private:
     PluginPcmPreview pcm_preview_{};
     // Message/background control only. Never accessed by processBlock.
     std::mutex background_tasks_mu_;
+    // Serializes non-audio program producers; processBlock never takes it.
+    std::mutex state_commit_mu_;
     std::vector<std::shared_ptr<mgstc::app::EditorBackgroundTask>> background_tasks_;
     bool background_tasks_shutdown_{};
     mgstc::engine::SequentialVoiceAllocator voices_{kMaxVoices};
@@ -300,7 +325,7 @@ private:
     std::uint64_t copy_ns_{};
 
     bool editor_shared_program_active_{false};
-    bool editor_runtime_program_temporary_{false};
+    std::atomic<bool> editor_runtime_program_temporary_{false};
     std::atomic<int> editor_master_volume_percent_{100};
     float master_volume_gain_{1.0F};
     std::uint64_t editor_master_volume_revision_{1};

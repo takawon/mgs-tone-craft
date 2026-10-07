@@ -34,7 +34,7 @@
 > **注意:** 通常の PowerShell から `cmake --build build` だけを実行しない。
 > Visual Studio の Developer 環境（`INCLUDE` 等）が無いと、標準ヘッダ未検出の C1083 になる。
 > CMake 構成時と、Ninja がソースをコンパイルする前に環境チェックがあり、未設定なら上記の正しい手順を案内して停止する。
-> 同時に `.\tools\build.cmd` を二重起動しない（走行中のテスト exe を `ninja clean` が消す）。
+> 同じ作業ツリーで `.\tools\build.cmd` を二重起動しない。作業ツリーとビルド先を排他ロックする。
 
 このスクリプトはVisual Studio C++環境を自動検出し、通常のPowerShellへ
 MSVC／Windows SDK／Ninjaの環境を読み込んでから、CMake構成、ビルド、テストを
@@ -47,11 +47,14 @@ PowerShell実行ポリシーを変更する必要はない。初回ビルドの�
 JUCEのWindowsリソース生成ツールは日本語を含む出力パスを処理できないため、
 プロジェクトパスに非ASCII文字がある場合、スクリプトはCMakeの中間Build treeを
 `%LOCALAPPDATA%\MgsToneCraft\cmake-build-<configuration>`へ自動配置する。
-完成した実行ファイルは従来どおりプロジェクト直下の`build`へ出力する。
+実行ファイルもそのBuild treeへ出力する。ASCIIの通常チェックアウトでは既定の
+Build tree／exe出力先は従来どおり`build`である。`-BuildDirectory`を指定した場合は
+exeとCTestも指定先を使用し、別ツリーのexeが上書きされて誤検証されることを防ぐ。
 
-> **Debug／Releaseの上書き注意:** 両構成は中間Build treeが別でも、実行可能な
-> `build\mgstc.exe`を共有する。最後にビルドした構成がこのファイルを上書きするため、
-> Debug検証後にそのまま起動すると、Standard変換もDebug速度で動作する。Debugは
+> **Debug／Releaseの上書き注意:** 同じBuild treeを指定すると最後の構成がexeを
+> 上書きする。構成ごとに異なる`-BuildDirectory`を使うとexeも分離される。
+> 既定の`build`でDebug検証後にそのまま起動すると、
+> Standard変換もDebug速度で動作する。Debugは
 > 診断用であり、利用者向けの変換速度評価には使わない。性能確認の最後は必ず
 > `.\tools\build.cmd -Configuration Release -SkipTests`（またはテストを含むRelease）
 > を実行し、ログがReleaseのBuild treeを示すことを確認してから`build\mgstc.exe`を
@@ -64,14 +67,66 @@ JUCEのWindowsリソース生成ツールは日本語を含む出力パスを処
 `third_party/patches/juce/direct2d.patch`（JUCE Forum / reuk、Direct2D
 `Present1` の Message Thread blocking 対策）を JUCE ソースへ適用する。
 JUCE 8.0.12 Windows painting overlay は使わない。すでに取得済みの
-`build/_deps/juce-src` がある場合も、構成のたびに 8.0.15 の
-`Windowing` / Direct2D 3ファイルを checkout してから patch を当てる。
+`build/_deps/juce-src` がある場合も、8.0.15 の
+`Windowing` / Direct2D 3ファイルとpatchの内容をハッシュで確認する。
+変更時だけstock復元とpatch適用を行い、内容が同じ場合はタイムスタンプを保持する。
 Standalone の画面位置は 8.0.15 `Windowing` の `logicalBounds` /
 `userBounds` に依存する（overlay 用の Displays 書き換えは持ち込まない）。
 上流に同等修正が入ったらこの patch を削除する。
 ASIO対応もJUCE 8.0.15同梱のASIO SDKヘッダーを`JUCE_ASIO=1`で使用するため、
 別途ASIO SDKをダウンロードする必要はない。本体はAGPL-3.0-only、同梱ASIO SDKは
 GPLv3側の条件で使用し、配布ZIPにはSteinbergのASIO SDKライセンス全文を含める。
+
+### 増分ビルドと最終検証
+
+Debugの既定は`/Z7`（OBJ内のデバッグ情報）。`/FS`付きでも発生したコンパイラPDB
+競合を避ける。リンクPDBは維持する。Releaseの最適化・製品動作は変更しない。
+ヘッダ更新はNinjaの依存関係で増分処理し、毎回全体cleanしない。
+依存関係が疑わしい場合は、まず次で記録を確認する。
+
+```powershell
+.\tools\build.cmd -PlanOnly -DependencyReport
+.\tools\build.cmd -TestRegex '"mgstc_(vst3_processor|layer_delay_scheduler)_tests"'
+.\tools\build.cmd -Target mgstc_vst3 -SkipTests
+```
+
+`.cmd`から複数Targetを渡す場合はPowerShell配列構文に頼らず、単一Targetで呼び出すか
+既定の全ターゲットビルドを使う。`-Target`は`-SkipTests`または`-PlanOnly`と併用する。
+PowerShellから`.cmd`へ`|`などのcmdメタ文字を含む正規表現を渡す場合は、上の例のように
+文字列内へ二重引用符を残す。外側のPowerShell引用符だけではcmdがパイプとして解釈する。
+テスト時は全前提ターゲットをビルドし、古いテストexeによるPASSを防ぐ。
+`-PlanOnly`は製品ターゲットのコンパイル／CTestを実行しないが、CMake構成に必要な
+JUCEの`juceaide`をビルドする場合がある。Ninja dry-runの工程数は再構成予定を含む概算。
+依存記録はBuild treeの`.mgstc-ninja-deps.txt`に保存する。
+
+工程別の固定費を調べる場合は `-Timings` を付ける。通常の環境初期化・排他・
+configure・ビルド・テスト・最終ソース照合を維持し、Build treeへ
+`.mgstc-timing-<PID>.json`、`.mgstc-cmake-profile.json`を保存する。
+Ninjaの依存走査統計もログへ出す。CMake profileの子工程はconfigure時間の内訳であり、
+合計へ重複加算しない。compile/linkはビルドログとNinja実行記録で区別する。
+テストを実行しない基準測定には `-SkipTests` を明示し、テストありの検証とは区別する。
+`build.cmd`起動前後を呼出し側のStopwatchでも測ると、PowerShell起動・終了を含む全体時間になる。
+同条件の比較では構成・tree・Jobs・テスト選択・計測有無を揃える。
+
+```powershell
+.\tools\build.cmd -BuildDirectory build-debug -Configuration Debug -Jobs 4 -SkipTests -Timings
+.\tools\build.cmd -BuildDirectory build-debug -Configuration Debug -Jobs 4 -Timings
+```
+
+実装・テスト・レビュー修正を完了してから最終検証を実行する。
+スクリプトはHEAD、未コミット／未追跡ソース、ローカルfixture、ビルド設定、前後SHA256を
+`.mgstc-validation.json`へ記録し、検証中に内容または更新時刻が変われば成功扱いしない。
+内容を変更後に戻す通常の編集も更新時刻で検出する。意図的な時刻復元や外部依存cacheの
+一時変更までを監視する仕組みではない。
+生成先・依存キャッシュ・内部の作業記録はソースハッシュ対象外。失敗時は
+`FailedOrIncomplete`、`-SkipTests`は`BuildPassedTestsNotRun`として区別する。
+証跡は各実行で更新するため、最終結果として残すものはローカルの監査／ログ先へコピーする。
+環境・外部依存の同一性や実UI・DAW・聴感をこのハッシュだけで保証したとは扱わない。
+実行中のMGSTCバイナリは強制終了せず、PIDとパスを表示して停止する。
+
+長いビルドではログを保存し、末尾・新規エラー・終了コードを確認する。
+同じ全文や同じ進捗を繰り返し取得せず、ビルドは統合者一人が実行する。
+独立レビューは対象差分を固定して読み取りで行い、後続修正を影響範囲だけ再確認する。
 
 ### 画面のPNG目視検査
 
@@ -118,28 +173,25 @@ SCC→OPLL／WAV→OPLLの探索性能はDebugビルドではなくReleaseビル
 通常テストには壁時計による合否を含めず、明示的にベンチターゲットを有効化する。
 
 ```powershell
-cmake -S . -B build-benchmark -G Ninja `
-    -DCMAKE_BUILD_TYPE=Release `
-    -DMGSTC_BUILD_TESTS=OFF `
-    -DMGSTC_BUILD_BENCHMARKS=ON
-cmake --build build-benchmark --target mgstc_wave_import_benchmark --parallel 8
-.\build\mgstc_wave_import_benchmark.exe `
+.\tools\build.cmd -Configuration Release -BuildDirectory build-benchmark `
+    -BuildBenchmarks -Target mgstc_wave_import_benchmark -Jobs 8 -SkipTests
+.\build-benchmark\mgstc_wave_import_benchmark.exe `
     --effort standard --workers 8 --runs 3 --case all
 ```
 
 日本語を含むソースパスでJUCE関連ターゲットの構成を避けたい場合は、
-ASCIIだけのBuild treeを`-B`へ指定する。
+ASCIIだけのBuild treeを`-BuildDirectory`へ指定する。
 
 ベンチCLIは`--effort standard|thorough`、`--workers N`、`--runs N`、
 `--case scc|wav-short|wav-2s|all`を受け付ける。`thorough`の既定実行回数は1回。
 個別実行例:
 
 ```powershell
-.\build\mgstc_wave_import_benchmark.exe `
+.\build-benchmark\mgstc_wave_import_benchmark.exe `
     --effort standard --workers 8 --runs 3 --case wav-2s
-.\build\mgstc_wave_import_benchmark.exe `
+.\build-benchmark\mgstc_wave_import_benchmark.exe `
     --effort thorough --workers 8 --runs 1 --case scc
-.\build\mgstc_wave_import_benchmark.exe `
+.\build-benchmark\mgstc_wave_import_benchmark.exe `
     --effort thorough --workers 8 --runs 1 --case wav-2s
 ```
 
@@ -180,15 +232,13 @@ WAV 2秒122,088.9ms（hash `7ca5239c56a82f02`）を測定済み。
 .\tools\build.cmd -Jobs 8
 ```
 
-## Developer PowerShellでの手動実行
+## Developer PowerShellでの実行
 
-Visual StudioのDeveloper PowerShellを既に使用している場合は、従来どおり
-個別に実行できる。
+Visual StudioのDeveloper PowerShellでも同じラッパーを使用する。
+環境チェックだけでなく排他・増分ビルド・ソース照合の手順を維持する。
 
 ```powershell
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
+.\tools\build.cmd -Configuration Debug
 ```
 
 ## 現在のターゲット
@@ -256,3 +306,34 @@ Plugin Code は製品と同じ `Mgti` なので、Cubase には診断 bundle だ
 Visual StudioとCMakeは通常、日本語を含むプロジェクトパスを扱える。
 一部の自動実行環境で8.3短縮パスに関するMSBuild警告が出る場合があるが、
 コンパイル結果には影響しない。
+
+### MSVC / CMake / Ninja の依存記録と復旧
+
+Windows wrapper は Ninja の `-t wincodepage` で使用する文字コードを取得し、
+CMake のコンパイラ検出から MSVC の `/showIncludes` 出力、Ninja の依存解析まで、
+コンソールの入力・出力コードページと PowerShell の出力文字コードを揃える。
+終了時は元へ戻す。生成済み Ninja ファイルの書換えや、日本語 prefix の固定値は使用しない。
+
+各ビルド後は、対象に応じた代表 OBJ の依存記録を必須検証する。
+OBJ の存在、有効な依存記録、依存件数、期待するプロジェクト・依存ライブラリのヘッダを確認し、
+コンパイル自体が成功していても依存が欠落していれば Fail とする。
+`-SkipTests` でもこの確認は省略しない。証跡はビルド先の
+`.mgstc-deps-validation.json` と `.mgstc-native-encoding.json` に保存する。
+`-Target` 指定時はそのビルドグラフに含まれる代表 OBJ を確認する。
+代表を含まないターゲットは NotApplicable と明示する。
+
+既存ツリーで検出済み prefix または依存記録が壊れている場合は、次を一度実行する。
+
+```powershell
+.\tools\build.cmd -Configuration Debug -BuildDirectory build-debug -RecoverDependencies
+```
+
+復旧は CMake の `--fresh` を使う（CMake 3.24 以降、プロジェクト自体は 3.25 以降が必要）。
+元の CMakeCache.txt を退避し、BOOL / STRING / PATH / FILEPATH の設定を初期 cache に保存する。
+UNINITIALIZED は値を保って STRING として保存し、INTERNAL / STATIC の検出結果は保存しない。
+wrapper の明示引数を初期 cache より後に指定し、今回の構成指定を優先する。
+コンパイラ検出と依存記録を再生成し、復旧時だけ --clean-first でサブディレクトリの旧OBJも再生成するため完全ビルドとなり、`-Target` / `-PlanOnly` は併用できない。
+
+新規ツリーを通信なしで検証する場合は `-DependencySourceRoot build/_deps` を指定できる。
+既存の juce-src / rpclib-src のソースだけを参照し、OBJ・生成物・バイナリは新しいツリーに作る。
+通常ビルドでは常時 fresh / clean を実行せず、Ninja の増分コンパイルを維持する。
