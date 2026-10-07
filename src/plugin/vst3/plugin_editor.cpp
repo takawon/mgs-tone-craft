@@ -71,6 +71,7 @@ MgstcAudioProcessorEditor::MgstcAudioProcessorEditor(
         },
     };
 
+    const auto revision = context_.stateRestoreRevision();
     const auto state = processor_.copyPluginState();
     composite_ = std::make_unique<mgstc::app::CompositeEditorComponent>(
         context_,
@@ -85,9 +86,20 @@ MgstcAudioProcessorEditor::MgstcAudioProcessorEditor(
         state.sound);
     addAndMakeVisible(composite_.get());
     setSize(composite_->getWidth(), composite_->getHeight());
+    context_.acknowledgeStateRestore(revision);
+    processor_.setEditorStateRestoredCallback([this, hydrated_revision = revision]() mutable {
+        const auto restored_revision = context_.stateRestoreRevision();
+        if (restored_revision == hydrated_revision) return;
+        scc_window_.reset();
+        opll_window_.reset();
+        composite_->restoreHostState(processor_.copyPluginState().sound);
+        context_.acknowledgeStateRestore(restored_revision);
+        hydrated_revision = restored_revision;
+    });
 }
 
 MgstcAudioProcessorEditor::~MgstcAudioProcessorEditor() {
+    processor_.setEditorStateRestoredCallback({});
     setLookAndFeel(nullptr);
     scc_window_.reset();
     opll_window_.reset();
@@ -132,7 +144,25 @@ void MgstcAudioProcessorEditor::openSatellite(
                 link_,
                 open_editor,
                 no_spectrum,
-                [](std::vector<mgstc::engine::OpllPatchParameters>) {},
+                [this](std::vector<mgstc::engine::OpllPatchParameters> candidates) {
+                    if (candidates.empty()) return;
+                    const auto revision = context_.stateRestoreRevision();
+                    juce::Component::SafePointer<MgstcAudioProcessorEditor> safe(this);
+                    juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+                        .withTitle(juce::String::fromUTF8("SCC → OPLL"))
+                        .withMessage(juce::String::fromUTF8("変換候補を総合音色の最初のOPLLチャンネルのベースへ適用します。OPLLがない場合は追加します。現在のOPLLベースは置き換わります。SCCチャンネルは保持します。"))
+                        .withButton(juce::String::fromUTF8("適用"))
+                        .withButton(juce::String::fromUTF8("キャンセル"))
+                        .withAssociatedComponent(this),
+                        [safe, revision, candidates = std::move(candidates)](int result) mutable {
+                            if (!safe || result != 1
+                                || safe->context_.stateRestoreRevision() != revision) return;
+                            if (!safe->composite_->applyOpllConversionCandidate(candidates.front())) return;
+                            if (auto* editor = dynamic_cast<mgstc::app::OpllEditorComponent*>(
+                                    safe->opll_window_->getContentComponent()))
+                                editor->receiveConversionCandidates(std::move(candidates));
+                        });
+                },
                 no_library,
                 kind.equalsIgnoreCase("scc-envelope"),
                 no_change);

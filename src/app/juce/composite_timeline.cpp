@@ -1405,7 +1405,8 @@ public:
         PreviewCallback on_preview,
         std::function<void(std::uint8_t)> on_note_off,
         std::function<void()> on_end)
-        : on_apply_(std::move(on_apply)),
+        : session_(session),
+          on_apply_(std::move(on_apply)),
           on_preview_(std::move(on_preview)),
           on_note_off_(std::move(on_note_off)),
           on_end_(std::move(on_end)),
@@ -1435,7 +1436,7 @@ public:
 
         panel_.setDiffBaseline(baseline);
         panel_.setAuditionNote(
-            static_cast<std::uint8_t>(LastAuditionNoteStore::instance().get()));
+            auditionNote());
         panel_.setParameters(initial);
         panel_.onChange = [this](bool commit) {
             juce::ignoreUnused(commit);
@@ -1526,9 +1527,15 @@ private:
         }
     }
 
+    std::uint8_t auditionNote() const {
+        if (session_ != nullptr
+            && !standaloneHostPreferences(session_->snapshot().capabilities))
+            return session_->auditionPreferences().last_note;
+        return LastAuditionNoteStore::instance().get();
+    }
+
     void auditionPreview() {
-        const auto note = static_cast<std::uint8_t>(
-            LastAuditionNoteStore::instance().get());
+        const auto note = auditionNote();
         panel_.setAuditionNote(note);
         if (on_preview_) on_preview_(panel_.parameters(), note, true);
     }
@@ -1541,6 +1548,7 @@ private:
         }
     }
 
+    mgstc::app::EditorSession* session_{};
     std::function<void(mgstc::engine::OpllPatchParameters)> on_apply_;
     PreviewCallback on_preview_;
     std::function<void(std::uint8_t)> on_note_off_;
@@ -4076,6 +4084,7 @@ public:
     void setMoveCallback(MoveCallback cb) { move_callback_ = std::move(cb); }
     void setInsertZoneCallback(InsertZoneCallback cb) { insert_zone_callback_ = std::move(cb); }
     void clearStack() { setStack(-1, false, false, false, {}, {}, {}); }
+    void cancelPendingActions() noexcept { ++action_generation_; }
     void setStack(int count, bool loop_start, bool loop_end, bool insert_after,
         std::vector<juce::String> before, std::vector<juce::String> after,
         std::vector<juce::String> after_end) {
@@ -4185,8 +4194,9 @@ private:
         const int count = count_;
         menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
             [safe = juce::Component::SafePointer<CountCommandStackView>(this),
-                index, count, before, after_commands](int result) {
-                if (!safe || safe->count_ != count || safe->before_ != before
+                index, count, before, after_commands, generation = action_generation_](int result) {
+                if (!safe || safe->action_generation_ != generation
+                    || safe->count_ != count || safe->before_ != before
                     || safe->after_ != after_commands) return;
                 if (result == 1 && safe->delete_callback_) {
                     auto cb = safe->delete_callback_; cb(index);
@@ -4198,6 +4208,7 @@ private:
     DeleteCallback delete_callback_;
     MoveCallback move_callback_;
     InsertZoneCallback insert_zone_callback_;
+    std::uint64_t action_generation_{};
     int count_{-1};
     bool has_loop_start_{}, has_loop_end_{}, insert_after_{};
     std::vector<juce::String> before_, after_, after_end_;
@@ -4330,8 +4341,8 @@ public:
         add_channel_.onClick = [this] {
             makeAddChannelMenu().showMenuAsync(
                 juce::PopupMenu::Options().withTargetComponent(&add_channel_),
-                [safe = juce::Component::SafePointer<Impl>(this)](int result) {
-                    if (safe != nullptr) safe->addChannelFromMenu(result);
+                [safe = juce::Component::SafePointer<Impl>(this), generation = dialog_generation_](int result) {
+                    if (safe != nullptr && safe->dialog_generation_ == generation) safe->addChannelFromMenu(result);
                 });
         };
         addAndMakeVisible(add_channel_);
@@ -4649,6 +4660,7 @@ public:
     }
 
     ~Impl() override {
+        cancelPendingDialogs();
         stopTimer();
         cancelMorphGeneration();
         if (morph_worker_.joinable()) {
@@ -5444,6 +5456,7 @@ public:
                     lfo_poll_keys_callback_();
                 }
             });
+        pending_dialogs_.emplace_back(dialog);
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         dialog->setContentOwned(content, true);
@@ -5473,6 +5486,16 @@ public:
         tempo_.setText(
             juce::String(playback_tempo_), juce::dontSendNotification);
         repaint();
+    }
+
+    void cancelPendingDialogs() {
+        ++dialog_generation_;
+        command_stack_.cancelPendingActions();
+        closeRateEditor(false);
+        auto dialogs = std::move(pending_dialogs_);
+        pending_dialogs_.clear();
+        for (auto& dialog : dialogs)
+            if (dialog) delete dialog.getComponent();
     }
 
     void setTimbre(
@@ -6073,6 +6096,7 @@ private:
                         layer_index, target, settings, use_free_curve);
                 }
             });
+        pending_dialogs_.emplace_back(dialog);
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         dialog->setContentOwned(content, true);
@@ -7001,9 +7025,9 @@ private:
                         " とそのエンベロープを削除しますか？"))
                 .withButton(juce::String::fromUTF8("削除"))
                 .withButton(juce::String::fromUTF8("キャンセル")),
-            [safe = juce::Component::SafePointer<Impl>(this), layer_index](
+            [safe = juce::Component::SafePointer<Impl>(this), layer_index, generation = dialog_generation_](
                 int result) {
-                if (safe != nullptr && result == 1) {
+                if (safe != nullptr && result == 1 && safe->dialog_generation_ == generation) {
                     safe->removeLayerAt(layer_index);
                 }
             });
@@ -9984,6 +10008,7 @@ private:
                     }, focus_morph);
             }
         }
+        pending_dialogs_.emplace_back(dialog);
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         juce::Component* dialog_content = content;
@@ -10098,6 +10123,7 @@ private:
             [this, layer_index]() -> std::optional<std::uint64_t> {
                 return addBlankOriginal(layer_index);
             });
+        pending_dialogs_.emplace_back(dialog);
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         dialog->setContentOwned(content, true);
@@ -10176,6 +10202,7 @@ private:
                     precise_mode);
             },
             precise);
+        pending_dialogs_.emplace_back(dialog);
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         dialog->setContentOwned(content, true);
@@ -10211,6 +10238,7 @@ private:
             [this](int typed) {
                 applyPitchTypedDelta(selected_count_, typed);
             });
+        pending_dialogs_.emplace_back(dialog);
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         dialog->setContentOwned(content, true);
@@ -10342,6 +10370,7 @@ private:
                 [this, count](std::uint8_t r, std::uint8_t d) {
                     applyPsgManualY(count, r, d);
                 });
+            pending_dialogs_.emplace_back(dialog);
             dialog->setUsingNativeTitleBar(true);
             dialog->setResizable(false, false);
             dialog->setContentOwned(content, true);
@@ -10429,6 +10458,7 @@ private:
             [this] {
                 if (manual_y_end_) manual_y_end_();
             });
+        pending_dialogs_.emplace_back(dialog);
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(false, false);
         dialog->setContentOwned(content, true);
@@ -11328,6 +11358,8 @@ private:
     MutateTimbreMemoCallback mutate_memo_callback_;
     LfoSessionCallback lfo_session_callback_;
     LfoPollKeysCallback lfo_poll_keys_callback_;
+    std::uint64_t dialog_generation_{};
+    std::vector<juce::Component::SafePointer<juce::DialogWindow>> pending_dialogs_;
     mgstc::app::EditorSession* session_{};
     std::unique_ptr<RateEnvelopeEditorWindow> rate_window_;
     std::optional<std::size_t> rate_editor_layer_;
@@ -11550,6 +11582,10 @@ void CompositeTimeline::setEditorSession(
 
 void CompositeTimeline::setPlaybackTempo(int tempo_bpm) {
     impl_->setPlaybackTempo(tempo_bpm);
+}
+
+void CompositeTimeline::cancelPendingDialogs() {
+    impl_->cancelPendingDialogs();
 }
 
 void CompositeTimeline::setTimbre(

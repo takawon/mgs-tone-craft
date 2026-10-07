@@ -227,9 +227,21 @@ public:
 // Thin composition root. No engine() accessor. Scope polls consume frames and
 // are not audition. Independent OPLL scope uses waveform_scope.
 // Composite Editor playback waveform uses composite_playback_waveform.
+struct EditorAuditionPreferences {
+    bool composite_immediate{true};
+    bool scc_immediate{true};
+    bool opll_immediate{true};
+    std::uint8_t last_note{60};
+};
+
 class EditorSession {
 public:
     virtual ~EditorSession() = default;
+    // Message-thread UI preferences, separate from the sound document.
+    virtual EditorAuditionPreferences& auditionPreferences() noexcept {
+        return audition_preferences_;
+    }
+    virtual std::uint64_t stateRestoreRevision() const noexcept { return 0; }
 
     // Read-only copy. Must not consume queues or change host state.
     // ASIO driver enumeration and hardware status text are queries on Output.
@@ -243,6 +255,8 @@ public:
         mgstc::engine::OpllScopeFrame& frame) = 0;
     [[nodiscard]] virtual bool pollLatestOpllScope(
         mgstc::engine::OpllScopeFrame& frame) = 0;
+private:
+    EditorAuditionPreferences audition_preferences_;
 };
 
 // Per-instance editor collaboration. Not engine or plugin state authority.

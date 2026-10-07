@@ -79,6 +79,7 @@ MgstcAudioProcessor::MgstcAudioProcessor()
 }
 
 MgstcAudioProcessor::~MgstcAudioProcessor() {
+    cancelPendingUpdate();
     std::vector<std::shared_ptr<mgstc::app::EditorBackgroundTask>> tasks;
     {
         std::lock_guard<std::mutex> lock(background_tasks_mu_);
@@ -1209,7 +1210,9 @@ void MgstcAudioProcessor::setStateInformation(
     const auto mode = host_prepared_.load(std::memory_order_acquire)
         ? CommitMode::Live
         : CommitMode::Offline;
-    static_cast<void>(commitPluginState(parsed.document, mode));
+    if (commitPluginState(parsed.document, mode, true, nullptr, {}, true)) {
+        notifyEditorStateRestored();
+    }
 }
 
 PluginStateDocument MgstcAudioProcessor::copyPluginState() const {
@@ -1237,7 +1240,22 @@ bool MgstcAudioProcessor::replacePluginState(PluginStateDocument document) {
     const auto mode = host_prepared_.load(std::memory_order_acquire)
         ? CommitMode::Live
         : CommitMode::Offline;
-    return commitPluginState(std::move(document), mode);
+    if (!commitPluginState(std::move(document), mode, true, nullptr, {}, true)) return false;
+    notifyEditorStateRestored();
+    return true;
+}
+
+void MgstcAudioProcessor::notifyEditorStateRestored() {
+    if (juce::MessageManager::getInstance()->isThisTheMessageThread()) {
+        cancelPendingUpdate();
+        handleAsyncUpdate();
+    } else {
+        triggerAsyncUpdate();
+    }
+}
+
+void MgstcAudioProcessor::handleAsyncUpdate() {
+    if (editor_state_restored_) editor_state_restored_();
 }
 
 bool MgstcAudioProcessor::onAudioThread() const noexcept {
@@ -1288,11 +1306,16 @@ bool MgstcAudioProcessor::commitPluginState(
     PluginStateDocument document,
     CommitMode mode,
     bool polyphonic,
-    std::uint8_t* voice_capacity) {
+    std::uint8_t* voice_capacity,
+    std::optional<std::uint64_t> expected_restore_revision,
+    bool host_restore) {
     if (onAudioThread()) {
         state_audio_reject_count_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    std::lock_guard<std::mutex> producer_lock(state_commit_mu_);
+    if (expected_restore_revision && *expected_restore_revision != editorStateRestoreRevision())
+        return false;
     static_cast<void>(mgstc::engine::enforceOpllRegisterAutoExclusivity(
         document.sound));
     document.sound.playback_tempo = std::clamp(
@@ -1371,13 +1394,15 @@ bool MgstcAudioProcessor::commitPluginState(
         voices_.setActiveChannelCount(capacity == 0 ? 1 : capacity);
         voices_.setPolyphonic(true);
     }
+    if (host_restore) state_restore_revision_.fetch_add(1, std::memory_order_release);
     return true;
 }
 
 bool MgstcAudioProcessor::replaceEditorComposite(
     mgstc::engine::CompositeTimbre sound,
     bool polyphonic,
-    std::uint8_t& voice_capacity) {
+    std::uint8_t& voice_capacity,
+    std::optional<std::uint64_t> expected_restore_revision) {
     voice_capacity = 1;
     if (onAudioThread()) {
         state_audio_reject_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1389,18 +1414,22 @@ bool MgstcAudioProcessor::replaceEditorComposite(
         ? CommitMode::Live
         : CommitMode::Offline;
     return commitPluginState(
-        std::move(document), mode, polyphonic, &voice_capacity);
+        std::move(document), mode, polyphonic, &voice_capacity, expected_restore_revision);
 }
 
 bool MgstcAudioProcessor::previewEditorComposite(
     mgstc::engine::CompositeTimbre sound,
     bool polyphonic,
-    std::uint8_t& voice_capacity) {
+    std::uint8_t& voice_capacity,
+    std::optional<std::uint64_t> expected_restore_revision) {
     voice_capacity = 1;
     if (onAudioThread()
         || !validatePluginSoundSnapshot(sound)) {
         return false;
     }
+    std::lock_guard<std::mutex> producer_lock(state_commit_mu_);
+    if (expected_restore_revision && *expected_restore_revision != editorStateRestoreRevision())
+        return false;
     static_cast<void>(
         mgstc::engine::enforceOpllRegisterAutoExclusivity(sound));
     auto edit = engine_.beginProgramEdit();
@@ -1441,8 +1470,14 @@ bool MgstcAudioProcessor::previewEditorComposite(
 }
 
 bool MgstcAudioProcessor::editorSubmitEngine(
-    const mgstc::engine::EngineCommand& command) {
+    const mgstc::engine::EngineCommand& command,
+    std::optional<std::uint64_t> expected_restore_revision) {
     if (onAudioThread()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(state_commit_mu_);
+    if (expected_restore_revision
+        && *expected_restore_revision != editorStateRestoreRevision()) {
         return false;
     }
     if (!engine_.submit(command)) {
@@ -1457,19 +1492,22 @@ bool MgstcAudioProcessor::editorSubmitEngine(
 
 bool MgstcAudioProcessor::editorNoteOn(
     std::uint8_t track,
-    std::uint8_t note) {
+    std::uint8_t note,
+    std::optional<std::uint64_t> expected_restore_revision) {
     return editorSubmitEngine(
-        mgstc::engine::EngineCommand::noteOn(track, note));
+        mgstc::engine::EngineCommand::noteOn(track, note), expected_restore_revision);
 }
 
-bool MgstcAudioProcessor::editorNoteOff(std::uint8_t track) {
+bool MgstcAudioProcessor::editorNoteOff(std::uint8_t track,
+    std::optional<std::uint64_t> expected_restore_revision) {
     return editorSubmitEngine(
-        mgstc::engine::EngineCommand::noteOff(track));
+        mgstc::engine::EngineCommand::noteOff(track), expected_restore_revision);
 }
 
-void MgstcAudioProcessor::editorSilenceTrack(std::uint8_t track) {
+void MgstcAudioProcessor::editorSilenceTrack(std::uint8_t track,
+    std::optional<std::uint64_t> expected_restore_revision) {
     static_cast<void>(editorSubmitEngine(
-        mgstc::engine::EngineCommand::silenceTrack(track)));
+        mgstc::engine::EngineCommand::silenceTrack(track), expected_restore_revision));
 }
 
 void MgstcAudioProcessor::editorFlushPending() {
@@ -1572,11 +1610,12 @@ bool MgstcAudioProcessor::editorRestoreCommittedProgram() {
     if (!editor_runtime_program_temporary_ || onAudioThread()) {
         return !editor_runtime_program_temporary_;
     }
+    const auto revision = editorStateRestoreRevision();
     auto document = copyPluginState();
     const auto mode = host_prepared_.load(std::memory_order_acquire)
         ? CommitMode::Live
         : CommitMode::Offline;
-    return commitPluginState(std::move(document), mode);
+    return commitPluginState(std::move(document), mode, true, nullptr, revision);
 }
 
 const mgstc::engine::SccWaveform&

@@ -35,7 +35,32 @@
 
 namespace mgstc::app {
 
+struct SatelliteEditorParityTestAccess {
+    static bool check(SccEditorComponent& scc, OpllEditorComponent& opll) {
+        scc.saveSccImmediateAuditionSetting(false);
+        opll.saveOpllImmediateAuditionSetting(false);
+        scc.saveLastAuditionNoteSetting(73);
+        for (int i = 0; i < 60; ++i) { scc.timerCallback(); opll.timerCallback(); }
+        return !scc.immediate_audition_.getToggleState()
+            && !opll.immediate_audition_.getToggleState()
+            && scc.last_audition_note_ == 73 && opll.last_audition_note_ == 73;
+    }
+};
+
 struct CompositeEditorComponentTestAccess {
+    static void immediate(CompositeEditorComponent& editor, bool enabled) {
+        editor.immediate_audition_.setToggleState(enabled, juce::dontSendNotification);
+        editor.saveCompositeImmediateAuditionSetting(enabled);
+    }
+    static bool immediate(const CompositeEditorComponent& editor) {
+        return editor.immediate_audition_.getToggleState();
+    }
+    static void note(CompositeEditorComponent& editor, std::uint8_t note) {
+        editor.saveLastAuditionNoteSetting(note);
+    }
+    static std::uint8_t note(const CompositeEditorComponent& editor) {
+        return editor.last_audition_note_;
+    }
     static const mgstc::engine::CompositeTimbre& sound(const CompositeEditorComponent& editor) { return editor.timbre_; }
     static bool wavEnabled(const CompositeEditorComponent& editor) { return editor.import_wave_.isEnabled(); }
     static std::size_t historySize(const CompositeEditorComponent& editor) { return editor.history_.size(); }
@@ -154,6 +179,9 @@ struct CompositeWavConversionTestAccess {
 namespace mgstc::plugin {
 
 struct MgstcAudioProcessorTestAccess {
+    static void notifyStateRestored(MgstcAudioProcessor& processor) {
+        processor.notifyEditorStateRestored();
+    }
     static std::uint64_t frame(const MgstcAudioProcessor& processor) {
         return processor.engine_frame_position_;
     }
@@ -3767,6 +3795,122 @@ void testPluginProjectRestore() {
         "44.1 kHz restore does not touch latency");
 }
 
+void testEditorParityCorrections() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    MgstcAudioProcessor processor;
+    MgstcAudioProcessor other;
+    auto original = mgstc::engine::defaultCompositeTimbre();
+    require(processor.replacePluginState(documentFrom(original, 0, {})), "parity seed");
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    mgstc::app::CompositeEditorComponent component(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {}, [] {}, [](std::uint8_t) {},
+        [](juce::Component*) {}, [] {}, original);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    const auto bytes = stateBytes(processor);
+    EditorAccess::immediate(component, false);
+    EditorAccess::note(component, 73);
+    for (int i = 0; i < 60; ++i) EditorAccess::pollOwned(component);
+    require(!EditorAccess::immediate(component) && EditorAccess::note(component) == 73,
+        "timer retains plugin immediate OFF and last audition note");
+    require(sameBlock(bytes, stateBytes(processor)), "UI audition preferences do not change sound state");
+    require(other.editorAuditionPreferences().composite_immediate
+        && other.editorAuditionPreferences().last_note == 60, "audition preferences are per instance");
+    {
+        mgstc::plugin::PluginEditorContext reopened(processor);
+        require(!reopened.auditionPreferences().composite_immediate
+            && reopened.auditionPreferences().last_note == 73, "editor reopen retains audition preferences");
+    }
+    const auto history = EditorAccess::historySize(component);
+    const auto scc = EditorAccess::sound(component).layers[1];
+    auto patch = mgstc::engine::decodeOpllPatch(std::array<std::uint8_t, 8>{0x71,0x61,0x1e,0x17,0xd0,0x78,0,0x17});
+    require(component.applyOpllConversionCandidate(patch), "conversion candidate applies");
+    require(processor.copyPluginState().sound == EditorAccess::sound(component),
+        "conversion candidate reflects into processor sound authority");
+    require(EditorAccess::sound(component).layers[1] == scc, "SCC candidate source is preserved");
+    require(EditorAccess::sound(component).layers[2].base_timbre->opll_registers
+        == mgstc::engine::encodeOpllPatch(patch), "OPLL destination gets converted bytes");
+    require(EditorAccess::historySize(component) == history + 1, "conversion is one undo transaction");
+    EditorAccess::undo(component);
+    require(EditorAccess::sound(component) == original, "conversion undo restores original");
+    auto no_opll = sccOnlyTimbre();
+    no_opll.layers[0].envelope_number = 2;
+    component.restoreHostState(no_opll);
+    require(component.applyOpllConversionCandidate(patch), "conversion adds missing OPLL destination");
+    require(processor.copyPluginState().sound == EditorAccess::sound(component),
+        "added OPLL conversion reflects into processor sound authority");
+    require(EditorAccess::sound(component).layers.size() == no_opll.layers.size() + 1
+        && EditorAccess::sound(component).layers[0] == no_opll.layers[0], "add preserves SCC channel");
+    require(EditorAccess::sound(component).layers.back().envelope_number != 2,
+        "added OPLL channel uses a free envelope number");
+    require(EditorAccess::historySize(component) == 2, "add and candidate replacement are one undo transaction");
+    EditorAccess::undo(component);
+    require(EditorAccess::sound(component) == no_opll, "one undo removes added OPLL channel");
+    {
+        const auto open = [](const juce::String&, std::optional<std::uint64_t>) {};
+        mgstc::app::SccEditorComponent scc_editor(context, link, open, [] {},
+            [](std::vector<mgstc::engine::OpllPatchParameters>) {}, [](juce::Component*) {}, true, [] {});
+        mgstc::app::OpllEditorComponent opll_editor(context, link, open, [] {},
+            [](juce::Component*) {}, true, [] {});
+        require(mgstc::app::SatelliteEditorParityTestAccess::check(scc_editor, opll_editor),
+            "owned SCC and OPLL timers retain immediate OFF and shared instance note");
+    }
+
+    std::unique_ptr<juce::AudioProcessorEditor> editor(processor.createEditor());
+    auto restored = original;
+    restored.name = "Host restore while editor open";
+    restored.layers[1].enabled = false;
+    const auto compiles = Access::stateCompileCount(processor);
+    MgstcAudioProcessor source;
+    require(source.replacePluginState(documentFrom(restored, 0, {})), "restore source");
+    const auto blob = stateBytes(source);
+    processor.setStateInformation(blob.getData(), static_cast<int>(blob.getSize()));
+    requireWorkingCompositeMatchesProcessor(editor.get(), processor, "host restore hydrates existing editor");
+    require(Access::stateCompileCount(processor) == compiles + 1,
+        "host hydration does not compile or resubmit old sound");
+    const auto revision = processor.editorStateRestoreRevision();
+    processor.setStateInformation("invalid", 7);
+    require(processor.editorStateRestoreRevision() == revision, "invalid state does not notify UI");
+    requireWorkingCompositeMatchesProcessor(editor.get(), processor, "invalid state leaves UI intact");
+    const auto old_revision = processor.editorStateRestoreRevision();
+    context.acknowledgeStateRestore(old_revision);
+    restored.name = "Background host restore";
+    require(source.replacePluginState(documentFrom(restored, 0, {})), "background restore source");
+    const auto background_blob = stateBytes(source);
+    std::thread restore_thread([&] {
+        processor.setStateInformation(background_blob.getData(), static_cast<int>(background_blob.getSize()));
+    });
+    restore_thread.join();
+    std::uint8_t capacity{};
+    const auto background_compiles = Access::stateCompileCount(processor);
+    require(!processor.replaceEditorComposite(original, true, capacity, old_revision),
+        "old UI document cannot overwrite background host restore before dispatch");
+    require(!processor.previewEditorComposite(original, true, capacity, old_revision),
+        "old temporary preview cannot overwrite restored runtime");
+    require(!context.audition().noteOn(9, 73)
+        && !context.audition().noteOff(9),
+        "old UI notes and cleanup cannot affect restored host runtime");
+    context.acknowledgeStateRestore(processor.editorStateRestoreRevision());
+    require(context.audition().noteOn(9, 73)
+        && context.audition().noteOff(9),
+        "hydrated editor can audition the restored runtime");
+    require(Access::stateCompileCount(processor) == background_compiles,
+        "stale editor submissions reject before compiling");
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    requireWorkingCompositeMatchesProcessor(editor.get(), processor, "background restore hydrates on message thread");
+    for (auto* child : editor->getChildren()) {
+        if (auto* composite = dynamic_cast<mgstc::app::CompositeEditorComponent*>(child))
+        {
+            require(EditorAccess::historySize(*composite) == 1,
+                "host restore resets old undo history");
+            EditorAccess::editName(*composite, "New edit after restore");
+            Access::notifyStateRestored(processor);
+            require(EditorAccess::sound(*composite).name == "New edit after restore",
+                "late duplicate restore notification preserves subsequent edit");
+        }
+    }
+}
+
 void testPluginEditor() {
     MgstcAudioProcessor processor;
     const auto before = stateBytes(processor);
@@ -4736,6 +4880,7 @@ int main() {
         testSccMorphPluginStateCompatibility();
         testPluginProjectRestore();
         testPluginEditor();
+        testEditorParityCorrections();
         testCompositePlaybackWaveform();
         testCompositeEditorDelayedKeyOff();
         testPluginSoundAuthority();
