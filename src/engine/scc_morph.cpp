@@ -1595,6 +1595,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
             std::map<SccWaveform, std::size_t> offsets;
             std::map<std::size_t, SccWaveform> event_waves;
             std::optional<std::uint8_t> start;
+            std::vector<SavedTimbreReference> references;
         };
         std::vector<Group> groups;
         for (std::size_t layer_index = 0; layer_index < input.layers.size(); ++layer_index) {
@@ -1640,10 +1641,34 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
                 return fail("SCC channel needs more than 32 output waveforms");
             groups.push_back(std::move(group));
         }
+        // Shared definitions are exact final 32-byte waves. Explicit manual
+        // ranges keep their start/offset contract; automatic channels reuse
+        // any existing definition and reserve a run only for missing waves.
+        std::map<SccWaveform, SavedTimbreReference> bank;
+        for (const auto& [wave, allocation] : materialized) {
+            const auto* snapshot = findEmbeddedTimbreSnapshot(
+                result.timbre, allocation.id);
+            if (!snapshot) return fail("SCC output waveform snapshot is unavailable");
+            auto reference = *snapshot;
+            reference.number_mode = TimbreNumberMode::Manual;
+            reference.manual_number = allocation.number;
+            bank.emplace(wave, std::move(reference));
+        }
         const auto legacy_used = static_cast<std::size_t>(
             std::count(occupied.begin(), occupied.end(), true));
+        std::map<SccWaveform, bool> known_waves;
+        for (const auto& [wave, reference] : bank) known_waves.emplace(wave, true);
         result.required = legacy_used;
-        for (const auto& group : groups) result.required += group.waves.size();
+        for (const auto& group : groups) {
+            if (!input.layers[group.layer].scc_output_start) continue;
+            result.required += group.waves.size();
+            for (const auto& wave : group.waves) known_waves.emplace(wave, true);
+        }
+        for (const auto& group : groups) {
+            if (input.layers[group.layer].scc_output_start) continue;
+            for (const auto& wave : group.waves)
+                if (known_waves.emplace(wave, true).second) ++result.required;
+        }
         result.capacity = 32;
         if (result.required > 32)
             return fail("SCC global output capacity exceeded: required "
@@ -1654,11 +1679,24 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
                 if (occupied[n]) return false;
             return true;
         };
-        const auto reserve = [&](std::size_t start, std::size_t count) {
-            for (std::size_t n = start; n < start + count; ++n) occupied[n] = true;
+        const auto define_wave = [&](const SccWaveform& wave, std::uint8_t number) {
+            SavedTimbreReference reference;
+            reference.library_id = allocateCompositeOwnedTimbreId(result.timbre);
+            reference.source = TimbreSource::Scc;
+            reference.number_mode = TimbreNumberMode::Manual;
+            reference.manual_number = number;
+            reference.name = "SCC channel @" + std::to_string(number);
+            for (std::size_t n = 0; n < 32; ++n)
+                reference.scc_waveform[n] = static_cast<std::uint8_t>(wave[n]);
+            result.timbre.embedded_timbres.push_back(reference);
+            occupied[number] = true;
+            const auto existing = bank.find(wave);
+            if (existing == bank.end() || number < *existing->second.manual_number)
+                bank[wave] = reference;
+            return reference;
         };
-        // A manual range never silently moves. Reserve every manual request
-        // before first-fit automatic channels, irrespective of layer order.
+        // Manual/manual and manual/legacy overlap remains an error even when
+        // samples match: an explicit authored range is never silently moved.
         for (auto& group : groups) {
             const auto requested = input.layers[group.layer].scc_output_start;
             if (!requested) continue;
@@ -1666,34 +1704,32 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
                 return fail("SCC manual channel range conflicts or exceeds @31 (start @"
                     + std::to_string(*requested) + ")");
             group.start = requested;
-            reserve(*requested, group.waves.size());
+            for (std::size_t offset = 0; offset < group.waves.size(); ++offset)
+                group.references.push_back(define_wave(group.waves[offset],
+                    static_cast<std::uint8_t>(*requested + offset)));
         }
         for (auto& group : groups) {
             if (group.start) continue;
-            for (std::size_t start = 0; start < 32; ++start) {
-                if (!fits(start, group.waves.size())) continue;
-                group.start = static_cast<std::uint8_t>(start);
-                reserve(start, group.waves.size());
-                break;
+            std::vector<SccWaveform> missing;
+            for (const auto& wave : group.waves)
+                if (!bank.contains(wave)) missing.push_back(wave);
+            if (!missing.empty()) {
+                std::optional<std::size_t> start;
+                for (std::size_t n = 0; n < 32; ++n)
+                    if (fits(n, missing.size())) { start = n; break; }
+                if (!start)
+                    return fail("SCC automatic allocation has no contiguous range of "
+                        + std::to_string(missing.size()) + " new waveforms");
+                for (std::size_t offset = 0; offset < missing.size(); ++offset)
+                    define_wave(missing[offset], static_cast<std::uint8_t>(*start + offset));
             }
-            if (!group.start)
-                return fail("SCC automatic allocation has no contiguous range of "
-                    + std::to_string(group.waves.size()) + " waveforms");
+            for (const auto& wave : group.waves) group.references.push_back(bank.at(wave));
+            // Automatic references may span a shared bank and a new run. This
+            // diagnostic records the base number, not a relocated manual range.
+            group.start = group.references.front().manual_number;
         }
         for (const auto& group : groups) {
-            std::vector<SavedTimbreReference> references;
-            for (std::size_t offset = 0; offset < group.waves.size(); ++offset) {
-                SavedTimbreReference reference;
-                reference.library_id = allocateCompositeOwnedTimbreId(result.timbre);
-                reference.source = TimbreSource::Scc;
-                reference.number_mode = TimbreNumberMode::Manual;
-                reference.manual_number = static_cast<std::uint8_t>(*group.start + offset);
-                reference.name = "SCC channel @" + std::to_string(*reference.manual_number);
-                for (std::size_t n = 0; n < 32; ++n)
-                    reference.scc_waveform[n] = static_cast<std::uint8_t>(group.waves[offset][n]);
-                result.timbre.embedded_timbres.push_back(reference);
-                references.push_back(std::move(reference));
-            }
+            const auto& references = group.references;
             auto& layer = result.timbre.layers[group.layer];
             layer.base_timbre = references.front();
             for (const auto& [index, wave] : group.event_waves) {

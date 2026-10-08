@@ -995,13 +995,17 @@ void testContiguousChannelAllocation() {
     tone.layers.push_back(second);
     const auto allocated = compileSccMorph(tone);
     require(allocated.valid && allocated.channel_allocations.size() == 2,
-            "two SCC channels receive distinct contiguous ranges");
+            "two SCC channels receive shared exact-wave output assignments");
     const auto a = allocated.channel_allocations[0];
     const auto b = allocated.channel_allocations[1];
-    require(b.start == 0 && b.manual && a.start >= b.count,
-            "manual range reserved before automatic regardless of layer order");
-    require(allocated.used == a.count + b.count && allocated.capacity == 32,
-            "global capacity includes both complete channel ranges");
+    require(b.start == 0 && b.manual && a.start == b.start && !a.manual,
+            "automatic channel reuses exact manual bank regardless of layer order");
+    require(allocated.used == b.count && allocated.required == b.count
+                && allocated.capacity == 32,
+            "global capacity counts shared output definitions once");
+    require(allocated.timbre.layers[0].base_timbre->library_id
+                == allocated.timbre.layers[1].base_timbre->library_id,
+            "shared base waveform uses the same owned definition");
     const auto saved = CompositeTimbreLibrary::serializeTimbreFile(tone, 0);
     require(CompositeTimbreLibrary::deserializeTimbreFile(saved) == tone,
             "manual and automatic starts survive portable save");
@@ -1028,6 +1032,16 @@ void testContiguousChannelAllocation() {
         if (i == 30) {
             const auto full = compileSccMorph(tone);
             require(full.valid && full.used == 32, "exact global 32-wave capacity accepted");
+            auto doubled = tone;
+            auto shared = doubled.layers.front();
+            shared.channel = 1;
+            shared.envelope_number = 1;
+            shared.scc_output_start.reset();
+            doubled.layers.push_back(std::move(shared));
+            const auto full_shared = compileSccMorph(doubled);
+            require(full_shared.valid && full_shared.used == 32
+                        && full_shared.required == 32,
+                    "two complete channels share the same 32-wave bank");
         }
     }
     require(!compileSccMorph(tone).valid, "33 distinct output waves rejected");
@@ -1040,6 +1054,232 @@ void testContiguousChannelAllocation() {
     tone.layers.push_back(legacy);
     require(!compileSccMorph(tone).valid, "contiguous range cannot overwrite ordinary channel waveform");
 }
+void testSharedAutomaticSccBankAndEnvelopes() {
+    auto tone = morphProgram(sawWave(), sawWave(3), 0, 20, 0);
+    auto& first = tone.layers.front();
+    first.scc_output_allocation = SccOutputAllocationMode::Contiguous;
+    first.scc_output_start = 16;
+    first.timbre_automation[1].scc_morph.enabled = false;
+    first.envelope_timeline = {.length_counts = 8,
+        .loop_start_count = 2, .loop_end_count = 6};
+    first.timbre_automation[1].count = 4;
+    first.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {EnvelopeEventKind::Volume, 8, 0, 2},
+        {EnvelopeEventKind::Volume, 3, 0, 4},
+    };
+    auto second = first;
+    second.channel = 1;
+    second.envelope_number = 1;
+    second.scc_output_start.reset();
+    second.micro_detune = 9;
+    second.relative_semitones = 2;
+    tone.layers.push_back(second);
+    const auto compiled = compileSccMorph(tone);
+    require(compiled.valid && compiled.used == 2 && compiled.required == 2,
+            "two detuned SCC channels reuse final exact waves");
+    require(compiled.timbre.layers[0].timbre_automation[1].target_library_id
+                == compiled.timbre.layers[1].timbre_automation[1].target_library_id,
+            "shared event wave uses the same definition ID");
+    const auto output = formatMgsComposite(tone);
+    require(output.valid() && extractMgsSourceDefinitions(output.source, 's').size() == 2
+                && extractMgsSourceDefinitions(output.source, 'e').size() == 1,
+            "same tone/volume/pitch/loop bytes emit one shared SCC @e");
+    require(output.source.find("5 v15 @16 @e0") != std::string::npos
+                && output.source.find("@\\9") != std::string::npos,
+            "second channel references shared ENV and keeps track micro-detune");
+    const auto imported = parseMgsComposite(output.source);
+    require(imported.valid() && imported.timbre.layers.size() == 2
+                && imported.timbre.layers[0].envelope_number
+                    != imported.timbre.layers[1].envelope_number,
+            "shared ENV import creates independently editable authoring lanes");
+    const auto reexport = formatMgsComposite(imported.timbre);
+    require(reexport.valid() && extractMgsSourceDefinitions(reexport.source, 'e').size() == 1,
+            "shared SCC ENV fixture imports and re-exports without duplication");
+    EngineCore imported_engine;
+    require(compileCompositeProgram(imported_engine, imported.timbre),
+            "shared ENV imported fixture compiles through ordinary runtime path");
+    require(imported.timbre.layers[1].micro_detune == 9
+                && imported.timbre.layers[1].relative_semitones == 2,
+            "shared ENV roundtrip preserves track pitch settings");
+    auto changed = tone;
+    changed.layers[1].envelope_timeline.loop_end_count = 7;
+    const auto loop_output = formatMgsComposite(changed);
+    require(loop_output.valid() && extractMgsSourceDefinitions(loop_output.source, 'e').size() == 2,
+            "different loop bytes never share ENV");
+    changed = tone;
+    changed.layers[1].pitch_envelope.events = {{EnvelopeEventKind::Pitch, 1, 0, 3}};
+    const auto pitch_output = formatMgsComposite(changed);
+    require(pitch_output.valid() && extractMgsSourceDefinitions(pitch_output.source, 'e').size() == 2,
+            "different ENV pitch bytes never share ENV");
+    changed = tone;
+    const auto new_wave = sccTone(4000, 18, sawWave(5));
+    changed.embedded_timbres.push_back(new_wave);
+    changed.layers[1].timbre_automation[1].target_library_id = new_wave.library_id;
+    const auto partial = compileSccMorph(changed);
+    require(partial.valid && partial.used == 3 && partial.required == 3
+                && partial.timbre.layers[1].base_timbre->manual_number == 16
+                && partial.timbre.layers[1].timbre_automation[1].value == 0,
+            "automatic channel reuses shared base and first-fits only its new wave");
+    changed = tone;
+    changed.layers[0].scc_output_allocation = SccOutputAllocationMode::LegacyBank;
+    changed.layers[0].scc_output_start.reset();
+    const auto legacy_shared = compileSccMorph(changed);
+    require(legacy_shared.valid && legacy_shared.used == 2
+                && legacy_shared.timbre.layers[0].base_timbre->library_id
+                    == legacy_shared.timbre.layers[1].base_timbre->library_id,
+            "automatic channel shares exact existing legacy definitions");
+}
+
+void testSharedSequenceDefinitionHasIndependentTrackState() {
+    // Definition pointer and execution state live separately in MGSDRV track work.
+    const std::vector<std::uint8_t> shared{
+        0xEF, 2, 0x28, 2, 0x40, 0xE3, 2, 0xE5, 2, 0x60};
+    RuntimeSession session;
+    require(session.setSequenceEnvelope(3, shared)
+                && session.setSequenceEnvelope(4, shared),
+            "same immutable ENV definition installs on two SCC tracks");
+    session.gateUntilNoteOn();
+    require(session.queueNoteOn(3, 60) && session.queueNoteOn(4, 60),
+            "shared ENV fixture keys on both SCC tracks");
+    std::array<int, 2> observed{-1, -1};
+    const auto volumes = [&]() {
+        auto result = observed;
+        for (const auto& write : session.writes())
+            if (write.chip == ChipId::Scc && write.reason == WriteReason::Volume
+                && write.track >= 3 && write.track <= 4)
+                result[write.track - 3] = write.value;
+        observed = result;
+        return result;
+    };
+    require(session.processTick().ok() && volumes() == std::array<int, 2>{15, 15},
+            "shared definition initializes each track's volume on key-on");
+    require(session.processTick().ok(), "shared ENV hold tick");
+    require(session.processTick().ok() && volumes() == std::array<int, 2>{15, 15},
+            "shared ENV ramp starts with independent retained origin");
+    require(session.queueKeyOn(3) && session.processTick().ok()
+                && volumes() == std::array<int, 2>{15, 12},
+            "retrigger one shared ENV track does not reset other's ramp remainder");
+    require(session.processTick().ok() && volumes()[1] == 3,
+            "other shared ENV track reaches its own loop phase");
+    require(session.queueKeyOn(3) && session.processTick().ok() && volumes()[1] == 3,
+            "repeated retrigger preserves other track's loop wait");
+    require(session.processTick().ok() && volumes()[1] == 5,
+            "other track continues through its independent loop position");
+    require(session.queueKeyOn(3) && session.processTick().ok(),
+            "shared ENV key-on ordered-write fixture advances");
+    std::uint8_t previous_track{};
+    for (const auto& write : session.writes()) {
+        require(write.track >= previous_track, "track write order stays stable with shared ENV");
+        previous_track = write.track;
+    }
+}
+
+void testSharedBankOnSccChannelFourFiveRam() {
+    auto authored = morphProgram(sawWave(), sawWave(), 0, 20, 0);
+    auto& first = authored.layers.front();
+    first.channel = 3;
+    first.scc_output_allocation = SccOutputAllocationMode::Contiguous;
+    first.scc_output_start = 16;
+    first.timbre_automation.clear();
+    first.envelope_timeline = {.length_counts = 8,
+        .loop_start_count = 2, .loop_end_count = 6};
+    first.volume_envelope.events = {
+        {EnvelopeEventKind::Volume, 15, 0, 0},
+        {EnvelopeEventKind::Volume, 8, 0, 2},
+        {EnvelopeEventKind::Volume, 3, 0, 4},
+    };
+    auto second = first;
+    second.channel = 4;
+    second.envelope_number = 1;
+    second.scc_output_start.reset();
+    second.micro_detune = 9;
+    authored.layers.push_back(second);
+    const auto bank = compileSccMorph(authored);
+    require(bank.valid && bank.used == 1 && bank.required == 1
+                && bank.timbre.layers[0].base_timbre == bank.timbre.layers[1].base_timbre,
+            "SCC channels four/five share one exact final bank definition");
+    const auto numbers = resolveTimbreNumbers(bank.timbre);
+    const auto envelope = formatMgsCompositeEnvelope(bank.timbre.layers[0], 0,
+        kMgscEnvelopeCompiledByteLimit, &numbers);
+    const auto detuned = formatMgsCompositeEnvelope(bank.timbre.layers[1], 1,
+        kMgscEnvelopeCompiledByteLimit, &numbers);
+    require(envelope.valid() && detuned.valid() && envelope.bytecode == detuned.bytecode,
+            "shared-RAM channel pair emits identical ENV bytes outside detune");
+    const auto make_engine = [&](bool play_four, bool play_five) {
+        auto engine = std::make_unique<EngineCore>();
+        require(engine->setGains({.master = 1.0f, .psg = 1.0f,
+                    .scc = 1.0f, .opll = 1.0f}), "shared-RAM PCM gains configured");
+        auto& session = engine->session();
+        const auto& reference = *bank.timbre.layers[0].base_timbre;
+        require(session.mapper().defineSccPatch(*reference.manual_number, reference.scc_waveform)
+                    == MapError::None,
+                "final shared-bank definition installs through existing mapper");
+        for (const std::uint8_t track : {std::uint8_t{6}, std::uint8_t{7}})
+            require(session.setSequenceEnvelope(track, envelope.bytecode)
+                        && session.setTrackPatch(track, reference.manual_number)
+                        && session.setTrackVolume(track, 15)
+                        && session.setTrackDetune(track, 0, track == 7 ? 9 : 0),
+                    "actual SCC shared-RAM tracks retain independent ENV/detune state");
+        session.gateUntilNoteOn();
+        require((!play_four || session.queueNoteOn(6, 60))
+                    && (!play_five || session.queueNoteOn(7, 60)),
+                "shared-RAM fixture queues requested physical notes");
+        return engine;
+    };
+    auto both = make_engine(true, true);
+    auto four = make_engine(true, false);
+    auto five = make_engine(false, true);
+    std::array<float, 1600> mixed{}, pcm_four{}, pcm_five{};
+    require(both->render(mixed).ok() && four->render(pcm_four).ok()
+                && five->render(pcm_five).ok(), "shared-RAM fixture renders without runtime errors");
+    std::array<std::vector<std::uint8_t>, 2> transfers;
+    std::array<unsigned, 2> periods{};
+    std::uint8_t previous_track{};
+    for (const auto& write : both->session().writes()) {
+        require(write.track >= previous_track, "shared-RAM same-tick writes keep MGSDRV track order");
+        previous_track = write.track;
+        if (write.chip != ChipId::Scc || write.track < 6 || write.track > 7) continue;
+        const auto channel = static_cast<std::size_t>(write.track - 6);
+        if (write.reason == WriteReason::Patch && write.port == 0) {
+            require(write.address == 96 + transfers[channel].size() % 32,
+                    "both shared-RAM wave transfers preserve addresses 96 through 127");
+            transfers[channel].push_back(write.value);
+        }
+        if (write.reason == WriteReason::Frequency && write.port == 1)
+            periods[channel] |= static_cast<unsigned>(write.value)
+                << ((write.address % 2) * 8);
+    }
+    require(!transfers[0].empty() && transfers[0].size() % 32 == 0
+                && transfers[0] == transfers[1],
+            "sharing a definition retains both complete identical physical wave writes");
+    require(periods[0] != periods[1], "shared waveform leaves physical channel detune independent");
+    double peak_four{}, peak_five{};
+    for (std::size_t i = 0; i < mixed.size(); ++i) {
+        peak_four = std::max(peak_four, std::abs(static_cast<double>(pcm_four[i])));
+        peak_five = std::max(peak_five, std::abs(static_cast<double>(pcm_five[i])));
+        requireNear(mixed[i], static_cast<double>(pcm_four[i]) + pcm_five[i], 1.0e-6,
+                    "same-wave shared-RAM pair PCM equals independent physical-channel sum");
+    }
+    require(peak_four > 0.001 && peak_five > 0.001, "both shared-RAM channels remain audible");
+    std::array<int, 2> volumes{15, 15};
+    const auto render_tick = [&]() {
+        const auto rendered = both->render(mixed);
+        for (const auto& write : both->session().writes())
+            if (write.chip == ChipId::Scc && write.reason == WriteReason::Volume
+                && write.track >= 6 && write.track <= 7)
+                volumes[write.track - 6] = write.value;
+        return rendered.ok();
+    };
+    require(render_tick() && render_tick() && volumes == std::array<int, 2>{8, 8},
+            "shared-RAM pair advances the same ENV independently");
+    require(both->session().queueKeyOn(6) && render_tick()
+                && volumes == std::array<int, 2>{15, 8},
+            "retrigger fourth SCC channel leaves fifth channel ENV wait intact");
+    require(render_tick() && volumes[1] == 3,
+            "fifth SCC channel reaches its own loop after fourth channel retrigger");
+}
+
 void testCompositeCompilationBoundariesAndAllocation() {
     const auto first = sawWave();
     const auto last = sawWave(3, 8);
@@ -1852,6 +2092,9 @@ int main() {
         testSccMorphDistributionPlans();
         testGlobalPhaseOptimizationAndTransitionCost();
         testContiguousChannelAllocation();
+        testSharedAutomaticSccBankAndEnvelopes();
+        testSharedSequenceDefinitionHasIndependentTrackState();
+        testSharedBankOnSccChannelFourFiveRam();
         testCompositeCompilationBoundariesAndAllocation();
         testMorphBlockBoundaryAnchors();
         testMorphAcrossEnvelopeLoopBrackets();

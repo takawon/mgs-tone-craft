@@ -46,6 +46,14 @@ RealtimeEngineHost::~RealtimeEngineHost() {
     }
 }
 
+std::size_t RealtimeEngineHost::freeProgramSlotCount() const noexcept {
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < kProgramSlotCount; ++index)
+        if (programs_[index].state.load(std::memory_order_acquire) == ProgramSlotState::Free)
+            ++count;
+    return count;
+}
+
 ProgramEdit RealtimeEngineHost::beginProgramEdit() {
     // All construction and destruction stays on the UI thread.
     // Skip EngineCore construction when every slot is busy so rapid 1s

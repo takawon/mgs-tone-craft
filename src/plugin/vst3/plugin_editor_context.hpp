@@ -213,7 +213,8 @@ private:
                 : std::nullopt;
             result.ok = request.temporary
                 ? self_.processor_.previewEditorComposite(
-                    *request.timbre, request.polyphonic, capacity, revision)
+                    *request.timbre, request.polyphonic, capacity, revision,
+                    request.reserve_restore_slot, &result.deferred)
                 : self_.processor_.replaceEditorComposite(
                     *request.timbre, request.polyphonic, capacity, revision);
             result.voice_capacity = capacity;

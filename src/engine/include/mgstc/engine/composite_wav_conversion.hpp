@@ -17,6 +17,7 @@ enum class CompositeWavConfiguration { Scc, SccScc, SccOpllRom, SccOpllOriginal 
 enum class CompositeWavStrategy { Automatic, FundamentalResidual, LowHigh, AttackSustain, Independent };
 enum class CompositeWavPreference { Balanced, Quality, Compact };
 enum class CompositeWavLoopMode { Automatic, None };
+enum class CompositeWavSccWaveMethod { Reconstructed, DirectPeriodic };
 enum class CompositeWavStage { Idle, Candidates, Morph, Envelope, Evaluation, Completed, Cancelled };
 
 struct CompositeWavConversionControl {
@@ -30,6 +31,7 @@ struct CompositeWavConversionOptions {
     CompositeWavStrategy strategy{CompositeWavStrategy::Automatic};
     CompositeWavPreference preference{CompositeWavPreference::Balanced};
     CompositeWavLoopMode loop_mode{CompositeWavLoopMode::Automatic};
+    CompositeWavSccWaveMethod scc_wave_method{CompositeWavSccWaveMethod::Reconstructed};
     std::size_t max_scc_waveforms{16};
     // Selected by the composite editor's allocation control, not duplicated UI.
     std::optional<std::uint8_t> scc_start_number;
@@ -55,6 +57,12 @@ struct CompositeWavQualityMetrics {
     double volume{};
     double transition{};
     double complexity{};
+    // Local maxima, independently reported from whole-selection mean errors.
+    double max_wave_sample{}, max_wave_aligned{}, max_wave_harmonic{};
+    double max_wave_log_spectrum{}, max_wave_rms{}, max_transition_per_count{};
+    double max_pcm_discontinuity{}, max_pcm_spectral_change{};
+    double loop_entry{}, loop_boundary{}, loop_steady{};
+    double neighbour_pitch_penalty{};
     double total{};
 };
 
@@ -66,6 +74,8 @@ struct CompositeWavQualityWeights {
     double attack{0.8};
     double volume{0.5};
     double transition{0.02};
+    double local_discontinuity{0.25};
+    double waveform_continuity{0.10};
     double complexity{0.003};
 };
 
@@ -122,6 +132,19 @@ struct CompositeWavMorphSearchDiagnostics {
     // feature proposal, complete candidate evaluation and early-return work.
     // Disjoint from adaptive_candidate_seconds; both are worker wall times.
     double adaptive_refinement_seconds{};
+    std::size_t source_spectrum_cache_hits{}, source_spectrum_cache_misses{};
+    std::size_t source_wave_cache_hits{}, source_wave_cache_misses{};
+    std::size_t source_cache_bytes{};
+    std::size_t same_wave_trials{}, detune_trials{}, near_wave_trials{}, mixed_role_trials{};
+    std::size_t neighbour_pitch_probe_renders{};
+    std::size_t opll_contour_probe_renders{}, opll_counterfactual_probe_renders{};
+    std::size_t approximate_reuse_trials{}, approximate_reuse_accepted{}, dynamic_opll_trials{}, dynamic_opll_accepted{};
+    // Last fully scored approximate-reuse proposal versus its current retained baseline.
+    double approximate_reuse_objective_delta{}, approximate_reuse_local_delta{};
+    std::int32_t approximate_reuse_waveforms_saved{};
+    double source_feature_seconds{}, keyframe_seconds{}, reuse_seconds{}, loop_seconds{};
+    double detune_seconds{}, opll_seconds{}, serialization_seconds{};
+    double wave_generation_seconds{}, direct_extraction_seconds{}, rendering_seconds{}, scoring_seconds{};
 };
 
 struct CompositeWavConversionResult {

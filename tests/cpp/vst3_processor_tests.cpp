@@ -66,6 +66,11 @@ struct CompositeEditorComponentTestAccess {
     static std::size_t historySize(const CompositeEditorComponent& editor) { return editor.history_.size(); }
     static std::size_t historyCursor(const CompositeEditorComponent& editor) { return editor.history_cursor_; }
     static void applyWave(CompositeEditorComponent& editor, const mgstc::engine::CompositeTimbre& sound) { editor.applyWaveConversion(sound); }
+    static void bindWaveAudition(CompositeEditorComponent& editor, CompositeWavConversionContent& content) {
+        editor.bindWaveConversionAudition(content);
+    }
+    static bool hasWavePreview(const CompositeEditorComponent& editor) { return editor.wave_conversion_preview_.has_value(); }
+    static const mgstc::engine::CompositeTimbre& wavePreview(const CompositeEditorComponent& editor) { return *editor.wave_conversion_preview_; }
     static void undo(CompositeEditorComponent& editor) { editor.undo(); }
     static void redo(CompositeEditorComponent& editor) { editor.redo(); }
     static bool matches(const CompositeEditorComponent& editor, const mgstc::engine::CompositeTimbre& snapshot) {
@@ -157,6 +162,22 @@ struct CompositeWavConversionTestAccess {
     static void clickAnalyze(CompositeWavConversionContent& content) { content.analyze_.onClick(); }
     static void clickConvert(CompositeWavConversionContent& content) { content.convert_.onClick(); }
     static void clickApply(CompositeWavConversionContent& content) { content.apply_.onClick(); }
+    static void clickCancel(CompositeWavConversionContent& content) { content.cancel_.onClick(); }
+    static int waveMethod(const CompositeWavConversionContent& content) { return content.wave_method_.getSelectedId(); }
+    static void setWaveMethod(CompositeWavConversionContent& content, int id) { content.wave_method_.setSelectedId(id, juce::sendNotificationSync); }
+    static bool hasComparisonButtonsWithoutAb(const CompositeWavConversionContent& content) {
+        bool original = false, converted = false, stop = false;
+        for (auto* child : content.getChildren()) {
+            if (auto* button = dynamic_cast<juce::TextButton*>(child)) {
+                const auto label = button->getButtonText();
+                if (label.contains("A/B")) return false;
+                original |= label == juce::String::fromUTF8("原音 ▶");
+                converted |= label == juce::String::fromUTF8("変換音 ▶");
+                stop |= label == juce::String::fromUTF8("停止");
+            }
+        }
+        return original && converted && stop;
+    }
     static bool hasResult(const CompositeWavConversionContent& content) { return content.result_.has_value(); }
     static juce::String status(const CompositeWavConversionContent& content) { return content.status_.getText(); }
     static void setSelection(CompositeWavConversionContent& content, std::size_t begin, std::size_t end) {
@@ -168,6 +189,9 @@ struct CompositeWavConversionTestAccess {
     static bool buttonsInside(const CompositeWavConversionContent& content) {
         return content.getLocalBounds().contains(content.level_match_.getBounds())
             && content.level_match_.getWidth() >= UiScale::sx(250)
+            && content.getLocalBounds().contains(content.wave_method_.getBounds())
+            && !content.wave_method_.getBounds().intersects(content.level_match_.getBounds())
+            && content.wave_method_.getWidth() >= UiScale::sx(250)
             && content.getLocalBounds().contains(content.analyze_.getBounds())
             && content.status_.getHeight() >= UiScale::sx(100)
             && content.getLocalBounds().contains(content.apply_.getBounds());
@@ -4443,6 +4467,145 @@ void testCompositeWavUiTransactions() {
     processEmpty(processor, 512);
 }
 
+void testCompositeWavCandidateAudition() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    using WavAccess = mgstc::app::CompositeWavConversionTestAccess;
+    using ProcessorAccess = mgstc::plugin::MgstcAudioProcessorTestAccess;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    auto original = mgstc::engine::defaultCompositeTimbre();
+    original.name = "WAV audition original";
+    require(processor.replacePluginState(documentFrom(original, 0, {})), "seed candidate audition state");
+    processEmpty(processor, 512);
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {}, [] {}, [](std::uint8_t) {},
+        [](juce::Component*) {}, [] {}, original);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    const auto before = EditorAccess::sound(editor);
+    const auto saved_state = stateBytes(processor);
+    const auto history_before = EditorAccess::historySize(editor);
+    auto candidate = sccOnlyTimbre();
+    candidate.name = "Temporary WAV candidate";
+    auto pcm = std::make_shared<mgstc::engine::SourcePcm>();
+    pcm->sample_rate = 48000; pcm->channels = 1;
+    pcm->mono_samples.assign(128, 0.1f); pcm->interleaved_samples = pcm->mono_samples;
+    mgstc::engine::CompositeWavConversionResult valid;
+    valid.completion = mgstc::engine::CompositeWavConversionCompletion::Completed;
+    valid.composite_tone = candidate;
+    {
+        mgstc::app::CompositeWavConversionContent content(
+            [&](const mgstc::engine::CompositeTimbre& converted, std::function<void()> close) {
+                EditorAccess::applyWave(editor, converted);
+                if (close) close();
+            }, context.pcmPreview(), context.backgroundTasks());
+        EditorAccess::bindWaveAudition(editor, content);
+        require(WavAccess::hasComparisonButtonsWithoutAb(content), "Original/Converted/Stop remain and A/B is absent");
+        require(WavAccess::waveMethod(content) == 1, "SCC wave generation defaults to reconstructed");
+        WavAccess::setWaveMethod(content, 2);
+        require(WavAccess::waveMethod(content) == 2, "direct periodic generation is keyboard-selectable in shared UI");
+        // Windows WM_CHAR supplies a printable text character; the one-argument
+        // KeyPress constructor intentionally supplies no text character.
+        const juce::KeyPress pc_z('Z', {}, 'z');
+        require(!content.keyPressed(pc_z), "no candidate does not capture PC performance keys");
+        require(WavAccess::accept(content, valid, pcm), "install completed WAV audition candidate");
+        processEmpty(processor, 512);
+        require(EditorAccess::hasWavePreview(editor) && EditorAccess::wavePreview(editor) == candidate,
+            "actual dialog callback binding publishes a separate temporary candidate");
+        const auto& plan = ProcessorAccess::plan(processor);
+        require(plan.audible_layers.size() == 1
+                && plan.audible_layers.front().source == mgstc::engine::TimbreSource::Scc
+                && plan.audible_layers.front().relative_semitones == candidate.layers.front().relative_semitones,
+            "host MIDI uses the candidate's layers and transposition before Apply");
+        require(content.keyPressed(pc_z), "WAV window forwards PC performance keys through existing mapping");
+        require(!content.keyPressed(juce::KeyPress('z', juce::ModifierKeys::ctrlModifier, 'z')),
+            "WAV window preserves modified editing shortcuts");
+        EditorAccess::start(editor, 72);
+        require(EditorAccess::scheduled(editor) == 1 && EditorAccess::containsNote(editor, 72),
+            "shared PC/MIDI UI note path uses candidate scheduling rather than original three layers");
+        const auto onset = EditorAccess::onset(editor);
+        EditorAccess::release(editor, 72, onset + 25.0);
+        require(EditorAccess::startsAndStopsShiftedEqually(editor, 25.0),
+            "candidate audition preserves layer delays and key release timing");
+        require(peakOf(captureHostNotePcm(processor, 8192)) > 0.001,
+            "actual DAW MIDI input sounds the temporary candidate through EngineCore");
+        require(EditorAccess::sound(editor) == before && EditorAccess::historySize(editor) == history_before
+                && sameBlock(saved_state, stateBytes(processor)),
+            "candidate keyboard and host MIDI audition preserve authoring data, Undo and serialized Plugin State");
+        require(!WavAccess::accept(content, {}, {}) && !WavAccess::accept(content, valid, pcm, true),
+            "failed or cancelled reconversion is not a candidate replacement");
+        require(EditorAccess::wavePreview(editor) == candidate, "failed reconversion retains prior performance candidate");
+        // A stopped host has no audio consumer to retire pending programs.
+        // Multiple valid conversions must leave one slot for Cancel restoration.
+        processEmpty(processor, 512);
+        const auto stopped_compiles = ProcessorAccess::stateCompileCount(processor);
+        require(WavAccess::accept(content, valid, pcm), "publish first stopped-host candidate");
+        auto latest = valid;
+        latest.composite_tone->layers.front().relative_semitones += 7;
+        require(WavAccess::accept(content, latest, pcm), "retain newest stopped-host candidate");
+        EditorAccess::pollOwned(editor);
+        require(ProcessorAccess::stateCompileCount(processor) == stopped_compiles + 1,
+            "capacity wait neither compiles nor consumes restoration slot");
+        WavAccess::clickCancel(content);
+        processEmpty(processor, 512);
+        EditorAccess::pollOwned(editor);
+        require(!EditorAccess::hasWavePreview(editor) && EditorAccess::scheduled(editor) == 0
+                && EditorAccess::voices(editor) == 0 && ProcessorAccess::plan(processor).audible_layers.size() == 3,
+            "Cancel stops candidate notes and restores the original host MIDI playback plan");
+        require(sameBlock(saved_state, stateBytes(processor)) && EditorAccess::sound(editor) == before,
+            "Cancel restores only runtime program and leaves state bytes unchanged");
+        require(WavAccess::accept(content, valid, pcm), "candidate can be installed again after cancellation");
+        require(WavAccess::accept(content, latest, pcm), "retain latest candidate for resumed host");
+        processEmpty(processor, 512);
+        EditorAccess::pollOwned(editor);
+        processEmpty(processor, 512);
+        require(ProcessorAccess::plan(processor).audible_layers.front().relative_semitones
+                == latest.composite_tone->layers.front().relative_semitones,
+            "timer publishes the latest candidate when actual program capacity returns");
+        require(WavAccess::accept(content, valid, pcm), "restore Apply candidate");
+        processEmpty(processor, 512);
+        WavAccess::clickApply(content);
+        require(!EditorAccess::hasWavePreview(editor) && processor.copyPluginState().sound == candidate
+                && EditorAccess::historySize(editor) == history_before + 1,
+            "Apply clears temporary preview before committing exactly one Undo transaction");
+        processEmpty(processor, 512);
+        EditorAccess::undo(editor);
+        require(EditorAccess::sound(editor) == before && processor.copyPluginState().sound == before,
+            "Undo after candidate audition and Apply restores complete original sound");
+        processEmpty(processor, 512);
+        require(WavAccess::accept(content, valid, pcm), "candidate is available for host-restore lifecycle test");
+        processEmpty(processor, 512);
+        auto restored = before; restored.name = "DAW state restored during WAV preview";
+        require(processor.replacePluginState(documentFrom(restored, 0, {})), "host restores a sound while candidate is installed");
+        processEmpty(processor, 512);
+        editor.restoreHostState(processor.copyPluginState().sound);
+        require(!EditorAccess::hasWavePreview(editor), "host restore drops stale candidate without resubmission");
+        WavAccess::clickCancel(content);
+        require(processor.copyPluginState().sound == restored && EditorAccess::sound(editor) == restored,
+            "old converter cancellation cannot overwrite a newer DAW state");
+    }
+    processEmpty(processor, 512);
+    const auto closed_state = stateBytes(processor);
+    {
+        mgstc::app::CompositeWavConversionContent closing_content(
+            [](const mgstc::engine::CompositeTimbre&, std::function<void()>) {},
+            context.pcmPreview(), context.backgroundTasks());
+        EditorAccess::bindWaveAudition(editor, closing_content);
+        require(WavAccess::accept(closing_content, valid, pcm), "close test publishes first candidate");
+        auto newest = valid;
+        newest.composite_tone->layers.front().relative_semitones += 7;
+        require(WavAccess::accept(closing_content, newest, pcm), "close test retains newest candidate");
+        // Destruction closes the converter without an audio block between candidates.
+    }
+    processEmpty(processor, 512);
+    EditorAccess::pollOwned(editor);
+    require(!EditorAccess::hasWavePreview(editor)
+            && ProcessorAccess::plan(processor).audible_layers.size() == 3
+            && sameBlock(closed_state, stateBytes(processor)),
+        "closing stopped-host converter restores author program and discards deferred candidate");
+}
+
 void testCompositeWavRangeInteractions() {
     using WavAccess = mgstc::app::CompositeWavConversionTestAccess;
     auto pcm = std::make_shared<mgstc::engine::SourcePcm>();
@@ -4506,7 +4669,9 @@ void testCompositeWavActualUiWorkerAndApply() {
             EditorAccess::applyWave(editor, converted);
             if (close) close();
         }, context.pcmPreview(), context.backgroundTasks());
+    EditorAccess::bindWaveAudition(editor, content);
     WavAccess::source(content, pcm);
+    WavAccess::setWaveMethod(content, 2);
     WavAccess::setBudget(content, 1);
     WavAccess::clickAnalyze(content);
     for (int wait = 0; wait < 400 && !WavAccess::analysis(content); ++wait)
@@ -4525,7 +4690,15 @@ void testCompositeWavActualUiWorkerAndApply() {
     for (int wait = 0; wait < 15000 && !WavAccess::hasResult(content); ++wait)
         juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
     require(WavAccess::hasResult(content), "Convert button runs actual optimizer and publishes its completed result");
+    require(EditorAccess::hasWavePreview(editor) && EditorAccess::sound(editor) == previous
+            && processor.copyPluginState().sound == previous,
+        "actual direct-periodic conversion publishes candidate for performance without committing it");
+    // Deliberately keep the candidate pending: Apply must commit directly even
+    // when the host has not consumed another block after worker completion.
+    const auto apply_compiles = Access::stateCompileCount(processor);
     WavAccess::clickApply(content);
+    require(Access::stateCompileCount(processor) == apply_compiles + 1,
+        "Apply submits one converted program without an obsolete original-program restore");
     require(applied && EditorAccess::sound(editor) != previous,
         "Apply control sends actual converted result through shared editor transaction");
     require(processor.copyPluginState().sound == EditorAccess::sound(editor),
@@ -4547,21 +4720,30 @@ void testWavMorphPlanVstStateAndReediting() {
     auto pcm = std::make_shared<SourcePcm>();
     pcm->sample_rate = 48'000; pcm->channels = 1; pcm->bit_depth = 32;
     pcm->sample_format = SourceSampleFormat::FloatPcm;
-    for (std::size_t i = 0; i < 14'400; ++i) {
+    // Use the measured 0.25s benchmark source/budget that actually retains a
+    // nonzero Morph plan. A static winner is legal for the old low-budget source.
+    constexpr std::size_t fixture_frames = 12'000;
+    constexpr std::size_t fixture_key_off = 8'640;
+    constexpr double fixture_frequency = 261.625565;
+    for (std::size_t i = 0; i < fixture_frames; ++i) {
         const double t = static_cast<double>(i) / 48'000;
-        const double u = std::clamp((t - .018) / .234, 0.0, 1.0);
-        const double phase = 2 * std::numbers::pi * 220 * t;
-        const auto value = static_cast<float>(std::min(1.0, t / .012) * .28
-            * (.8 * std::sin(phase) + .62 * (1 - u) * std::sin(2 * phase + .2)
-                + .58 * u * std::sin(5 * phase - .3)));
+        const double attack = std::min(1.0, t / .012);
+        const double release = i < fixture_key_off ? 1.0
+            : std::exp(-static_cast<double>(i - fixture_key_off) / (48'000 * .055));
+        const double phase = 2 * std::numbers::pi * fixture_frequency * t;
+        const auto value = static_cast<float>(.34 * attack * release
+            * (.72 * std::sin(phase) + .21 * std::sin(2 * phase + .17)
+                + .07 * std::sin(3 * phase + .41)));
         pcm->mono_samples.push_back(value); pcm->interleaved_samples.push_back(value);
     }
-    SourceAnalysisOptions analysis_options; analysis_options.reference_pitch_hz = 220;
+    SourceAnalysisOptions analysis_options; analysis_options.reference_pitch_hz = fixture_frequency;
     auto analysis = analyzeCompositeWaveSource(pcm, {0, pcm->mono_samples.size()}, analysis_options);
     require(analysis.analysis != nullptr, "WAV plan VST fixture analysis completes");
     CompositeWavConversionOptions options;
-    options.max_scc_waveforms = 4; options.max_evaluations = 12;
-    options.loop_mode = CompositeWavLoopMode::None;
+    options.max_scc_waveforms = 8; options.max_evaluations = 96;
+    options.key_off_position = fixture_key_off;
+    options.stagnation_limit = 0;
+    options.loop_mode = CompositeWavLoopMode::Automatic;
     auto converted = convertCompositeWave(analysis.analysis, options);
     require(converted.composite_tone.has_value() && converted.morph_search.complete_comparisons > 0,
         "actual VST fixture conversion completes fair three-mode comparison");
@@ -4575,7 +4757,7 @@ void testWavMorphPlanVstStateAndReediting() {
     const auto exported = formatMgsComposite(confirmed);
     require(compiled.valid && exported.valid(), "confirmed converter plan compiles for audition and MGSC");
     CompositeWavRenderOptions rendering;
-    rendering.midi_note = 57; rendering.frame_count = 14'400; rendering.key_off_frame = 12'000;
+    rendering.midi_note = 60; rendering.frame_count = fixture_frames; rendering.key_off_frame = fixture_key_off;
     const auto original_pcm = renderCompositeWav(confirmed, rendering);
     require(original_pcm.ok(), "confirmed converter plan uses actual Engine PCM for state parity");
 
@@ -4623,12 +4805,23 @@ void testWavMorphPlanVstStateAndReediting() {
     processEmpty(processor, 512);
 
     const auto original_base = *confirmed.layers.front().base_timbre;
+    // The optimizer may retain a redundant embedded copy of the layer's base.
+    // Exercise the separate base-only picker precondition without changing any
+    // saved Morph plan, layer base or other source waveform.
+    auto picker_source = confirmed;
+    std::erase_if(picker_source.embedded_timbres, [&](const auto& snapshot) {
+        return snapshot.library_id == original_base.library_id;
+    });
+    require(renderCompositeWav(picker_source, rendering).stereo_pcm == original_pcm.stereo_pcm,
+        "base-only picker setup preserves the converter-confirmed actual Engine PCM");
+    EditorAccess::applyWave(editor, picker_source);
+    processEmpty(processor, 512);
     const auto replacement = std::find_if(confirmed.embedded_timbres.begin(), confirmed.embedded_timbres.end(),
         [&](const auto& snapshot) {
             return snapshot.source == TimbreSource::Scc && snapshot.library_id != original_base.library_id;
         });
     require(replacement != confirmed.embedded_timbres.end(), "base reassignment fixture has a distinct existing SCC source");
-    require(std::none_of(confirmed.embedded_timbres.begin(), confirmed.embedded_timbres.end(),
+    require(std::none_of(picker_source.embedded_timbres.begin(), picker_source.embedded_timbres.end(),
         [&](const auto& snapshot) { return snapshot.library_id == original_base.library_id; }),
         "old WAV base exists only in its layer before the actual assignment");
     const auto base_history = EditorAccess::historySize(editor);
@@ -4653,7 +4846,7 @@ void testWavMorphPlanVstStateAndReediting() {
             && reassigned_parse.document.sound == reassigned,
         "retained old base and confirmed plans survive WAV-free Plugin State serialization");
     EditorAccess::undo(editor);
-    require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
+    require(EditorAccess::sound(editor) == picker_source && processor.copyPluginState().sound == picker_source,
         "Undo of base selection removes the retained copy and restores original confirmed WAV state");
     processEmpty(processor, 512);
     EditorAccess::redo(editor);
@@ -4675,7 +4868,11 @@ void testWavMorphPlanVstStateAndReediting() {
     processEmpty(processor, 512);
     EditorAccess::undo(editor); // reset -> reassigned
     processEmpty(processor, 512);
-    EditorAccess::undo(editor); // reassigned -> original confirmed conversion
+    EditorAccess::undo(editor); // reassigned -> base-only picker source
+    require(EditorAccess::sound(editor) == picker_source && processor.copyPluginState().sound == picker_source,
+        "Undo of base reset and reassignment restores the complete base-only picker input");
+    processEmpty(processor, 512);
+    if (picker_source != confirmed) EditorAccess::undo(editor); // remove redundant-copy setup
     require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
         "Undo of base reset and reassignment restores complete WAV-free conversion state");
     processEmpty(processor, 512);
@@ -4893,6 +5090,7 @@ int main() {
         testConversionOwnerClose();
         testConversionCompletionCancellation();
         testCompositeWavUiTransactions();
+        testCompositeWavCandidateAudition();
         testCompositeWavRangeInteractions();
         testCompositeWavActualUiWorkerAndApply();
         testWavMorphPlanVstStateAndReediting();

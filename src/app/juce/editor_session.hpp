@@ -120,11 +120,13 @@ struct CompositeAuditionRequest {
     mgstc::engine::CompositeTimbre* timbre{};
     bool polyphonic{true};
     bool temporary{false};
+    bool reserve_restore_slot{false};
     const mgstc::engine::TimbreLibrary* library{};
 };
 
 struct AuditionResult {
     bool ok{false};
+    bool deferred{false};
     bool update_allocator{false};
     std::uint8_t voice_capacity{1};
 };
