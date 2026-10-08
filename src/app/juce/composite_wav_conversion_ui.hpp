@@ -204,7 +204,7 @@ public:
         button(original_, "原音 ▶", [this] { previewSource(); });
         button(converted_, "変換音 ▶", [this] { previewResult(); });
         button(stop_, "停止", [this] { stopPcm(); });
-        button(ab_, "A/B ▶", [this] { if (ab_result_) previewResult(); else previewSource(); ab_result_ = !ab_result_; });
+        converted_.setTooltip(juce::String::fromUTF8("変換候補は適用前にPC鍵盤／MIDIでも試聴できます。"));
         button(zoom_in_, "＋", [this] { range_.zoom(1); });
         button(zoom_out_, "−", [this] { range_.zoom(-1); });
         button(analyze_, "範囲を解析", [this] { analyze(); });
@@ -244,7 +244,10 @@ public:
         preference_.addItem(juce::String::fromUTF8("音色数優先"), 3);
         sustain_.addItem(juce::String::fromUTF8("サステイン自動"), 1);
         sustain_.addItem(juce::String::fromUTF8("ループなし"), 2);
-        for (auto* combo : {&configuration_, &strategy_, &fixed_tone_, &preference_, &sustain_}) {
+        wave_method_.addItem(juce::String::fromUTF8("SCC波形：解析再構成"), 1);
+        wave_method_.addItem(juce::String::fromUTF8("SCC波形：周期直接抽出"), 2);
+        wave_method_.setTooltip(juce::String::fromUTF8("キーフレーム波形の生成方式。どちらも既存のMorphを使用します。"));
+        for (auto* combo : {&configuration_, &strategy_, &fixed_tone_, &preference_, &sustain_, &wave_method_}) {
             combo->setSelectedId(1, juce::dontSendNotification); addAndMakeVisible(combo);
         }
         configuration_.onChange = [this] { refreshEnabled(); };
@@ -269,12 +272,14 @@ public:
         int order = 1;
         for (auto* c : std::initializer_list<juce::Component*>{&load_, &range_, &zoom_in_, &zoom_out_, &begin_, &end_,
                 &pitch_, &key_off_, &configuration_, &strategy_, &fixed_tone_, &budget_, &preference_, &sustain_,
-                &original_, &converted_, &stop_, &ab_, &level_match_, &analyze_, &convert_, &apply_, &cancel_}) c->setExplicitFocusOrder(order++);
+                &original_, &converted_, &stop_, &level_match_, &wave_method_, &analyze_, &convert_, &apply_, &cancel_}) c->setExplicitFocusOrder(order++);
+        setWantsKeyboardFocus(true);
         refreshEnabled();
         setSize(UiScale::sx(1080), UiScale::sx(900));
     }
     ~CompositeWavConversionContent() override {
         stopPcm();
+        clearCandidateAudition();
         if (control_) control_->cancel_requested.store(true);
         if (analysis_cancel_) analysis_cancel_->store(true, std::memory_order_release);
         // A registered plugin worker remains owned by its processor; deleting
@@ -290,13 +295,16 @@ public:
         area.removeFromTop(UiLayout::sm); range_.setBounds(area.removeFromTop(UiScale::sx(150)));
         area.removeFromTop(UiLayout::sm);
         auto row = area.removeFromTop(UiLayout::textButtonH);
-        for (auto* b : {&original_, &converted_, &stop_, &ab_}) {
+        for (auto* b : {&original_, &converted_, &stop_}) {
             b->setBounds(row.removeFromLeft(UiScale::sx(130))); row.removeFromLeft(UiLayout::controlGap);
         }
         zoom_out_.setBounds(row.removeFromRight(UiLayout::iconButton)); row.removeFromRight(UiLayout::controlGap);
         zoom_in_.setBounds(row.removeFromRight(UiLayout::iconButton));
         area.removeFromTop(UiLayout::xs);
-        level_match_.setBounds(area.removeFromTop(UiLayout::fieldH));
+        auto comparison = area.removeFromTop(UiLayout::fieldH);
+        wave_method_.setBounds(comparison.removeFromRight((comparison.getWidth() - UiLayout::controlGap) / 2));
+        comparison.removeFromRight(UiLayout::controlGap);
+        level_match_.setBounds(comparison);
         area.removeFromTop(UiLayout::sm);
         std::array<juce::Component*, 10> controls{&begin_, &end_, &pitch_, &key_off_, &budget_,
             &configuration_, &strategy_, &fixed_tone_, &preference_, &sustain_};
@@ -316,10 +324,34 @@ public:
         area.removeFromBottom(UiLayout::sm); status_.setBounds(area);
         for (auto& label : labels_) label.setFont(UiFonts::body()); metadata_.setFont(UiFonts::body()); metadata_detail_.setFont(UiFonts::body());
     }
+    void setAuditionCallbacks(
+        std::function<void(const mgstc::engine::CompositeTimbre*)> candidate,
+        std::function<bool(const juce::KeyPress&)> key,
+        std::function<void()> poll) {
+        audition_candidate_ = std::move(candidate);
+        audition_key_ = std::move(key);
+        audition_poll_ = std::move(poll);
+    }
+    bool keyPressed(const juce::KeyPress& key) override {
+        if (!audition_published_ || textEntryHasFocusWithin(*this)) return false;
+        return audition_key_ && audition_key_(key);
+    }
+    bool keyStateChanged(bool) override {
+        // Poll even during text entry so the existing suppression rule releases
+        // a PC note held when focus moves into an editable field.
+        if (audition_published_ && audition_poll_) audition_poll_();
+        return false;
+    }
 private:
+    void clearCandidateAudition() {
+        if (!audition_published_) return;
+        audition_published_ = false;
+        if (audition_candidate_) audition_candidate_(nullptr);
+    }
     void stopPcm() { if (player_) player_->stop(); }
     void close() {
         stopPcm();
+        clearCandidateAudition();
         if (analysis_cancel_) analysis_cancel_->store(true, std::memory_order_release);
         if (control_) control_->cancel_requested.store(true, std::memory_order_release);
         if (background_tasks_) delete busy_dialog_.getComponent();
@@ -329,7 +361,7 @@ private:
         const bool loaded = source_ != nullptr;
         analyze_.setEnabled(loaded); convert_.setEnabled(loaded); original_.setEnabled(loaded && player_ != nullptr);
         apply_.setEnabled(result_ && result_->composite_tone.has_value());
-        converted_.setEnabled(player_ && result_pcm_ != nullptr); ab_.setEnabled(player_ && loaded && result_pcm_ != nullptr);
+        converted_.setEnabled(player_ && result_pcm_ != nullptr);
         stop_.setEnabled(player_ != nullptr); level_match_.setEnabled(player_ != nullptr);
         strategy_.setEnabled(configuration_.getSelectedId() != 1);
         fixed_tone_.setEnabled(configuration_.getSelectedId() == 3);
@@ -512,6 +544,7 @@ private:
         }, [safe, path](Loaded loaded, bool cancelled) {
             if (!safe || cancelled) return;
             if (!loaded.pcm) { safe->report(juce::String::fromUTF8(loaded.error.c_str())); return; }
+            safe->clearCandidateAudition();
             safe->source_ = std::move(loaded.pcm); safe->analysis_.reset(); safe->analysis_summary_.clear(); safe->result_.reset(); safe->result_pcm_.reset();
             safe->source_metadata_ = std::move(loaded.metadata);
             safe->range_.setSource(safe->source_); safe->syncRange(); safe->refreshEnabled();
@@ -553,6 +586,10 @@ private:
         result_pcm_ = std::move(pcm);
         source_gain_ = source_gain; result_gain_ = result_gain;
         result_ = std::move(conversion);
+        if (audition_candidate_) {
+            audition_published_ = true;
+            audition_candidate_(&*result_->composite_tone);
+        }
         refreshEnabled();
         return true;
     }
@@ -561,7 +598,7 @@ private:
     BackgroundTaskBoundary* background_tasks_{};
     juce::Component::SafePointer<ConversionBusyDialog> busy_dialog_;
     CompositeWavRange range_;
-    juce::TextButton load_, original_, converted_, stop_, ab_, zoom_in_, zoom_out_, analyze_, convert_, apply_, cancel_;
+    juce::TextButton load_, original_, converted_, stop_, zoom_in_, zoom_out_, analyze_, convert_, apply_, cancel_;
     juce::TextEditor begin_, end_, pitch_, key_off_, budget_, status_;
     juce::ComboBox configuration_, strategy_, fixed_tone_, preference_, sustain_;
     juce::ToggleButton level_match_;
@@ -574,7 +611,11 @@ private:
     juce::String analysis_summary_;
     std::optional<mgstc::engine::CompositeWavConversionResult> result_;
     std::shared_ptr<mgstc::engine::CompositeWavConversionControl> control_;
-    bool ab_result_{};
+    std::function<void(const mgstc::engine::CompositeTimbre*)> audition_candidate_;
+    std::function<bool(const juce::KeyPress&)> audition_key_;
+    std::function<void()> audition_poll_;
+    bool audition_published_{};
+    juce::ComboBox wave_method_;
     float source_gain_{1.0f}, result_gain_{1.0f};
 };
 
@@ -601,6 +642,9 @@ inline void CompositeWavConversionContent::convert() {
     options.configuration = static_cast<mgstc::engine::CompositeWavConfiguration>(configuration_.getSelectedId() - 1);
     options.strategy = static_cast<mgstc::engine::CompositeWavStrategy>(strategy_.getSelectedId() - 1);
     options.preference = static_cast<mgstc::engine::CompositeWavPreference>(preference_.getSelectedId() - 1);
+    options.scc_wave_method = wave_method_.getSelectedId() == 2
+        ? mgstc::engine::CompositeWavSccWaveMethod::DirectPeriodic
+        : mgstc::engine::CompositeWavSccWaveMethod::Reconstructed;
     options.loop_mode = sustain_.getSelectedId() == 1 ? mgstc::engine::CompositeWavLoopMode::Automatic : mgstc::engine::CompositeWavLoopMode::None;
     options.max_scc_waveforms = static_cast<std::size_t>(max_waves);
     if (options.configuration == mgstc::engine::CompositeWavConfiguration::SccOpllRom && fixed_tone_.getSelectedId() > 1)
@@ -708,16 +752,19 @@ inline void CompositeWavConversionContent::convert() {
                     if (mode < selected_modes.size()) ++selected_modes[mode];
                 }
             }
-            juce::String message = juce::String::fromUTF8("変換完了。原音と変換音を比較してから適用してください。\n")
+            juce::String message = juce::String::fromUTF8("変換完了。PC鍵盤／MIDIで候補を試聴できます。原音と比較してから適用してください。\n")
                 + "SCC: " + juce::String(static_cast<int>(result.resource_plan.scc_waveforms))
-                + juce::String::fromUTF8(" 音色 / 評価 ") + juce::String(static_cast<int>(result.evaluations))
+                + juce::String::fromUTF8(" ユニーク波形 / 評価 ") + juce::String(static_cast<int>(result.evaluations))
                 + " / " + juce::String(result.elapsed_seconds, 2) + " s\n"
                 + juce::String::fromUTF8("採用区間: 適応型 ") + juce::String(selected_modes[0])
                 + juce::String::fromUTF8(" / 時間配分型 ") + juce::String(selected_modes[1])
                 + juce::String::fromUTF8(" / 音色配分型 ") + juce::String(selected_modes[2]) + "\n"
                 + "STFT " + juce::String(q.multi_resolution_stft, 4) + " / Harmonic " + juce::String(q.harmonic, 4)
                 + " / ERB " + juce::String(q.erb, 4) + " / Attack " + juce::String(q.attack, 4)
-                + " / ENV " + juce::String(q.volume, 4);
+                + " / ENV " + juce::String(q.volume, 4)
+                + juce::String::fromUTF8("\n最大PCM変化 ") + juce::String(q.max_pcm_discontinuity, 4)
+                + juce::String::fromUTF8(" / 最大隣接倍音差 ") + juce::String(q.max_wave_harmonic, 4)
+                + juce::String::fromUTF8(" / ループ接続 ") + juce::String(q.loop_boundary, 4);
             if (safe->analysis_summary_.isNotEmpty()) message += "\n" + safe->analysis_summary_;
             for (const auto& warning : result.warnings) message += "\n" + juce::String::fromUTF8(warning.c_str());
             safe->report(message); safe->refreshEnabled();

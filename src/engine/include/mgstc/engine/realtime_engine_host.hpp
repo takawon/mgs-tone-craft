@@ -56,6 +56,9 @@ public:
     RealtimeEngineHost& operator=(const RealtimeEngineHost&) = delete;
 
     // UI thread only. Construction and program editing may allocate.
+    // Producer thread only, under its existing exclusion. Audio can only free
+    // slots; reserve a free slot for restoring a temporary audition program.
+    [[nodiscard]] std::size_t freeProgramSlotCount() const noexcept;
     [[nodiscard]] ProgramEdit beginProgramEdit();
     [[nodiscard]] bool submitProgram(
         ProgramEdit& edit,

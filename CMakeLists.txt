@@ -674,6 +674,23 @@ if(MGSTC_BUILD_TESTS)
     endforeach()
 
     add_executable(
+        mgstc_composite_wav_improvement_tests
+        tests/cpp/composite_wav_improvement_tests.cpp)
+    target_link_libraries(
+        mgstc_composite_wav_improvement_tests PRIVATE mgstc_engine)
+    target_compile_features(
+        mgstc_composite_wav_improvement_tests PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(
+            mgstc_composite_wav_improvement_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    else()
+        target_compile_options(
+            mgstc_composite_wav_improvement_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(
+        NAME mgstc_composite_wav_improvement_tests
+        COMMAND mgstc_composite_wav_improvement_tests)
+    add_executable(
         mgstc_realtime_engine_host_tests
         tests/cpp/realtime_engine_host_tests.cpp)
     target_link_libraries(
@@ -934,6 +951,28 @@ if(MGSTC_BUILD_BENCHMARKS)
     else()
         target_compile_options(
             mgstc_wave_import_benchmark PRIVATE -Wall -Wextra -Wpedantic
+        )
+    endif()
+endif()
+
+if(MGSTC_BUILD_BENCHMARKS)
+    add_executable(
+        mgstc_composite_wav_improvement_benchmark
+        tests/cpp/composite_wav_improvement_benchmark.cpp
+    )
+    target_link_libraries(
+        mgstc_composite_wav_improvement_benchmark PRIVATE mgstc_engine
+    )
+    target_compile_features(
+        mgstc_composite_wav_improvement_benchmark PRIVATE cxx_std_20
+    )
+    if(MSVC)
+        target_compile_options(
+            mgstc_composite_wav_improvement_benchmark PRIVATE /W4 /permissive- /EHsc /utf-8
+        )
+    else()
+        target_compile_options(
+            mgstc_composite_wav_improvement_benchmark PRIVATE -Wall -Wextra -Wpedantic
         )
     endif()
 endif()

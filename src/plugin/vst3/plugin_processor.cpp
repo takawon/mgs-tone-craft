@@ -1421,7 +1421,9 @@ bool MgstcAudioProcessor::previewEditorComposite(
     mgstc::engine::CompositeTimbre sound,
     bool polyphonic,
     std::uint8_t& voice_capacity,
-    std::optional<std::uint64_t> expected_restore_revision) {
+    std::optional<std::uint64_t> expected_restore_revision,
+    bool reserve_restore_slot, bool* deferred) {
+    if (deferred) *deferred = false;
     voice_capacity = 1;
     if (onAudioThread()
         || !validatePluginSoundSnapshot(sound)) {
@@ -1430,6 +1432,12 @@ bool MgstcAudioProcessor::previewEditorComposite(
     std::lock_guard<std::mutex> producer_lock(state_commit_mu_);
     if (expected_restore_revision && *expected_restore_revision != editorStateRestoreRevision())
         return false;
+    // Only the serialized producer consumes Free slots. The audio consumer
+    // retires Pending/Active slots, so this check preserves a restoration slot.
+    if (reserve_restore_slot && engine_.freeProgramSlotCount() < 2) {
+        if (deferred) *deferred = true;
+        return false;
+    }
     static_cast<void>(
         mgstc::engine::enforceOpllRegisterAutoExclusivity(sound));
     auto edit = engine_.beginProgramEdit();

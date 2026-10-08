@@ -1110,9 +1110,14 @@ MgsCompositeIoResult formatMgsComposite(
     }
 
     output << "\r\n";
+    std::vector<std::uint8_t> envelope_numbers;
+    envelope_numbers.reserve(timbre.layers.size());
+    using SequenceKey = std::pair<std::string, std::vector<std::uint8_t>>;
+    std::map<SequenceKey, std::uint8_t> shared_scc_envelopes;
     for (std::size_t index = 0; index < timbre.layers.size(); ++index) {
         const auto& layer = timbre.layers[index];
         const auto number = layer.envelope_number;
+        envelope_numbers.push_back(number);
         if (layer.volume_envelope.kind == EnvelopeKind::Rate) {
             output << rateDefinition(layer, number);
         } else if (layerUsesSequenceEnvelope(layer)) {
@@ -1127,6 +1132,16 @@ MgsCompositeIoResult formatMgsComposite(
                             + ": " + issueName(issue));
                 }
             } else {
+                // Definitions are immutable; execution wait/position/loop
+                // state remains per track. Track detune is outside this key.
+                if (layer.source == TimbreSource::Scc) {
+                    const SequenceKey key{
+                        formatSequenceEnvelopeHeader(layer.source, layer.volume_envelope.rate),
+                        formatted.bytecode};
+                    const auto [shared, inserted] = shared_scc_envelopes.emplace(key, number);
+                    envelope_numbers.back() = shared->second;
+                    if (!inserted) continue;
+                }
                 output << formatted.definition;
             }
         }
@@ -1144,7 +1159,9 @@ MgsCompositeIoResult formatMgsComposite(
             : layer.source == TimbreSource::Scc
                 ? 4U + layer.channel
                 : 9U + layer.channel;
-        output << formatMgsCompositeTrackSetup(layer, &numbers)
+        auto output_layer = layer;
+        output_layer.envelope_number = envelope_numbers[index];
+        output << formatMgsCompositeTrackSetup(output_layer, &numbers)
                << " ; MGSTC-LAYER track=" << track
                << " name=" << hexText(layer.name)
                << " relative=" << static_cast<int>(
@@ -1403,6 +1420,18 @@ ParsedMgsComposite parseMgsComposite(std::string_view source) {
                             event.target_library_id =
                                 timbre->second.library_id;
                         }
+                    }
+                    if (track.has_envelope) {
+                        // A shared source definition becomes independently
+                        // editable authoring lanes. Export can share it again.
+                        track.layer.envelope_number = static_cast<std::uint8_t>(track.envelope_number);
+                        const bool used = std::any_of(result.timbre.layers.begin(),
+                            result.timbre.layers.end(), [&](const CompositeLayer& layer) {
+                                return (layer.volume_envelope.kind == EnvelopeKind::Rate
+                                    || layerUsesSequenceEnvelope(layer))
+                                    && layer.envelope_number == track.layer.envelope_number;
+                            });
+                        if (used) track.layer.envelope_number = nextFreeEnvelopeNumber(result.timbre);
                     }
                     result.timbre.layers.push_back(std::move(track.layer));
                 }

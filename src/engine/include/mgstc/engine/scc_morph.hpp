@@ -132,6 +132,9 @@ struct SccMorphPairTrace {
 
 struct SccMorphChannelAllocation {
     std::size_t layer_index{};
+    // Manual: fixed contiguous start/count. Automatic: base reference number
+    // and distinct referenced-wave count; exact shared numbers may be sparse.
+    // The materialized layer events are the authoritative output-number map.
     std::uint8_t start{}, count{};
     bool manual{};
 };
@@ -143,8 +146,9 @@ struct SccMorphCompileResult {
     bool valid{true};
     bool cancelled{};
     std::string error;
-    // Counts only byte-distinct derived waveforms. Capacity excludes source
-    // slots already occupied in the selected 0..31 / 16..31 range.
+    // Legacy Bank: derived byte-distinct waves; capacity excludes source slots.
+    // Channel allocation: physical bank occupancy, including retained legacy and
+    // manual reservations; automatic exact sharing consumes no extra slot.
     std::size_t used{}, capacity{}, required{};
     std::vector<SccMorphWaveDiagnostic> diagnostics;
     std::vector<SccMorphChannelAllocation> channel_allocations;

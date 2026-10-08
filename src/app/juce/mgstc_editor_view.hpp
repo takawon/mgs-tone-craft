@@ -4424,7 +4424,7 @@ public:
                 audition_layer_filter_ =
                     isolate && layer ? layer : std::nullopt;
                 performance_keyboard_.setInputActiveOverride(
-                    satellite_session_ || spectrogram_input_active_);
+                    satellite_session_ || spectrogram_input_active_ || wave_conversion_preview_.has_value());
                 composite_program_stale_ = true;
                 if (!layer) {
                     stopAudition();
@@ -4480,7 +4480,7 @@ public:
                 if (textEntryHasFocusWithin(*this)) {
                     return true;
                 }
-                if (!audition_layer_filter_) {
+                if (!audition_layer_filter_ && !wave_conversion_preview_) {
                     return false;
                 }
                 auto* focused =
@@ -4570,6 +4570,8 @@ public:
         ++host_restore_generation_;
         timeline_preview_pending_ = false;
         if (wave_converter_window_) delete wave_converter_window_.getComponent();
+        wave_conversion_preview_.reset();
+        performance_keyboard_.setInputActiveOverride(satellite_session_ || spectrogram_input_active_);
         timeline_.cancelPendingDialogs();
         performance_keyboard_.allNotesOff();
         silenceAuditionNotes();
@@ -4738,7 +4740,7 @@ public:
     void setSpectrogramInputActive(bool active) noexcept {
         spectrogram_input_active_ = active;
         performance_keyboard_.setInputActiveOverride(
-            satellite_session_ || spectrogram_input_active_);
+            satellite_session_ || spectrogram_input_active_ || wave_conversion_preview_.has_value());
     }
 
     void auditionImportedCandidate(
@@ -5236,7 +5238,51 @@ private:
             [open = std::move(open)](int result) { if (result == 1) open(); });
     }
 
+    void setWaveConversionPreview(const mgstc::engine::CompositeTimbre* candidate,
+        bool restore_authoring = true) {
+        if (!candidate && !wave_conversion_preview_) return;
+        wave_submission_deferred_ = false;
+        performance_keyboard_.allNotesOff();
+        silenceAuditionNotes();
+        if (candidate) {
+            manual_y_preview_timbre_.reset();
+            wave_conversion_preview_ = *candidate;
+        } else {
+            wave_conversion_preview_.reset();
+        }
+        performance_keyboard_.setInputActiveOverride(
+            satellite_session_ || spectrogram_input_active_ || wave_conversion_preview_.has_value());
+        composite_program_stale_ = true;
+        // Apply immediately submits the converted authoring sound. Avoid an
+        // obsolete restore between the pending candidate and that commit:
+        // the bounded program slots may not be retired until the next block.
+        if (hydrating_ || (!candidate && !restore_authoring)) return;
+        // Both installing the candidate and restoring the authoring sound are
+        // runtime-only submissions. A cancelled dialog must not commit state.
+        engine_ready_ = session_.snapshot().audio_running && configureEngine(!candidate);
+    }
+
+    void bindWaveConversionAudition(CompositeWavConversionContent& content) {
+        const juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+        const auto generation = host_restore_generation_;
+        content.setAuditionCallbacks(
+            [safe, generation](const mgstc::engine::CompositeTimbre* candidate) {
+                if (safe && safe->host_restore_generation_ == generation)
+                    safe->setWaveConversionPreview(candidate);
+            },
+            [safe, generation](const juce::KeyPress& key) {
+                if (!safe || safe->host_restore_generation_ != generation || !safe->wave_conversion_preview_) return false;
+                safe->performance_keyboard_.pollPerformanceInput();
+                return safe->performance_keyboard_.shouldConsumeKeyPress(key);
+            },
+            [safe, generation] {
+                if (safe && safe->host_restore_generation_ == generation)
+                    safe->performance_keyboard_.pollPerformanceInput();
+            });
+    }
+
     void applyWaveConversion(const mgstc::engine::CompositeTimbre& converted) {
+        setWaveConversionPreview(nullptr, false);
         // Capture pending text edits before replacement, preserving the entire
         // authoring state as the immediately preceding Undo state.
         stopAudition();
@@ -5284,6 +5330,7 @@ private:
                     .withAssociatedComponent(safe.getComponent()),
                     [apply = std::move(apply)](int result) { if (result == 1) apply(); });
             }, session_.pcmPreview(), session_.backgroundTasks());
+        bindWaveConversionAudition(*content);
         dialog->setUsingNativeTitleBar(true);
         dialog->setResizable(true, false);
         dialog->setContentOwned(content, true);
@@ -6917,18 +6964,30 @@ private:
         }
     }
 
-    bool configureEngine() {
+    bool configureEngine(bool temporary_restore = false) {
         if (hydrating_) {
             return false;
         }
         MGSTC_UI_ACTIVITY("composite: configureEngine (compile + submit)");
         CompositeAuditionRequest request;
-        request.timbre = manual_y_preview_timbre_
-            ? &*manual_y_preview_timbre_ : &timbre_;
+        // The submission boundary may normalize register-auto exclusivity.
+        // Restore from a copy so merely closing WAV conversion is non-destructive.
+        auto restore_copy = temporary_restore
+            ? std::optional<mgstc::engine::CompositeTimbre>(timbre_) : std::nullopt;
+        request.timbre = wave_conversion_preview_ ? &*wave_conversion_preview_
+            : restore_copy ? &*restore_copy
+            : manual_y_preview_timbre_ ? &*manual_y_preview_timbre_ : &timbre_;
         request.polyphonic = performance_keyboard_.polyphonic();
-        request.temporary = manual_y_preview_timbre_.has_value();
+        request.temporary = temporary_restore || wave_conversion_preview_.has_value() || manual_y_preview_timbre_.has_value();
         request.library = &timbre_library_;
+        request.reserve_restore_slot = wave_conversion_preview_.has_value();
         const auto result = session_.audition().submitComposite(request);
+        wave_submission_deferred_ = wave_conversion_preview_.has_value() && result.deferred;
+        if (result.deferred) {
+            engine_ready_ = false;
+            composite_program_stale_ = true;
+            return false;
+        }
         if (result.update_allocator) {
             if (result.ok) {
                 // The new program resets physical voice ownership. No start
@@ -7010,8 +7069,8 @@ private:
                 || !performance_keyboard_.polyphonic())) {
             silenceAuditionNotes();
         }
-        const auto& note_timbre = manual_y_preview_timbre_
-            ? *manual_y_preview_timbre_ : timbre_;
+        const auto& note_timbre = wave_conversion_preview_ ? *wave_conversion_preview_
+            : manual_y_preview_timbre_ ? *manual_y_preview_timbre_ : timbre_;
         // Editing a held polyphonic note does not replace its submitted program.
         // A new note must still reject an invalid, currently edited envelope.
         if (!already_configured && composite_program_stale_
@@ -7053,7 +7112,7 @@ private:
             mgstc::engine::buildCompositePlaybackPlan(note_timbre);
         double maximum_delay_ms = 0.0;
         for (const auto& binding : plan.audible_layers) {
-            if (audition_layer_filter_
+            if (audition_layer_filter_ && !wave_conversion_preview_
                 && binding.layer_index != *audition_layer_filter_) {
                 continue;
             }
@@ -7266,6 +7325,8 @@ private:
             master_volume_, master_volume_revision_, session_);
         const double now =
             juce::Time::getMillisecondCounterHiRes();
+        if (wave_submission_deferred_ && wave_conversion_preview_)
+            engine_ready_ = configureEngine();
         dispatchScheduledLayerNotes(now);
         if ((library_manager_performance_id_ || library_manager_imported_)
             && voice_allocator_.activeVoiceCount() == 0) {
@@ -7359,6 +7420,8 @@ private:
     SwitchLookAndFeel switch_look_and_feel_;
     mgstc::engine::CompositeTimbre timbre_;
     std::optional<mgstc::engine::CompositeTimbre> manual_y_preview_timbre_;
+    std::optional<mgstc::engine::CompositeTimbre> wave_conversion_preview_;
+    bool wave_submission_deferred_{false};
     juce::Label title_;
     juce::Label description_;
     juce::Label composite_library_title_;

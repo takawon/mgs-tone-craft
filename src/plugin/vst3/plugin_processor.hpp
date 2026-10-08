@@ -93,7 +93,8 @@ public:
         mgstc::engine::CompositeTimbre sound,
         bool polyphonic,
         std::uint8_t& voice_capacity,
-        std::optional<std::uint64_t> expected_restore_revision = {});
+        std::optional<std::uint64_t> expected_restore_revision = {},
+        bool reserve_restore_slot = false, bool* deferred = nullptr);
     [[nodiscard]] bool editorNoteOn(
         std::uint8_t track,
         std::uint8_t note,
