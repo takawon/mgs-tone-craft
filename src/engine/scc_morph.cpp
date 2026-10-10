@@ -1383,6 +1383,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
     struct Node {
         SccWaveform wave;
         std::optional<std::size_t> event_index;
+        bool base_source{};
         SccMorphWaveDiagnostic diagnostic;
     };
     struct Pending { std::size_t layer{}; Node node; };
@@ -1415,8 +1416,11 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
             return first.after_loop_start < second.after_loop_start;
         });
         if (tones.empty()) continue;
+        // A first incoming transition starts at the channel's key-on tone.
+        // The sentinel is local to compilation: no @0 enters the authored lane.
+        const auto base_position = layer.timbre_automation.size();
         if (layer.timbre_automation[tones.front()].scc_morph.enabled)
-            return fail("SCC morph destination has no preceding tone event");
+            tones.insert(tones.begin(), base_position);
         for (std::size_t arrival = 1; arrival < tones.size();) {
             if (cancellation.stop_requested()) {
                 result.cancelled = true; return fail("SCC morph generation cancelled");
@@ -1432,16 +1436,21 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
             std::vector<Node> nodes;
             const auto sourceNode = [&](std::size_t tone_position) -> std::optional<Node> {
                 const auto event_index = tones[tone_position];
-                const auto& event = layer.timbre_automation[event_index];
-                const auto* source = sourceForEvent(event);
-                if (!source || source->source != TimbreSource::Scc) return std::nullopt;
-                if (!contiguous(layer)
+                const bool base = event_index == base_position;
+                const auto* source = base
+                    ? (layer.base_timbre ? &*layer.base_timbre : nullptr)
+                    : sourceForEvent(layer.timbre_automation[event_index]);
+                if ((!source && !base) || (source && source->source != TimbreSource::Scc))
+                    return std::nullopt;
+                if (source && !contiguous(layer)
                     && !assignedNumberForLibraryId(source_numbers,source->library_id)) return std::nullopt;
                 Node node;
-                node.wave = sourceWave(*source);
-                node.event_index = event_index;
+                node.wave = source ? sourceWave(*source)
+                    : generateSccPreset(SccWavePreset::Sine, SccHarmonic::One);
+                if (!base) node.event_index = event_index;
+                node.base_source = base;
                 node.diagnostic.layer_index = layer_index;
-                node.diagnostic.count = event.count;
+                node.diagnostic.count = base ? 0 : layer.timbre_automation[event_index].count;
                 node.diagnostic.result = analyzeSccMorphWaveform(node.wave).descriptors;
                 node.diagnostic.target = node.diagnostic.result;
                 return node;
@@ -1450,23 +1459,25 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
             if (!start_node) return fail("SCC morph source waveform snapshot is unavailable");
             nodes.push_back(*start_node);
             for (std::size_t position = block_start+1; position <= block_end; ++position) {
-                const auto& start_event = layer.timbre_automation[tones[position-1]];
+                const auto original_start = sourceNode(position-1);
+                if (!original_start)
+                    return fail("SCC morph source waveform snapshot is unavailable");
+                const auto start_count = original_start->diagnostic.count;
                 const auto& end_event = layer.timbre_automation[tones[position]];
                 const auto& settings = end_event.scc_morph;
-                if (end_event.count <= start_event.count)
+                if (end_event.count <= start_count)
                     return fail("SCC morph tone events must have strictly increasing counts");
                 if (end_event.count > layer.envelope_timeline.length_counts
                     || end_event.count > EnvelopeTimeline::kMaximumLengthCounts)
                     return fail("SCC morph tone event lies outside the envelope timeline");
-                const auto duration = end_event.count-start_event.count;
+                const auto duration = end_event.count-start_count;
                 if (settings.intermediate_count > duration-1)
                     return fail("SCC morph intermediate count exceeds available time slots");
                 if (!std::isfinite(settings.curve) || settings.curve < kSccMorphGammaMin
                     || settings.curve > kSccMorphGammaMax)
                     return fail("SCC morph curve is out of range");
                 const auto end_node = sourceNode(position);
-                const auto original_start = sourceNode(position-1);
-                if (!end_node || !original_start)
+                if (!end_node)
                     return fail("SCC morph source waveform snapshot is unavailable");
                 if (!isValidSccMorphDistributionMode(settings.distribution_mode))
                     return fail("SCC morph distribution mode is invalid");
@@ -1499,7 +1510,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
                     Node node;
                     node.wave = generated.intermediate[i];
                     node.diagnostic = generated.diagnostics[i];
-                    node.diagnostic.count = start_event.count+planned.plan.points[i+1].event_count;
+                    node.diagnostic.count = start_count+planned.plan.points[i+1].event_count;
                     node.diagnostic.layer_index = layer_index;
                     nodes.push_back(node);
                 }
@@ -1557,7 +1568,32 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
         }
         auto& events = result.timbre.layers[item.layer].timbre_automation;
         const auto& assigned = allocation->second;
-        if (node.event_index) {
+        if (node.base_source) {
+            // Phase adjustment affects only the transient key-on snapshot,
+            // preserving both the source data and the absence of an authored @0.
+            const auto& original = input.layers[item.layer].base_timbre;
+            if (original && sourceWave(*original) == node.wave) {
+                result.timbre.layers[item.layer].base_timbre = *original;
+                freeze(*result.timbre.layers[item.layer].base_timbre);
+            } else {
+                // The channel base may be the sole holder of a snapshot also
+                // referenced by later ordinary @ events. Retain that owned
+                // source before replacing the transient key-on tone.
+                if (original && std::none_of(result.timbre.embedded_timbres.begin(),
+                    result.timbre.embedded_timbres.end(), [&](const auto& candidate) {
+                        return candidate.library_id == original->library_id;
+                    })) {
+                    auto retained = *original;
+                    freeze(retained);
+                    result.timbre.embedded_timbres.push_back(std::move(retained));
+                }
+                const auto* reference = findEmbeddedTimbreSnapshot(result.timbre,assigned.id);
+                if (!reference) return fail("SCC morph base waveform snapshot is unavailable");
+                result.timbre.layers[item.layer].base_timbre = *reference;
+            }
+            node.diagnostic.output_number =
+                *result.timbre.layers[item.layer].base_timbre->manual_number;
+        } else if (node.event_index) {
             // Byte-identical source nodes retain their existing snapshot ID.
             // Only an actually phase-shifted source needs a derived reference.
             auto& event = events[*node.event_index];
@@ -1613,8 +1649,12 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
             };
             if (layer.base_timbre && layer.base_timbre->source != TimbreSource::Scc)
                 return fail("SCC channel base snapshot has a different sound source");
-            add_wave(layer.base_timbre ? sourceWave(*layer.base_timbre)
-                : generateSccPreset(SccWavePreset::Sine, SccHarmonic::One));
+            auto base_wave = layer.base_timbre ? sourceWave(*layer.base_timbre)
+                : generateSccPreset(SccWavePreset::Sine, SccHarmonic::One);
+            for (const auto& item : pending)
+                if (item.layer == layer_index && item.node.base_source)
+                    base_wave = item.node.wave;
+            add_wave(base_wave);
             // Final phase-adjusted endpoints replace their authored event
             // waveform. Do not reserve discarded endpoint phase variants.
             for (const auto& item : pending) {
@@ -1743,7 +1783,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
                 if (item.layer != group.layer) continue;
                 const auto& reference = references[group.offsets.at(item.node.wave)];
                 auto& diagnostic = item.node.diagnostic;
-                if (!item.node.event_index) {
+                if (!item.node.event_index && !item.node.base_source) {
                     EnvelopeEvent event;
                     event.kind = EnvelopeEventKind::Timbre;
                     event.count = diagnostic.count;
@@ -1756,7 +1796,8 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
                     layer.timbre_automation.push_back(event);
                 }
                 diagnostic.output_number = *reference.manual_number;
-                diagnostic.generated = !item.node.event_index || diagnostic.phase_shift != 0;
+                diagnostic.generated = (!item.node.event_index && !item.node.base_source)
+                    || diagnostic.phase_shift != 0;
                 result.diagnostics.push_back(diagnostic);
             }
             result.channel_allocations.push_back({group.layer, *group.start,

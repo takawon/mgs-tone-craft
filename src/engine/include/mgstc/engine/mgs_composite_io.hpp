@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -33,6 +34,12 @@ struct ParsedMgsComposite {
 // SavedTimbreReference snapshot.
 [[nodiscard]] MgsCompositeIoResult formatMgsComposite(
     const CompositeTimbre& timbre,
+    const TimbreLibrary* library = nullptr);
+
+// Uses global number assignments, but emits only this layer's original tones.
+[[nodiscard]] MgsCompositeIoResult formatMgsCompositeLayerTimbres(
+    const CompositeTimbre& timbre,
+    std::size_t layer_index,
     const TimbreLibrary* library = nullptr);
 
 // Reads the source emitted above and ordinary MGSC sources containing the same

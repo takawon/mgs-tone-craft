@@ -12,6 +12,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "mgstc/engine/composite_timbre.hpp"
+#include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/timbre_library.hpp"
 
 namespace mgstc::engine {
@@ -39,6 +40,8 @@ struct EnvelopeTimbreChoice {
     engine::TimbrePick pick{engine::TimbrePick::Library};
     std::uint64_t library_id{};
     std::uint8_t rom_number{};
+    // UI-only preset selection; committed as an existing owned Library snapshot.
+    std::optional<engine::SccWavePreset> scc_preset;
 };
 
 [[nodiscard]] inline juce::String envelopeTimbreCatalogLabel(

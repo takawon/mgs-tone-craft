@@ -3989,7 +3989,7 @@ public:
             EditorIcon::Redo,
             juce::String::fromUTF8("Redo (Ctrl+Y)"),
             [this] { redo(); });
-        configureButton(import_wave_, "WAV",
+        configureButton(import_wave_, juce::String::fromUTF8("WAV変換"),
             juce::String::fromUTF8("WAVから総合音色へ変換"),
             [this] { openWaveConverter(); });
         composite_filter_.setTextToShowWhenEmpty(
@@ -5016,7 +5016,7 @@ public:
             button->setBounds(file_row.removeFromLeft(iconButton));
             file_row.removeFromLeft(controlGap);
         }
-        import_wave_.setBounds(file_row.removeFromLeft(UiLayout::libraryButtonMinW));
+        import_wave_.setBounds(file_row.removeFromLeft(UiScale::sx(112)));
         file_row.removeFromLeft(controlGap);
         area.removeFromTop(sm);
 
@@ -7793,7 +7793,7 @@ public:
             [this] { copyDefinition(); });
         configureButton(
             import_wave_,
-            "WAV",
+            juce::String::fromUTF8("WAV変換"),
             juce::String::fromUTF8("WAVファイルから変換"),
             [this] { importWaveFile(); });
         configureButton(
@@ -8646,7 +8646,7 @@ public:
             || target->source != mgstc::engine::TimbreSource::Scc) {
             return false;
         }
-        owned_edit_id_ = id;
+        owned_edit_snapshot_ = *target;
         selected_library_id_.reset();
         SccWaveform waveform{};
         std::transform(
@@ -8669,32 +8669,29 @@ public:
     }
 
     void publishOwnedSnapshot() {
-        if (!owned_edit_id_) {
+        if (!owned_edit_snapshot_) {
             return;
         }
-        auto snapshot = link_.owned_target;
-        if (!snapshot || snapshot->library_id != *owned_edit_id_) {
-            snapshot = mgstc::engine::SavedTimbreReference{};
-            snapshot->library_id = *owned_edit_id_;
-            snapshot->source = mgstc::engine::TimbreSource::Scc;
-        }
+        auto snapshot = *owned_edit_snapshot_;
         std::transform(
             scc_wave_.begin(),
             scc_wave_.end(),
-            snapshot->scc_waveform.begin(),
+            snapshot.scc_waveform.begin(),
             [](std::int8_t value) {
                 return static_cast<std::uint8_t>(value);
             });
         const auto owned_name = utf8Text(name_.getText().trim());
         if (!owned_name.empty()) {
-            snapshot->name = owned_name;
+            snapshot.name = owned_name;
         }
-        link_.owned_target = *snapshot;
-        link_.publishOwned(*snapshot);
+        // A reused editor may publish during activation before the next
+        // tone loads. Keep its snapshot separate from the pending target.
+        owned_edit_snapshot_ = snapshot;
+        link_.publishOwned(std::move(snapshot));
     }
 
     void syncOwnedLibraryActions() {
-        const bool owned = owned_edit_id_.has_value();
+        const bool owned = owned_edit_snapshot_.has_value();
         library_new_.setEnabled(!owned);
         library_save_as_.setEnabled(!owned);
         library_delete_.setEnabled(!owned);
@@ -8720,7 +8717,7 @@ public:
                 return;
             }
         }
-        owned_edit_id_.reset();
+        owned_edit_snapshot_.reset();
         syncOwnedLibraryActions();
         selected_library_id_ = id;
         refreshLibraryList();
@@ -9060,7 +9057,7 @@ public:
         file_row.removeFromLeft(controlGap);
         redo_.setBounds(file_row.removeFromLeft(iconButton));
         file_row.removeFromLeft(lg - xs);
-        import_wave_.setBounds(file_row.removeFromLeft(UiScale::sx(66)));
+        import_wave_.setBounds(file_row.removeFromLeft(UiScale::sx(112)));
         file_row.removeFromLeft(sm);
         import_audacity_.setBounds(file_row.removeFromLeft(UiScale::sx(184)));
         file_row.removeFromLeft(sm);
@@ -10467,7 +10464,7 @@ private:
     }
 
     void saveLibraryEntry(bool save_as) {
-        if (owned_edit_id_) {
+        if (owned_edit_snapshot_) {
             if (!save_as) {
                 saveOwnedCompositeSnapshot();
             }
@@ -11156,7 +11153,7 @@ private:
     }
 
     [[nodiscard]] bool usesCompositeAudition() const noexcept {
-        return owned_edit_id_.has_value()
+        return owned_edit_snapshot_.has_value()
             && link_.owned_audition.ready();
     }
 
@@ -11367,7 +11364,7 @@ private:
     juce::TooltipWindow tooltip_window_;
     SwitchLookAndFeel switch_look_and_feel_;
     bool envelope_context_{};
-    std::optional<std::uint64_t> owned_edit_id_;
+    std::optional<mgstc::engine::SavedTimbreReference> owned_edit_snapshot_;
     SccWaveform scc_wave_{};
     std::optional<int> ui_scale_session_override_;
     std::vector<SccWaveform> history_;
@@ -11921,7 +11918,7 @@ public:
             [this] { redo(); });
         configureButton(
             import_wave_,
-            "WAV",
+            juce::String::fromUTF8("WAV変換"),
             juce::String::fromUTF8("WAVファイルからOPLL近似変換"),
             [this] { importWaveFile(); });
         configureButton(
@@ -12412,7 +12409,7 @@ public:
             || target->source != mgstc::engine::TimbreSource::Opll) {
             return false;
         }
-        owned_edit_id_ = id;
+        owned_edit_snapshot_ = *target;
         selected_library_id_.reset();
         name_.setText(
             juce::String::fromUTF8(target->name.c_str()),
@@ -12427,26 +12424,23 @@ public:
     }
 
     void publishOwnedSnapshot() {
-        if (!owned_edit_id_) {
+        if (!owned_edit_snapshot_) {
             return;
         }
-        auto snapshot = link_.owned_target;
-        if (!snapshot || snapshot->library_id != *owned_edit_id_) {
-            snapshot = mgstc::engine::SavedTimbreReference{};
-            snapshot->library_id = *owned_edit_id_;
-            snapshot->source = mgstc::engine::TimbreSource::Opll;
-        }
-        snapshot->opll_registers = mgstc::engine::encodeOpllPatch(patch_);
+        auto snapshot = *owned_edit_snapshot_;
+        snapshot.opll_registers = mgstc::engine::encodeOpllPatch(patch_);
         const auto owned_name = utf8Text(name_.getText().trim());
         if (!owned_name.empty()) {
-            snapshot->name = owned_name;
+            snapshot.name = owned_name;
         }
-        link_.owned_target = *snapshot;
-        link_.publishOwned(*snapshot);
+        // A reused editor may publish during activation before the next
+        // tone loads. Keep its snapshot separate from the pending target.
+        owned_edit_snapshot_ = snapshot;
+        link_.publishOwned(std::move(snapshot));
     }
 
     void syncOwnedLibraryActions() {
-        const bool owned = owned_edit_id_.has_value();
+        const bool owned = owned_edit_snapshot_.has_value();
         library_new_.setEnabled(!owned);
         library_save_as_.setEnabled(!owned);
         library_delete_.setEnabled(!owned);
@@ -12472,7 +12466,7 @@ public:
                 return;
             }
         }
-        owned_edit_id_.reset();
+        owned_edit_snapshot_.reset();
         syncOwnedLibraryActions();
         selected_library_id_ = id;
         refreshLibraryList();
@@ -12744,7 +12738,7 @@ public:
         }
         toolbar.removeFromLeft(controlGap);
         import_wave_.setBounds(
-            toolbar.removeFromLeft(UiScale::sx(70)));
+            toolbar.removeFromLeft(UiScale::sx(112)));
         toolbar.removeFromLeft(controlGap);
         import_audacity_.setBounds(
             toolbar.removeFromLeft(UiScale::sx(154)));
@@ -13798,7 +13792,7 @@ private:
     }
 
     void saveLibraryEntry(bool save_as) {
-        if (owned_edit_id_) {
+        if (owned_edit_snapshot_) {
             if (!save_as) {
                 saveOwnedCompositeSnapshot();
             }
@@ -14385,7 +14379,7 @@ private:
     }
 
     [[nodiscard]] bool usesCompositeAudition() const noexcept {
-        return owned_edit_id_.has_value()
+        return owned_edit_snapshot_.has_value()
             && link_.owned_audition.ready();
     }
 
@@ -14543,7 +14537,7 @@ private:
     juce::TooltipWindow tooltip_window_;
     SwitchLookAndFeel switch_look_and_feel_;
     bool envelope_context_{};
-    std::optional<std::uint64_t> owned_edit_id_;
+    std::optional<mgstc::engine::SavedTimbreReference> owned_edit_snapshot_;
     mgstc::engine::OpllPatchParameters patch_;
     std::optional<int> ui_scale_session_override_;
     std::vector<mgstc::engine::OpllPatchParameters> history_;

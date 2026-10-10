@@ -5044,6 +5044,33 @@ void testMgsCompositeSourceRoundTrip() {
     REQUIRE_EQ(formatted.source.find("@v16") != std::string::npos, true);
     REQUIRE_EQ(formatted.source.find("@e1") != std::string::npos, true);
 
+    const auto scc_preview = formatMgsCompositeLayerTimbres(original, 1);
+    REQUIRE_EQ(scc_preview.valid(), true);
+    REQUIRE_EQ(scc_preview.source.find("@s15") != std::string::npos, true);
+    REQUIRE_EQ(scc_preview.source.find("@v16"), std::string::npos);
+    REQUIRE_EQ(extractMgsSourceDefinitions(scc_preview.source, 's').size(), 1U);
+    const auto opll_preview = formatMgsCompositeLayerTimbres(original, 2);
+    REQUIRE_EQ(opll_preview.valid(), true);
+    REQUIRE_EQ(opll_preview.source.find("@v16") != std::string::npos, true);
+    REQUIRE_EQ(opll_preview.source.find("@s15"), std::string::npos);
+    REQUIRE_EQ(formatMgsCompositeLayerTimbres(original, 0).source.empty(), true);
+    REQUIRE_EQ(formatMgsCompositeLayerTimbres(original, 3).valid(), false);
+    auto with_slide = original;
+    auto slide_tone = *with_slide.layers[1].base_timbre;
+    slide_tone.library_id = 303;
+    slide_tone.manual_number = 19;
+    slide_tone.name = "Slide target";
+    slide_tone.scc_waveform[0] ^= 127;
+    with_slide.embedded_timbres.push_back(slide_tone);
+    with_slide.layers[1].timbre_automation[0].target_library_id = 303;
+    const auto slide_preview = formatMgsCompositeLayerTimbres(with_slide, 1);
+    REQUIRE_EQ(slide_preview.valid(), true);
+    REQUIRE_EQ(extractMgsSourceDefinitions(slide_preview.source, 's').size(), 2U);
+    REQUIRE_EQ(slide_preview.source.find("@s19") != std::string::npos, true);
+    const auto slide_full = formatMgsComposite(with_slide);
+    REQUIRE_EQ(slide_full.valid(), true);
+    REQUIRE_EQ(slide_full.source.find(slide_preview.source) != std::string::npos, true);
+
     const auto parsed = parseMgsComposite(formatted.source);
     REQUIRE_EQ(parsed.valid(), true);
     REQUIRE_EQ(parsed.timbre.name, original.name);

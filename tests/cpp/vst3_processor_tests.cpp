@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "mgstc/engine/chip_rack.hpp"
@@ -36,6 +37,30 @@
 namespace mgstc::app {
 
 struct SatelliteEditorParityTestAccess {
+    template<class Editor>
+    static const std::optional<mgstc::engine::SavedTimbreReference>&
+    ownedSnapshot(const Editor& editor) {
+        return editor.owned_edit_snapshot_;
+    }
+    template<class Editor>
+    static void activationRefresh(Editor& editor) {
+        editor.engine_ready_ = true;
+        editor.refreshExternalState();
+    }
+    static void editOwned(SccEditorComponent& editor) {
+        editor.saveSccImmediateAuditionSetting(false);
+        editor.name_.setText("Edited SCC A", juce::dontSendNotification);
+        auto waveform = editor.scc_wave_;
+        waveform[3] = static_cast<std::int8_t>(waveform[3] ^ 0x3f);
+        editor.commitWave(waveform);
+    }
+    static void editOwned(OpllEditorComponent& editor) {
+        editor.saveOpllImmediateAuditionSetting(false);
+        editor.name_.setText("Edited OPLL A", juce::dontSendNotification);
+        auto registers = mgstc::engine::encodeOpllPatch(editor.patch_);
+        registers[3] ^= 0x07;
+        editor.commitPatch(mgstc::engine::decodeOpllPatch(registers));
+    }
     static bool check(SccEditorComponent& scc, OpllEditorComponent& opll) {
         scc.saveSccImmediateAuditionSetting(false);
         opll.saveOpllImmediateAuditionSetting(false);
@@ -63,6 +88,9 @@ struct CompositeEditorComponentTestAccess {
     }
     static const mgstc::engine::CompositeTimbre& sound(const CompositeEditorComponent& editor) { return editor.timbre_; }
     static bool wavEnabled(const CompositeEditorComponent& editor) { return editor.import_wave_.isEnabled(); }
+    static bool hasWaveConversionCaption(const CompositeEditorComponent& editor) {
+        return editor.import_wave_.getButtonText() == juce::String::fromUTF8("WAV変換");
+    }
     static std::size_t historySize(const CompositeEditorComponent& editor) { return editor.history_.size(); }
     static std::size_t historyCursor(const CompositeEditorComponent& editor) { return editor.history_cursor_; }
     static void applyWave(CompositeEditorComponent& editor, const mgstc::engine::CompositeTimbre& sound) { editor.applyWaveConversion(sound); }
@@ -145,6 +173,14 @@ struct CompositeWavConversionTestAccess {
         content.source_ = std::move(pcm); content.analysis_.reset(); content.analysis_summary_.clear();
         content.range_.setSource(content.source_); content.syncRange(); content.refreshEnabled();
     }
+    static void load(CompositeWavConversionContent& content,
+        std::function<mgstc::platform::AudacityWaveImportResult()> loader) {
+        content.loadWaveSource(std::move(loader), "Audacity selection", "Acquiring audio");
+    }
+    static bool loading(const CompositeWavConversionContent& content) { return content.busy_dialog_ != nullptr; }
+    static std::shared_ptr<const mgstc::engine::SourcePcm> source(const CompositeWavConversionContent& content) { return content.source_; }
+    static auto selection(const CompositeWavConversionContent& content) { return content.range_.selection(); }
+    static void cancelLoad(CompositeWavConversionContent& content) { content.analysis_cancel_->store(true); }
     static void seedAnalysis(CompositeWavConversionContent& content,
         std::shared_ptr<const mgstc::engine::SourceAnalysis> analysis) { content.analysis_ = std::move(analysis); }
     static std::shared_ptr<const mgstc::engine::SourceAnalysis> analysis(const CompositeWavConversionContent& content) { return content.analysis_; }
@@ -165,6 +201,15 @@ struct CompositeWavConversionTestAccess {
     static void clickCancel(CompositeWavConversionContent& content) { content.cancel_.onClick(); }
     static int waveMethod(const CompositeWavConversionContent& content) { return content.wave_method_.getSelectedId(); }
     static void setWaveMethod(CompositeWavConversionContent& content, int id) { content.wave_method_.setSelectedId(id, juce::sendNotificationSync); }
+    static bool hasAudacityBesideLoad(const CompositeWavConversionContent& content) {
+        return content.load_.getButtonText() == juce::String::fromUTF8("WAVを開く…")
+            && content.audacity_.getButtonText() == juce::String::fromUTF8("Audacityから変換")
+            && content.audacity_.isEnabled()
+            && content.audacity_.getX() == content.load_.getRight() + UiLayout::controlGap
+            && content.audacity_.getY() == content.load_.getY()
+            && content.getLocalBounds().contains(content.audacity_.getBounds())
+            && content.metadata_.getX() == content.audacity_.getRight() + UiLayout::controlGap;
+    }
     static bool hasComparisonButtonsWithoutAb(const CompositeWavConversionContent& content) {
         bool original = false, converted = false, stop = false;
         for (auto* child : content.getChildren()) {
@@ -3819,6 +3864,95 @@ void testPluginProjectRestore() {
         "44.1 kHz restore does not touch latency");
 }
 
+// Reproduce Standalone's ordering: the composite posts target B, window
+// activation refreshes the old editor A, then requestLibraryEntry loads B.
+// Plugin uses the same satellite components, with no SQLite fallback available.
+void testOwnedEditorPendingTargetKeepsSnapshot() {
+    using Access = mgstc::app::SatelliteEditorParityTestAccess;
+    using mgstc::engine::SavedTimbreReference;
+    using mgstc::engine::TimbreSource;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    auto timbre = mgstc::engine::defaultCompositeTimbre();
+    const auto open = [](const juce::String&, std::optional<std::uint64_t>) {};
+    mgstc::app::SccEditorComponent scc(context, link, open, [] {},
+        [](std::vector<mgstc::engine::OpllPatchParameters>) {},
+        [](juce::Component*) {}, true, [] {});
+    mgstc::app::OpllEditorComponent opll(context, link, open, [] {},
+        [](juce::Component*) {}, true, [] {});
+    std::size_t synced = 0;
+    link.owned_audition = {
+        [&] {
+            require(link.owned_published.has_value(), "owned sync has snapshot");
+            require(mgstc::engine::replaceOwnedTimbreSnapshot(
+                timbre, *link.owned_published), "owned snapshot remains in composite");
+            ++synced;
+        }, [] {}, [](std::uint8_t) {}, [](std::uint8_t) {}, [] {}};
+    const auto exercise = [&](auto& editor, TimbreSource source,
+                              std::size_t layer_index) {
+        SavedTimbreReference a;
+        a.library_id = 0xff00000000000000ULL + layer_index * 2;
+        a.revision = 7;
+        a.name = source == TimbreSource::Scc ? "SCC A" : "OPLL A";
+        a.source = source;
+        a.number_mode = mgstc::engine::TimbreNumberMode::Manual;
+        a.manual_number = 23;
+        a.opll_registers = {0x71, 0x61, 0x1e, 0x17, 0xd0, 0x78, 0, 0x17};
+        for (std::size_t i = 0; i < a.scc_waveform.size(); ++i)
+            a.scc_waveform[i] = static_cast<std::uint8_t>(i * 3 + 1);
+        auto b = a;
+        ++b.library_id;
+        b.revision = 11;
+        b.name = source == TimbreSource::Scc ? "SCC B" : "OPLL B";
+        b.manual_number = 24;
+        b.opll_registers[3] ^= 0x04;
+        b.scc_waveform[3] ^= 0x7f;
+        timbre.layers[layer_index].base_opll_rom.reset();
+        timbre.layers[layer_index].base_timbre = a;
+        timbre.embedded_timbres.push_back(b);
+        link.owned_target = a;
+        editor.requestLibraryEntry(a.library_id);
+        Access::editOwned(editor);
+        require(link.owned_published.has_value(), "edit publishes owned A");
+        const auto edited_a = *link.owned_published;
+        require(edited_a.name != a.name
+            && edited_a.library_id == a.library_id
+            && edited_a.number_mode == a.number_mode
+            && edited_a.manual_number == a.manual_number
+            && edited_a.revision == a.revision,
+            "editing preserves A assignment metadata");
+        require(a.name == (source == TimbreSource::Scc ? "SCC A" : "OPLL A")
+            && a.opll_registers[3] == 0x17 && a.scc_waveform[3] == 10,
+            "owned editing preserves original source A");
+        link.owned_target = b;
+        const auto before_refresh = synced;
+        Access::activationRefresh(editor);
+        require(synced > before_refresh, "activation refresh publishes current owned tone");
+        require(link.owned_target == b,
+            "activation of A preserves pending embedded B request");
+        require(link.owned_published == edited_a,
+            "activation keeps A payload and assignment metadata");
+        editor.requestLibraryEntry(b.library_id);
+        require(Access::ownedSnapshot(editor) == b,
+            "same-channel switch loads embedded B without library fallback");
+        require(*mgstc::engine::findEmbeddedTimbreSnapshot(timbre, b.library_id) == b,
+            "switch preserves original B payload and assignment");
+        link.owned_target = edited_a;
+        Access::activationRefresh(editor);
+        require(link.owned_target == edited_a,
+            "activation of B preserves pending edited A request");
+        editor.requestLibraryEntry(a.library_id);
+        require(Access::ownedSnapshot(editor) == edited_a,
+            "A to B to A retains edited waveform or patch and name");
+        require(*mgstc::engine::findEmbeddedTimbreSnapshot(timbre, b.library_id) == b,
+            "reopening A leaves B unchanged");
+    };
+    exercise(scc, TimbreSource::Scc, 1);
+    exercise(opll, TimbreSource::Opll, 2);
+}
+
 void testEditorParityCorrections() {
     using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
     MgstcAudioProcessor processor;
@@ -4362,6 +4496,77 @@ void testConversionCompletionCancellation() {
         juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
     }
 }
+void testCompositeWavSourceImportTransactions() {
+    using WavAccess = mgstc::app::CompositeWavConversionTestAccess;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    mgstc::plugin::PluginEditorContext context(processor);
+    const auto authoring = processor.copyPluginState().sound;
+    const auto message_thread = std::this_thread::get_id();
+    // PCM16, mono, 48 kHz, two explicit samples. No filesystem/Audacity fixture.
+    const std::vector<std::uint8_t> wave{
+        'R','I','F','F',40,0,0,0,'W','A','V','E','f','m','t',' ',16,0,0,0,
+        1,0,1,0,128,187,0,0,0,119,1,0,2,0,16,0,'d','a','t','a',4,0,0,0,
+        0,32,0,224};
+    bool applied = false;
+    auto content = std::make_unique<mgstc::app::CompositeWavConversionContent>(
+        [&](const mgstc::engine::CompositeTimbre&, std::function<void()>) { applied = true; },
+        context.pcmPreview(), context.backgroundTasks());
+    auto finish = [&] {
+        for (int wait = 0; wait < 250 && WavAccess::loading(*content); ++wait)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+        require(!WavAccess::loading(*content), "source import worker finishes within bounded wait");
+    };
+    std::atomic<bool> worker_thread{false};
+    WavAccess::load(*content, [&] {
+        worker_thread.store(std::this_thread::get_id() != message_thread);
+        return mgstc::platform::AudacityWaveImportResult{wave, {}};
+    });
+    finish();
+    const auto loaded = WavAccess::source(*content);
+    require(worker_thread.load() && loaded && loaded->mono_samples.size() == 2,
+        "Audacity/file source provider and common WAVE decoder run on conversion worker");
+    const auto range = WavAccess::selection(*content);
+    require(range.begin == 0 && range.end == 2 && loaded->sample_rate == 48000
+            && loaded->mono_samples[0] == 0.25f && loaded->mono_samples[1] == -0.25f,
+        "source import populates exact PCM and full selection without conversion/apply");
+    WavAccess::load(*content, [] {
+        return mgstc::platform::AudacityWaveImportResult{{}, L"pipe unavailable"};
+    });
+    finish();
+    require(WavAccess::source(*content) == loaded && WavAccess::status(*content).contains("pipe unavailable"),
+        "failed Audacity acquisition retains previous valid source and reports its error");
+    struct Pending { std::atomic<bool> started{false}; std::atomic<bool> released{false}; };
+    auto pending = std::make_shared<Pending>();
+    auto provider = [pending, wave] {
+        pending->started.store(true);
+        for (int wait = 0; wait < 5000 && !pending->released.load(); ++wait)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return mgstc::platform::AudacityWaveImportResult{wave, {}};
+    };
+    WavAccess::load(*content, provider);
+    for (int wait = 0; wait < 100 && !pending->started.load(); ++wait)
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+    WavAccess::cancelLoad(*content);
+    pending->released.store(true);
+    finish();
+    require(WavAccess::source(*content) == loaded, "cancelled source acquisition does not publish PCM");
+    pending = std::make_shared<Pending>();
+    WavAccess::load(*content, [pending, wave] {
+        pending->started.store(true);
+        for (int wait = 0; wait < 5000 && !pending->released.load(); ++wait)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return mgstc::platform::AudacityWaveImportResult{wave, {}};
+    });
+    for (int wait = 0; wait < 100 && !pending->started.load(); ++wait)
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+    content.reset();
+    pending->released.store(true);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(60);
+    require(!applied && processor.copyPluginState().sound == authoring,
+        "source inspection/failure/cancellation/editor close never applies or changes VST3 authoring state");
+}
+
 void testCompositeWavUiTransactions() {
     using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
     using WavAccess = mgstc::app::CompositeWavConversionTestAccess;
@@ -4389,6 +4594,7 @@ void testCompositeWavUiTransactions() {
     auto converted = sccOnlyTimbre(); converted.name = "WAV result";
     const auto history_before = EditorAccess::historySize(editor);
     require(EditorAccess::wavEnabled(editor), "VST shared editor enables WAV conversion button");
+    require(EditorAccess::hasWaveConversionCaption(editor), "shared editor uses WAV conversion caption");
     require(context.pcmPreview() != nullptr, "VST converter uses host PCM boundary");
     {
         mgstc::app::CompositeWavConversionContent content(
@@ -4429,6 +4635,7 @@ void testCompositeWavUiTransactions() {
             UiScale::setActivePercent(scale);
             content.setSize(UiScale::sx(900), UiScale::sx(900)); content.resized();
             require(WavAccess::buttonsInside(content), "converter minimum layout preserves comparison and result controls");
+            require(WavAccess::hasAudacityBesideLoad(content), "Audacity conversion sits beside WAV open inside morph window at every UI scale");
             auto image = content.createComponentSnapshot(content.getLocalBounds());
             const auto folder = juce::File::getCurrentWorkingDirectory().getChildFile("build/composite-wav-ui-captures");
             require(folder.createDirectory().wasOk(), "converter capture directory");
@@ -5077,6 +5284,7 @@ int main() {
         testSccMorphPluginStateCompatibility();
         testPluginProjectRestore();
         testPluginEditor();
+        testOwnedEditorPendingTargetKeepsSnapshot();
         testEditorParityCorrections();
         testCompositePlaybackWaveform();
         testCompositeEditorDelayedKeyOff();
@@ -5089,6 +5297,7 @@ int main() {
         testVstConverterWorkerQuiescesAtProcessorTeardown();
         testConversionOwnerClose();
         testConversionCompletionCancellation();
+        testCompositeWavSourceImportTransactions();
         testCompositeWavUiTransactions();
         testCompositeWavCandidateAudition();
         testCompositeWavRangeInteractions();

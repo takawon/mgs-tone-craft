@@ -120,13 +120,27 @@ bool mgstc::app::invalidateEditedSccMorphPlans(
             if (reference && reference->source == TimbreSource::Scc) result.wave = reference->scc_waveform;
             return result;
         };
+        Endpoint base;
+        base.pick = TimbrePick::Library;
+        if (layer.base_timbre) {
+            base.id = layer.base_timbre->library_id; base.wave = layer.base_timbre->scc_waveform;
+        } else {
+            std::array<std::uint8_t, 32> wave{};
+            const auto sine = generateSccPreset(SccWavePreset::Sine, SccHarmonic::One);
+            for (std::size_t i = 0; i < wave.size(); ++i) wave[i] = static_cast<std::uint8_t>(sine[i]);
+            base.wave = wave;
+        }
         std::vector<std::pair<std::size_t, Dependency>> result;
-        for (std::size_t i = 1; i < tones.size(); ++i) {
+        for (std::size_t i = 0; i < tones.size(); ++i) {
             const auto& settings = layer.timbre_automation[tones[i]].scc_morph;
-            std::size_t start = i - 1, end = i;
+            if (i == 0 && !settings.enabled) continue;
+            std::size_t start = i > 0 ? i - 1 : 0, end = i;
             while (start > 0 && layer.timbre_automation[tones[start]].scc_morph.enabled) --start;
             while (end + 1 < tones.size() && layer.timbre_automation[tones[end + 1]].scc_morph.enabled) ++end;
-            Dependency dependency{endpoint(i - 1), endpoint(i), endpoint(start), endpoint(end),
+            const bool starts_at_base = start == 0
+                && layer.timbre_automation[tones[0]].scc_morph.enabled;
+            Dependency dependency{i > 0 ? endpoint(i - 1) : base, endpoint(i),
+                starts_at_base ? base : endpoint(start), endpoint(end),
                 start != 0, end + 1 != tones.size(), settings.enabled, settings.intermediate_count,
                 settings.curve, settings.distribution_mode};
             const auto boundaryWithin = [&](const std::optional<std::uint32_t>& boundary) {
@@ -209,6 +223,12 @@ void insertCurrentAssignmentCatalogItem(
     mgstc::engine::TimbreSource source,
     const EnvelopeTimbreChoice& current,
     const std::vector<EnvelopeTimbreCatalogItem>& catalog) {
+    if (source == mgstc::engine::TimbreSource::Scc && current.scc_preset) {
+        constexpr std::array<const char*, 6> names{
+            "Sine", "Square", "Triangle", "Saw", "Pulse 25%", "Pulse 12.5%"};
+        return juce::String::fromUTF8("現在: ")
+            + juce::String(names[static_cast<std::size_t>(*current.scc_preset)]);
+    }
     if (source == mgstc::engine::TimbreSource::Opll
         && current.pick == mgstc::engine::TimbrePick::OpllRom) {
         return juce::String::fromUTF8("現在: ")
@@ -521,7 +541,7 @@ public:
         }
         morph_uniform_.setJustificationType(juce::Justification::centredRight);
         if (!morph_available_) morph_error_.setText(
-            juce::String::fromUTF8("直前に音色イベントが必要です。同じカウントではモーフィングできません。"),
+            juce::String::fromUTF8("開始音色より後のカウントを選んでください。同じカウントではモーフィングできません。"),
             juce::dontSendNotification);
         syncMorphEnabled();
         setSize(getWidth(), getHeight() + (UiLayout::fieldH + UiLayout::sm) * 10);
@@ -627,7 +647,10 @@ public:
         std::function<void(std::uint8_t)> on_note_on = {},
         std::function<void(std::uint8_t)> on_note_off = {},
         std::function<void()> on_audition = {},
-        std::function<std::optional<std::uint64_t>()> on_blank = {})
+        std::function<std::optional<std::uint64_t>()> on_blank = {},
+        std::function<void(EnvelopeTimbreChoice, std::uint8_t)> on_perform = {},
+        std::function<void()> on_performance_end = {},
+        std::function<void(EnvelopeTimbreChoice)> on_selection_preview = {})
         : source_(source),
           catalog_(catalog),
           current_(current),
@@ -642,6 +665,8 @@ public:
           on_note_off_(std::move(on_note_off)),
           on_audition_(std::move(on_audition)),
           on_blank_(std::move(on_blank)),
+          on_performance_end_(std::move(on_performance_end)),
+          on_selection_preview_(std::move(on_selection_preview)),
           layer_base_(layer_base) {
         current_label_.setText(
             currentAssignmentCaption(source_, current_, catalog_),
@@ -681,14 +706,14 @@ public:
                     ? (layer_base_
                            ? "OPLL ROM（@0～@14）。読込でこのチャンネルの基本音色に設定します"
                            : "OPLL ROM（@0～@14）。読込でこのカウントの@に設定します")
-                    : "SCC波形プリセット。@割当はライブラリ音色を選んでください"));
+                    : "SCC波形プリセット。読込でこのカウントの所有音色として設定します"));
         preset_.onChange = [this] {
-            if (source_ == mgstc::engine::TimbreSource::Opll
-                && preset_.getSelectedId() > 0) {
+            if (preset_.getSelectedId() > 0) {
                 list_.setSelectedId(0, juce::dontSendNotification);
             }
             syncDetailFromSelection();
             liveApplySelection();
+            previewSelection();
         };
         addAndMakeVisible(preset_);
 
@@ -771,12 +796,12 @@ public:
         list_.setTextWhenNothingSelected(
             juce::String::fromUTF8("保存済み音色を選択"));
         list_.onChange = [this] {
-            if (list_.getSelectedId() > 0
-                && source_ == mgstc::engine::TimbreSource::Opll) {
+            if (list_.getSelectedId() > 0) {
                 preset_.setSelectedId(0, juce::dontSendNotification);
             }
             syncDetailFromSelection();
             liveApplySelection();
+            previewSelection();
         };
         addAndMakeVisible(list_);
         load_.setButtonText(juce::String::fromUTF8("読込"));
@@ -823,11 +848,17 @@ public:
         memo_.onFocusLost = [this] { commitMemo(); };
         addAndMakeVisible(memo_);
 
-        if (layer_base_ && performance_session != nullptr) {
+        if (performance_session != nullptr) {
             keyboard_ = std::make_unique<mgstc::app::PerformanceKeyboard>(
                 *performance_session);
             keyboard_->setHeadlessMode(true);
-            keyboard_->setCallbacks(on_note_on_, on_note_off_);
+            keyboard_->setCallbacks(
+                [this, perform = std::move(on_perform)](std::uint8_t note) {
+                    if (perform) {
+                        if (auto choice = selectedChoice()) perform(*choice, note);
+                        else perform(current_, note);
+                    } else if (on_note_on_) on_note_on_(note);
+                }, on_note_off_);
             keyboard_->setSuppressPcInputCallback(
                 [this] { return textEntryHasFocusWithin(*this); });
             addChildComponent(*keyboard_);
@@ -850,7 +881,25 @@ public:
             UiLayout::compositeTimbrePickH + extra);
     }
 
+    bool verifyPresetSelection() {
+        for (int id = 1; id <= 6; ++id) {
+            preset_.setSelectedId(id, juce::dontSendNotification);
+            preset_.onChange();
+            const auto choice = selectedChoice();
+            if (!choice || !choice->scc_preset || !load_.isEnabled()
+                || static_cast<int>(*choice->scc_preset) != id - 1
+                || list_.getSelectedId() != 0) return false;
+        }
+        load_.onClick();
+        if (layer_base_ && preview_.onClick) preview_.onClick();
+        return true;
+    }
+
     ~EnvelopeTimbrePickContent() override {
+        // Release held PC/MIDI notes before restoring the authored program.
+        if (keyboard_) keyboard_->allNotesOff();
+        keyboard_.reset();
+        if (on_performance_end_) on_performance_end_();
         favorite_only_.setLookAndFeel(nullptr);
         morph_enabled_.setLookAndFeel(nullptr);
     }
@@ -872,7 +921,7 @@ public:
     }
 
     void visibilityChanged() override {
-        if (layer_base_ && isShowing()) {
+        if (keyboard_ != nullptr && isShowing()) {
             grabKeyboardFocus();
         }
     }
@@ -1154,7 +1203,19 @@ private:
             && current_.library_id != 0;
     }
 
+    void previewSelection() {
+        if (live_apply_armed_ && !syncing_ && on_selection_preview_)
+            if (const auto choice = selectedChoice()) on_selection_preview_(*choice);
+    }
+
     [[nodiscard]] std::optional<EnvelopeTimbreChoice> selectedChoice() const {
+        if (source_ == mgstc::engine::TimbreSource::Scc
+            && preset_.getSelectedId() > 0) {
+            EnvelopeTimbreChoice choice;
+            choice.scc_preset = static_cast<mgstc::engine::SccWavePreset>(
+                juce::jlimit(0, 5, preset_.getSelectedId() - 1));
+            return choice;
+        }
         if (source_ == mgstc::engine::TimbreSource::Opll
             && preset_.getSelectedId() > 0) {
             EnvelopeTimbreChoice choice;
@@ -1355,6 +1416,8 @@ private:
     std::function<void(std::uint8_t)> on_note_on_;
     std::function<void(std::uint8_t)> on_note_off_;
     std::function<void()> on_audition_;
+    std::function<void()> on_performance_end_;
+    std::function<void(EnvelopeTimbreChoice)> on_selection_preview_;
     std::function<std::optional<std::uint64_t>()> on_blank_;
     bool layer_base_{};
     bool live_apply_armed_{};
@@ -2102,6 +2165,117 @@ enum class TimelineModulationTarget : std::uint8_t {
     return {};
 }
 
+// Evaluated on the message thread from the same authoring values and shared
+// modulation evaluator used by the timeline, audition and MGSC expansion.
+class TimelineModulationWavePreview final : public juce::Component {
+public:
+    static constexpr int kPreviewCounts = 512;
+    struct Data {
+        TimelineModulationTarget target{};
+        std::array<std::optional<int>, kPreviewCounts + 1> base{}, free_curve{};
+    };
+
+    explicit TimelineModulationWavePreview(Data data) : data_(std::move(data)) {}
+
+    void setSettings(mgstc::engine::ModulationParameters settings, bool free_curve) {
+        settings_ = settings;
+        free_curve_ = free_curve;
+        repaint();
+    }
+
+    [[nodiscard]] std::optional<int> valueAt(int count) const {
+        if (count < 0 || count > kPreviewCounts) return std::nullopt;
+        const auto base = data_.base[static_cast<std::size_t>(count)];
+        if (!base) return std::nullopt;
+        if (free_curve_) {
+            return settings_.enabled
+                ? data_.free_curve[static_cast<std::size_t>(count)].value_or(*base)
+                : *base;
+        }
+        const auto [minimum, maximum] = valueRange();
+        return mgstc::engine::modulationEffectiveValueAtCount(
+            settings_, static_cast<std::uint32_t>(count), *base, minimum, maximum);
+    }
+
+    void paint(juce::Graphics& graphics) override {
+        const auto bounds = getLocalBounds().toFloat().reduced(1.0F);
+        graphics.setColour(juce::Colour(UiLayout::panelFill));
+        graphics.fillRoundedRectangle(bounds, 5.0F);
+        graphics.setColour(juce::Colour(0xFF435160));
+        graphics.drawRoundedRectangle(bounds, 5.0F, 1.0F);
+        auto graph = bounds.reduced(static_cast<float>(UiLayout::xs));
+        auto scale = graph.removeFromLeft(static_cast<float>(UiLayout::fieldH));
+        const int counts = free_curve_ ? kPreviewCounts : juce::jmin(kPreviewCounts,
+            juce::jmax(240, 240 + static_cast<int>(mgstc::engine::softwareLfoFirstUpdateTick(
+                settings_.delay, settings_.speed))));
+        auto [minimum, maximum] = valueRange();
+        if (data_.target == TimelineModulationTarget::Pitch) {
+            int extent = mgstc::engine::kSoftwareLfoPreviewExtent;
+            for (int count = 0; count <= counts; ++count) {
+                if (const auto value = valueAt(count)) extent = juce::jmax(extent, std::abs(*value));
+                if (const auto base = data_.base[static_cast<std::size_t>(count)])
+                    extent = juce::jmax(extent, std::abs(*base));
+            }
+            minimum = -extent;
+            maximum = extent;
+        }
+        const auto map_y = [&](int value) {
+            return juce::jmap(static_cast<float>(value), static_cast<float>(minimum),
+                static_cast<float>(maximum), graph.getBottom(), graph.getY());
+        };
+        graphics.setFont(UiFonts::dense());
+        graphics.setColour(juce::Colour(0xFF8896A3));
+        const float text_h = UiFonts::dense().getHeight();
+        graphics.drawText(juce::String(maximum), scale.withHeight(text_h).toNearestInt(),
+            juce::Justification::centredRight, false);
+        graphics.drawText(juce::String(minimum), scale.withTop(scale.getBottom() - text_h).toNearestInt(),
+            juce::Justification::centredRight, false);
+        graphics.setColour(juce::Colour(0xFF586675));
+        if (minimum < 0) graphics.drawHorizontalLine(juce::roundToInt(map_y(0)), graph.getX(), graph.getRight());
+        for (int count = 60; count < counts; count += 60) {
+            const float x = graph.getX() + graph.getWidth() * static_cast<float>(count) / counts;
+            graphics.drawVerticalLine(juce::roundToInt(x), graph.getY(), graph.getBottom());
+            graphics.drawText(juce::String(count / 60) + "s", juce::roundToInt(x) + UiLayout::xs,
+                juce::roundToInt(graph.getY()), UiLayout::fieldH, juce::roundToInt(text_h),
+                juce::Justification::centredLeft, false);
+        }
+        const auto draw = [&](bool effective, juce::Colour colour) {
+            juce::Path path;
+            std::optional<float> previous_y;
+            for (int count = 0; count <= counts; ++count) {
+                const auto value = effective ? valueAt(count) : data_.base[static_cast<std::size_t>(count)];
+                if (!value) { previous_y.reset(); continue; }
+                const float x = graph.getX() + graph.getWidth() * static_cast<float>(count) / counts;
+                const float y = map_y(*value);
+                if (previous_y) { path.lineTo(x, *previous_y); path.lineTo(x, y); }
+                else path.startNewSubPath(x, y);
+                previous_y = y;
+            }
+            graphics.setColour(colour);
+            graphics.strokePath(path, juce::PathStrokeType(effective ? 1.5F : 1.0F));
+        };
+        graphics.saveState();
+        graphics.reduceClipRegion(graph.toNearestInt());
+        draw(false, juce::Colour(0xFF8896A3).withAlpha(0.45F));
+        draw(true, juce::Colour(kUiHoverAccent));
+        graphics.restoreState();
+    }
+
+private:
+    [[nodiscard]] std::pair<int, int> valueRange() const {
+        switch (data_.target) {
+        case TimelineModulationTarget::Pitch: return {-32768, 32767};
+        case TimelineModulationTarget::Tremolo: return {0, 15};
+        case TimelineModulationTarget::TotalLevel: return {0, 63};
+        case TimelineModulationTarget::Feedback: return {0, 7};
+        }
+        return {0, 15};
+    }
+    Data data_;
+    mgstc::engine::ModulationParameters settings_{};
+    bool free_curve_{};
+};
+
 class TimelineModulationDialogContent final : public juce::Component {
 public:
     using ChangeCallback = std::function<void(
@@ -2111,8 +2285,9 @@ public:
         TimelineModulationTarget target,
         mgstc::engine::ModulationParameters initial,
         bool free_curve,
+        TimelineModulationWavePreview::Data preview_data,
         ChangeCallback on_change)
-        : on_change_(std::move(on_change)) {
+        : on_change_(std::move(on_change)), wave_(std::move(preview_data)) {
         title_.setText(timelineModulationName(target), juce::dontSendNotification);
         title_.setFont(UiFonts::heading());
         addAndMakeVisible(title_);
@@ -2145,6 +2320,8 @@ public:
             -127, 127, juce::String::fromUTF8(
                 "1ステップの変化量 (−127～127)。上昇／下降では絶対値を使用"));
 
+        addAndMakeVisible(wave_);
+
         hint_.setText(juce::String::fromUTF8(
             "上昇／下降では深さを使わず、粗さの絶対値で変化します。"),
             juce::dontSendNotification);
@@ -2171,10 +2348,12 @@ public:
         roughness_.setValue(initial.roughness, juce::dontSendNotification);
         assigning_ = false;
         updateParamAvailability();
+        updateWave();
         setSize(UiLayout::compositeLfoDialogW,
             UiLayout::panelPad * 2 + UiLayout::titleH + UiLayout::xs
                 + UiLayout::textButtonH + UiLayout::sm
                 + (UiLayout::fieldH + UiLayout::controlGap) * 5
+                + UiLayout::compositeLfoWaveH + UiLayout::sm
                 + UiLayout::fieldH * 2 + UiLayout::sm
                 + UiLayout::textButtonH);
     }
@@ -2201,9 +2380,19 @@ public:
         area.removeFromTop(controlGap);
         layoutParam(area.removeFromTop(fieldH), roughness_label_, roughness_);
         area.removeFromTop(sm);
+        wave_.setBounds(area.removeFromTop(compositeLfoWaveH));
+        area.removeFromTop(sm);
         hint_.setBounds(area.removeFromTop(fieldH * 2));
         close_.setBounds(area.removeFromBottom(textButtonH)
             .removeFromLeft(libraryButtonMinW));
+    }
+
+    [[nodiscard]] bool verifyPreviewLayoutAndDelay(int delay) const {
+        return static_cast<int>(delay_.getValue()) == delay
+            && wave_.getY() >= roughness_.getBottom() + UiLayout::sm
+            && wave_.getHeight() == UiLayout::compositeLfoWaveH
+            && wave_.getBottom() <= hint_.getY()
+            && hint_.getBottom() <= close_.getY();
     }
 
 private:
@@ -2243,8 +2432,11 @@ private:
             juce::dontSendNotification);
     }
 
-    void commit() {
-        if (assigning_ || !on_change_) return;
+    void updateWave() {
+        wave_.setSettings(settingsFromControls(), mode_.getSelectedId() == 4);
+    }
+
+    [[nodiscard]] mgstc::engine::ModulationParameters settingsFromControls() const {
         mgstc::engine::ModulationParameters settings;
         settings.enabled = enabled_.getToggleState();
         settings.mode = static_cast<mgstc::engine::ModulationMode>(
@@ -2253,7 +2445,13 @@ private:
         settings.depth = static_cast<std::uint8_t>(depth_.getValue());
         settings.speed = static_cast<std::uint8_t>(speed_.getValue());
         settings.roughness = static_cast<std::int8_t>(roughness_.getValue());
-        on_change_(settings, mode_.getSelectedId() == 4);
+        return settings;
+    }
+
+    void commit() {
+        if (assigning_) return;
+        updateWave();
+        if (on_change_) on_change_(settingsFromControls(), mode_.getSelectedId() == 4);
     }
 
     ChangeCallback on_change_;
@@ -2264,6 +2462,7 @@ private:
     juce::ToggleButton enabled_;
     juce::ComboBox mode_;
     juce::Slider delay_, depth_, speed_, roughness_;
+    TimelineModulationWavePreview wave_;
     juce::TextButton close_;
 };
 
@@ -2430,12 +2629,18 @@ void paintRateEnvelopeGraph(
     const mgstc::engine::RateEnvelopeHandleLayout* handles = nullptr,
     int hover_index = -1,
     int active_index = -1,
-    bool draw_handles = true) {
-    const auto graph = rateEnvelopePlotRect(bounds);
+    bool draw_handles = true,
+    bool volume_lane = false) {
+    // Main @r preview uses the full volume amplitude height; the separate
+    // handle editor retains its handle and time-label margins.
+    const auto graph = volume_lane
+        ? bounds.toFloat().expanded(0.0F, 3.0F)
+        : rateEnvelopePlotRect(bounds);
     graphics.setColour(juce::Colour(0xFF111920));
-    graphics.fillRoundedRectangle(graph, 5.0F);
+    const auto background = volume_lane ? bounds.toFloat() : graph;
+    graphics.fillRoundedRectangle(background, 5.0F);
     graphics.setColour(juce::Colour(0xFF435160));
-    graphics.drawRoundedRectangle(graph, 5.0F, 1.0F);
+    graphics.drawRoundedRectangle(background, 5.0F, 1.0F);
     const float key_off_x = rateEnvelopeXFromSeconds(
         graph, mgstc::engine::RateEnvelopeTrace::kKeyOffSeconds);
     const float dash_pattern[]{4.0F, 3.0F};
@@ -4507,7 +4712,7 @@ public:
             juce::TextEditor::focusedOutlineColourId,
             juce::Colour(kUiHoverAccent));
         envelope_mml_preview_.setTooltip(juce::String::fromUTF8(
-            "定義=@e（長いときは複数行）、その下=発音前トラックMML。"
+            "音色定義=@s/@v、エンベロープ=@e/@r、その下=発音前トラックMML。"
             "マウスで範囲選択して Ctrl+C でコピーできます"));
         addAndMakeVisible(envelope_mml_preview_);
 
@@ -4516,6 +4721,13 @@ public:
         mml_toggle_.setTooltip(juce::String::fromUTF8("選択チャンネルの定義と発音前MML。読取専用・範囲コピー可能"));
         mml_toggle_.onClick = [this] { resized(); repaint(); };
         addAndMakeVisible(mml_toggle_);
+        zoom_in_.setButtonText("+"); zoom_out_.setButtonText("-");
+        zoom_in_.setTooltip(juce::String::fromUTF8("ステップ間隔を拡大"));
+        zoom_out_.setTooltip(juce::String::fromUTF8("ステップ間隔を縮小"));
+        zoom_in_.setExplicitFocusOrder(120); zoom_out_.setExplicitFocusOrder(121);
+        zoom_in_.onClick = [this] { zoomCountColumns(graphArea().getCentreX(), 0.8); };
+        zoom_out_.onClick = [this] { zoomCountColumns(graphArea().getCentreX(), 1.25); };
+        addAndMakeVisible(zoom_in_); addAndMakeVisible(zoom_out_);
         pitch_lane_toggle_.setButtonText(juce::String::fromUTF8("音程"));
         pitch_lane_toggle_.setLookAndFeel(&modulation_switch_look_and_feel_);
         pitch_lane_toggle_.setTooltip(juce::String::fromUTF8(
@@ -4692,6 +4904,53 @@ public:
         setEditCallback([&](const auto&, bool, bool) { ++callbacks; });
         auto model = mgstc::engine::defaultCompositeTimbre();
         check(model.layers.size() == 3, "fixture must contain PSG/SCC/OPLL");
+        auto ramp_fixture = model.layers.front();
+        ramp_fixture.volume_envelope.events = {
+            {.kind = mgstc::engine::EnvelopeEventKind::Volume,
+             .value = 15, .count = 0},
+            {.kind = mgstc::engine::EnvelopeEventKind::Volume,
+             .value = 8, .count = 10, .automatic = true},
+        };
+        check(!isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 0)
+                && isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 1)
+                && isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 5)
+                && !isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 10)
+                && !isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 11),
+            "automatic ramp origin/target or display-only mouse edit range is wrong");
+        ramp_fixture.volume_envelope.events.insert(
+            ramp_fixture.volume_envelope.events.begin() + 1,
+            {.kind = mgstc::engine::EnvelopeEventKind::Volume,
+             .value = 12, .count = 5});
+        check(!isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 1)
+                && !isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 4)
+                && !isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 5)
+                && isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 6)
+                && !isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 10)
+                && ramp_fixture.volume_envelope.events.size() == 3,
+            "manual ramp origin or preceding hold was incorrectly mouse-protected");
+        ramp_fixture.volume_envelope.events.push_back(
+            {.kind = mgstc::engine::EnvelopeEventKind::Volume,
+             .value = 6, .count = 15});
+        ramp_fixture.volume_envelope.events.push_back(
+            {.kind = mgstc::engine::EnvelopeEventKind::Volume,
+             .value = 2, .count = 20, .automatic = true});
+        check(!isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 12)
+                && !isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 15)
+                && isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 16)
+                && !isDisplayOnlyAutomaticVolumeCount(ramp_fixture, 20),
+            "automatic ramp protection did not restart at intervening manual origin");
+        {
+            auto layer = mgstc::engine::defaultCompositeTimbre().layers[0];
+            layer.envelope_timeline.length_counts = 16;
+            layer.volume_envelope.events = {
+                {.kind = mgstc::engine::EnvelopeEventKind::Volume, .value = 15, .count = 0},
+                {.kind = mgstc::engine::EnvelopeEventKind::Volume, .value = 0, .count = 10, .automatic = true},
+                {.kind = mgstc::engine::EnvelopeEventKind::Volume, .value = 8, .count = 12}};
+            const auto author = authorVolumeSamples(layer, 16);
+            const auto actual = mgstc::engine::sampleCompositeVolumeLane(layer, 16);
+            check(author[10] == 0 && author[12] == 8 && actual[12] == 0 && actual[13] == 8,
+                "post-ramp author editing position or real tick overlay shifted");
+        }
         for (auto& layer : model.layers) {
             layer.envelope_timeline.length_counts = 32;
             layer.volume_envelope.events.clear();
@@ -4855,8 +5114,30 @@ public:
         selectOverviewLayer(0);
         // Exercise real hit testing and the actual mouse edit path after relayout.
         const auto slots = makeEditLaneSlots(graph_bounds_[0], timbre_.layers[0].source);
-        const auto point = graphStrip(slots.volume).getCentre().toFloat();
+        const auto volume_plot = graphStrip(slots.volume);
+        for (int count = 0; count < 24; ++count) {
+            const int left = xForCount(volume_plot, count);
+            const int right = xForCount(volume_plot, count + 1);
+            if (right > left)
+                check(countAtX(volume_plot, left) == count
+                    && countAtX(volume_plot, (left + right - 1) / 2) == count,
+                    "count hit test differs from drawn cell boundary");
+        }
+        const auto point = juce::Point<float>(
+            static_cast<float>(xForCount(volume_plot, 0)),
+            static_cast<float>(volume_plot.getCentreY()));
         const auto now = juce::Time::getCurrentTime();
+        const auto generated_point = juce::Point<float>(
+            static_cast<float>(xForCount(volume_plot, 3)),
+            static_cast<float>(volume_plot.getCentreY()));
+        const juce::MouseEvent generated_event(
+            juce::Desktop::getInstance().getMainMouseSource(), generated_point,
+            juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),
+            1.0f, 0.0f, 0.0f, 0.0f, 0.0f, this, this, now, generated_point, now, 1, false);
+        callbacks = 0;
+        mouseDown(generated_event); mouseUp(generated_event);
+        check(callbacks == 0 && timbre_ == model,
+            "mouse click changed a display-only automatic volume cell");
         const juce::MouseEvent event(
             juce::Desktop::getInstance().getMainMouseSource(), point,
             juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),
@@ -4897,6 +5178,52 @@ public:
         check(modulation_toggles_[1].isVisible()
                 && timbre_ == full && callbacks == 0,
             "modulation control navigation changed data or visibility");
+        {
+            for (const auto target : {TimelineModulationTarget::Pitch,
+                    TimelineModulationTarget::Tremolo, TimelineModulationTarget::TotalLevel,
+                    TimelineModulationTarget::Feedback}) {
+                TimelineModulationWavePreview::Data data;
+                data.target = target;
+                for (auto& base : data.base) base = 5;
+                for (auto& value : data.free_curve) value = 3;
+                data.base[1].reset(); // ROM/unavailable intervals must remain gaps.
+                TimelineModulationWavePreview wave(data);
+                mgstc::engine::ModulationParameters settings;
+                settings.enabled = true;
+                settings.mode = mgstc::engine::ModulationMode::StepUp;
+                settings.delay = 17;
+                settings.speed = 1;
+                settings.roughness = 8;
+                wave.setSettings(settings, false);
+                const int first = static_cast<int>(mgstc::engine::softwareLfoFirstUpdateTick(
+                    settings.delay, settings.speed));
+                const int maximum = target == TimelineModulationTarget::Pitch ? 32767
+                    : target == TimelineModulationTarget::Tremolo ? 15
+                    : target == TimelineModulationTarget::TotalLevel ? 63 : 7;
+                check(wave.valueAt(first - 1) == 5
+                        && wave.valueAt(first) == juce::jmin(maximum, 13)
+                        && !wave.valueAt(1),
+                    "modulation preview differs from effective step or fills unavailable interval");
+                settings.enabled = false;
+                wave.setSettings(settings, false);
+                check(wave.valueAt(first) == 5, "disabled modulation preview changes base value");
+                settings.enabled = true;
+                wave.setSettings(settings, true);
+                check(wave.valueAt(first) == 3, "free curve preview does not show actual lane value");
+                int changes = 0;
+                TimelineModulationDialogContent dialog(target, settings, false, std::move(data),
+                    [&changes](const auto&, bool) { ++changes; });
+                dialog.resized();
+                check(dialog.verifyPreviewLayoutAndDelay(17) && changes == 0,
+                    "opening modulation settings changed authoring data or hid delay/wave preview");
+                if (directory != juce::File{}) {
+                    auto stream = directory.getChildFile("modulation-"
+                        + juce::String(static_cast<int>(target)) + ".png").createOutputStream();
+                    if (stream) juce::PNGImageFormat{}.writeImageToStream(
+                        dialog.createComponentSnapshot(dialog.getLocalBounds()), *stream);
+                }
+            }
+        }
         save("workspace-17-count");
         focus_.setToggleState(true, juce::dontSendNotification); focus_.onClick();
         save("workspace-focus");
@@ -4937,10 +5264,11 @@ public:
                 "morph capture fixture must have valid owned source waves and a generated bank");
             const juce::Rectangle<int> lane(0, 0, getWidth(), UiLayout::fieldH);
             const juce::Point<int> middle(
-                (xForCount(lane, 2) + xForCount(lane, 12)) / 2, lane.getCentreY());
+                (xForCount(lane, 2) + xForCount(lane, 12)) / 2, timbreMarkerY(lane, scc.source));
             check(morphLineArrivalAt(timbre_.layers[1], lane, middle) == 12,
                 "morph line does not open arrival event");
-            const juce::Point<int> first_label(xForCount(lane, 2) + UiLayout::controlGap * 2, lane.getCentreY());
+            const juce::Point<int> first_label(xForCount(lane, 2) + UiLayout::controlGap * 2,
+                lane.getY() + juce::roundToInt(UiFonts::dense(true).getHeight()) / 2);
             check(timbreMarkerCountAt(timbre_.layers[1], lane, first_label) == 2,
                 "outgoing morph line steals source marker label");
             timbre_.layers[1].timbre_automation[0].scc_morph.enabled = false;
@@ -4948,6 +5276,31 @@ public:
                 "normal tone interval has morph hit target");
             check(morph_bank_usage_.isVisible(),
                 "Morph Bank usage is not always visible");
+            {
+                auto base_model = morph_model;
+                base_model.layers[1].base_timbre = first_wave;
+                base_model.layers[1].timbre_automation = {arrival};
+                setTimbre(base_model, true); selectOverviewLayer(1);
+                const auto source = morphStartEvent(timbre_.layers[1],
+                    timbre_.layers[1].timbre_automation.front());
+                check(source && source->count == 0 && source->target_library_id == first_wave.library_id
+                    && morph_preview_.valid && timbre_.layers[1].timbre_automation.size() == 1,
+                    "first morph did not use initial tone without author @ insertion");
+                const juce::Point<int> base_middle(
+                    (xForCount(lane, 0) + xForCount(lane, 12)) / 2,
+                    timbreMarkerY(lane, scc.source));
+                check(morphLineArrivalAt(timbre_.layers[1], lane, base_middle) == 12,
+                    "base-to-first-tone morph line lacks arrival hit target");
+                save("workspace-base-scc-morph");
+                auto confirmed_base = timbre_;
+                confirmed_base.layers[1].timbre_automation.front().scc_morph.explicit_plan = morph_preview_.plans.front().result.plan;
+                auto edited_base = confirmed_base;
+                edited_base.layers[1].base_timbre->scc_waveform[0] ^= 1;
+                check(mgstc::app::invalidateEditedSccMorphPlans(confirmed_base, edited_base)
+                    && !edited_base.layers[1].timbre_automation.front().scc_morph.explicit_plan,
+                    "initial waveform edit retained first morph's obsolete confirmed plan");
+                setTimbre(morph_model, true); selectOverviewLayer(1);
+            }
             const auto picker_scale = UiScale::active_percent;
             for (const int percent : {75, 100, 125}) {
                 UiScale::setActivePercent(percent);
@@ -5118,6 +5471,7 @@ public:
             check(second_disabled.accepted && second_disabled.error.isEmpty() && morph_preview_.valid,
                 "disabling the remaining invalid transition did not repair the morph state");
             reduced.enabled = true;
+            reduced.intermediate_count = 2; // count0-to-2 cannot hold two intermediate states.
             const auto repaired = timbre_;
             const auto invalid_new = apply_verified_morph(1, 2, reduced);
             check(!invalid_new.accepted && timbre_ == repaired,
@@ -5135,18 +5489,206 @@ public:
                 "morph capture must show the enabled interval in a valid tone lane");
             const juce::Point<int> visible_morph_line(
                 (xForCount(visible_tone_lane, 2) + xForCount(visible_tone_lane, 12)) / 2,
-                visible_tone_lane.getCentreY());
+                timbreMarkerY(visible_tone_lane, timbre_.layers[1].source));
             const juce::Point<int> visible_normal_gap(
                 (xForCount(visible_tone_lane, 12) + xForCount(visible_tone_lane, 22)) / 2,
-                visible_tone_lane.getCentreY());
+                timbreMarkerY(visible_tone_lane, timbre_.layers[1].source));
             check(morphLineArrivalAt(timbre_.layers[1], visible_tone_lane, visible_morph_line) == 12
                     && !morphLineArrivalAt(timbre_.layers[1], visible_tone_lane, visible_normal_gap),
                 "rendered morph interval and normal gap do not match hit testing");
             save("workspace-scc-morph");
         }
+        {
+            auto audition_model = mgstc::engine::defaultCompositeTimbre();
+            mgstc::engine::SavedTimbreReference target;
+            target.library_id = mgstc::engine::allocateCompositeOwnedTimbreId(audition_model);
+            target.source = mgstc::engine::TimbreSource::Scc;
+            target.name = "Picker target";
+            target.scc_waveform.fill(42);
+            audition_model.embedded_timbres.push_back(target);
+            mgstc::engine::EnvelopeEvent at;
+            at.kind = mgstc::engine::EnvelopeEventKind::Timbre;
+            at.count = 8;
+            at.target_library_id = target.library_id;
+            audition_model.layers[1].timbre_automation.push_back(at);
+            setTimbre(audition_model, true);
+            const auto before = timbre_;
+            std::optional<mgstc::engine::CompositeTimbre> played;
+            const auto saved_preview = manual_y_preview_;
+            manual_y_preview_ = [&](auto candidate, std::uint8_t note, bool one_second) {
+                check(note == 60 && !one_second, "picker performance changed note or gate mode");
+                played = std::move(candidate);
+            };
+            EnvelopeTimbreChoice choice;
+            choice.library_id = target.library_id;
+            previewTimbreChoice(1, choice, 60);
+            check(played && played->layers[1].base_timbre
+                    && played->layers[1].base_timbre->scc_waveform == target.scc_waveform
+                    && played->layers[1].timbre_automation.empty(),
+                "picker did not audition selected embedded tone from key-on");
+            check(timbre_ == before && played && played->layers[0] == before.layers[0]
+                    && played->layers[2] == before.layers[2]
+                    && played->layers[1].volume_envelope == before.layers[1].volume_envelope,
+                "picker performance altered authoring state, other channels or ENV");
+            choice.pick = mgstc::engine::TimbrePick::OpllRom;
+            choice.rom_number = 4;
+            played.reset();
+            previewTimbreChoice(2, choice, 60);
+            check(played && !played->layers[2].base_timbre
+                    && played->layers[2].base_opll_rom == 4 && timbre_ == before,
+                "picker ROM audition changed authored state or retained original base");
+            manual_y_preview_ = saved_preview;
+        }
+        setTimbre(model, true); selectOverviewLayer(0);
+        {
+            const auto before = timbre_;
+            callbacks = 0;
+            const auto original_length = visibleCountRange().getLength();
+            zoom_in_.onClick();
+            const auto enlarged_length = visibleCountRange().getLength();
+            zoom_out_.onClick();
+            check(enlarged_length <= original_length
+                && visibleCountRange().getLength() >= enlarged_length
+                && timbre_ == before && callbacks == 0,
+                "step zoom buttons changed authoring state or zoom direction");
+            check(zoom_in_.getX() >= mml_toggle_.getRight()
+                && zoom_out_.getX() >= zoom_in_.getRight(),
+                "step zoom buttons are not placed after MGSC preview");
+        }
+        const auto normal_volume_height = makeEditLaneSlots(
+            graph_bounds_[0], model.layers[0].source).volume.getHeight();
+        {
+            int selected_previews = 0, loaded = 0;
+            EnvelopeTimbreChoice preset_choice;
+            EnvelopeTimbrePickContent picker(mgstc::engine::TimbreSource::Scc,
+                {}, {}, [&](auto choice) { ++loaded; preset_choice = choice; }, {}, {},
+                {}, {}, {}, {}, false, nullptr, {}, {}, {}, {}, {}, {},
+                [&](auto choice) { if (choice.scc_preset) ++selected_previews; });
+            check(picker.verifyPresetSelection() && selected_previews == 6 && loaded == 1,
+                "SCC preset controls did not select, preview and load all six presets");
+            setTimbre(model, true); selectOverviewLayer(1);
+            const auto before = timbre_;
+            applyTimbreChoice(12, preset_choice);
+            const auto* event = timbreEventAt(timbre_.layers[1], 12);
+            const auto* reference = event ? mgstc::engine::findEmbeddedTimbreSnapshot(
+                timbre_, event->target_library_id) : nullptr;
+            check(reference && reference->source == mgstc::engine::TimbreSource::Scc
+                && reference->scc_waveform == presetReference(before,
+                    mgstc::engine::SccWavePreset::Pulse12_5).scc_waveform,
+                "SCC preset load did not persist an owned waveform");
+            std::optional<mgstc::engine::CompositeTimbre> played;
+            const auto saved_preview = manual_y_preview_;
+            manual_y_preview_ = [&](auto candidate, auto, bool one_second) {
+                check(one_second, "selection audition did not use one-second preview");
+                played = std::move(candidate);
+            };
+            const auto authored = timbre_;
+            previewTimbreChoice(1, preset_choice, 60, true);
+            check(played && played->layers.size() == 1
+                && played->layers[0].source == mgstc::engine::TimbreSource::Scc
+                && played->layers[0].base_timbre && timbre_ == authored,
+                "preset selection preview was not a temporary single tone");
+            manual_y_preview_ = saved_preview;
+            setTimbre(before, true); selectOverviewLayer(1);
+            timbre_.layers[1].base_timbre = presetReference(timbre_, mgstc::engine::SccWavePreset::Triangle);
+            timbre_.layers[1].base_timbre->number_mode = mgstc::engine::TimbreNumberMode::Manual;
+            timbre_.layers[1].base_timbre->manual_number = std::uint8_t{23};
+            const auto old_base = *timbre_.layers[1].base_timbre;
+            mgstc::engine::EnvelopeEvent old_at;
+            old_at.kind = mgstc::engine::EnvelopeEventKind::Timbre;
+            old_at.count = 10; old_at.value = 23; old_at.target_library_id = 0;
+            timbre_.layers[1].timbre_automation.push_back(old_at);
+            int base_previews = 0;
+            EnvelopeTimbrePickContent base_picker(mgstc::engine::TimbreSource::Scc,
+                {}, {}, [&](auto choice) { applyLayerBaseChoice(1, choice); }, {}, {},
+                {}, {}, {}, {}, true, nullptr, {}, {}, [&] { ++base_previews; });
+            check(base_picker.verifyPresetSelection() && base_previews == 7
+                && timbre_.layers[1].base_timbre
+                && timbre_.layers[1].base_timbre->scc_waveform == presetReference(before,
+                    mgstc::engine::SccWavePreset::Pulse12_5).scc_waveform,
+                "base SCC preset assignment or existing one-second audition not connected");
+            const auto* retained = mgstc::engine::findEmbeddedTimbreSnapshot(timbre_, old_base.library_id);
+            check(retained && retained->scc_waveform == old_base.scc_waveform,
+                "base preset replacement lost a referenced prior @ waveform");
+            check(mgstc::engine::resolveTimbreNumbers(timbre_).warnings.empty()
+                && timbre_.layers[1].timbre_automation.back().target_library_id == old_base.library_id
+                && timbre_.layers[1].base_timbre->number_mode == mgstc::engine::TimbreNumberMode::Automatic,
+                "base preset replacement collided with retained manual tone or rebound raw @ incorrectly");
+            mgstc::engine::EngineCore preset_engine;
+            check(mgstc::engine::formatMgsComposite(timbre_).valid()
+                && mgstc::engine::compileCompositeProgram(preset_engine, timbre_),
+                "manual base preset replacement broke export or audition preparation");
+            auto shared_base = before;
+            shared_base.layers[1].base_timbre = old_base;
+            auto other = shared_base.layers[1]; other.channel = 1; other.envelope_number = 3;
+            other.timbre_automation.clear(); shared_base.layers.push_back(other);
+            setTimbre(shared_base, true); selectOverviewLayer(1);
+            applyLayerBaseChoice(1, preset_choice);
+            check(timbre_.layers.back().base_timbre == std::optional{old_base}
+                && mgstc::engine::resolveTimbreNumbers(timbre_).warnings.empty()
+                && mgstc::engine::formatMgsComposite(timbre_).valid()
+                && mgstc::engine::compileCompositeProgram(preset_engine, timbre_),
+                "base preset replacement damaged another channel's shared manual tone");
+            setTimbre(before, true); selectOverviewLayer(0);
+        }
         model.layers[0].volume_envelope.kind = mgstc::engine::EnvelopeKind::Rate;
         setTimbre(model, true); selectOverviewLayer(0); setup_tab_.onClick();
+        const auto rate_slots = makeEditLaneSlots(graph_bounds_[0], model.layers[0].source);
+        check(rate_slots.volume.getHeight() == normal_volume_height,
+            "rate preview height differs from volume editing");
+        check(rate_slots.pitch.isEmpty() && rate_slots.timbre.isEmpty()
+                && rate_slots.volume.getBottom() == graph_bounds_[0].getBottom(),
+            "rate preview retains unused lane space");
+        check(graphArea().getHeight() == laneHeightForIndex(0)
+                && horizontal_scroll_.getY() == graphArea().getBottom(),
+            "rate preview outer whitespace was not compacted");
         save("workspace-rate");
+        {
+            setTimbre(model, true); selectOverviewLayer(1);
+            const auto volume = graphStrip(makeEditLaneSlots(
+                graph_bounds_[1], timbre_.layers[1].source).volume);
+            parameter_.setSelectedId(static_cast<int>(Parameter::Volume), juce::dontSendNotification);
+            hover_mouse_pos_ = volume.getCentre(); hover_preview_value_ = 7;
+            const auto popup = hoverPopupBounds();
+            if (popup) {
+                juce::Image image(juce::Image::ARGB, getWidth(), getHeight(), true);
+                const auto measure = [&](bool restore) {
+                    const auto start = juce::Time::getHighResolutionTicks();
+                    for (int i = 0; i < 200; ++i) {
+                        juce::Graphics graphics(image);
+                        graphics.reduceClipRegion(popup->expanded(6));
+                        if (restore) {
+                            hover_preview_value_.reset(); paint(graphics);
+                            hover_preview_value_ = 7; drawHoverValuePopup(graphics);
+                        } else drawHoverValuePopup(graphics);
+                    }
+                    return juce::Time::highResolutionTicksToSeconds(
+                        juce::Time::getHighResolutionTicks() - start) * 1000.0 / 200.0;
+                };
+                {
+                    juce::Graphics graphics(image); paint(graphics);
+                }
+                auto clean = image.createCopy();
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    juce::Graphics graphics(image);
+                    graphics.reduceClipRegion(popup->expanded(6)); paint(graphics);
+                }
+                bool popup_restored = true;
+                for (int y = popup->getY(); y < popup->getBottom(); ++y)
+                    for (int x = popup->getX(); x < popup->getRight(); ++x)
+                        popup_restored = popup_restored
+                            && image.getPixelAt(x, y) == clean.getPixelAt(x, y);
+                check(popup_restored, "partial popup repaint accumulated text or background pixels");
+                measure(false); measure(true);
+                const double current_ms = measure(false), restored_ms = measure(true);
+                directory.getChildFile("hover-repaint-benchmark.txt").replaceWithText(
+                    "CPU offscreen JUCE image; same popup clip; 200 paints after warmup\ncurrent_ms="
+                    + juce::String(current_ms, 6) + "\nrestored_ms=" + juce::String(restored_ms, 6)
+                    + "\nratio=" + juce::String(restored_ms / juce::jmax(0.000001, current_ms), 3) + "\n");
+            }
+            hover_preview_value_.reset(); hover_mouse_pos_.reset();
+        }
+
         model.layers.clear(); setTimbre(model, true);
         check(selected_layer_ == -1 && !envelope_mml_preview_.isVisible(), "empty model retained editable controls");
         check(psg_add_.isVisible() && scc_add_.isVisible() && opll_add_.isVisible()
@@ -5489,6 +6031,7 @@ public:
     }
 
     void cancelPendingDialogs() {
+        pending_auto_settings_.reset();
         ++dialog_generation_;
         command_stack_.cancelPendingActions();
         closeRateEditor(false);
@@ -5502,6 +6045,7 @@ public:
         const mgstc::engine::CompositeTimbre& timbre,
         bool reset_scroll_extent = false) {
         const auto previous_pitch_expanded = pitch_lane_expanded_;
+        pending_auto_settings_.reset();
         timbre_ = timbre;
         last_published_timbre_ = timbre;
         pending_plan_invalidation_ = false;
@@ -5626,6 +6170,10 @@ public:
         compact_overview_.setEnabled(!empty && !focus_.getToggleState());
         header.removeFromLeft(controlGap);
         mml_toggle_.setBounds(header.removeFromLeft(compositeSelectorW));
+        header.removeFromLeft(controlGap);
+        zoom_in_.setBounds(header.removeFromLeft(textButtonH));
+        header.removeFromLeft(controlGap);
+        zoom_out_.setBounds(header.removeFromLeft(textButtonH));
         auto side = inspectorArea();
         setup_tab_.setVisible(inspector_visible_);
         count_tab_.setVisible(inspector_visible_);
@@ -5653,6 +6201,7 @@ public:
         morph_bank_usage_.setBounds(edit_header);
         auto preview_area = workspaceArea();
         preview_area.setTop(graph.getBottom() + kScrollBarSize + sm);
+        preview_area.setHeight(juce::jmin(preview_area.getHeight(), envelopePreviewH));
         envelope_mml_preview_.setBounds(preview_area);
         vertical_scroll_.setBounds(graph.getRight(), graph.getY(), kScrollBarSize, graph.getHeight());
         horizontal_scroll_.setBounds(graph.getX(), graph.getBottom(), graph.getWidth(), kScrollBarSize);
@@ -5663,6 +6212,7 @@ public:
     }
 
     void mouseDown(const juce::MouseEvent& event) override {
+        pending_auto_settings_.reset();
         if (event.mods.isPopupMenu()) {
             deleteCommandAt(event.getPosition());
             return;
@@ -5742,6 +6292,23 @@ public:
                 repaint();
                 return;
             }
+            if (slots.tl_auto.contains(event.getPosition())
+                || slots.fb_auto.contains(event.getPosition())) {
+                const bool tl = slots.tl_auto.contains(event.getPosition());
+                const auto target = tl ? TimelineModulationTarget::TotalLevel
+                    : TimelineModulationTarget::Feedback;
+                if (!mgstc::engine::opllRegisterAutoAvailableAt(selected_layer,
+                        static_cast<std::uint32_t>(selected_count_))) {
+                    reportStatus(juce::String::fromUTF8("ROM音色区間ではTL/FB自動を設定できません"));
+                } else {
+                    // A click opens settings; only an actual drag writes free
+                    // curve points. Opening settings never edits the model.
+                    pending_auto_settings_ = target;
+                }
+                drawing_ = false;
+                repaint();
+                return;
+            }
         }
         if (selectedEditMode() == EditMode::Draw) {
             if (!in_graph) {
@@ -5764,6 +6331,14 @@ public:
     }
 
     void mouseDrag(const juce::MouseEvent& event) override {
+        if (pending_auto_settings_ && event.mouseWasDraggedSinceMouseDown()) {
+            const auto* curve = freeCurveFor(timbre_.layers[static_cast<std::size_t>(selected_layer_)],
+                *pending_auto_settings_);
+            if (curve && curve->mode == mgstc::engine::OpllRegisterAutoMode::FreeCurve) {
+                pending_auto_settings_.reset();
+                drawing_ = edit_draw_bounds_.has_value();
+            }
+        }
         if (!drawing_) {
             return;
         }
@@ -5775,6 +6350,14 @@ public:
     }
 
     void mouseUp(const juce::MouseEvent& event) override {
+        if (pending_auto_settings_) {
+            const auto target = *pending_auto_settings_;
+            pending_auto_settings_.reset();
+            if (!event.mouseWasDraggedSinceMouseDown()) {
+                openTimelineModulationDialog(target, selected_count_);
+            }
+            return;
+        }
         if (!drawing_) {
             return;
         }
@@ -5895,11 +6478,8 @@ public:
 
     void paint(juce::Graphics& graphics) override {
         const auto clip = graphics.getClipBounds().getSmallestIntegerContainer();
-        const auto popup = hoverPopupBounds();
-        if (popup && popup->expanded(8).contains(clip)) {
-            drawHoverValuePopup(graphics);
-            return;
-        }
+        // Always restore the clipped underlying scene before drawing a popup.
+        // Alpha text/rounded corners must never accumulate over previous paints.
         graphics.fillAll(juce::Colour(0xFF161B22));
         graphics.setColour(juce::Colour(0xFF20262E));
         graphics.fillRect(inspectorArea());
@@ -6073,7 +6653,8 @@ private:
         applyTimelineModulation(layer_index, target, settings, free_curve);
     }
 
-    void openTimelineModulationDialog(TimelineModulationTarget target) {
+    void openTimelineModulationDialog(TimelineModulationTarget target,
+        std::optional<int> clicked_count = std::nullopt) {
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) return;
         const auto layer_index = static_cast<std::size_t>(selected_layer_);
@@ -6083,11 +6664,42 @@ private:
         const auto* curve = freeCurveFor(layer, target);
         const bool free_curve = curve != nullptr
             && curve->mode == mgstc::engine::OpllRegisterAutoMode::FreeCurve;
+        auto initial = modulationFor(layer, target);
+        if (clicked_count) initial.delay = static_cast<std::uint8_t>(
+            juce::jlimit(0, 255, *clicked_count));
+        TimelineModulationWavePreview::Data preview_data;
+        preview_data.target = target;
+        const auto* library = timbreLibrary();
+        const auto* volumes = target == TimelineModulationTarget::Tremolo
+            ? &cachedVolumeSamples(layer_index, TimelineModulationWavePreview::kPreviewCounts + 1)
+            : nullptr;
+        auto preview_curve = curve ? *curve : mgstc::engine::OpllRegisterAutoLane{};
+        preview_curve.mode = mgstc::engine::OpllRegisterAutoMode::FreeCurve;
+        if (preview_curve.free_curve.empty()) preview_curve.free_curve.push_back(preview_curve.depth);
+        const auto register_target = target == TimelineModulationTarget::TotalLevel
+            ? mgstc::engine::OpllRegisterAutoTarget::TotalLevel
+            : mgstc::engine::OpllRegisterAutoTarget::Feedback;
+        for (int count = 0; count <= TimelineModulationWavePreview::kPreviewCounts; ++count) {
+            auto& base = preview_data.base[static_cast<std::size_t>(count)];
+            if (target == TimelineModulationTarget::Pitch) {
+                base = cumulativePitchAt(layer, count);
+            } else if (volumes) {
+                base = static_cast<int>((*volumes)[static_cast<std::size_t>(count)]);
+            } else if (const auto regs = mgstc::engine::opllOriginalRegisterImageAt(
+                    layer, static_cast<std::uint32_t>(count), library, true, false)) {
+                base = target == TimelineModulationTarget::TotalLevel
+                    ? static_cast<int>((*regs)[2] & 0x3F)
+                    : static_cast<int>((*regs)[3] & 0x07);
+                preview_data.free_curve[static_cast<std::size_t>(count)] =
+                    mgstc::engine::opllRegisterAutoValueAt(preview_curve, register_target,
+                        static_cast<std::uint32_t>(count), layer.envelope_timeline.length_counts);
+            }
+        }
         UiScale::forceGlobalForNonEditorUi();
         auto* dialog = new ModalDialogWindow(
             timelineModulationName(target), juce::Colour(0xFF1B222C));
         auto* content = new TimelineModulationDialogContent(
-            target, modulationFor(layer, target), free_curve,
+            target, initial, free_curve, std::move(preview_data),
             [safe = juce::Component::SafePointer<Impl>(this), layer_index, target](
                 const mgstc::engine::ModulationParameters& settings,
                 bool use_free_curve) {
@@ -6533,6 +7145,14 @@ private:
             return UiLayout::compositeMixLaneH;
         }
         if (lane_index == selected_layer_) {
+            if (lane_index >= 0
+                && lane_index < static_cast<int>(timbre_.layers.size())
+                && timbre_.layers[static_cast<std::size_t>(lane_index)]
+                    .volume_envelope.kind == mgstc::engine::EnvelopeKind::Rate) {
+                return UiLayout::editLaneFramePadV * 2
+                    + UiLayout::editLaneInnerPadV * 2
+                    + UiLayout::commandSummaryH + UiLayout::editVolumeLaneH;
+            }
             if (lane_index >= 0
                 && lane_index < static_cast<int>(timbre_.layers.size())
                 && timbre_.layers[static_cast<std::size_t>(lane_index)].source
@@ -7120,6 +7740,21 @@ private:
         return layer.timbre_automation;
     }
 
+    [[nodiscard]] static bool isDisplayOnlyAutomaticVolumeCount(
+        const mgstc::engine::CompositeLayer& layer,
+        std::uint32_t count) {
+        const mgstc::engine::EnvelopeEvent* next = nullptr;
+        std::uint32_t origin{};
+        for (const auto& event : layer.volume_envelope.events) {
+            if (event.kind != mgstc::engine::EnvelopeEventKind::Volume) continue;
+            // An authored point always remains editable. The serializer stops
+            // at every manual point before searching for the next ramp target.
+            if (event.count == count) return false;
+            if (event.count < count) origin = std::max(origin, event.count);
+            else if (!next || event.count < next->count) next = &event;
+        }
+        return next && next->automatic && count > origin;
+    }
     void editFromMouse(const juce::MouseEvent& event, bool commit) {
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(graph_bounds_.size())) {
@@ -7143,6 +7778,11 @@ private:
             return;
         }
         const int count = countAtX(bounds, point.x);
+        if (parameter == Parameter::Volume
+            && isDisplayOnlyAutomaticVolumeCount(
+                layer, static_cast<std::uint32_t>(count))) {
+            return;
+        }
         if (isRegisterAutoParameter(parameter)) {
             const auto [minimum, maximum] = valueRangeFor(parameter);
             editRegisterAutoFreeCurve(
@@ -7736,6 +8376,13 @@ private:
         area.removeFromRight(kScrollBarSize);
         area.removeFromBottom(kScrollBarSize + UiLayout::sm
             + (mml_toggle_.getToggleState() ? UiLayout::envelopePreviewH + UiLayout::sm : 0));
+        if (selected_layer_ >= 0
+            && selected_layer_ < static_cast<int>(timbre_.layers.size())
+            && timbre_.layers[static_cast<std::size_t>(selected_layer_)]
+                .volume_envelope.kind == mgstc::engine::EnvelopeKind::Rate) {
+            area.setHeight(juce::jmin(area.getHeight(),
+                laneHeightForIndex(selected_layer_)));
+        }
         return area;
     }
 
@@ -7745,13 +8392,13 @@ private:
 
     [[nodiscard]] int countAtX(
         juce::Rectangle<int> bounds, int x) const {
-        const auto visible = visibleCountRange();
-        return juce::jlimit(
-            0, maximumCount(), static_cast<int>(std::floor(
-                visible.getStart()
-                + static_cast<double>(x - bounds.getX())
-                    * visible.getLength()
-                    / juce::jmax(1, bounds.getWidth()))));
+        int first = 0, last = maximumCount();
+        while (first < last) {
+            const int middle = first + (last - first + 1) / 2;
+            if (xForCount(bounds, middle) <= x) first = middle;
+            else last = middle - 1;
+        }
+        return first;
     }
 
     [[nodiscard]] int xForCount(
@@ -8073,6 +8720,9 @@ private:
         const int end_count = static_cast<int>(
             layer.envelope_timeline.length_counts);
         const auto& sampled = cachedVolumeSamples(layer_index, end_count);
+        const auto& authored = volume_sample_cache_[layer_index].author_samples;
+        const bool has_automatic_volume = std::any_of(points.begin(), points.end(),
+            [](const Point& point) { return point.automatic; });
         const auto draw_output_span = [&](int start, int stop) {
             const int last = juce::jmin(stop, end_count);
             for (int count = start; count < last; ++count) {
@@ -8101,33 +8751,37 @@ private:
             const int x0 = xForCount(bounds, start);
             const int x1 = xForCount(bounds, juce::jmax(start + 1, stop));
             const int width = juce::jmax(2, x1 - x0);
-            const bool ramp_to_next = index + 1 < points.size()
-                && points[index + 1].automatic
-                && points[index + 1].count > start;
-            if (ramp_to_next) {
-                const float y0 = volumeYFromValue(
-                    layer.source, bounds, points[index].volume);
-                const float y1 = volumeYFromValue(
-                    layer.source, bounds, points[index + 1].volume);
-                juce::Path bar;
-                bar.startNewSubPath(
-                    static_cast<float>(x0),
-                    static_cast<float>(bounds.getBottom()));
-                bar.lineTo(static_cast<float>(x0), y0);
-                bar.lineTo(static_cast<float>(x1), y1);
-                bar.lineTo(
-                    static_cast<float>(x1),
-                    static_cast<float>(bounds.getBottom()));
-                bar.closeSubPath();
-                graphics.setColour(colour.withAlpha(fill_opacity));
-                graphics.fillPath(bar);
-                graphics.setColour(juce::Colour(kUiHoverAccent));
-                graphics.drawLine(
-                    static_cast<float>(x0),
-                    y0,
-                    static_cast<float>(x1),
-                    y1,
-                    2.0F);
+            if (has_automatic_volume) {
+                const int last = juce::jmin(stop, end_count);
+                for (int count = start; count < last; ++count) {
+                    const int cell_x0 = xForCount(bounds, count);
+                    const int cell_x1 = xForCount(bounds, count + 1);
+                    const float y = volumeYFromValue(
+                        layer.source,
+                        bounds,
+                        authored[static_cast<std::size_t>(count)]);
+                    graphics.setColour(colour.withAlpha(fill_opacity));
+                    graphics.fillRect(
+                        cell_x0,
+                        juce::roundToInt(y),
+                        juce::jmax(1, cell_x1 - cell_x0),
+                        juce::jmax(
+                            1,
+                            bounds.getBottom() - juce::roundToInt(y)));
+                    graphics.setColour(juce::Colour(kUiHoverAccent));
+                    graphics.drawLine(
+                        static_cast<float>(cell_x0), y,
+                        static_cast<float>(cell_x1), y, 2.0F);
+                    if (count + 1 < last) {
+                        const float next_y = volumeYFromValue(
+                            layer.source,
+                            bounds,
+                            authored[static_cast<std::size_t>(count + 1)]);
+                        graphics.drawLine(
+                            static_cast<float>(cell_x1), y,
+                            static_cast<float>(cell_x1), next_y, 2.0F);
+                    }
+                }
             } else {
                 const float top = volumeYFromValue(
                     layer.source, bounds, points[index].volume);
@@ -8264,6 +8918,13 @@ private:
         EditLaneSlots slots;
         slots.preview = {}; // MGSC preview is pinned below the scrolling graph.
         slots.summary = content.removeFromTop(UiLayout::commandSummaryH);
+        if (selected_layer_ >= 0
+            && selected_layer_ < static_cast<int>(timbre_.layers.size())
+            && timbre_.layers[static_cast<std::size_t>(selected_layer_)]
+                .volume_envelope.kind == mgstc::engine::EnvelopeKind::Rate) {
+            slots.volume = content.removeFromTop(UiLayout::editVolumeLaneH);
+            return slots;
+        }
         const bool has_register = showsRegisterLane(source);
         const int marker_h = UiLayout::editMarkerLaneH;
         if (has_register) {
@@ -8494,13 +9155,6 @@ private:
                 juce::Justification::centredLeft,
                 1);
             auto graph_slot = slots.volume;
-            graph_slot = graph_slot.getUnion(slots.pitch);
-            if (!slots.timbre.isEmpty()) {
-                graph_slot = graph_slot.getUnion(slots.timbre);
-            }
-            if (!slots.register_write.isEmpty()) {
-                graph_slot = graph_slot.getUnion(slots.register_write);
-            }
             auto graph_label = graph_slot.removeFromLeft(
                 UiLayout::compositeOverviewLabelW);
             graphics.setColour(juce::Colour(0xFFC9D1D9));
@@ -8520,7 +9174,8 @@ private:
                 &layout,
                 -1,
                 -1,
-                false);
+                false,
+                true);
             {
                 auto preview = slots.preview;
                 auto preview_label = preview.removeFromLeft(
@@ -8596,6 +9251,10 @@ private:
             morph_preview_ = *mgstc::engine::compileSccMorphCached(timbre_);
             morph_preview_input_ = timbre_;
         }
+        scc_timbre_usage_.resize(timbre_.layers.size());
+        for (std::size_t i = 0; i < timbre_.layers.size(); ++i)
+            scc_timbre_usage_[i] = timbre_.layers[i].source == mgstc::engine::TimbreSource::Scc
+                ? sccTimbreUsage(i) : juce::String{};
         morph_bank_.setSelectedId(timbre_.scc_morph_bank_base + 1, juce::dontSendNotification);
         const bool contiguous = std::any_of(timbre_.layers.begin(), timbre_.layers.end(), [](const auto& layer) {
             return layer.source == mgstc::engine::TimbreSource::Scc
@@ -8717,6 +9376,11 @@ private:
             }
         }
         if (!morph_preview_.valid) validation_error = juce::String::fromUTF8(morph_preview_.error.c_str());
+        const auto tones = mgstc::engine::formatMgsCompositeLayerTimbres(
+            preview, static_cast<std::size_t>(selected_layer_), timbreLibrary());
+        const auto tone_definitions = juce::String::fromUTF8(tones.source.c_str()).trimEnd();
+        if (!tones.valid() && validation_error.isEmpty())
+            validation_error = juce::String::fromUTF8(tones.issues.front().c_str());
         const auto envelope_notice = validation_error.isNotEmpty()
             ? validation_error : output_notice;
         const bool new_notice = envelope_notice.isNotEmpty()
@@ -8731,7 +9395,8 @@ private:
                 .c_str());
         const auto preview_text = validation_error.isNotEmpty()
             ? validation_error
-            : (definition.isNotEmpty() ? definition + "\n" : juce::String{})
+            : (tone_definitions.isNotEmpty() ? tone_definitions + "\n\n" : juce::String{})
+                + (definition.isNotEmpty() ? definition + "\n" : juce::String{})
                 + track
                 + (output_notice.isNotEmpty() ? "\n; " + output_notice : juce::String{});
         if (preview_text == last_envelope_mml_preview_) {
@@ -8909,6 +9574,30 @@ private:
         }
     }
 
+    [[nodiscard]] juce::String sccTimbreUsage(std::size_t layer_index) const {
+        if (layer_index >= morph_preview_.timbre.layers.size()) return "0 (0)";
+        std::array<bool, 32> used{}, generated{};
+        const auto& layer = morph_preview_.timbre.layers[layer_index];
+        const auto numbers = mgstc::engine::resolveTimbreNumbers(morph_preview_.timbre);
+        const auto mark = [&](std::uint64_t id, int fallback) {
+            int number = fallback;
+            for (const auto& assignment : numbers.assignments)
+                if (assignment.library_id == id) { number = assignment.number; break; }
+            if (number >= 0 && number < 32) used[static_cast<std::size_t>(number)] = true;
+        };
+        if (layer.base_timbre) mark(layer.base_timbre->library_id, -1);
+        for (const auto& event : layer.timbre_automation)
+            if (event.kind == mgstc::engine::EnvelopeEventKind::Timbre)
+                mark(event.target_library_id, event.value);
+        for (const auto& diagnostic : morph_preview_.diagnostics)
+            if (diagnostic.layer_index == layer_index && diagnostic.output_number < 32) {
+                used[diagnostic.output_number] = true;
+                if (diagnostic.generated) generated[diagnostic.output_number] = true;
+            }
+        return juce::String(static_cast<int>(std::count(used.begin(), used.end(), true)))
+            + " (" + juce::String(static_cast<int>(std::count(generated.begin(), generated.end(), true))) + ")";
+    }
+
     void paintEditSubLane(
         juce::Graphics& graphics,
         juce::Rectangle<int> slot,
@@ -8916,8 +9605,13 @@ private:
         juce::Colour colour,
         Parameter parameter,
         const juce::String& title) {
-        paintEditSubLaneChrome(graphics, slot, parameter,
-            parameter == Parameter::Pitch ? juce::String{} : title);
+        auto caption = parameter == Parameter::Pitch ? juce::String{} : title;
+        if (parameter == Parameter::Timbre
+            && timbre_.layers[layer_index].source == mgstc::engine::TimbreSource::Scc)
+            caption += " / " + (layer_index < scc_timbre_usage_.size()
+                ? scc_timbre_usage_[layer_index] : juce::String("0 (0)"))
+                + juce::String::fromUTF8(" 種");
+        paintEditSubLaneChrome(graphics, slot, parameter, caption);
         if (parameter == Parameter::Pitch && !pitchLaneExpanded())
             return;
         slot.removeFromLeft(UiLayout::compositeOverviewLabelW);
@@ -9602,21 +10296,28 @@ private:
         }
     }
 
+    [[nodiscard]] static int timbreMarkerY(juce::Rectangle<int> bounds,
+        mgstc::engine::TimbreSource source) {
+        return source == mgstc::engine::TimbreSource::Scc
+            ? bounds.getBottom() - UiLayout::xs - 4 : bounds.getCentreY();
+    }
+
     void drawTimbreMarkers(
         juce::Graphics& graphics,
         juce::Rectangle<int> bounds,
         const mgstc::engine::CompositeLayer& layer,
         juce::Colour colour) const {
+        const int marker_y = timbreMarkerY(bounds, layer.source);
         if (layer.source == mgstc::engine::TimbreSource::Scc) {
             for (const auto* event : orderedTimbreEvents(layer)) {
-                const auto* previous = previousTimbreEvent(layer, *event);
-                if (!event->scc_morph.enabled || previous == nullptr || previous->count >= event->count) continue;
+                const auto previous = morphStartEvent(layer, *event);
+                if (!event->scc_morph.enabled || !previous || previous->count >= event->count) continue;
                 graphics.setColour(colour.withAlpha(0.8F));
                 graphics.drawLine(
                     static_cast<float>(xForCount(bounds, static_cast<int>(previous->count))),
-                    static_cast<float>(bounds.getCentreY()),
+                    static_cast<float>(marker_y),
                     static_cast<float>(xForCount(bounds, static_cast<int>(event->count))),
-                    static_cast<float>(bounds.getCentreY()), static_cast<float>(UiLayout::xs));
+                    static_cast<float>(marker_y), static_cast<float>(UiLayout::xs));
             }
         }
         graphics.setFont(UiFonts::dense(true));
@@ -9628,15 +10329,18 @@ private:
             graphics.setColour(colour);
             graphics.fillEllipse(
                 static_cast<float>(x - 4),
-                static_cast<float>(bounds.getCentreY() - 4),
+                static_cast<float>(marker_y - 4),
                 8.0F,
                 8.0F);
+            const int label_h = layer.source == mgstc::engine::TimbreSource::Scc
+                ? juce::roundToInt(UiFonts::dense(true).getHeight())
+                : bounds.getHeight();
             graphics.drawText(
                 timbreCommandLabel(event),
                 x + 6,
                 bounds.getY(),
                 juce::jmax(48, bounds.getRight() - x - 8),
-                bounds.getHeight(),
+                label_h,
                 juce::Justification::centredLeft,
                 false);
         }
@@ -9698,13 +10402,25 @@ private:
         return found != ordered.end() && found != ordered.begin() ? *(found - 1) : nullptr;
     }
 
+    [[nodiscard]] static std::optional<mgstc::engine::EnvelopeEvent> morphStartEvent(
+        const mgstc::engine::CompositeLayer& layer,
+        const mgstc::engine::EnvelopeEvent& arrival) {
+        if (const auto* previous = previousTimbreEvent(layer, arrival)) return *previous;
+        if (layer.source != mgstc::engine::TimbreSource::Scc) return std::nullopt;
+        mgstc::engine::EnvelopeEvent base;
+        base.kind = mgstc::engine::EnvelopeEventKind::Timbre;
+        base.timbre_pick = mgstc::engine::TimbrePick::Library;
+        base.target_library_id = layer.base_timbre ? layer.base_timbre->library_id : 0;
+        return base;
+    }
+
     [[nodiscard]] std::optional<int> morphLineArrivalAt(
         const mgstc::engine::CompositeLayer& layer, juce::Rectangle<int> bounds,
         juce::Point<int> point) const {
         if (layer.source != mgstc::engine::TimbreSource::Scc || !bounds.contains(point)
-            || std::abs(point.y - bounds.getCentreY()) > UiLayout::controlGap) return std::nullopt;
+            || std::abs(point.y - timbreMarkerY(bounds, layer.source)) > UiLayout::controlGap) return std::nullopt;
         for (const auto* event : orderedTimbreEvents(layer)) {
-            const auto* previous = previousTimbreEvent(layer, *event);
+            const auto previous = morphStartEvent(layer, *event);
             if (event->scc_morph.enabled && previous && previous->count < event->count
                 && point.x > xForCount(bounds, static_cast<int>(previous->count)) + UiLayout::xs
                 && point.x < xForCount(bounds, static_cast<int>(event->count)) - UiLayout::xs)
@@ -9889,7 +10605,13 @@ private:
                 12 + text_w,
                 bounds.getHeight());
             area = area.getIntersection(bounds);
-            if (!area.contains(point)) {
+            if (layer.source == mgstc::engine::TimbreSource::Scc) {
+                const auto label_area = juce::Rectangle<int>(x + 6, bounds.getY(), text_w,
+                    juce::roundToInt(font.getHeight())).getIntersection(bounds);
+                const auto marker_area = juce::Rectangle<int>(x - 6,
+                    timbreMarkerY(bounds, layer.source) - 6, 12, 12).getIntersection(bounds);
+                if (!label_area.contains(point) && !marker_area.contains(point)) continue;
+            } else if (!area.contains(point)) {
                 continue;
             }
             const int distance = point.x >= x ? point.x - x : x - point.x;
@@ -9899,6 +10621,64 @@ private:
             }
         }
         return hit;
+    }
+
+    [[nodiscard]] static mgstc::engine::SavedTimbreReference presetReference(
+        const mgstc::engine::CompositeTimbre& sound,
+        mgstc::engine::SccWavePreset preset) {
+        constexpr std::array<const char*, 6> names{
+            "Sine", "Square", "Triangle", "Saw", "Pulse 25%", "Pulse 12.5%"};
+        mgstc::engine::SavedTimbreReference result;
+        result.library_id = mgstc::engine::allocateCompositeOwnedTimbreId(sound);
+        result.source = mgstc::engine::TimbreSource::Scc;
+        result.name = names[static_cast<std::size_t>(preset)];
+        const auto wave = mgstc::engine::generateSccPreset(
+            preset, mgstc::engine::SccHarmonic::One);
+        for (std::size_t i = 0; i < wave.size(); ++i)
+            result.scc_waveform[i] = static_cast<std::uint8_t>(wave[i]);
+        return result;
+    }
+
+    void previewTimbreChoice(std::size_t layer_index,
+        const EnvelopeTimbreChoice& choice, std::uint8_t note, bool one_second = false) {
+        if (!manual_y_preview_ || layer_index >= timbre_.layers.size()) return;
+        auto preview = timbre_;
+        auto& layer = preview.layers[layer_index];
+        if (choice.scc_preset && layer.source == mgstc::engine::TimbreSource::Scc) {
+            layer.base_timbre = presetReference(preview, *choice.scc_preset);
+            layer.base_opll_rom.reset();
+        } else if (choice.pick == mgstc::engine::TimbrePick::OpllRom) {
+            layer.base_timbre.reset();
+            layer.base_opll_rom = choice.rom_number;
+        } else if (choice.pick == mgstc::engine::TimbrePick::Library) {
+            std::optional<mgstc::engine::SavedTimbreReference> snapshot;
+            if (const auto* embedded = mgstc::engine::findEmbeddedTimbreSnapshot(
+                    preview, choice.library_id)) snapshot = *embedded;
+            else if (const auto* library = timbreLibrary()) {
+                if (const auto* entry = library->find(choice.library_id))
+                    snapshot = mgstc::engine::makeSavedTimbreReference(*entry);
+            }
+            if (!snapshot || snapshot->source != layer.source) return;
+            layer.base_timbre = std::move(snapshot);
+            layer.base_opll_rom.reset();
+        } else return;
+        // Audition the selected source from key-on through the existing ENV,
+        // pitch and modulation paths, without earlier @/manual-y replacing it.
+        std::erase_if(layer.timbre_automation, [](const auto& event) {
+            return event.kind == mgstc::engine::EnvelopeEventKind::Timbre
+                || (event.kind == mgstc::engine::EnvelopeEventKind::RegisterWrite
+                    && event.value >= 0 && event.value <= 7);
+        });
+        if (one_second) {
+            // Selection audition is a single neutral tone, independent of the ENV.
+            const auto defaults = mgstc::engine::defaultCompositeTimbre();
+            auto plain = *std::find_if(defaults.layers.begin(), defaults.layers.end(),
+                [&](const auto& candidate) { return candidate.source == layer.source; });
+            plain.base_timbre = layer.base_timbre;
+            plain.base_opll_rom = layer.base_opll_rom;
+            preview.layers = {std::move(plain)};
+        }
+        manual_y_preview_(std::move(preview), note, one_second);
     }
 
     void pickTimbreAt(int timeline_count, bool focus_morph) {
@@ -9985,18 +10765,38 @@ private:
                 return mutate_memo_callback_
                     ? mutate_memo_callback_(id, std::move(memo))
                     : false;
+            },
+            false, session_, {},
+            [this](std::uint8_t note) {
+                if (manual_y_note_off_) manual_y_note_off_(note);
+            }, {}, {},
+            [this, layer_index = static_cast<std::size_t>(selected_layer_)](
+                EnvelopeTimbreChoice choice, std::uint8_t note) {
+                previewTimbreChoice(layer_index, choice, note);
+            },
+            [this] { if (manual_y_end_) manual_y_end_(); },
+            [this, layer_index = static_cast<std::size_t>(selected_layer_)](
+                EnvelopeTimbreChoice choice) {
+                if (timbre_.layers[layer_index].source != mgstc::engine::TimbreSource::Scc) return;
+                const auto note = session_ != nullptr
+                    && !standaloneHostPreferences(session_->snapshot().capabilities)
+                    ? session_->auditionPreferences().last_note
+                    : LastAuditionNoteStore::instance().get();
+                previewTimbreChoice(layer_index, choice, note, true);
             });
         bool has_morph_settings = false;
         if (layer.source == mgstc::engine::TimbreSource::Scc) {
             const auto* arrival = timbreEventAt(layer, static_cast<std::uint32_t>(timeline_count));
-            const auto* previous = arrival ? previousTimbreEvent(layer, *arrival) : nullptr;
+            const auto previous = arrival ? morphStartEvent(layer, *arrival) : std::nullopt;
             if (arrival) {
                 has_morph_settings = true;
                 const auto maximum = previous && previous->count < arrival->count
                     ? static_cast<int>(std::min<std::uint32_t>(255, arrival->count - previous->count - 1)) : -1;
                 const auto layer_index = static_cast<std::size_t>(selected_layer_);
                 content->configureMorph(arrival->scc_morph,
-                    previous ? timbreCommandLabel(*previous) : juce::String::fromUTF8("（なし）"),
+                    previous ? (previousTimbreEvent(layer, *arrival)
+                        ? timbreCommandLabel(*previous)
+                        : juce::String::fromUTF8("初期音色")) : juce::String::fromUTF8("（なし）"),
                     timbreCommandLabel(*arrival), maximum,
                     [this, count, layer_index,
                      safe = juce::Component::SafePointer<EnvelopeTimbrePickContent>(content)](
@@ -10134,6 +10934,51 @@ private:
 
     void applyLayerBaseChoice(
         std::size_t layer_index, const EnvelopeTimbreChoice& choice) {
+        if (layer_index < timbre_.layers.size() && choice.scc_preset
+            && timbre_.layers[layer_index].source == mgstc::engine::TimbreSource::Scc) {
+            selected_layer_ = static_cast<int>(layer_index);
+            auto snapshot = presetReference(timbre_, *choice.scc_preset);
+            if (const auto& previous = timbre_.layers[layer_index].base_timbre) {
+                snapshot.number_mode = previous->number_mode;
+                snapshot.manual_number = previous->manual_number;
+                const auto id = previous->library_id;
+                const bool another_owner = std::any_of(timbre_.embedded_timbres.begin(),
+                    timbre_.embedded_timbres.end(), [id](const auto& entry) { return entry.library_id == id; })
+                    || std::any_of(timbre_.layers.begin(), timbre_.layers.end(),
+                        [&](const auto& layer) { return &layer != &timbre_.layers[layer_index]
+                            && layer.base_timbre && layer.base_timbre->library_id == id; });
+                const auto assigned = mgstc::engine::assignedNumberForLibraryId(
+                    mgstc::engine::resolveTimbreNumbers(timbre_), id);
+                bool referenced = false;
+                for (const auto& layer : timbre_.layers)
+                    for (const auto& event : layer.timbre_automation)
+                        referenced = referenced || (event.kind == mgstc::engine::EnvelopeEventKind::Timbre
+                            && event.timbre_pick == mgstc::engine::TimbrePick::Library
+                            && (event.target_library_id == id || (!event.target_library_id
+                                && layer.source == previous->source
+                                && ((assigned && event.value == *assigned)
+                                    || (previous->manual_number && event.value == *previous->manual_number)))));
+                if (referenced && !another_owner) timbre_.embedded_timbres.push_back(*previous);
+                if (referenced || another_owner) {
+                    // Keep the former tone's output assignment for existing users.
+                    // The replacement is a distinct waveform and needs its own number.
+                    snapshot.number_mode = mgstc::engine::TimbreNumberMode::Automatic;
+                    snapshot.manual_number.reset();
+                    for (auto& layer : timbre_.layers)
+                        for (auto& event : layer.timbre_automation)
+                            if (event.kind == mgstc::engine::EnvelopeEventKind::Timbre
+                                && event.timbre_pick == mgstc::engine::TimbrePick::Library
+                                && !event.target_library_id && layer.source == previous->source
+                                && ((assigned && event.value == *assigned)
+                                    || (previous->manual_number && event.value == *previous->manual_number)))
+                                event.target_library_id = id;
+                }
+            }
+            timbre_.layers[layer_index].base_timbre = std::move(snapshot);
+            timbre_.layers[layer_index].base_opll_rom.reset();
+            notifyLayerEdit(0, 0, true);
+            return;
+        }
         if (!assign_timbre_callback_ || layer_index >= timbre_.layers.size()) {
             return;
         }
@@ -10583,6 +11428,13 @@ private:
         event.count = static_cast<std::uint32_t>(timeline_count);
         event.timbre_pick = choice.pick;
         event.target_library_id = choice.library_id;
+        if (choice.scc_preset
+            && timbre_.layers[static_cast<std::size_t>(selected_layer_)].source
+                == mgstc::engine::TimbreSource::Scc) {
+            auto snapshot = presetReference(timbre_, *choice.scc_preset);
+            event.target_library_id = snapshot.library_id;
+            timbre_.embedded_timbres.push_back(std::move(snapshot));
+        }
         if (choice.pick == mgstc::engine::TimbrePick::Library
             && mgstc::engine::isStandaloneLibraryTimbreId(choice.library_id)
             && timbre_library_callback_) {
@@ -11058,6 +11910,37 @@ private:
         return cache.trace;
     }
 
+    [[nodiscard]] static std::vector<std::uint8_t> authorVolumeSamples(
+        const mgstc::engine::CompositeLayer& layer, int ticks) {
+        std::vector<mgstc::engine::EnvelopeEvent> points;
+        for (const auto& event : layer.volume_envelope.events)
+            if (event.kind == mgstc::engine::EnvelopeEventKind::Volume) points.push_back(event);
+        std::stable_sort(points.begin(), points.end(), [](const auto& a, const auto& b) {
+            return a.count < b.count;
+        });
+        if (points.empty() || points.front().count > 0) points.insert(points.begin(),
+            {.kind = mgstc::engine::EnvelopeEventKind::Volume, .value = layer.volume});
+        std::vector<std::uint8_t> result(static_cast<std::size_t>(juce::jmax(0, ticks)), layer.volume);
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            const auto start = static_cast<int>(points[i].count);
+            const int stop = i + 1 < points.size() ? static_cast<int>(points[i + 1].count) : ticks;
+            const auto origin = static_cast<std::uint8_t>(juce::jlimit(0, 15, points[i].value));
+            const bool ramp = i + 1 < points.size() && points[i + 1].automatic;
+            const int ramp_start = ramp && points[i + 1].secondary > 0
+                ? juce::jlimit(start, stop, points[i + 1].secondary - 1) : start;
+            const auto samples = ramp && stop > ramp_start
+                ? mgstc::engine::sampleAutomaticRampVolumes(origin,
+                    static_cast<std::uint8_t>(juce::jlimit(0, 15, points[i + 1].value)),
+                    static_cast<std::uint32_t>(stop - ramp_start), false)
+                : std::vector<std::uint8_t>{};
+            for (int count = juce::jmax(0, start); count < juce::jmin(stop, ticks); ++count)
+                result[static_cast<std::size_t>(count)] = !samples.empty() && count >= ramp_start
+                    ? samples[std::min(static_cast<std::size_t>(count - ramp_start), samples.size() - 1)]
+                    : origin;
+        }
+        return result;
+    }
+
     [[nodiscard]] const std::vector<std::uint8_t>& cachedVolumeSamples(
         std::size_t layer_index,
         int ticks) const {
@@ -11074,6 +11957,7 @@ private:
         cache.ticks = ticks;
         cache.fingerprint = fingerprint;
         cache.samples = mgstc::engine::sampleCompositeVolumeLane(layer, ticks);
+        cache.author_samples = authorVolumeSamples(layer, ticks);
         return cache.samples;
     }
 
@@ -11186,6 +12070,7 @@ private:
             edit_mode_.setVisible(visible && !show_rate);
             parameter_.setVisible(visible && !show_rate);
             mml_toggle_.setEnabled(visible);
+            zoom_in_.setEnabled(visible); zoom_out_.setEnabled(visible);
             envelope_mml_preview_.setVisible(visible && mml_toggle_.getToggleState());
             auto_mode_.setVisible(visible && show_auto && count_inspector_);
             auto_depth_.setVisible(visible && show_auto && count_inspector_);
@@ -11323,6 +12208,7 @@ private:
     juce::TextEditor envelope_mml_preview_;
     juce::String last_envelope_mml_preview_;
     juce::Label morph_bank_label_, morph_bank_usage_;
+    std::vector<juce::String> scc_timbre_usage_;
     juce::String morph_bank_error_;
     juce::ComboBox morph_bank_;
     std::optional<mgstc::engine::CompositeTimbre> morph_preview_input_;
@@ -11365,6 +12251,7 @@ private:
     std::optional<std::size_t> rate_editor_layer_;
     juce::OwnedArray<CompositeLayerSetupView> layer_setups_;
     juce::TextButton mml_toggle_;
+    juce::TextButton zoom_in_, zoom_out_;
     juce::ToggleButton pitch_lane_toggle_;
     std::vector<bool> pitch_lane_expanded_;
     std::vector<bool> envelope_number_active_;
@@ -11389,12 +12276,14 @@ private:
         int ticks{-1};
         std::uint64_t fingerprint{};
         std::vector<std::uint8_t> samples;
+        std::vector<std::uint8_t> author_samples;
     };
     mutable std::vector<RateTraceCache> rate_trace_cache_;
     mutable std::vector<VolumeSampleCache> volume_sample_cache_;
     juce::MouseCursor::StandardCursorType last_mouse_cursor_{
         juce::MouseCursor::NormalCursor};
     std::optional<juce::Rectangle<int>> edit_draw_bounds_;
+    std::optional<TimelineModulationTarget> pending_auto_settings_;
     std::optional<int> hover_preview_value_;
     std::optional<juce::Point<int>> hover_mouse_pos_;
     std::optional<Parameter> hover_edit_parameter_;
