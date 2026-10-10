@@ -201,6 +201,13 @@ public:
             control.setButtonText(juce::String::fromUTF8(text)); control.onClick = std::move(action); addAndMakeVisible(control);
         };
         button(load_, "WAVを開く…", [this] { loadWave(); });
+        button(audacity_, "Audacityから変換", [this] { importAudacitySelection(); });
+        audacity_.setTooltip(juce::String::fromUTF8(
+            "Audacityの選択範囲から総合音色へ変換します。"
+            "編集→環境設定→モジュールでmod-script-pipeを有効にし、"
+            "Audacityを再起動してください。"
+            "有効中は同じPC上の他のプログラムからもAudacityを操作できるため、"
+            "信頼できる環境で使用してください"));
         button(original_, "原音 ▶", [this] { previewSource(); });
         button(converted_, "変換音 ▶", [this] { previewResult(); });
         button(stop_, "停止", [this] { stopPcm(); });
@@ -270,7 +277,7 @@ public:
         };
         addAndMakeVisible(range_);
         int order = 1;
-        for (auto* c : std::initializer_list<juce::Component*>{&load_, &range_, &zoom_in_, &zoom_out_, &begin_, &end_,
+        for (auto* c : std::initializer_list<juce::Component*>{&load_, &audacity_, &range_, &zoom_in_, &zoom_out_, &begin_, &end_,
                 &pitch_, &key_off_, &configuration_, &strategy_, &fixed_tone_, &budget_, &preference_, &sustain_,
                 &original_, &converted_, &stop_, &level_match_, &wave_method_, &analyze_, &convert_, &apply_, &cancel_}) c->setExplicitFocusOrder(order++);
         setWantsKeyboardFocus(true);
@@ -290,7 +297,9 @@ public:
     void resized() override {
         auto area = getLocalBounds().reduced(UiLayout::panelPad);
         auto top = area.removeFromTop(UiLayout::fieldH);
-        load_.setBounds(top.removeFromLeft(UiScale::sx(160))); top.removeFromLeft(UiLayout::controlGap); metadata_.setBounds(top);
+        load_.setBounds(top.removeFromLeft(UiScale::sx(160))); top.removeFromLeft(UiLayout::controlGap);
+        audacity_.setBounds(top.removeFromLeft(UiScale::sx(184))); top.removeFromLeft(UiLayout::controlGap);
+        metadata_.setBounds(top);
         area.removeFromTop(UiLayout::xs); metadata_detail_.setBounds(area.removeFromTop(UiLayout::fieldH));
         area.removeFromTop(UiLayout::sm); range_.setBounds(area.removeFromTop(UiScale::sx(150)));
         area.removeFromTop(UiLayout::sm);
@@ -341,6 +350,11 @@ public:
         // a PC note held when focus moves into an editable field.
         if (audition_published_ && audition_poll_) audition_poll_();
         return false;
+    }
+    void importAudacitySelection() {
+        loadWaveSource([] { return mgstc::platform::exportAudacitySelectionToWave(); },
+            juce::String::fromUTF8("Audacityの選択範囲"),
+            juce::String::fromUTF8("Audacityから音声を取得中"));
     }
 private:
     void clearCandidateAudition() {
@@ -519,36 +533,52 @@ private:
     void loadWave() {
         juce::FileChooser chooser(juce::String::fromUTF8("WAVから総合音色へ変換"), {}, "*.wav;*.wave");
         if (!chooser.browseForFileToOpen()) return;
-        stopPcm();
         const auto path = std::filesystem::path(chooser.getResult().getFullPathName().toWideCharPointer());
-        struct Loaded { std::shared_ptr<const mgstc::engine::SourcePcm> pcm; mgstc::engine::SourceMetadata metadata; std::string error; };
-        const auto cancellation = std::make_shared<std::atomic<bool>>(false);
+        loadWaveSource([path] {
+            mgstc::platform::AudacityWaveImportResult imported;
+            imported.wave = mgstc::platform::readWaveFileBytes(path);
+            if (!imported.wave) imported.error = L"WAVファイルを読み込めませんでした";
+            return imported;
+        }, juce::String(path.filename().wstring().c_str()), juce::String::fromUTF8("WAV読み込み中"));
+    }
+    using WaveSourceLoader = std::function<mgstc::platform::AudacityWaveImportResult()>;
+    void loadWaveSource(WaveSourceLoader loader, juce::String source_name, juce::String stage) {
+        // Audacity pipe I/O and WAV decoding share the existing conversion worker.
+        // A closed/cancelled window never publishes the staged source or changes authoring.
+        if (busy_dialog_) return;
+        stopPcm();
+        struct Loaded { std::shared_ptr<const mgstc::engine::SourcePcm> pcm; mgstc::engine::SourceMetadata metadata; juce::String error; };
+        analysis_cancel_ = std::make_shared<std::atomic<bool>>(false);
+        const auto cancellation = analysis_cancel_;
         auto progress = std::make_shared<ConversionProgressState>();
         progress->custom_cancel = [cancellation] { cancellation->store(true); };
         progress->custom_cancelled = [cancellation] { return cancellation->load(); };
-        progress->custom_stage = [] { return juce::String::fromUTF8("WAV読み込み中"); };
+        progress->custom_stage = [stage] { return stage; };
         const juce::Component::SafePointer<CompositeWavConversionContent> safe(this);
-        busy_dialog_ = runWithConversionBusyDialog(this, [path, cancellation](ConversionProgressState& progress) {
+        busy_dialog_ = runWithConversionBusyDialog(this, [loader = std::move(loader), cancellation](ConversionProgressState& progress) {
             Loaded loaded;
             if (progress.cancellationRequested()) return loaded;
-            const auto bytes = mgstc::platform::readWaveFileBytes(path);
-            if (!bytes) { loaded.error = "WAV file could not be read"; return loaded; }
+            auto imported = loader();
             if (progress.cancellationRequested()) return loaded;
+            if (!imported.wave) { loaded.error = juce::String(imported.error.c_str()); return loaded; }
             auto pcm = std::make_shared<mgstc::engine::SourcePcm>();
-            if (mgstc::engine::parseCompositeWavePcm(*bytes, *pcm, &loaded.error, cancellation)) {
+            std::string error;
+            if (mgstc::engine::parseCompositeWavePcm(*imported.wave, *pcm, &error, cancellation)) {
                 loaded.metadata = summarizePcm(*pcm, cancellation);
                 if (progress.cancellationRequested()) return loaded;
                 loaded.pcm = std::move(pcm);
+            } else {
+                loaded.error = juce::String::fromUTF8(error.c_str());
             }
             return loaded;
-        }, [safe, path](Loaded loaded, bool cancelled) {
+        }, [safe, source_name](Loaded loaded, bool cancelled) {
             if (!safe || cancelled) return;
-            if (!loaded.pcm) { safe->report(juce::String::fromUTF8(loaded.error.c_str())); return; }
+            if (!loaded.pcm) { safe->report(loaded.error); return; }
             safe->clearCandidateAudition();
             safe->source_ = std::move(loaded.pcm); safe->analysis_.reset(); safe->analysis_summary_.clear(); safe->result_.reset(); safe->result_pcm_.reset();
             safe->source_metadata_ = std::move(loaded.metadata);
             safe->range_.setSource(safe->source_); safe->syncRange(); safe->refreshEnabled();
-            safe->metadata_.setText(juce::String(path.filename().wstring().c_str()) + " / " + juce::String(safe->source_->sample_rate) + " Hz / "
+            safe->metadata_.setText(source_name + " / " + juce::String(safe->source_->sample_rate) + " Hz / "
                 + juce::String(safe->source_->channels) + " ch / " + juce::String(safe->source_->bit_depth) + " bit / "
                 + juce::String::fromUTF8(safe->source_->sample_format == mgstc::engine::SourceSampleFormat::FloatPcm ? "Float PCM" : "Integer PCM"), juce::dontSendNotification);
             auto stats = juce::String(safe->source_metadata_.duration_seconds, 3) + " s / peak "
@@ -598,7 +628,7 @@ private:
     BackgroundTaskBoundary* background_tasks_{};
     juce::Component::SafePointer<ConversionBusyDialog> busy_dialog_;
     CompositeWavRange range_;
-    juce::TextButton load_, original_, converted_, stop_, zoom_in_, zoom_out_, analyze_, convert_, apply_, cancel_;
+    juce::TextButton load_, audacity_, original_, converted_, stop_, zoom_in_, zoom_out_, analyze_, convert_, apply_, cancel_;
     juce::TextEditor begin_, end_, pitch_, key_off_, budget_, status_;
     juce::ComboBox configuration_, strategy_, fixed_tone_, preference_, sustain_;
     juce::ToggleButton level_match_;

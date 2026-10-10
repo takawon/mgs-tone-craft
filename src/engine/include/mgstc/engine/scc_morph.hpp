@@ -197,6 +197,8 @@ struct SccMorphCompileResult {
     std::vector<SccWaveform>& waves, bool fixed_start, bool fixed_end);
 // Non-audio-thread API. Keeps authored sources/events intact and materializes
 // the derived cache into a separate CompositeTimbre for existing consumers.
+// A first incoming transition starts at count zero from the channel base tone;
+// its optimized source replaces only the derived base snapshot, not an @0 event.
 [[nodiscard]] SccMorphCompileResult compileSccMorph(const CompositeTimbre& input);
 [[nodiscard]] SccMorphCompileResult compileSccMorph(
     const CompositeTimbre& input, std::stop_token cancellation);

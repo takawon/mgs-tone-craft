@@ -1342,7 +1342,7 @@ void testCompositeCompilationBoundariesAndAllocation() {
         });
     const auto no_previous_result = compileSccMorph(no_previous);
     require(!no_previous_result.valid,
-            "enabled incoming morph without a previous tone is rejected");
+            "incoming morph at count zero has no positive-duration interval");
 
     auto no_slots = morphProgram(first, last, 4, 5, 1);
     const auto no_slots_result = compileSccMorph(no_slots);
@@ -1429,6 +1429,157 @@ void testCompositeCompilationBoundariesAndAllocation() {
             "overflow result reports required and available slot counts");
     require(overflow_result.timbre == overflow,
             "invalid compilation returns the unmaterialized source model");
+}
+
+void testIncomingMorphFromChannelBase() {
+    const auto first = sawWave(3, 5);
+    const auto last = sawWave(5, 9);
+    const auto snapshotWave = [](const SavedTimbreReference& reference) {
+        SccWaveform wave{};
+        for (std::size_t n = 0; n < wave.size(); ++n)
+            wave[n] = std::bit_cast<std::int8_t>(reference.scc_waveform[n]);
+        return wave;
+    };
+    for (const auto allocation : {SccOutputAllocationMode::LegacyBank,
+                                  SccOutputAllocationMode::Contiguous}) {
+        for (const auto mode : {SccMorphDistributionMode::ToneDistribution,
+                               SccMorphDistributionMode::TimeDistribution,
+                               SccMorphDistributionMode::AdaptiveDistribution}) {
+            auto explicit_source = morphProgram(first, last, 0, 20, 2);
+            explicit_source.layers[0].scc_output_allocation = allocation;
+            explicit_source.layers[0].timbre_automation[1].scc_morph.distribution_mode = mode;
+            auto implicit_source = explicit_source;
+            implicit_source.layers[0].timbre_automation.erase(
+                implicit_source.layers[0].timbre_automation.begin());
+            const auto original = implicit_source;
+            const auto explicit_result = compileSccMorph(explicit_source);
+            const auto implicit_result = compileSccMorph(implicit_source);
+            require(explicit_result.valid && implicit_result.valid,
+                    "first incoming morph compiles from channel initial snapshot");
+            require(implicit_source == original
+                        && *implicit_result.authored_input == original,
+                    "base morph preserves snapshots and authored events non-destructively");
+            require(implicit_result.timbre.layers[0].timbre_automation.size()
+                        == explicit_result.timbre.layers[0].timbre_automation.size() - 1,
+                    "virtual base does not materialize a redundant count-zero @ event");
+            require(implicit_result.plans.size() == 1
+                        && implicit_result.plans[0].destination_event_index == 0
+                        && implicit_result.plans[0].result.plan
+                            == explicit_result.plans[0].result.plan,
+                    "base fallback preserves timing and authored destination index in all distributions");
+            require(snapshotWave(*implicit_result.timbre.layers[0].base_timbre)
+                        == materializedWaveFor(explicit_result.timbre,
+                                               diagnosticAt(explicit_result, 0)),
+                    "derived key-on snapshot uses the same optimized source phase as explicit @0");
+            for (const auto& diagnostic : implicit_result.diagnostics) {
+                if (diagnostic.count == 0) continue;
+                const auto& reference = diagnosticAt(explicit_result, diagnostic.count);
+                require(materializedWaveFor(implicit_result.timbre, diagnostic)
+                            == materializedWaveFor(explicit_result.timbre, reference),
+                        "base fallback keeps intermediate and arrival wave bytes identical");
+            }
+        }
+    }
+
+    auto source = morphProgram(first, last, 0, 20, 2);
+    source.layers[0].timbre_automation.erase(source.layers[0].timbre_automation.begin());
+    auto cached = compileSccMorphCached(source);
+    require(cached->valid && cached == compileSccMorphCached(source),
+            "unchanged implicit source reuses the prepared immutable cache");
+    auto changed = source;
+    changed.layers[0].base_timbre->scc_waveform[0]++;
+    const auto changed_cache = compileSccMorphCached(changed);
+    require(changed_cache->valid && changed_cache != cached,
+            "editing channel initial waveform invalidates implicit-source morph cache");
+    auto saved_plan = source;
+    saved_plan.layers[0].timbre_automation[0].scc_morph.explicit_plan =
+        cached->plans[0].result.plan;
+    const auto saved_payload = serializeCompositeSoundPayload(saved_plan);
+    const auto persisted = deserializeCompositeSoundPayload(saved_payload, kCompositeSoundPayloadVersion);
+    require(persisted.has_value()
+                && serializeCompositeSoundPayload(*persisted) == saved_payload
+                && persisted->layers[0].base_timbre == saved_plan.layers[0].base_timbre
+                && persisted->layers[0].timbre_automation == saved_plan.layers[0].timbre_automation
+                && compileSccMorph(*persisted).valid,
+            "implicit base morph and explicit distribution plan sound payload round-trip without synthetic @0");
+    const auto portable = CompositeTimbreLibrary::deserializeTimbreFile(
+        CompositeTimbreLibrary::serializeTimbreFile(saved_plan, 1));
+    require(portable.has_value() && *portable == saved_plan && compileSccMorph(*portable).valid,
+            "portable implicit base morph round-trip preserves sound and composite metadata");
+    saved_plan.layers[0].timbre_automation[0].count = 1;
+    saved_plan.layers[0].timbre_automation[0].scc_morph.explicit_plan.reset();
+    require(!compileSccMorph(saved_plan).valid,
+            "implicit base duration enforces available intermediate slots");
+
+    auto missing_destination = source;
+    missing_destination.embedded_timbres.clear();
+    require(!compileSccMorph(missing_destination).valid,
+            "base fallback does not hide an unavailable destination snapshot");
+    auto invalid_base = source;
+    invalid_base.layers[0].base_timbre->source = TimbreSource::Opll;
+    require(!compileSccMorph(invalid_base).valid,
+            "base fallback rejects an initial snapshot from another chip");
+
+    auto defaults = morphProgram(generateSccPreset(SccWavePreset::Sine, SccHarmonic::One),
+                                 generateSccPreset(SccWavePreset::Sine, SccHarmonic::One));
+    defaults.layers[0].timbre_automation.erase(defaults.layers[0].timbre_automation.begin());
+    defaults.layers[0].base_timbre.reset();
+    const auto default_result = compileSccMorph(defaults);
+    require(default_result.valid && default_result.timbre.layers[0].base_timbre
+                && snapshotWave(*default_result.timbre.layers[0].base_timbre)
+                    == generateSccPreset(SccWavePreset::Sine, SccHarmonic::One),
+            "unset channel initial tone uses established default sine snapshot");
+
+    auto chain = source;
+    chain.embedded_timbres.push_back(sccTone(1003, 17, first));
+    chain.layers[0].timbre_automation.push_back(toneEvent(1003, 28,
+        chain.layers[0].timbre_automation[0].scc_morph));
+    const auto chain_result = compileSccMorph(chain);
+    require(chain_result.valid && chain_result.plans.size() == 2
+                && chain_result.plans[1].destination_event_index == 1,
+            "first base morph can continue into consecutive explicit arrivals");
+
+    auto reused_base = morphProgram(sawWave(), rotateSccWaveform(sawWave(), 7), 0, 20, 0);
+    const auto original_base = *reused_base.layers[0].base_timbre;
+    reused_base.layers[0].timbre_automation.erase(reused_base.layers[0].timbre_automation.begin());
+    reused_base.layers[0].timbre_automation.push_back(toneEvent(original_base.library_id, 28));
+    const auto reused_result = compileSccMorph(reused_base);
+    require(reused_result.valid && diagnosticAt(reused_result, 0).phase_shift != 0,
+            "bounded base-to-rotated tone morph changes the virtual source phase");
+    const auto* retained_base = findEmbeddedTimbreSnapshot(reused_result.timbre, original_base.library_id);
+    require(retained_base && retained_base->scc_waveform == original_base.scc_waveform,
+            "phase-adjusted virtual base retains its original snapshot for later ordinary @");
+    const auto ordinary = std::find_if(reused_result.timbre.layers[0].timbre_automation.begin(),
+        reused_result.timbre.layers[0].timbre_automation.end(), [](const auto& event) {
+            return event.kind == EnvelopeEventKind::Timbre && event.count == 28;
+        });
+    require(ordinary != reused_result.timbre.layers[0].timbre_automation.end()
+                && ordinary->target_library_id == original_base.library_id,
+            "ordinary switch back preserves the original base snapshot identity");
+    const auto formatted_reused = formatMgsComposite(reused_result.timbre);
+    require(formatted_reused.valid(),
+            "phase-adjusted base with ordinary switch back exports complete SCC definitions");
+    EngineCore reused_engine;
+    require(compileCompositeProgram(reused_engine, reused_result.timbre),
+            "materialized ordinary switch back resolves the retained initial snapshot");
+    EngineCore authored_reused_engine;
+    require(compileCompositeProgram(authored_reused_engine, reused_base)
+                && formatMgsComposite(reused_base).valid(),
+            "authored base-to-morph-to-base path compiles and exports through shared preparation");
+
+    auto preceding = morphProgram(first, last, 5, 20, 2);
+    auto alternate_base = preceding;
+    alternate_base.layers[0].base_timbre = sccTone(1004, 18, sawWave(7, 13));
+    preceding.embedded_timbres.push_back(*preceding.layers[0].base_timbre);
+    alternate_base.embedded_timbres.push_back(*preceding.layers[0].base_timbre);
+    const auto before = compileSccMorph(preceding);
+    const auto after = compileSccMorph(alternate_base);
+    require(before.valid && after.valid && before.plans[0].result.plan == after.plans[0].result.plan,
+            "preceding explicit tone retains precedence over channel initial tone");
+    for (const auto& diagnostic : before.diagnostics)
+        require(materializedWaveFor(before.timbre, diagnostic)
+                    == materializedWaveFor(after.timbre, diagnosticAt(after, diagnostic.count)),
+                "changing unrelated channel base does not alter an explicit morph segment");
 }
 
 void testMorphBlockBoundaryAnchors() {
@@ -2096,6 +2247,7 @@ int main() {
         testSharedSequenceDefinitionHasIndependentTrackState();
         testSharedBankOnSccChannelFourFiveRam();
         testCompositeCompilationBoundariesAndAllocation();
+        testIncomingMorphFromChannelBase();
         testMorphBlockBoundaryAnchors();
         testMorphAcrossEnvelopeLoopBrackets();
         testSeparateMorphBlocksKeepNormalTransition();

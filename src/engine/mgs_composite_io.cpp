@@ -1018,40 +1018,24 @@ std::string formatMgsRateDefinition(
     return rateDefinition(layer, number);
 }
 
-MgsCompositeIoResult formatMgsComposite(
-    const CompositeTimbre& source_timbre,
-    const TimbreLibrary* library) {
-    MgsCompositeIoResult result;
-    const auto morph = compileSccMorphCached(source_timbre);
-    if (!morph->valid) {
-        result.issues.push_back(morph->error);
-        return result;
-    }
-    const auto& timbre = morph->timbre;
-    const auto validation = validateCompositeTimbre(timbre);
-    for (const auto& warning : validation.warnings) {
-        result.issues.push_back(warning);
-    }
-    const auto numbers = resolveTimbreNumbers(timbre);
-    for (const auto& warning : numbers.warnings) {
-        addIssue(result.issues, warning);
-    }
-    if (!result.valid()) {
-        return result;
-    }
-
-    std::ostringstream output;
-    output << "; #opll_mode 0\r\n"
-           << "; #tempo " << std::clamp(
-               timbre.playback_tempo,
-               kMgscTempoMin,
-               kMgscTempoMax)
-           << "\r\n"
-           << "; MGSTC-COMPOSITE name=" << hexText(timbre.name)
-           << "\r\n\r\n";
-
+namespace {
+void writeCompositeTimbreDefinitions(
+    std::ostringstream& output, MgsCompositeIoResult& result,
+    const CompositeTimbre& timbre, const TimbreNumberResolution& numbers,
+    const TimbreLibrary* library, const CompositeLayer* selected_layer) {
     std::set<TimbreKey> emitted;
     for (const auto& assignment : numbers.assignments) {
+        if (selected_layer != nullptr) {
+            const bool used = (selected_layer->base_timbre
+                    && selected_layer->base_timbre->library_id == assignment.library_id)
+                || std::any_of(selected_layer->timbre_automation.begin(),
+                    selected_layer->timbre_automation.end(), [&](const auto& event) {
+                        return event.kind == EnvelopeEventKind::Timbre
+                            && event.timbre_pick == TimbrePick::Library
+                            && event.target_library_id == assignment.library_id;
+                    });
+            if (!used) continue;
+        }
         TimbreSource source = TimbreSource::Psg;
         const auto find_source = [&](
                                       const CompositeLayer& layer) {
@@ -1105,6 +1089,65 @@ MgsCompositeIoResult formatMgsComposite(
                 reference->name);
         }
     }
+}
+} // namespace
+
+MgsCompositeIoResult formatMgsCompositeLayerTimbres(
+    const CompositeTimbre& source_timbre, std::size_t layer_index,
+    const TimbreLibrary* library) {
+    MgsCompositeIoResult result;
+    const auto morph = compileSccMorphCached(source_timbre);
+    if (!morph->valid) {
+        result.issues.push_back(morph->error);
+        return result;
+    }
+    const auto& timbre = morph->timbre;
+    if (layer_index >= timbre.layers.size()) {
+        result.issues.push_back("invalid preview layer");
+        return result;
+    }
+    const auto numbers = resolveTimbreNumbers(timbre);
+    result.issues = numbers.warnings;
+    std::ostringstream output;
+    writeCompositeTimbreDefinitions(output, result, timbre, numbers, library,
+        &timbre.layers[layer_index]);
+    if (result.valid()) result.source = output.str();
+    return result;
+}
+
+MgsCompositeIoResult formatMgsComposite(
+    const CompositeTimbre& source_timbre,
+    const TimbreLibrary* library) {
+    MgsCompositeIoResult result;
+    const auto morph = compileSccMorphCached(source_timbre);
+    if (!morph->valid) {
+        result.issues.push_back(morph->error);
+        return result;
+    }
+    const auto& timbre = morph->timbre;
+    const auto validation = validateCompositeTimbre(timbre);
+    for (const auto& warning : validation.warnings) {
+        result.issues.push_back(warning);
+    }
+    const auto numbers = resolveTimbreNumbers(timbre);
+    for (const auto& warning : numbers.warnings) {
+        addIssue(result.issues, warning);
+    }
+    if (!result.valid()) {
+        return result;
+    }
+
+    std::ostringstream output;
+    output << "; #opll_mode 0\r\n"
+           << "; #tempo " << std::clamp(
+               timbre.playback_tempo,
+               kMgscTempoMin,
+               kMgscTempoMax)
+           << "\r\n"
+           << "; MGSTC-COMPOSITE name=" << hexText(timbre.name)
+           << "\r\n\r\n";
+
+    writeCompositeTimbreDefinitions(output, result, timbre, numbers, library, nullptr);
     if (!result.valid()) {
         return result;
     }
