@@ -20,6 +20,7 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 
 #include "mgstc/engine/composite_envelope_compile.hpp"
+#include "mgstc/engine/composite_step_edit.hpp"
 #include "mgstc/engine/composite_program_compiler.hpp"
 #include "juce_chip_tracks.hpp"
 #include "juce_utf8.hpp"
@@ -4564,6 +4565,15 @@ public:
         };
         addAndMakeVisible(compact_overview_);
 
+        step_edit_mode_.setButtonText(juce::String::fromUTF8("削除/挿入"));
+        step_edit_mode_.setClickingTogglesState(true);
+        step_edit_mode_.setTooltip(juce::String::fromUTF8(
+            "左ドラッグで左側のステップを削除／挿入。命令行は全行、その他はその行のみ。"
+            "OFFでもCtrl＋左ドラッグで操作できます。Escで取消"));
+        step_edit_mode_.onClick = [this] { cancelStepDrag(); repaint(); };
+        addAndMakeVisible(step_edit_mode_);
+        setWantsKeyboardFocus(true);
+
         tempo_label_.setText(
             juce::String::fromUTF8("テンポ"),
             juce::dontSendNotification);
@@ -5212,6 +5222,7 @@ public:
         check(callbacks > 0 && timbre_.layers[0] != model.layers[0], "volume mouse editing stopped working");
         check(timbre_.layers[1] == model.layers[1] && timbre_.layers[2] == model.layers[2],
             "mouse edit changed another channel");
+        failures += verifyStepDrag();
         setTimbre(model, true);
         for (int i = 0; i < 3; ++i) addLayer(mgstc::engine::TimbreSource::Psg);
         for (int i = 0; i < 5; ++i) addLayer(mgstc::engine::TimbreSource::Scc);
@@ -6096,6 +6107,7 @@ public:
     }
 
     void cancelPendingDialogs() {
+        cancelStepDrag();
         pending_auto_settings_.reset();
         ++dialog_generation_;
         command_stack_.cancelPendingActions();
@@ -6109,6 +6121,9 @@ public:
     void setTimbre(
         const mgstc::engine::CompositeTimbre& timbre,
         bool reset_scroll_extent = false) {
+        // A host restore / Undo supersedes a provisional mouse gesture.
+        if (step_drag_) stopTimer();
+        step_drag_.reset();
         const auto previous_pitch_expanded = pitch_lane_expanded_;
         pending_auto_settings_.reset();
         timbre_ = timbre;
@@ -6276,7 +6291,265 @@ public:
         ensureLaneLayout();
     }
 
+    juce::String verifyStepDrag() {
+        juce::String failures;
+        const auto check = [&](bool ok, const char* message) {
+            if (!ok) failures += juce::String(message) + "\n";
+        };
+        const auto saved_callback = edit_callback_;
+        const auto saved_scale = UiScale::active_percent;
+        auto model = mgstc::engine::defaultCompositeTimbre();
+        auto& layer = model.layers[0];
+        layer.envelope_timeline.length_counts = 24;
+        layer.envelope_timeline.loop_start_count.reset();
+        layer.envelope_timeline.loop_end_count.reset();
+        layer.volume_envelope.kind = mgstc::engine::EnvelopeKind::Sequence;
+        layer.volume_envelope.events = {
+            {mgstc::engine::EnvelopeEventKind::Volume, 15, 0, 0},
+            {mgstc::engine::EnvelopeEventKind::Volume, 8, 0, 6},
+            {mgstc::engine::EnvelopeEventKind::Volume, 4, 0, 12}};
+        const auto event_at = [&](juce::Point<int> p, juce::Point<int> down, bool dragged, bool ctrl) {
+            const auto now = juce::Time::getCurrentTime();
+            return juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(), p.toFloat(),
+                juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier
+                    | (ctrl ? juce::ModifierKeys::ctrlModifier : 0)),
+                1.0f, 0.0f, 0.0f, 0.0f, 0.0f, this, this, now, down.toFloat(), now, 1, dragged);
+        };
+        for (int scale : {75, 100, 125}) {
+            UiScale::setActivePercent(scale);
+            selected_layer_ = 0;
+            setTimbre(model, true);
+            refreshUiScaleFonts();
+            int commits{};
+            setEditCallback([&](const auto&, bool commit, bool) { if (commit) ++commits; });
+            check(step_edit_mode_.isVisible(), "step edit toggle is not visible");
+            const auto graph = graph_bounds_[0];
+            const auto slots = makeEditLaneSlots(graph, layer.source);
+            const auto plot = timelinePlotBounds(graph);
+            const auto point_at = [&](int count, juce::Rectangle<int> row) {
+                return juce::Point<int>((xForCount(plot, count) + xForCount(plot, count + 1)) / 2,
+                    row.getCentreY());
+            };
+            const auto from = point_at(6, slots.summary);
+            const auto to = point_at(8, slots.summary);
+            step_edit_mode_.setToggleState(true, juce::dontSendNotification);
+            step_edit_mode_.onClick();
+            check(timbre_ == model && commits == 0, "step edit toggle mutates sound");
+            mouseDown(event_at(from, from, false, false));
+            mouseUp(event_at(from, from, false, false));
+            check(timbre_ == model && commits == 0, "step edit click mutates sound");
+            mouseDown(event_at(from, from, false, false));
+            mouseDrag(event_at(to, from, true, false));
+            check(step_drag_ && step_drag_->delta == 2 && commits == 0,
+                "step drag fails to preview without committing");
+            check(timbre_.layers[0].envelope_timeline.length_counts == 26
+                && timbre_.layers[1] == model.layers[1], "all-lane slide moved other channel or missed END");
+            mouseDrag(event_at(from, from, true, false));
+            check(timbre_ == model, "returning step drag fails to restore exact original");
+            mouseDrag(event_at(to, from, true, false));
+            mouseUp(event_at(to, from, true, false));
+            check(commits == 1 && !step_drag_, "step drag must commit exactly once");
+            setTimbre(model, true);
+            commits = 0;
+            step_edit_mode_.setToggleState(false, juce::dontSendNotification);
+            const auto volume_from = point_at(6, slots.volume);
+            const auto volume_to = point_at(8, slots.volume);
+            mouseDown(event_at(volume_from, volume_from, false, true));
+            mouseDrag(event_at(volume_to, volume_from, true, true));
+            check(step_drag_ && step_drag_->delta == 2
+                && timbre_.layers[0].envelope_timeline == model.layers[0].envelope_timeline,
+                "Ctrl individual slide failed or moved timeline");
+            check(keyPressed(juce::KeyPress(juce::KeyPress::escapeKey))
+                && timbre_ == model && commits == 0, "Esc must discard local preview");
+            mouseUp(event_at(volume_to, volume_from, true, true));
+            check(commits == 0, "mouseUp committed an escaped slide");
+            auto long_model = model;
+            long_model.layers[0].envelope_timeline.length_counts =
+                mgstc::engine::kMgscEnvelopeUiLengthCap;
+            setTimbre(long_model, true);
+            const auto edge = juce::Point<int>(plot.getRight() - 1, slots.summary.getCentreY());
+            const auto before_scroll = visibleCountRange();
+            mouseDown(event_at(edge, edge, false, true));
+            check(step_drag_.has_value(), "edge click must exercise a valid pending gesture");
+            for (int tick = 0; tick < 4; ++tick) autoScrollStepDrag();
+            mouseUp(event_at(edge, edge, false, true));
+            check(timbre_ == long_model && commits == 0 && visibleCountRange() == before_scroll,
+                "holding a click at the edge must not start auto-scroll or insert steps");
+            setTimbre(model, true);
+            mouseDown(event_at(from, from, false, true));
+            mouseDrag(event_at(to, from, true, true));
+            focusLost(juce::Component::focusChangedDirectly);
+            check(!step_drag_ && timbre_ == model && commits == 0,
+                "focus transfer must discard an uncommitted slide");
+            mouseDown(event_at(from, from, false, true));
+            mouseDrag(event_at(to, from, true, true));
+            selectOverviewLayer(1);
+            check(!step_drag_ && timbre_ == model && commits == 0,
+                "channel selection must discard an uncommitted slide");
+            selectOverviewLayer(0);
+            mouseDown(event_at(from, from, false, true));
+            mouseDrag(event_at(to, from, true, true));
+            setTimbre(model, true);
+            mouseUp(event_at(to, from, true, true));
+            check(commits == 0 && timbre_ == model, "host replacement retained a stale gesture");
+        }
+        UiScale::setActivePercent(saved_scale);
+        setEditCallback(saved_callback);
+        step_edit_mode_.setToggleState(false, juce::dontSendNotification);
+        setTimbre(model, true);
+        return failures;
+    }
+
+    void layoutStepEditToggle() {
+        step_edit_mode_.setVisible(false);
+        if (selected_layer_ < 0 || selected_layer_ >= static_cast<int>(graph_bounds_.size())
+            || selected_layer_ >= static_cast<int>(timbre_.layers.size())) return;
+        const auto& layer = timbre_.layers[static_cast<std::size_t>(selected_layer_)];
+        if (layer.volume_envelope.kind != mgstc::engine::EnvelopeKind::Sequence) return;
+        auto label = makeEditLaneSlots(graph_bounds_[static_cast<std::size_t>(selected_layer_)],
+            layer.source).summary.removeFromLeft(UiLayout::compositeOverviewLabelW);
+        label.removeFromLeft(UiLayout::textButtonH + UiLayout::controlGap * 2);
+        auto bounds = label.reduced(UiLayout::xs, UiLayout::xs);
+        step_edit_mode_.setBounds(bounds);
+        step_edit_mode_.setVisible(graphArea().contains(bounds));
+        step_edit_mode_.toFront(false);
+    }
+
+    void beginStepDrag(const juce::MouseEvent& event, int layer_index,
+        juce::Rectangle<int> graph) {
+        using Lane = mgstc::engine::CompositeStepEditLane;
+        drawing_ = false;
+        edit_draw_bounds_.reset();
+        const auto& layer = timbre_.layers[static_cast<std::size_t>(layer_index)];
+        if (layer.volume_envelope.kind != mgstc::engine::EnvelopeKind::Sequence) {
+            reportStatus(juce::String::fromUTF8("@rには削除／挿入するステップ列がありません"));
+            return;
+        }
+        const auto slots = makeEditLaneSlots(graph, layer.source);
+        std::optional<Lane> lane;
+        const auto point = event.getPosition();
+        if (graphStrip(slots.summary).contains(point)) lane = Lane::All;
+        else if (graphStrip(slots.volume).contains(point)) lane = Lane::Volume;
+        else if (graphStrip(slots.pitch).contains(point)) lane = Lane::Pitch;
+        else if (graphStrip(slots.timbre).contains(point)) lane = Lane::Timbre;
+        else if (graphStrip(slots.register_write).contains(point)) lane = Lane::RegisterWrite;
+        else if (graphStrip(slots.tl_auto).contains(point)) lane = Lane::Tl;
+        else if (graphStrip(slots.fb_auto).contains(point)) lane = Lane::Fb;
+        if (!lane) return;
+        const int start = countAtX(timelinePlotBounds(graph), point.x);
+        if (start > static_cast<int>(layer.envelope_timeline.length_counts)) return;
+        cancelMorphGeneration(true);
+        step_drag_ = StepDrag{timbre_, *lane, layer_index, start, 0,
+            std::numeric_limits<int>::min(), selected_count_, point};
+        selected_count_ = start;
+        if (isShowing()) grabKeyboardFocus();
+        startTimerHz(30);
+        repaint();
+    }
+
+    void updateStepDrag(const juce::MouseEvent& event) {
+        if (!step_drag_) return;
+        if (!step_drag_->active && !event.mouseWasDraggedSinceMouseDown()) return;
+        step_drag_->active = true;
+        step_drag_->pointer = event.getPosition();
+        updateStepDragAtPointer();
+    }
+
+    void updateStepDragAtPointer() {
+        if (!step_drag_) return;
+        auto& drag = *step_drag_;
+        const auto plot = timelinePlotBounds(graph_bounds_[static_cast<std::size_t>(drag.layer)]);
+        const int requested = countAtX(plot, drag.pointer.x) - drag.start;
+        if (requested == drag.requested_delta) return;
+        drag.requested_delta = requested;
+        auto delta = requested;
+        auto result = mgstc::engine::editCompositeSteps(
+            drag.original.layers[static_cast<std::size_t>(drag.layer)], drag.lane,
+            static_cast<std::uint32_t>(drag.start), delta);
+        const auto error = result.error;
+        // Stop at the nearest usable count, never cut off the retained suffix.
+        while (!result.accepted && delta != 0) {
+            delta += delta > 0 ? -1 : 1;
+            result = mgstc::engine::editCompositeSteps(
+                drag.original.layers[static_cast<std::size_t>(drag.layer)], drag.lane,
+                static_cast<std::uint32_t>(drag.start), delta);
+        }
+        if (!result.accepted) return;
+        drag.delta = result.applied_delta;
+        timbre_ = drag.original;
+        timbre_.layers[static_cast<std::size_t>(drag.layer)] = std::move(result.layer);
+        selected_count_ = drag.start + drag.delta;
+        position_.setText("ct " + juce::String(selected_count_), juce::dontSendNotification);
+        reportStatus(juce::String::fromUTF8(drag.delta < 0 ? "削除 " : "挿入 ")
+            + juce::String(std::abs(drag.delta)) + juce::String::fromUTF8(" ステップ（離すと確定、Escで取消）")
+            + (delta != requested ? " / " + juce::String::fromUTF8(error.c_str()) : juce::String{}));
+        overview_content_.repaint();
+        repaint();
+    }
+
+    void autoScrollStepDrag() {
+        if (!step_drag_ || !step_drag_->active) return;
+        const auto plot = timelinePlotBounds(graph_bounds_[static_cast<std::size_t>(step_drag_->layer)]);
+        const int x = step_drag_->pointer.x;
+        int direction = x < plot.getX() + UiLayout::sm ? -1
+            : x >= plot.getRight() - UiLayout::sm ? 1 : 0;
+        if (direction == 0) return;
+        const auto range = visibleCountRange();
+        if (direction > 0) maybeExpandScrollExtent(static_cast<int>(range.getEnd()));
+        horizontal_scroll_.setCurrentRangeStart(juce::jmax(0.0,
+            range.getStart() + direction), juce::dontSendNotification);
+        updateStepDragAtPointer();
+        overview_content_.repaint();
+        repaint();
+    }
+
+    void cancelStepDrag() {
+        if (!step_drag_) return;
+        timbre_ = std::move(step_drag_->original);
+        selected_count_ = step_drag_->original_selection;
+        step_drag_.reset();
+        stopTimer();
+        position_.setText("ct " + juce::String(selected_count_), juce::dontSendNotification);
+        reportStatus(juce::String::fromUTF8("ステップの削除／挿入を取り消しました"));
+        overview_content_.repaint();
+        repaint();
+    }
+
+    void finishStepDrag() {
+        if (!step_drag_) return;
+        const auto changed = timbre_ != step_drag_->original;
+        step_drag_.reset();
+        stopTimer();
+        if (!changed) return;
+        refreshCountCeilingCache();
+        ensureScrollExtentIncludesContent();
+        updateScrollRanges();
+        syncPointEditors();
+        syncRegisterAutoEditors();
+        syncInspector();
+        updateEnvelopeMmlPreview();
+        publishEdit(true, true);
+        overview_content_.repaint();
+        repaint();
+    }
+
+    bool keyPressed(const juce::KeyPress& key) override {
+        if (step_drag_ && key.getKeyCode() == juce::KeyPress::escapeKey) {
+            cancelStepDrag();
+            return true;
+        }
+        // Commands such as Undo must not capture a provisional local candidate.
+        if (step_drag_ && (key.getModifiers().isCtrlDown()
+            || key.getKeyCode() == juce::KeyPress::tabKey)) cancelStepDrag();
+        return false;
+    }
+
+    void focusLost(FocusChangeType) override {
+        cancelStepDrag();
+    }
+
     void mouseDown(const juce::MouseEvent& event) override {
+        cancelStepDrag();
         pending_auto_settings_.reset();
         if (event.mods.isPopupMenu()) {
             deleteCommandAt(event.getPosition());
@@ -6290,6 +6563,12 @@ public:
         selected_layer_ = layer;
         const auto graph = graph_bounds_[static_cast<std::size_t>(layer)];
         const bool in_graph = graph.contains(event.getPosition());
+        if (in_graph && event.mods.isLeftButtonDown()
+            && (step_edit_mode_.getToggleState() || event.mods.isCtrlDown())) {
+            // Reserve the gesture before Draw mode can alter values or open a picker.
+            beginStepDrag(event, layer, graph);
+            return;
+        }
         if (in_graph) {
             auto count_bounds = timelinePlotBounds(graph);
             selected_count_ = countAtX(count_bounds, event.getPosition().x);
@@ -6396,6 +6675,10 @@ public:
     }
 
     void mouseDrag(const juce::MouseEvent& event) override {
+        if (step_drag_) {
+            updateStepDrag(event);
+            return;
+        }
         if (pending_auto_settings_ && event.mouseWasDraggedSinceMouseDown()) {
             const auto* curve = freeCurveFor(timbre_.layers[static_cast<std::size_t>(selected_layer_)],
                 *pending_auto_settings_);
@@ -6415,6 +6698,11 @@ public:
     }
 
     void mouseUp(const juce::MouseEvent& event) override {
+        if (step_drag_) {
+            updateStepDrag(event);
+            finishStepDrag();
+            return;
+        }
         if (pending_auto_settings_) {
             const auto target = *pending_auto_settings_;
             pending_auto_settings_.reset();
@@ -6434,6 +6722,7 @@ public:
     }
 
     void mouseDoubleClick(const juce::MouseEvent& event) override {
+        if (step_edit_mode_.getToggleState() || event.mods.isCtrlDown()) return;
         const int layer = layerAt(event.getPosition());
         if (layer < 0
             || layer != selected_layer_
@@ -6511,6 +6800,7 @@ public:
     void mouseWheelMove(
         const juce::MouseEvent& event,
         const juce::MouseWheelDetails& wheel) override {
+        if (step_drag_) return; // Do not change the gesture's count-to-pixel scale.
         if (event.mods.isCtrlDown()) {
             const double factor = wheel.deltaY > 0.0 ? 0.85 : 1.18;
             zoomCountColumns(event.getPosition().x, factor);
@@ -6585,6 +6875,16 @@ public:
         drawSelectedCountBand(graphics, plot);
         paintStartDelay(graphics, plot, index);
         paintEditTier(graphics, lane, index, colour);
+        if (step_drag_) {
+            graphics.setColour(uiHoverAccent());
+            const int start_x = xForCount(plot, step_drag_->start);
+            const int end_x = xForCount(plot, step_drag_->start + step_drag_->delta);
+            graphics.drawVerticalLine(end_x, static_cast<float>(lane.getY()),
+                static_cast<float>(lane.getBottom()));
+            graphics.setColour(uiHoverAccent().withAlpha(0.12f));
+            graphics.fillRect(juce::Rectangle<int>(juce::jmin(start_x, end_x), lane.getY(),
+                std::abs(end_x - start_x), lane.getHeight()));
+        }
         drawHoverValuePopup(graphics);
     }
 
@@ -6805,6 +7105,7 @@ private:
         return workspaceArea().withHeight(overviewHeight());
     }
     void selectOverviewLayer(int index) {
+        cancelStepDrag();
         if (index == selected_layer_) return;
         selected_layer_ = index;
         drawing_ = false; edit_draw_bounds_.reset();
@@ -6829,6 +7130,7 @@ private:
                 auto* button = buttons->add(new juce::TextButton());
                 button->setClickingTogglesState(true);
                 button->onClick = [this, i, buttons] {
+                    cancelStepDrag();
                     auto& layer = timbre_.layers[static_cast<std::size_t>(i)];
                     const bool on = (*buttons)[i]->getToggleState();
                     if (buttons == &overview_mute_) {
@@ -7065,6 +7367,7 @@ private:
     }
 
     void applyRegisterAutoFromEditors(bool set_start_count) {
+        cancelStepDrag();
         auto* lane = selectedRegisterAutoLane();
         if (lane == nullptr
             || selected_layer_ < 0
@@ -7496,6 +7799,7 @@ private:
     }
 
     void applyInspector() {
+        cancelStepDrag();
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
             return;
@@ -7523,6 +7827,7 @@ private:
     }
 
     void clearSelectedLoop() {
+        cancelStepDrag();
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
             return;
@@ -7652,6 +7957,7 @@ private:
     }
 
     void addLayer(mgstc::engine::TimbreSource source) {
+        cancelStepDrag();
         const auto free_channel = mgstc::engine::firstAvailableChannel(
             timbre_, source);
         if (!free_channel) {
@@ -7719,6 +8025,7 @@ private:
     }
 
     void removeLayerAt(std::size_t layer_index) {
+        cancelStepDrag();
         if (layer_index >= timbre_.layers.size()) {
             return;
         }
@@ -7758,6 +8065,7 @@ private:
     }
 
     void duplicateLayerAt(std::size_t layer_index) {
+        cancelStepDrag();
         if (layer_index >= timbre_.layers.size()) {
             return;
         }
@@ -8273,6 +8581,7 @@ private:
         bool commit,
         std::optional<bool> automatic_override = std::nullopt,
         std::optional<bool> precise_override = std::nullopt) {
+        cancelStepDrag();
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
             return;
@@ -8380,6 +8689,7 @@ private:
     }
 
     void setTimelineMarker(int timeline_count, bool commit) {
+        cancelStepDrag();
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
             return;
@@ -10567,6 +10877,10 @@ private:
     }
 
     void timerCallback() override {
+        if (step_drag_) {
+            autoScrollStepDrag();
+            return;
+        }
         std::shared_ptr<const mgstc::engine::SccMorphCompileResult> result;
         std::uint64_t generation{};
         {
@@ -12061,6 +12375,7 @@ private:
     }
 
     void layoutPitchLaneToggle() {
+        layoutStepEditToggle();
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())
             || selected_layer_ >= static_cast<int>(graph_bounds_.size())) {
@@ -12205,6 +12520,7 @@ private:
     }
 
     void commitPlaybackTempoFromEditor() {
+        cancelStepDrag();
         const int next = juce::jlimit(
             mgstc::engine::kMgscTempoMin,
             mgstc::engine::kMgscTempoMax,
@@ -12239,6 +12555,7 @@ private:
     juce::ComboBox auto_mode_;
     juce::TextButton add_channel_;
     juce::TextButton compact_overview_;
+    juce::TextButton step_edit_mode_;
     juce::TextButton psg_add_;
     juce::TextButton scc_add_;
     juce::TextButton opll_add_;
@@ -12365,6 +12682,18 @@ private:
         static_cast<int>(mgstc::engine::EnvelopeTimeline::kDefaultLengthCounts)};
     bool scroll_extent_initialized_{};
     bool drawing_{};
+    struct StepDrag {
+        mgstc::engine::CompositeTimbre original;
+        mgstc::engine::CompositeStepEditLane lane;
+        int layer{};
+        int start{};
+        int delta{};
+        int requested_delta{std::numeric_limits<int>::min()};
+        int original_selection{};
+        juce::Point<int> pointer;
+        bool active{};
+    };
+    std::optional<StepDrag> step_drag_;
     static constexpr int kScopeHistorySize = 4096;
     std::array<std::array<float, kScopeHistorySize>, 4>
         scope_history_{};
