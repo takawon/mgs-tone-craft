@@ -188,7 +188,7 @@ private:
     bool active_start_{true}, dragging_{};
 };
 
-class CompositeWavConversionContent final : public juce::Component {
+class CompositeWavConversionContent final : public juce::Component, private juce::ListBoxModel {
     friend struct CompositeWavConversionTestAccess;
 public:
     using ApplyCallback = std::function<void(const mgstc::engine::CompositeTimbre&, std::function<void()>)>;
@@ -210,17 +210,18 @@ public:
             "信頼できる環境で使用してください"));
         button(original_, "原音 ▶", [this] { previewSource(); });
         button(converted_, "変換音 ▶", [this] { previewResult(); });
-        button(stop_, "停止", [this] { stopPcm(); });
+        button(stop_, "停止", [this] { stopPcm(); cancelPreviewRender(); if (audition_stop_) audition_stop_(); });
         converted_.setTooltip(juce::String::fromUTF8("変換候補は適用前にPC鍵盤／MIDIでも試聴できます。"));
         button(zoom_in_, "＋", [this] { range_.zoom(1); });
         button(zoom_out_, "−", [this] { range_.zoom(-1); });
         button(analyze_, "範囲を解析", [this] { analyze(); });
         button(convert_, "変換 / 再変換", [this] { convert(); });
         button(apply_, "適用", [this] {
-            if (!result_ || !result_->composite_tone) return;
-            stopPcm();
+            const auto* selected = selectedCandidate();
+            if (!selected) return;
+            stopPcm(); cancelPreviewRender();
             const juce::Component::SafePointer<CompositeWavConversionContent> safe(this);
-            apply_callback_(*result_->composite_tone, [safe] { if (safe) safe->close(); });
+            apply_callback_(selected->tone, [safe] { if (safe) safe->close(); });
         });
         button(cancel_, "キャンセル", [this] { close(); });
         level_match_.setButtonText(juce::String::fromUTF8("比較音量を合わせる"));
@@ -263,11 +264,22 @@ public:
         metadata_detail_.setFont(UiFonts::body()); metadata_detail_.setJustificationType(juce::Justification::topLeft);
         addAndMakeVisible(metadata_detail_);
         status_.setMultiLine(true); status_.setReadOnly(true); UiFonts::styleBodyField(status_); addAndMakeVisible(status_);
-        const char* labels[] = {"開始サンプル / 秒", "終了サンプル / 秒（終端を含まない）", "基準音高 Hz（autoで推定）", "キーオフ秒（autoで推定）", "最大SCC音色数（1〜32）", "音源構成", "2ch分担", "OPLL固定音色", "最適化方針", "サステイン"};
+        candidates_title_.setText(juce::String::fromUTF8("変換候補"), juce::dontSendNotification);
+        candidates_empty_.setText(juce::String::fromUTF8("変換後に候補が表示されます"), juce::dontSendNotification);
+        candidates_empty_.setJustificationType(juce::Justification::topLeft);
+        addAndMakeVisible(candidates_title_); addAndMakeVisible(candidates_empty_);
+        candidates_.setModel(this); candidates_.setMultipleSelectionEnabled(false);
+        candidates_.setColour(juce::ListBox::backgroundColourId, juce::Colour(UiLayout::panelFill));
+        addAndMakeVisible(candidates_);
+        const char* labels[] = {"開始サンプル / 秒", "終了サンプル / 秒", "基準音高 Hz", "キーオフ秒", "最大SCC音色数", "音源構成", "2ch分担", "OPLL固定音色", "最適化方針", "サステイン"};
         for (std::size_t i = 0; i < labels_.size(); ++i) {
             labels_[i].setText(juce::String::fromUTF8(labels[i]), juce::dontSendNotification);
             labels_[i].setFont(UiFonts::body()); addAndMakeVisible(labels_[i]);
         }
+        labels_[1].setTooltip(juce::String::fromUTF8("終了サンプル / 秒（終端を含まない）"));
+        pitch_.setTooltip(juce::String::fromUTF8("基準音高 Hz（autoで推定）"));
+        key_off_.setTooltip(juce::String::fromUTF8("キーオフ秒（autoで推定）"));
+        budget_.setTooltip(juce::String::fromUTF8("最大SCC音色数（1〜32）"));
         range_.setTooltip(juce::String::fromUTF8("開始・終了ハンドルをドラッグ。左右キーで1サンプル、Shiftで10ms調整。"));
         range_.changed = [this](bool start) {
             const bool invalidated = analysis_ != nullptr;
@@ -279,19 +291,20 @@ public:
         int order = 1;
         for (auto* c : std::initializer_list<juce::Component*>{&load_, &audacity_, &range_, &zoom_in_, &zoom_out_, &begin_, &end_,
                 &pitch_, &key_off_, &configuration_, &strategy_, &fixed_tone_, &budget_, &preference_, &sustain_,
-                &original_, &converted_, &stop_, &level_match_, &wave_method_, &analyze_, &convert_, &apply_, &cancel_}) c->setExplicitFocusOrder(order++);
+                &original_, &converted_, &stop_, &level_match_, &wave_method_, &candidates_, &analyze_, &convert_, &apply_, &cancel_}) c->setExplicitFocusOrder(order++);
         setWantsKeyboardFocus(true);
         refreshEnabled();
         setSize(UiScale::sx(1080), UiScale::sx(900));
     }
     ~CompositeWavConversionContent() override {
-        stopPcm();
+        stopPcm(); cancelPreviewRender();
+        candidates_.setModel(nullptr);
         clearCandidateAudition();
         if (control_) control_->cancel_requested.store(true);
         if (analysis_cancel_) analysis_cancel_->store(true, std::memory_order_release);
         // A registered plugin worker remains owned by its processor; deleting
         // the UI here cancels it without joining on editor close.
-        if (background_tasks_) delete busy_dialog_.getComponent();
+        if (background_tasks_) { delete busy_dialog_.getComponent(); delete preview_dialog_.getComponent(); }
     }
     void paint(juce::Graphics& g) override { paintPageBackground(g, getLocalBounds()); }
     void resized() override {
@@ -318,28 +331,46 @@ public:
         std::array<juce::Component*, 10> controls{&begin_, &end_, &pitch_, &key_off_, &budget_,
             &configuration_, &strategy_, &fixed_tone_, &preference_, &sustain_};
         for (std::size_t i = 0; i < 5; ++i) {
-            auto settings = area.removeFromTop(UiLayout::fieldH * 2);
+            // Keep the body-sized fields, with label and input on the same row.
+            auto settings = area.removeFromTop(UiLayout::fieldH + UiLayout::panelPad * 2)
+                .reduced(0, UiLayout::panelPad);
             auto left = settings.removeFromLeft((settings.getWidth() - UiLayout::panelGap) / 2);
             settings.removeFromLeft(UiLayout::panelGap);
-            labels_[i].setBounds(left.removeFromTop(UiLayout::fieldH)); controls[i]->setBounds(left);
-            labels_[i + 5].setBounds(settings.removeFromTop(UiLayout::fieldH)); controls[i + 5]->setBounds(settings);
+            auto place = [&](std::size_t index, juce::Rectangle<int> cell) {
+                labels_[index].setBounds(cell.removeFromLeft(cell.getWidth() / 2));
+                cell.removeFromLeft(UiLayout::controlGap);
+                controls[index]->setBounds(cell);
+            };
+            place(i, left); place(i + 5, settings);
             area.removeFromTop(UiLayout::xs);
         }
+        area.removeFromTop(UiLayout::panelGap);
         auto buttons = area.removeFromBottom(UiLayout::textButtonH);
         cancel_.setBounds(buttons.removeFromRight(UiScale::sx(130))); buttons.removeFromRight(UiLayout::controlGap);
         apply_.setBounds(buttons.removeFromRight(UiScale::sx(130))); buttons.removeFromRight(UiLayout::controlGap);
         convert_.setBounds(buttons.removeFromRight(UiScale::sx(190)));
         buttons.removeFromRight(UiLayout::controlGap); analyze_.setBounds(buttons.removeFromRight(UiScale::sx(160)));
-        area.removeFromBottom(UiLayout::sm); status_.setBounds(area);
+        area.removeFromBottom(UiLayout::sm);
+        auto candidate_area = area.removeFromRight((area.getWidth() - UiLayout::panelGap) * 35 / 100);
+        area.removeFromRight(UiLayout::panelGap); status_.setBounds(area);
+        candidates_title_.setBounds(candidate_area.removeFromTop(UiLayout::fieldH));
+        candidate_area.removeFromTop(UiLayout::xs);
+        candidates_.setBounds(candidate_area); candidates_empty_.setBounds(candidate_area.reduced(UiLayout::panelPad));
+        candidates_title_.setFont(UiFonts::heading()); candidates_empty_.setFont(UiFonts::body());
+        candidates_.setRowHeight(UiLayout::fieldH + UiLayout::xs * 2);
         for (auto& label : labels_) label.setFont(UiFonts::body()); metadata_.setFont(UiFonts::body()); metadata_detail_.setFont(UiFonts::body());
     }
     void setAuditionCallbacks(
         std::function<void(const mgstc::engine::CompositeTimbre*)> candidate,
         std::function<bool(const juce::KeyPress&)> key,
-        std::function<void()> poll) {
+        std::function<void()> poll,
+        std::function<void()> one_second = {},
+        std::function<void()> stop = {}) {
         audition_candidate_ = std::move(candidate);
         audition_key_ = std::move(key);
         audition_poll_ = std::move(poll);
+        audition_one_second_ = std::move(one_second);
+        audition_stop_ = std::move(stop);
     }
     bool keyPressed(const juce::KeyPress& key) override {
         if (!audition_published_ || textEntryHasFocusWithin(*this)) return false;
@@ -364,18 +395,20 @@ private:
     }
     void stopPcm() { if (player_) player_->stop(); }
     void close() {
-        stopPcm();
+        stopPcm(); cancelPreviewRender();
         clearCandidateAudition();
         if (analysis_cancel_) analysis_cancel_->store(true, std::memory_order_release);
         if (control_) control_->cancel_requested.store(true, std::memory_order_release);
-        if (background_tasks_) delete busy_dialog_.getComponent();
+        if (background_tasks_) { delete busy_dialog_.getComponent(); delete preview_dialog_.getComponent(); }
+        result_.reset(); result_pcm_.reset(); alternate_pcm_.reset(); selected_candidate_ = -1;
+        candidates_.deselectAllRows(); candidates_.updateContent(); candidates_empty_.setVisible(true); refreshEnabled();
         if (auto* d = findParentComponentOfClass<juce::DialogWindow>()) d->exitModalState(0);
     }
     void refreshEnabled() {
         const bool loaded = source_ != nullptr;
         analyze_.setEnabled(loaded); convert_.setEnabled(loaded); original_.setEnabled(loaded && player_ != nullptr);
-        apply_.setEnabled(result_ && result_->composite_tone.has_value());
-        converted_.setEnabled(player_ && result_pcm_ != nullptr);
+        apply_.setEnabled(selectedCandidate() != nullptr);
+        converted_.setEnabled(player_ && result_pcm_ && selectedCandidate());
         stop_.setEnabled(player_ != nullptr); level_match_.setEnabled(player_ != nullptr);
         strategy_.setEnabled(configuration_.getSelectedId() != 1);
         fixed_tone_.setEnabled(configuration_.getSelectedId() == 3);
@@ -404,14 +437,18 @@ private:
         const auto error = player_->play(std::move(pcm), begin, end, gain); if (error.isNotEmpty()) report(error);
     }
     void previewSource() {
+        if (audition_stop_) audition_stop_();
+        cancelPreviewRender();
         if (!source_) return;
         const auto s = range_.selection();
         const bool match = level_match_.getToggleState() && result_ && result_->analysis_reference
             && s.begin == result_->analysis_reference->selection.begin && s.end == result_->analysis_reference->selection.end;
-        play(source_, s.begin, s.end, match ? source_gain_ : 1.0f);
+        play(source_, s.begin, s.end, match ? (selected_candidate_ > 0 && alternate_pcm_ ? alternate_source_gain_ : source_gain_) : 1.0f);
     }
-    void previewResult() { if (result_pcm_) play(result_pcm_, 0, result_pcm_->mono_samples.size(), level_match_.getToggleState() ? result_gain_ : 1.0f); }
+    void previewResult();
     void previewHandle(bool start) {
+        if (audition_stop_) audition_stop_();
+        cancelPreviewRender();
         if (!source_) return;
         const auto s = range_.selection(); const auto length = source_->sample_rate / 4;
         if (start) play(source_, s.begin, std::min(s.end, s.begin + length));
@@ -487,7 +524,7 @@ private:
     }
     void analyze() {
         if (!source_) return;
-        stopPcm();
+        stopPcm(); cancelPreviewRender();
         numericRange(true); numericRange(false);
         const auto selection = range_.selection();
         const auto pitch = pitch_.getText().trim();
@@ -546,7 +583,7 @@ private:
         // Audacity pipe I/O and WAV decoding share the existing conversion worker.
         // A closed/cancelled window never publishes the staged source or changes authoring.
         if (busy_dialog_) return;
-        stopPcm();
+        stopPcm(); cancelPreviewRender();
         struct Loaded { std::shared_ptr<const mgstc::engine::SourcePcm> pcm; mgstc::engine::SourceMetadata metadata; juce::String error; };
         analysis_cancel_ = std::make_shared<std::atomic<bool>>(false);
         const auto cancellation = analysis_cancel_;
@@ -574,8 +611,9 @@ private:
         }, [safe, source_name](Loaded loaded, bool cancelled) {
             if (!safe || cancelled) return;
             if (!loaded.pcm) { safe->report(loaded.error); return; }
-            safe->clearCandidateAudition();
+            safe->clearCandidateAudition(); safe->cancelPreviewRender(); safe->alternate_pcm_.reset();
             safe->source_ = std::move(loaded.pcm); safe->analysis_.reset(); safe->analysis_summary_.clear(); safe->result_.reset(); safe->result_pcm_.reset();
+            safe->selected_candidate_ = -1; safe->candidates_.updateContent(); safe->candidates_empty_.setVisible(true);
             safe->source_metadata_ = std::move(loaded.metadata);
             safe->range_.setSource(safe->source_); safe->syncRange(); safe->refreshEnabled();
             safe->metadata_.setText(source_name + " / " + juce::String(safe->source_->sample_rate) + " Hz / "
@@ -612,29 +650,68 @@ private:
         float source_gain, float result_gain) {
         if (cancelled || !pcm || !conversion.composite_tone
             || conversion.completion != mgstc::engine::CompositeWavConversionCompletion::Completed) return false;
+        stopPcm(); cancelPreviewRender(); alternate_pcm_.reset();
+        // Older callers without a list still expose the unchanged winner.
+        if (conversion.retained_candidates.empty()) conversion.retained_candidates.push_back(
+            {*conversion.composite_tone, conversion.resource_plan, conversion.quality, 0});
         analysis_ = conversion.analysis_reference;
         result_pcm_ = std::move(pcm);
         source_gain_ = source_gain; result_gain_ = result_gain;
         result_ = std::move(conversion);
-        if (audition_candidate_) {
-            audition_published_ = true;
-            audition_candidate_(&*result_->composite_tone);
-        }
+        selected_candidate_ = -1; candidates_.deselectAllRows(); candidates_.updateContent(); candidates_empty_.setVisible(false);
+        candidates_.selectRow(0); selectedRowsChanged(0);
         refreshEnabled();
         return true;
+    }
+    const mgstc::engine::CompositeWavRetainedCandidate* selectedCandidate() const {
+        if (!result_ || selected_candidate_ < 0 || static_cast<std::size_t>(selected_candidate_) >= result_->retained_candidates.size()) return nullptr;
+        return &result_->retained_candidates[static_cast<std::size_t>(selected_candidate_)];
+    }
+    int getNumRows() override { return result_ ? static_cast<int>(result_->retained_candidates.size()) : 0; }
+    void paintListBoxItem(int row, juce::Graphics& g, int width, int height, bool selected) override {
+        if (!result_ || row < 0 || static_cast<std::size_t>(row) >= result_->retained_candidates.size()) return;
+        if (selected) g.fillAll(findColour(juce::TextButton::buttonOnColourId));
+        g.setColour(findColour(juce::Label::textColourId)); g.setFont(UiFonts::body());
+        auto bounds = juce::Rectangle<int>(width, height).reduced(UiLayout::panelPad, UiLayout::xs);
+        auto first = bounds.removeFromTop(UiLayout::fieldH);
+        const auto count = juce::String::fromUTF8("SCC音色数 ")
+            + juce::String(static_cast<int>(result_->retained_candidates[static_cast<std::size_t>(row)].resources.scc_waveforms));
+        auto count_area = first.removeFromRight(UiScale::sx(158));
+        auto number_area = first.removeFromLeft(UiScale::sx(60));
+        g.drawText(juce::String::fromUTF8("候補") + juce::String(row + 1), number_area, juce::Justification::centredLeft);
+        g.drawText(count, count_area, juce::Justification::centredRight);
+        if (row == 0) g.drawText(juce::String::fromUTF8("自動選択"), first, juce::Justification::centredLeft);
+    }
+    void selectedRowsChanged(int row) override {
+        if (!result_ || row < 0 || row == selected_candidate_ || static_cast<std::size_t>(row) >= result_->retained_candidates.size()) return;
+        stopPcm(); cancelPreviewRender(); alternate_pcm_.reset();
+        selected_candidate_ = row;
+        if (audition_candidate_) { audition_published_ = true; audition_candidate_(&selectedCandidate()->tone); }
+        if (audition_published_ && audition_one_second_) audition_one_second_();
+        refreshEnabled();
+    }
+    void cancelPreviewRender() {
+        ++preview_generation_; preview_requested_ = false;
+        if (preview_cancel_) preview_cancel_->store(true, std::memory_order_release);
     }
     ApplyCallback apply_callback_;
     std::unique_ptr<CompositeWavPcmPlayer> player_;
     BackgroundTaskBoundary* background_tasks_{};
-    juce::Component::SafePointer<ConversionBusyDialog> busy_dialog_;
+    juce::Component::SafePointer<ConversionBusyDialog> busy_dialog_, preview_dialog_;
     CompositeWavRange range_;
     juce::TextButton load_, audacity_, original_, converted_, stop_, zoom_in_, zoom_out_, analyze_, convert_, apply_, cancel_;
     juce::TextEditor begin_, end_, pitch_, key_off_, budget_, status_;
     juce::ComboBox configuration_, strategy_, fixed_tone_, preference_, sustain_;
     juce::ToggleButton level_match_;
-    juce::Label metadata_, metadata_detail_;
+    juce::Label metadata_, metadata_detail_, candidates_title_, candidates_empty_;
+    juce::ListBox candidates_;
     std::array<juce::Label, 10> labels_;
-    std::shared_ptr<const mgstc::engine::SourcePcm> source_, result_pcm_;
+    std::shared_ptr<const mgstc::engine::SourcePcm> source_, result_pcm_, alternate_pcm_;
+    std::shared_ptr<std::atomic<bool>> preview_cancel_;
+    std::uint64_t preview_generation_{};
+    int selected_candidate_{-1};
+    bool preview_requested_{};
+    float alternate_gain_{1.0f}, alternate_source_gain_{1.0f};
     std::shared_ptr<const mgstc::engine::SourceAnalysis> analysis_;
     std::shared_ptr<std::atomic<bool>> analysis_cancel_;
     mgstc::engine::SourceMetadata source_metadata_;
@@ -644,14 +721,98 @@ private:
     std::function<void(const mgstc::engine::CompositeTimbre*)> audition_candidate_;
     std::function<bool(const juce::KeyPress&)> audition_key_;
     std::function<void()> audition_poll_;
+    std::function<void()> audition_one_second_;
+    std::function<void()> audition_stop_;
     bool audition_published_{};
     juce::ComboBox wave_method_;
     float source_gain_{1.0f}, result_gain_{1.0f};
 };
 
+inline void CompositeWavConversionContent::previewResult() {
+    if (audition_stop_) audition_stop_();
+    const auto* selected = selectedCandidate();
+    if (!selected || !result_pcm_) return;
+    if (selected_candidate_ == 0 || alternate_pcm_) {
+        const auto pcm = selected_candidate_ == 0 ? result_pcm_ : alternate_pcm_;
+        const auto gain = selected_candidate_ == 0 ? result_gain_ : alternate_gain_;
+        play(pcm, 0, pcm->mono_samples.size(), level_match_.getToggleState() ? gain : 1.0f);
+        return;
+    }
+    // At most one preview worker runs. A later explicit play request waits for
+    // the cancelled worker to retire rather than retaining PCM for every row.
+    stopPcm();
+    preview_requested_ = true;
+    if (preview_dialog_) return;
+    const auto generation = preview_generation_;
+    const auto id = selected->candidate_id;
+    const auto row = selected_candidate_;
+    preview_cancel_ = std::make_shared<std::atomic<bool>>(false);
+    const auto cancellation = preview_cancel_;
+    mgstc::engine::CompositeWavRenderOptions options;
+    options.frame_count = result_pcm_->mono_samples.size();
+    options.key_off_frame = result_->preview.requested_key_off_frame;
+    if (result_->analysis_reference) options.midi_note = static_cast<std::uint8_t>(std::lround(
+        69.0 + 12.0 * std::log2(result_->analysis_reference->reference_pitch_hz / 440.0)));
+    options.cancel = cancellation.get();
+    const auto analysis = result_->analysis_reference;
+    struct Preview {
+        std::shared_ptr<const mgstc::engine::SourcePcm> pcm;
+        float source_gain{1.0f}, gain{1.0f};
+    };
+    auto progress = std::make_shared<ConversionProgressState>();
+    progress->custom_cancel = [cancellation] { cancellation->store(true, std::memory_order_release); };
+    progress->custom_cancelled = [cancellation] { return cancellation->load(std::memory_order_acquire); };
+    progress->custom_stage = [] { return juce::String::fromUTF8("選択候補の試聴音を準備中"); };
+    const juce::Component::SafePointer<CompositeWavConversionContent> safe(this);
+    preview_dialog_ = runWithConversionBusyDialog(this,
+        [tone = selected->tone, options, cancellation, analysis](ConversionProgressState&) {
+            Preview preview;
+            auto rendered = mgstc::engine::renderCompositeWav(tone, options);
+            if (!rendered.ok() || cancellation->load(std::memory_order_acquire)) return preview;
+            auto pcm = std::make_shared<mgstc::engine::SourcePcm>();
+            pcm->sample_rate = mgstc::engine::CompositeWavRenderOptions::kSampleRate;
+            pcm->channels = 2; pcm->bit_depth = 32;
+            pcm->sample_format = mgstc::engine::SourceSampleFormat::FloatPcm;
+            pcm->mono_samples = std::move(rendered.mono_pcm);
+            pcm->interleaved_samples = std::move(rendered.stereo_pcm);
+            if (analysis) {
+                double energy = 0.0, peak = 0.0;
+                for (const auto sample : pcm->interleaved_samples) {
+                    energy += static_cast<double>(sample) * sample;
+                    peak = std::max(peak, std::abs(static_cast<double>(sample)));
+                }
+                const auto rms = std::sqrt(energy / std::max<std::size_t>(1, pcm->interleaved_samples.size()));
+                const auto source_rms = analysis->metadata.rms;
+                if (rms > 1e-12 && source_rms > 1e-12) {
+                    const auto target = std::min({0.125, 0.9 * rms / std::max(1e-12, peak),
+                        0.9 * source_rms / std::max(1e-12, analysis->metadata.peak)});
+                    preview.source_gain = static_cast<float>(target / source_rms);
+                    preview.gain = static_cast<float>(target / rms);
+                }
+            }
+            preview.pcm = std::move(pcm);
+            return preview;
+        }, [safe, generation, id, row](Preview preview, bool cancelled) {
+            if (!safe) return;
+            // ConversionBusyDialog deletes itself before this UI completion.
+            // Explicitly release the old handle before starting a queued request.
+            safe->preview_dialog_ = nullptr;
+            const auto* current = safe->selectedCandidate();
+            if (generation != safe->preview_generation_ || !current || row != safe->selected_candidate_ || id != current->candidate_id) {
+                if (safe->preview_requested_) safe->previewResult();
+                return;
+            }
+            safe->preview_requested_ = false;
+            if (cancelled || !preview.pcm) return;
+            safe->alternate_pcm_ = std::move(preview.pcm);
+            safe->alternate_gain_ = preview.gain; safe->alternate_source_gain_ = preview.source_gain;
+            safe->previewResult();
+        }, progress, background_tasks_);
+}
+
 inline void CompositeWavConversionContent::convert() {
     if (!source_) return;
-    stopPcm();
+    stopPcm(); cancelPreviewRender();
     numericRange(true); numericRange(false); stopPcm();
     const auto selection = range_.selection();
     const auto max_waves = budget_.getText().getIntValue();

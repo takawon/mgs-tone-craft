@@ -66,6 +66,17 @@ struct CompositeWavQualityMetrics {
     double total{};
 };
 
+// Dialog-only completed candidates, never part of timbre/plugin persistence.
+// PCM stays in the winner preview or the selected candidate's bounded UI cache.
+struct CompositeWavRetainedCandidate {
+    CompositeTimbre tone;
+    CompositeWavResourcePlan resources;
+    CompositeWavQualityMetrics quality;
+    std::uint64_t candidate_id{};
+    // Requested score offset; the existing evaluated score may approximate it.
+    std::uint8_t target_score_increase_percent{};
+};
+
 // Centralized objective weights; metrics are normalized dimensionless errors.
 struct CompositeWavQualityWeights {
     double multi_resolution_stft{1.0};
@@ -162,6 +173,11 @@ struct CompositeWavConversionResult {
     CompositeWavSearchDiagnostics search;
     CompositeWavMorphSearchDiagnostics morph_search;
     std::vector<CompositeWavMorphCandidateDiagnostic> morph_candidates;
+    // At most five distinct valid evaluated tones. First is the unchanged
+    // automatic winner; alternatives approximate +5/+10/+15/+20% loss in order.
+    // A conversion-local archive (bounded by the unchanged evaluation budget)
+    // contains tones/keys only and is discarded before this result is returned.
+    std::vector<CompositeWavRetainedCandidate> retained_candidates;
     std::vector<std::string> warnings;
     std::string error;
 };

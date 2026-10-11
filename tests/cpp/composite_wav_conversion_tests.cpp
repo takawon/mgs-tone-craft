@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "mgstc/engine/composite_wav_conversion.hpp"
+#include "mgstc/engine/detail/composite_wav_candidate_retention.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/mgs_composite_io.hpp"
 #include "mgstc/engine/scc_morph.hpp"
@@ -44,6 +45,20 @@ std::shared_ptr<const SourceAnalysis> fixture() {
     require(result.completion == SourceAnalysisCompletion::Completed, "fixture analysis");
     return result.analysis;
 }
+bool sameQuality(const CompositeWavQualityMetrics& a, const CompositeWavQualityMetrics& b) {
+    return a.multi_resolution_stft == b.multi_resolution_stft && a.harmonic == b.harmonic
+        && a.erb == b.erb && a.attack == b.attack && a.volume == b.volume
+        && a.transition == b.transition && a.complexity == b.complexity
+        && a.max_wave_sample == b.max_wave_sample && a.max_wave_aligned == b.max_wave_aligned
+        && a.max_wave_harmonic == b.max_wave_harmonic
+        && a.max_wave_log_spectrum == b.max_wave_log_spectrum && a.max_wave_rms == b.max_wave_rms
+        && a.max_transition_per_count == b.max_transition_per_count
+        && a.max_pcm_discontinuity == b.max_pcm_discontinuity
+        && a.max_pcm_spectral_change == b.max_pcm_spectral_change
+        && a.loop_entry == b.loop_entry && a.loop_boundary == b.loop_boundary
+        && a.loop_steady == b.loop_steady && a.neighbour_pitch_penalty == b.neighbour_pitch_penalty
+        && a.total == b.total;
+}
 void validate(const CompositeWavConversionResult& result, std::size_t layers, std::size_t limit) {
     if (result.completion != CompositeWavConversionCompletion::Completed)
         throw std::runtime_error("conversion failed: " + result.error);
@@ -65,8 +80,66 @@ void validate(const CompositeWavConversionResult& result, std::size_t layers, st
         "disjoint adaptive-search timers are finite, nonnegative, and bounded by conversion wall time");
     require(result.resource_plan.scc_waveforms > 0 && result.resource_plan.scc_waveforms <= limit,
             "waveform budget honored");
+    require(!result.retained_candidates.empty() && result.retained_candidates.size() <= 5,
+        "completed conversion retains at most five usable candidates");
+    const auto& automatic = result.retained_candidates.front();
+    require(automatic.target_score_increase_percent == 0, "automatic winner remains the zero-offset candidate");
+    require(automatic.tone == tone,
+        "retained candidate 1 is exactly the existing automatic winner");
+    require(automatic.resources.scc_waveforms == result.resource_plan.scc_waveforms
+            && automatic.resources.scc_numbers == result.resource_plan.scc_numbers
+            && automatic.resources.first_scc_number == result.resource_plan.first_scc_number,
+        "retained candidate 1 preserves the winner resource plan");
+    require(sameQuality(automatic.quality, result.quality),
+        "retained candidate 1 preserves every winner quality metric");
     const auto bank = compileSccMorph(tone);
     require(bank.valid && bank.used <= limit, "shared SCC allocator accepts output");
+    std::vector<CompositeTimbre> runtimeKeys;
+    for (std::size_t i = 0; i < result.retained_candidates.size(); ++i) {
+        const auto& candidate = result.retained_candidates[i];
+        require(candidate.target_score_increase_percent == i * 5,
+            "retained candidates request zero/five/ten/fifteen/twenty percent targets in order");
+        require(candidate.quality.total >= result.quality.total,
+            "alternate target scores do not precede the unchanged automatic winner");
+        SccMorphCompileResult alternateCompile;
+        const auto* compiledCandidate = &bank;
+        if (i != 0) {
+            alternateCompile = compileSccMorph(candidate.tone);
+            compiledCandidate = &alternateCompile;
+        }
+        auto runtimeKey = compiledCandidate->timbre;
+        for (auto& layer : runtimeKey.layers)
+            for (auto& event : layer.timbre_automation) event.scc_morph = {};
+        require(std::none_of(runtimeKeys.begin(), runtimeKeys.end(), [&](const auto& key) { return key == runtimeKey; }),
+            "retained alternatives exclude exact already-compiled runtime duplicates");
+        runtimeKeys.push_back(std::move(runtimeKey));
+        require(compiledCandidate->valid && compiledCandidate->used <= limit,
+            "retained candidate remains allocatable after common Morph compilation");
+        const auto resolved = resolveTimbreNumbers(compiledCandidate->timbre);
+        require(resolved.valid(), "retained candidate has valid final timbre-number resolution");
+        std::set<std::uint8_t> resolvedSccNumbers;
+        for (const auto& assignment : resolved.assignments) {
+            const auto* snapshot = findEmbeddedTimbreSnapshot(compiledCandidate->timbre, assignment.library_id);
+            if (snapshot && snapshot->source == TimbreSource::Scc)
+                resolvedSccNumbers.insert(assignment.number);
+        }
+        require(candidate.resources.scc_numbers
+                    == std::vector<std::uint8_t>(resolvedSccNumbers.begin(), resolvedSccNumbers.end())
+                && candidate.resources.scc_waveforms == resolvedSccNumbers.size(),
+            "retained SCC count equals the unique resolved SCC numbers in the completed tone");
+        require(candidate.resources.scc_waveforms <= limit,
+            "retained candidate reports its actual SCC waveform count within the configured limit");
+        for (std::size_t j = 0; j < i; ++j)
+            require(candidate.tone != result.retained_candidates[j].tone,
+                "retained candidates contain no exact duplicate timbres");
+        if (i > 1) {
+            const auto& previous = result.retained_candidates[i - 1];
+            require(previous.quality.total < candidate.quality.total
+                    || (previous.quality.total == candidate.quality.total
+                        && previous.candidate_id <= candidate.candidate_id),
+                "alternate retained candidates are ordered by quality then stable candidate ID");
+        }
+    }
     if (tone.layers.size() == 2 && tone.layers[0].source == TimbreSource::Scc
         && tone.layers[1].source == TimbreSource::Scc) {
         auto sharedRamBoundary = tone;
@@ -619,12 +692,16 @@ void completionRegressions() {
     SourceAnalysis empty;
     auto invalidAnalysis = std::make_shared<SourceAnalysis>(*analysis);
     invalidAnalysis->periodic_confidence = std::numeric_limits<double>::quiet_NaN();
-    require(convertCompositeWave(invalidAnalysis, options).completion == CompositeWavConversionCompletion::InvalidInput,
-        "nonfinite periodic summary is rejected before rendering");
+    const auto invalidSummary = convertCompositeWave(invalidAnalysis, options);
+    require(invalidSummary.completion == CompositeWavConversionCompletion::InvalidInput
+            && invalidSummary.retained_candidates.empty(),
+        "nonfinite periodic summary is rejected before rendering without retained candidates");
     invalidAnalysis = std::make_shared<SourceAnalysis>(*analysis);
     invalidAnalysis->harmonic_trajectory.front().periodic_confidence = 1.1;
-    require(convertCompositeWave(invalidAnalysis, options).completion == CompositeWavConversionCompletion::InvalidInput,
-        "out-of-range frame confidence is rejected before rendering");
+    const auto invalidFrame = convertCompositeWave(invalidAnalysis, options);
+    require(invalidFrame.completion == CompositeWavConversionCompletion::InvalidInput
+            && invalidFrame.retained_candidates.empty(),
+        "out-of-range frame confidence is rejected before rendering without retained candidates");
     require(std::isfinite(evaluateCompositeWavePcm(pcm->mono_samples, pcm->mono_samples, 220, 720,
         0, {}, nullptr, &empty).total), "metric API safely ignores incomplete optional analysis");
 }
@@ -891,6 +968,50 @@ void dynamicOpllRegressions(bool feedback) {
     }
 }
 
+void scoreSpacedCandidateRegressions() {
+    using detail::WavRetainedScore;
+    using detail::selectWavScoreSpacedAlternatives;
+    const std::array<WavRetainedScore, 8> movedWinner{{
+        {10.5, 1}, {11, 2}, {11.5, 3}, {12, 4}, {8.4, 5}, {8.8, 6}, {9.2, 7}, {9.6, 8}}};
+    require(selectWavScoreSpacedAlternatives(movedWinner, 10) == std::vector<std::size_t>{0, 1, 2, 3},
+        "score targets use the current winner baseline");
+    require(selectWavScoreSpacedAlternatives(movedWinner, 8) == std::vector<std::size_t>{4, 5, 6, 7},
+        "a late winner improvement reanchors targets to earlier evaluated alternatives");
+    const std::array<WavRetainedScore, 5> tied{{{20.5, 9}, {21.5, 8}, {22, 7}, {23, 6}, {24, 5}}};
+    require(selectWavScoreSpacedAlternatives(tied, 20) == std::vector<std::size_t>{0, 2, 3, 4},
+        "equidistant target assignments choose the lower score deterministically");
+    const std::array<WavRetainedScore, 5> equalScore{{{21, 4}, {21, 3}, {22, 2}, {23, 1}, {24, 0}}};
+    require(selectWavScoreSpacedAlternatives(equalScore, 20) == std::vector<std::size_t>{1, 2, 3, 4},
+        "equal score target assignments choose the stable candidate ID");
+    const std::array<WavRetainedScore, 5> scarce{{{10.0001, 1}, {10.0002, 2}, {10.0003, 3},
+        {9, 4}, {std::numeric_limits<double>::quiet_NaN(), 5}}};
+    require(selectWavScoreSpacedAlternatives(scarce, 10) == std::vector<std::size_t>{0, 1, 2},
+        "missing score ranges use available distinct candidates without fabrication or below-winner scores");
+    const std::array<WavRetainedScore, 5> zero{{{0, 8}, {.01, 7}, {.02, 6}, {.03, 5}, {.04, 4}}};
+    require(selectWavScoreSpacedAlternatives(zero, 0) == std::vector<std::size_t>{0, 1, 2, 3},
+        "zero baseline remains finite and chooses the closest existing alternatives");
+    require(selectWavScoreSpacedAlternatives({}, 1).empty()
+        && selectWavScoreSpacedAlternatives(zero, std::numeric_limits<double>::infinity()).empty(),
+        "empty and invalid baseline selection cannot fabricate a candidate");
+    // Exhaustive small oracle verifies the ordered joint assignment, rather
+    // than a greedy nearest choice that may consume a later target's option.
+    const std::array<WavRetainedScore, 7> joint{{{20.2, 1}, {21.8, 2}, {22.1, 3}, {22.9, 4},
+        {23.1, 5}, {24.3, 6}, {25, 7}}};
+    const auto selected = selectWavScoreSpacedAlternatives(joint, 20);
+    double selectedCost{};
+    for (std::size_t k = 0; k < selected.size(); ++k)
+        selectedCost += std::abs(joint[selected[k]].total - (21.0 + k));
+    double oracle = std::numeric_limits<double>::infinity();
+    for (std::size_t a = 0; a < joint.size(); ++a)
+        for (std::size_t b = a + 1; b < joint.size(); ++b)
+            for (std::size_t c = b + 1; c < joint.size(); ++c)
+                for (std::size_t d = c + 1; d < joint.size(); ++d)
+                    oracle = std::min(oracle, std::abs(joint[a].total - 21) + std::abs(joint[b].total - 22)
+                        + std::abs(joint[c].total - 23) + std::abs(joint[d].total - 24));
+    require(selected.size() == 4 && std::abs(selectedCost - oracle) < 1e-12,
+        "joint five-percent spacing minimizes total target deviation among existing candidates");
+}
+
 void run() {
     const auto analysis = fixture();
     const auto sourceBefore = analysis->source->interleaved_samples;
@@ -911,6 +1032,17 @@ void run() {
     const auto again = convertCompositeWave(analysis, options);
     require(first.composite_tone == again.composite_tone && first.preview.mono_pcm == again.preview.mono_pcm,
             "repeat conversion is deterministic with fresh runtime");
+    require(first.retained_candidates.size() == again.retained_candidates.size(),
+        "repeat conversion retains the same number of completed candidates");
+    for (std::size_t i = 0; i < first.retained_candidates.size(); ++i) {
+        const auto& lhs = first.retained_candidates[i];
+        const auto& rhs = again.retained_candidates[i];
+        require(lhs.candidate_id == rhs.candidate_id && lhs.tone == rhs.tone
+                && lhs.quality.total == rhs.quality.total
+                && lhs.target_score_increase_percent == rhs.target_score_increase_percent
+                && lhs.resources.scc_numbers == rhs.resources.scc_numbers,
+            "repeat conversion preserves deterministic retained-candidate order and data");
+    }
     requireSameMorphDecision(first, again);
     options.max_evaluations = 4;
     for (const auto strategy : {CompositeWavStrategy::Automatic, CompositeWavStrategy::FundamentalResidual,
@@ -966,6 +1098,7 @@ void run() {
     const auto cancelled = convertCompositeWave(analysis, options);
     require(cancelled.completion == CompositeWavConversionCompletion::Cancelled && cancelled.evaluations == 0,
             "pre-cancel does no candidate work");
+    require(cancelled.retained_candidates.empty(), "pre-cancel exposes no retained candidates");
     options.scc_start_number.reset();
     options.max_evaluations = 4096;
     options.control = std::make_shared<CompositeWavConversionControl>();
@@ -978,6 +1111,7 @@ void run() {
     cancelWorker.request_stop();
     require(interrupted.completion == CompositeWavConversionCompletion::Cancelled
             && interrupted.evaluations > 0, "active candidate evaluation cooperatively cancels");
+    require(interrupted.retained_candidates.empty(), "cancelled conversion does not expose a partial candidate list");
     require(analysis->source->interleaved_samples == sourceBefore, "source PCM remains immutable");
     const auto identical = evaluateCompositeWavePcm(sourceBefore, sourceBefore, 261.625565, 720);
     require(identical.total < 1e-9, "objective identity has zero error");
@@ -995,6 +1129,7 @@ int main() {
             std::fprintf(stderr, "WAV conversion regression [%s]: %s\n", name, error.what());
         }
     };
+    check("score spaced candidates", scoreSpacedCandidateRegressions);
     check("existing conversion", run);
     check("local discontinuity", localDiscontinuityRegressions);
     check("waveform methods", waveformMethodRegressions);

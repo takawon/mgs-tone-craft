@@ -4571,6 +4571,7 @@ public:
         timeline_preview_pending_ = false;
         if (wave_converter_window_) delete wave_converter_window_.getComponent();
         wave_conversion_preview_.reset();
+        wave_preview_audition_pending_ = false;
         performance_keyboard_.setInputActiveOverride(satellite_session_ || spectrogram_input_active_);
         timeline_.cancelPendingDialogs();
         performance_keyboard_.allNotesOff();
@@ -5242,6 +5243,7 @@ private:
         bool restore_authoring = true) {
         if (!candidate && !wave_conversion_preview_) return;
         wave_submission_deferred_ = false;
+        wave_preview_audition_pending_ = false;
         performance_keyboard_.allNotesOff();
         silenceAuditionNotes();
         if (candidate) {
@@ -5278,7 +5280,27 @@ private:
             [safe, generation] {
                 if (safe && safe->host_restore_generation_ == generation)
                     safe->performance_keyboard_.pollPerformanceInput();
+            },
+            [safe, generation] {
+                if (!safe || safe->host_restore_generation_ != generation || !safe->wave_conversion_preview_) return;
+                safe->wave_preview_audition_pending_ = true;
+                safe->startWaveConversionAuditionIfReady();
+            },
+            [safe, generation] {
+                if (!safe || safe->host_restore_generation_ != generation || !safe->wave_conversion_preview_) return;
+                safe->wave_preview_audition_pending_ = false;
+                safe->performance_keyboard_.allNotesOff();
+                safe->silenceAuditionNotes();
             });
+    }
+
+    void startWaveConversionAuditionIfReady() {
+        // A queued candidate must never trigger a note on the preceding program.
+        // The existing bounded-slot retry completes publication before audition.
+        if (!wave_preview_audition_pending_ || !wave_conversion_preview_
+            || !engine_ready_ || composite_program_stale_ || wave_submission_deferred_) return;
+        wave_preview_audition_pending_ = false;
+        startAudition();
     }
 
     void applyWaveConversion(const mgstc::engine::CompositeTimbre& converted) {
@@ -7064,6 +7086,8 @@ private:
         if (hydrating_) {
             return;
         }
+        if (!stop_after_one_second && wave_conversion_preview_)
+            wave_preview_audition_pending_ = false; // Explicit keyboard performance supersedes delayed auto-preview.
         if (silence_notes_first
             && (stop_after_one_second
                 || !performance_keyboard_.polyphonic())) {
@@ -7327,6 +7351,7 @@ private:
             juce::Time::getMillisecondCounterHiRes();
         if (wave_submission_deferred_ && wave_conversion_preview_)
             engine_ready_ = configureEngine();
+        startWaveConversionAuditionIfReady();
         dispatchScheduledLayerNotes(now);
         if ((library_manager_performance_id_ || library_manager_imported_)
             && voice_allocator_.activeVoiceCount() == 0) {
@@ -7422,6 +7447,7 @@ private:
     std::optional<mgstc::engine::CompositeTimbre> manual_y_preview_timbre_;
     std::optional<mgstc::engine::CompositeTimbre> wave_conversion_preview_;
     bool wave_submission_deferred_{false};
+    bool wave_preview_audition_pending_{false};
     juce::Label title_;
     juce::Label description_;
     juce::Label composite_library_title_;

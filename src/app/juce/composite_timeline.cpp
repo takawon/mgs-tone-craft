@@ -4993,6 +4993,71 @@ public:
             setSize(UiScale::sx(1528), UiScale::sx(750));
             refreshUiScaleFonts();
             const auto before = timbre_;
+            // Verify actual painted ramp outlines, independently of the runtime
+            // stair-step overlay and the author-count mouse boundary checks.
+            const auto saved_visible = visibleCountRange();
+            horizontal_scroll_.setCurrentRange(0.0, 32.0, juce::dontSendNotification);
+            for (std::size_t layer_index = 0; layer_index < model.layers.size(); ++layer_index) {
+                const juce::Rectangle<int> plot(12, 12, UiScale::sx(700), UiScale::sx(180));
+                juce::Image image(juce::Image::ARGB,
+                    plot.getRight() + 12, plot.getBottom() + 12, true);
+                {
+                    juce::Graphics graphics(image);
+                    drawVolumeBars(graphics, plot, layer_index, juce::Colours::white);
+                }
+                const auto is_outline = [&](int x, int y) {
+                    const auto pixel = image.getPixelAt(x, y);
+                    return static_cast<int>(pixel.getGreen()) - pixel.getRed() > 35
+                        && static_cast<int>(pixel.getGreen()) - pixel.getBlue() > 15;
+                };
+                const int x0 = xForCount(plot, 0), x1 = xForCount(plot, 6);
+                const float y0 = volumeYFromValue(model.layers[layer_index].source, plot, 15);
+                const float y1 = volumeYFromValue(model.layers[layer_index].source, plot, 9);
+                for (const float fraction : {0.25F, 0.75F}) {
+                    const int x = juce::roundToInt(x0 + (x1 - x0) * fraction);
+                    const int y = juce::roundToInt(y0 + (y1 - y0)
+                        * static_cast<float>(x - x0) / (x1 - x0));
+                    check(is_outline(x, y) || is_outline(x, y - 1) || is_outline(x, y + 1),
+                        "automatic volume outline does not connect author endpoints");
+                }
+                const int hold_x = (xForCount(plot, 26) + xForCount(plot, 27)) / 2;
+                const int hold_y = juce::roundToInt(volumeYFromValue(
+                    model.layers[layer_index].source, plot, 2));
+                check(!is_outline(hold_x, hold_y),
+                    "manual volume hold was incorrectly drawn as an automatic outline");
+                check(timbre_ == before, "volume outline painting changed author data");
+
+                // A nonzero secondary stores an imported ramp's start + 1.
+                // The prefix must remain flat, then connect to the same target.
+                auto& target = timbre_.layers[layer_index].volume_envelope.events[1];
+                const int saved_secondary = target.secondary;
+                target.secondary = 4;
+                const auto delayed_before = timbre_;
+                image.clear(image.getBounds());
+                {
+                    juce::Graphics graphics(image);
+                    drawVolumeBars(graphics, plot, layer_index, juce::Colours::white);
+                }
+                const int prefix_x = (xForCount(plot, 1) + xForCount(plot, 2)) / 2;
+                const int prefix_y = juce::roundToInt(y0);
+                check(is_outline(prefix_x, prefix_y)
+                        || is_outline(prefix_x, prefix_y - 1)
+                        || is_outline(prefix_x, prefix_y + 1),
+                    "imported automatic volume lost its flat prefix");
+                const int ramp_x0 = xForCount(plot, 3);
+                const int middle_x = (ramp_x0 + x1) / 2;
+                const int middle_y = juce::roundToInt(y0 + (y1 - y0)
+                    * static_cast<float>(middle_x - ramp_x0) / (x1 - ramp_x0));
+                check(is_outline(middle_x, middle_y)
+                        || is_outline(middle_x, middle_y - 1)
+                        || is_outline(middle_x, middle_y + 1),
+                    "imported automatic volume does not connect from its saved start");
+                check(timbre_ == delayed_before,
+                    "imported volume outline painting changed author metadata");
+                target.secondary = saved_secondary;
+            }
+            horizontal_scroll_.setCurrentRange(saved_visible.getStart(),
+                saved_visible.getLength(), juce::dontSendNotification);
             callbacks = 0;
             overview_select_[1]->onClick();
             check(selected_layer_ == 1, "overview selection failed");
@@ -8693,6 +8758,7 @@ private:
             int count{};
             int volume{};
             bool automatic{};
+            int secondary{};
         };
         std::vector<Point> points;
         for (const auto& event : layer.volume_envelope.events) {
@@ -8700,7 +8766,8 @@ private:
                 points.push_back({
                     static_cast<int>(event.count),
                     juce::jlimit(0, 15, event.value),
-                    event.automatic});
+                    event.automatic,
+                    event.secondary});
             }
         }
         std::stable_sort(
@@ -8720,9 +8787,6 @@ private:
         const int end_count = static_cast<int>(
             layer.envelope_timeline.length_counts);
         const auto& sampled = cachedVolumeSamples(layer_index, end_count);
-        const auto& authored = volume_sample_cache_[layer_index].author_samples;
-        const bool has_automatic_volume = std::any_of(points.begin(), points.end(),
-            [](const Point& point) { return point.automatic; });
         const auto draw_output_span = [&](int start, int stop) {
             const int last = juce::jmin(stop, end_count);
             for (int count = start; count < last; ++count) {
@@ -8751,37 +8815,40 @@ private:
             const int x0 = xForCount(bounds, start);
             const int x1 = xForCount(bounds, juce::jmax(start + 1, stop));
             const int width = juce::jmax(2, x1 - x0);
-            if (has_automatic_volume) {
-                const int last = juce::jmin(stop, end_count);
-                for (int count = start; count < last; ++count) {
-                    const int cell_x0 = xForCount(bounds, count);
-                    const int cell_x1 = xForCount(bounds, count + 1);
-                    const float y = volumeYFromValue(
-                        layer.source,
-                        bounds,
-                        authored[static_cast<std::size_t>(count)]);
-                    graphics.setColour(colour.withAlpha(fill_opacity));
-                    graphics.fillRect(
-                        cell_x0,
-                        juce::roundToInt(y),
-                        juce::jmax(1, cell_x1 - cell_x0),
-                        juce::jmax(
-                            1,
-                            bounds.getBottom() - juce::roundToInt(y)));
-                    graphics.setColour(juce::Colour(kUiHoverAccent));
+            const bool ramp_to_next = index + 1 < points.size()
+                && points[index + 1].automatic
+                && points[index + 1].count > start;
+            if (ramp_to_next) {
+                // Imported ramps may start after a hold; retain that author
+                // boundary while drawing a straight outline to the target.
+                const int ramp_start = points[index + 1].secondary > 0
+                    ? juce::jlimit(start, stop, points[index + 1].secondary - 1)
+                    : start;
+                const float ramp_x = static_cast<float>(xForCount(bounds, ramp_start));
+                const float y0 = volumeYFromValue(
+                    layer.source, bounds, points[index].volume);
+                const float y1 = volumeYFromValue(
+                    layer.source, bounds, points[index + 1].volume);
+                juce::Path bar;
+                bar.startNewSubPath(
+                    static_cast<float>(x0),
+                    static_cast<float>(bounds.getBottom()));
+                bar.lineTo(static_cast<float>(x0), y0);
+                bar.lineTo(ramp_x, y0);
+                bar.lineTo(static_cast<float>(x1), y1);
+                bar.lineTo(
+                    static_cast<float>(x1),
+                    static_cast<float>(bounds.getBottom()));
+                bar.closeSubPath();
+                graphics.setColour(colour.withAlpha(fill_opacity));
+                graphics.fillPath(bar);
+                graphics.setColour(juce::Colour(kUiHoverAccent));
+                if (ramp_start > start) {
                     graphics.drawLine(
-                        static_cast<float>(cell_x0), y,
-                        static_cast<float>(cell_x1), y, 2.0F);
-                    if (count + 1 < last) {
-                        const float next_y = volumeYFromValue(
-                            layer.source,
-                            bounds,
-                            authored[static_cast<std::size_t>(count + 1)]);
-                        graphics.drawLine(
-                            static_cast<float>(cell_x1), y,
-                            static_cast<float>(cell_x1), next_y, 2.0F);
-                    }
+                        static_cast<float>(x0), y0, ramp_x, y0, 2.0F);
                 }
+                graphics.drawLine(
+                    ramp_x, y0, static_cast<float>(x1), y1, 2.0F);
             } else {
                 const float top = volumeYFromValue(
                     layer.source, bounds, points[index].volume);
