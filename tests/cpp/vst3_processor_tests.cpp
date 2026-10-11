@@ -4,6 +4,7 @@
 #include "plugin_editor.hpp"
 #include "plugin_editor_context.hpp"
 #include "mgstc_editor_view.hpp"
+#include "ui_layout.hpp"
 
 #include <algorithm>
 #include <array>
@@ -74,6 +75,9 @@ struct SatelliteEditorParityTestAccess {
 };
 
 struct CompositeEditorComponentTestAccess {
+    static void size(CompositeEditorComponent& editor, int width, int height) {
+        editor.setSize(width, height);
+    }
     static void immediate(CompositeEditorComponent& editor, bool enabled) {
         editor.immediate_audition_.setToggleState(enabled, juce::dontSendNotification);
         editor.saveCompositeImmediateAuditionSetting(enabled);
@@ -4707,6 +4711,287 @@ void testCompositeWavUiTransactions() {
     processEmpty(processor, 512);
 }
 
+void testCompositeStepSlideVstTransactions() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+
+    auto original = mgstc::engine::defaultCompositeTimbre();
+    auto& edited_layer = original.layers.front();
+    edited_layer.envelope_timeline.length_counts = 24;
+    edited_layer.envelope_timeline.loop_start_count = 6;
+    edited_layer.envelope_timeline.loop_end_count = 18;
+    edited_layer.volume_envelope.kind = mgstc::engine::EnvelopeKind::Sequence;
+    edited_layer.volume_envelope.events = {
+        {mgstc::engine::EnvelopeEventKind::Volume, 15, 0, 0},
+        {mgstc::engine::EnvelopeEventKind::Volume, 9, 0, 6},
+        {mgstc::engine::EnvelopeEventKind::Volume, 3, 0, 12}};
+    edited_layer.pitch_envelope.events.clear();
+    mgstc::engine::EnvelopeEvent pitch;
+    pitch.kind = mgstc::engine::EnvelopeEventKind::Pitch;
+    pitch.value = -3;
+    pitch.count = 10;
+    edited_layer.pitch_envelope.events.push_back(pitch);
+    require(processor.replacePluginState(documentFrom(original, 0, {})),
+        "seed VST step-slide transaction state");
+    processEmpty(processor, 512);
+
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {}, [] {},
+        [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, original);
+    EditorAccess::size(editor, 1600, 1050);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+
+    std::function<juce::TextButton*(juce::Component&, const juce::String&)>
+        findButton = [&](juce::Component& root,
+                         const juce::String& text) -> juce::TextButton* {
+        for (int index = 0; index < root.getNumChildComponents(); ++index) {
+            auto* child = root.getChildComponent(index);
+            if (auto* button = dynamic_cast<juce::TextButton*>(child);
+                button != nullptr && button->getButtonText() == text)
+                return button;
+            if (auto* nested = findButton(*child, text)) return nested;
+        }
+        return nullptr;
+    };
+    const auto findHorizontalScrollBar = [](juce::Component& root) -> juce::ScrollBar* {
+        for (int index = 0; index < root.getNumChildComponents(); ++index) {
+            auto* child = root.getChildComponent(index);
+            if (auto* bar = dynamic_cast<juce::ScrollBar*>(child);
+                bar != nullptr && !bar->isVertical()) return bar;
+        }
+        return nullptr;
+    };
+    const auto findVerticalScrollBar = [](juce::Component& root) -> juce::ScrollBar* {
+        for (int index = 0; index < root.getNumChildComponents(); ++index) {
+            auto* child = root.getChildComponent(index);
+            if (auto* bar = dynamic_cast<juce::ScrollBar*>(child);
+                bar != nullptr && bar->isVertical()) return bar;
+        }
+        return nullptr;
+    };
+    auto* step_button = findButton(editor,
+        juce::String::fromUTF8("削除/挿入"));
+    require(step_button != nullptr && step_button->isVisible(),
+        "VST shared editor exposes the step edit toggle");
+    auto* timeline_impl = step_button->getParentComponent();
+    require(timeline_impl != nullptr,
+        "step edit toggle is owned by the shared timeline implementation");
+    auto* horizontal_scroll = findHorizontalScrollBar(*timeline_impl);
+    require(horizontal_scroll != nullptr,
+        "shared timeline exposes its horizontal count range");
+    auto* vertical_scroll = findVerticalScrollBar(*timeline_impl);
+    require(vertical_scroll != nullptr,
+        "shared timeline exposes its graph boundary");
+    require(!step_button->getToggleState(),
+        "step edit mode defaults off in the VST editor");
+
+    const auto initial_state = stateBytes(processor);
+    const auto initial_sound = EditorAccess::sound(editor);
+    const auto initial_history = EditorAccess::historySize(editor);
+    const auto initial_cursor = EditorAccess::historyCursor(editor);
+    step_button->setToggleState(true, juce::dontSendNotification);
+    step_button->onClick();
+    require(step_button->getToggleState()
+            && EditorAccess::sound(editor) == initial_sound
+            && EditorAccess::historySize(editor) == initial_history
+            && sameBlock(initial_state, stateBytes(processor)),
+        "toggling step edit mode changes no authoring data, history, or Plugin State");
+    step_button->setToggleState(false, juce::dontSendNotification);
+    step_button->onClick();
+    require(!step_button->getToggleState()
+            && EditorAccess::historyCursor(editor) == initial_cursor,
+        "step edit mode can return to off without an authoring transaction");
+    step_button->setToggleState(true, juce::dontSendNotification);
+    step_button->onClick();
+    require(step_button->getToggleState()
+            && sameBlock(initial_state, stateBytes(processor))
+            && EditorAccess::sound(editor) == initial_sound,
+        "step edit mode can be enabled without changing authoring data");
+
+    const auto pointFor = [&](int count, int lane_y) {
+        const auto bounds = step_button->getBounds();
+        const int graph_x = bounds.getX() - UiLayout::textButtonH
+            - UiLayout::controlGap * 2 - UiLayout::xs;
+        const int plot_x = graph_x + UiLayout::compositeOverviewLabelW;
+        const int plot_width = vertical_scroll->getX() - plot_x;
+        const double start = horizontal_scroll->getCurrentRangeStart();
+        const double visible = juce::jmax(1.0,
+            horizontal_scroll->getCurrentRangeSize());
+        const auto x_for = [&](int at) {
+            return plot_x + juce::roundToInt((at - start) * plot_width / visible);
+        };
+        return juce::Point<int>((x_for(count) + x_for(count + 1)) / 2, lane_y);
+    };
+    const auto eventAt = [&](juce::Component* target, juce::Point<int> point,
+                             juce::Point<int> down, bool ctrl, bool dragged) {
+        const auto now = juce::Time::getCurrentTime();
+        return juce::MouseEvent(
+            juce::Desktop::getInstance().getMainMouseSource(), point.toFloat(),
+            juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier
+                | (ctrl ? juce::ModifierKeys::ctrlModifier : 0)),
+            1.0f, 0.0f, 0.0f, 0.0f, 0.0f, target, target, now,
+            down.toFloat(), now, 1, dragged);
+    };
+    const auto drag = [&](juce::Point<int> from, juce::Point<int> to,
+                          bool ctrl, bool commit) {
+        timeline_impl->mouseDown(eventAt(timeline_impl, from, from, ctrl, false));
+        timeline_impl->mouseDrag(eventAt(timeline_impl, to, from, ctrl, true));
+        if (!commit) return;
+        timeline_impl->mouseUp(eventAt(timeline_impl, to, from, ctrl, true));
+    };
+
+    const auto command_y = step_button->getBounds().getCentreY();
+    const auto command_from = pointFor(6, command_y);
+    const auto command_to = pointFor(8, command_y);
+    const auto untouched_layer = initial_sound.layers.at(1);
+    drag(command_from, command_to, false, false);
+    require(EditorAccess::sound(editor) == initial_sound
+            && sameBlock(initial_state, stateBytes(processor))
+            && EditorAccess::historySize(editor) == initial_history,
+        "step slide candidate remains local to the timeline until mouse-up");
+    timeline_impl->mouseUp(eventAt(timeline_impl, command_to, command_from,
+        false, true));
+    // Exercise this as a running host: each Live edit consumes a bounded
+    // program slot until the next audio block retires it.
+    processEmpty(processor, 512);
+    const auto inserted_state = stateBytes(processor);
+    const auto inserted = EditorAccess::sound(editor);
+    require(inserted.layers[0].envelope_timeline.length_counts
+                == initial_sound.layers[0].envelope_timeline.length_counts + 2
+            && inserted.layers[0].envelope_timeline.loop_start_count == 8
+            && inserted.layers[0].envelope_timeline.loop_end_count == 20
+            && inserted.layers[0].pitch_envelope.events.front().count == 12
+            && inserted.layers[0].volume_envelope.events.back().count == 14
+            && inserted.layers[1] == untouched_layer,
+        "命令 row commits a two-step slide for only the selected channel, including END and loop");
+    require(EditorAccess::historySize(editor) == initial_history + 1
+            && processor.copyPluginState().sound == EditorAccess::sound(editor)
+            && !sameBlock(initial_state, inserted_state),
+        "one completed 命令-row slide publishes one VST Plugin State transaction");
+    EditorAccess::undo(editor);
+    processEmpty(processor, 512);
+    require(EditorAccess::sound(editor) == initial_sound
+            && sameBlock(initial_state, stateBytes(processor)),
+        "Undo restores the entire pre-slide VST sound and state");
+    EditorAccess::redo(editor);
+    processEmpty(processor, 512);
+    const auto redone_parent_sound = EditorAccess::sound(editor);
+    const auto redone_processor_sound = processor.copyPluginState().sound;
+    const auto redone_state = stateBytes(processor);
+    const auto describeLayer = [](const mgstc::engine::CompositeTimbre& sound,
+                                  std::size_t index) {
+        if (index >= sound.layers.size()) return std::string("<missing>");
+        const auto& layer = sound.layers[index];
+        std::string description = "END="
+            + std::to_string(layer.envelope_timeline.length_counts)
+            + " loop="
+            + std::to_string(layer.envelope_timeline.loop_start_count.value_or(~0u))
+            + "," + std::to_string(layer.envelope_timeline.loop_end_count.value_or(~0u))
+            + " volume=";
+        for (const auto& event : layer.volume_envelope.events)
+            description += std::to_string(event.count) + ":"
+                + std::to_string(event.value) + ",";
+        description += " pitch=";
+        for (const auto& event : layer.pitch_envelope.events)
+            description += std::to_string(event.count) + ":"
+                + std::to_string(event.value) + ",";
+        return description;
+    };
+    const auto firstDifferentLayer = [](const mgstc::engine::CompositeTimbre& a,
+                                        const mgstc::engine::CompositeTimbre& b) {
+        const auto common = std::min(a.layers.size(), b.layers.size());
+        for (std::size_t index = 0; index < common; ++index)
+            if (a.layers[index] != b.layers[index]) return index;
+        return common;
+    };
+    const bool parent_sound_matches = redone_parent_sound == inserted;
+    const bool processor_sound_matches = redone_processor_sound == inserted;
+    const bool state_matches = sameBlock(inserted_state, redone_state);
+    if (!parent_sound_matches || !processor_sound_matches || !state_matches) {
+        const auto parent_layer = firstDifferentLayer(inserted, redone_parent_sound);
+        const auto processor_layer = firstDifferentLayer(inserted, redone_processor_sound);
+        std::fprintf(stderr,
+            "step-slide redo diagnostic: parent=%d processor=%d bytes=%d "
+            "history=%zu/%zu stateBytes=%zu/%zu parentLayer[%zu]=[%s] expected=[%s] "
+            "processorLayer[%zu]=[%s] expected=[%s]\n",
+            parent_sound_matches, processor_sound_matches, state_matches,
+            EditorAccess::historyCursor(editor), EditorAccess::historySize(editor),
+            redone_state.getSize(), inserted_state.getSize(), parent_layer,
+            describeLayer(redone_parent_sound, parent_layer).c_str(),
+            describeLayer(inserted, parent_layer).c_str(), processor_layer,
+            describeLayer(redone_processor_sound, processor_layer).c_str(),
+            describeLayer(inserted, processor_layer).c_str());
+    }
+    require(parent_sound_matches,
+        "Redo restores the slid sound in the shared editor history");
+    require(processor_sound_matches,
+        "Redo republishes the slid sound into VST Plugin State");
+    require(state_matches,
+        "Redo restores the serialized VST Plugin State snapshot");
+    step_button->setToggleState(false, juce::dontSendNotification);
+    step_button->onClick();
+    require(!step_button->getToggleState(),
+        "Ctrl-drag coverage starts with step edit mode off");
+
+    const auto command_top = step_button->getBounds().getY() - UiLayout::xs;
+    const auto source = inserted.layers[0].source;
+    const int marker_lanes = source == mgstc::engine::TimbreSource::Scc ? 1 : 2;
+    const int volume_y = command_top + UiLayout::commandSummaryH
+        + marker_lanes * UiLayout::editMarkerLaneH
+        + UiLayout::editVolumeLaneH / 2;
+    const auto volume_from = pointFor(6, volume_y);
+    const auto volume_to = pointFor(8, volume_y);
+    const auto before_cancel = stateBytes(processor);
+    const auto cancel_sound = EditorAccess::sound(editor);
+    const auto cancel_history = EditorAccess::historySize(editor);
+    drag(volume_from, volume_to, true, false);
+    require(EditorAccess::sound(editor) == cancel_sound
+            && sameBlock(before_cancel, stateBytes(processor))
+            && EditorAccess::historySize(editor) == cancel_history,
+        "Ctrl-drag works with mode off while its individual-row candidate remains local");
+    require(timeline_impl->keyPressed(juce::KeyPress(juce::KeyPress::escapeKey)),
+        "Escape is consumed while cancelling a provisional step slide");
+    timeline_impl->mouseUp(eventAt(timeline_impl, volume_to, volume_from,
+        true, true));
+    require(EditorAccess::sound(editor) == cancel_sound
+            && sameBlock(before_cancel, stateBytes(processor))
+            && EditorAccess::historySize(editor) == cancel_history,
+        "Escape cancels Ctrl-drag without changing VST state or history");
+
+    drag(volume_from, volume_to, true, true);
+    processEmpty(processor, 512);
+    const auto volume_edited = EditorAccess::sound(editor);
+    require(volume_edited.layers[0].envelope_timeline
+                == cancel_sound.layers[0].envelope_timeline
+            && volume_edited.layers[0].pitch_envelope
+                == cancel_sound.layers[0].pitch_envelope
+            && volume_edited.layers[0].volume_envelope.events
+                != cancel_sound.layers[0].volume_envelope.events
+            && volume_edited.layers[1] == cancel_sound.layers[1]
+            && EditorAccess::historySize(editor) == cancel_history + 1
+            && processor.copyPluginState().sound == volume_edited,
+        "Ctrl-drag commits one individual-row edit without moving END, pitch, or another channel");
+
+    MgstcAudioProcessor restored;
+    restored.prepareToPlay(48'000.0, 512);
+    const auto saved_document = processor.copyPluginState();
+    require(restored.replacePluginState(saved_document),
+        "saved VST Plugin State accepts a step-edited sound");
+    mgstc::plugin::PluginEditorContext restored_context(restored);
+    mgstc::app::EditorLink restored_link;
+    mgstc::app::CompositeEditorComponent reopened(restored_context, restored_link,
+        [](const juce::String&, std::optional<std::uint64_t>) {}, [] {},
+        [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, saved_document.sound);
+    EditorAccess::size(reopened, 1600, 1050);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    require(EditorAccess::sound(reopened) == volume_edited
+            && restored.copyPluginState().sound == volume_edited,
+        "VST Plugin State and a recreated shared editor preserve step-slide results");
+}
+
 void testCompositeWavCandidateAudition() {
     using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
     using WavAccess = mgstc::app::CompositeWavConversionTestAccess;
@@ -5418,6 +5703,7 @@ int main() {
             testConversionOwnerClose();
             testConversionCompletionCancellation();
             testCompositeWavUiTransactions();
+            testCompositeStepSlideVstTransactions();
             testCompositeWavCandidateAudition();
             testCompositeWavRetainedSelectionAndPreview();
             testCompositeWavRangeInteractions();
@@ -5492,6 +5778,7 @@ int main() {
         testConversionCompletionCancellation();
         testCompositeWavSourceImportTransactions();
         testCompositeWavUiTransactions();
+        testCompositeStepSlideVstTransactions();
         testCompositeWavCandidateAudition();
         testCompositeWavRetainedSelectionAndPreview();
         testCompositeWavRangeInteractions();
