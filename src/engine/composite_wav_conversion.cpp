@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "mgstc/engine/composite_wav_conversion.hpp"
+#include "mgstc/engine/detail/composite_wav_candidate_retention.hpp"
 
 #include "mgstc/engine/scc_morph.hpp"
 #include "mgstc/engine/wave_import.hpp"
@@ -1415,6 +1416,15 @@ CompositeWavConversionResult convertCompositeWave(
         return sourceWaves.get(source, tick, strategy, part, method);
     };
     std::uint64_t finalCandidateId{};
+    struct EvaluatedDisplayCandidate {
+        CompositeWavRetainedCandidate candidate;
+        CompositeTimbre render_key;
+        std::vector<std::uint64_t> evaluated_ids;
+    };
+    // The final winner can move until the last existing evaluation. Keep only
+    // author/runtime metadata (never PCM), bounded by that evaluation budget,
+    // so final +5/+10/+15/+20% targets are anchored to its unchanged score.
+    std::vector<EvaluatedDisplayCandidate> displayArchive;
     std::vector<std::string> searchNotes;
     bool insufficientModeBudget{}, diagnosticLimitReached{};
     result.analysis_reference = analysis;
@@ -1425,6 +1435,31 @@ CompositeWavConversionResult convertCompositeWave(
         if (control) control->stage.store(value, std::memory_order_relaxed);
     };
     const auto finish = [&]() {
+        if (result.completion == CompositeWavConversionCompletion::Completed
+            && result.composite_tone && !cancelled(cancel)) {
+            auto& retained = result.retained_candidates;
+            retained.clear();
+            retained.reserve(5);
+            retained.push_back({*result.composite_tone, result.resource_plan, result.quality, finalCandidateId, 0});
+            const auto winner = std::find_if(displayArchive.begin(), displayArchive.end(), [&](const auto& item) {
+                return std::find(item.evaluated_ids.begin(), item.evaluated_ids.end(), finalCandidateId)
+                    != item.evaluated_ids.end();
+            });
+            std::vector<detail::WavRetainedScore> scores;
+            std::vector<std::size_t> archiveIndices;
+            for (std::size_t i = 0; i < displayArchive.size(); ++i) {
+                const auto& item = displayArchive[i];
+                if (item.candidate.tone == *result.composite_tone
+                    || (winner != displayArchive.end() && item.render_key == winner->render_key)) continue;
+                scores.push_back({item.candidate.quality.total, item.candidate.candidate_id});
+                archiveIndices.push_back(i);
+            }
+            for (const auto index : detail::selectWavScoreSpacedAlternatives(scores, result.quality.total)) {
+                auto candidate = std::move(displayArchive[archiveIndices[index]].candidate);
+                candidate.target_score_increase_percent = static_cast<std::uint8_t>(retained.size() * 5);
+                retained.push_back(std::move(candidate));
+            }
+        } else result.retained_candidates.clear();
         result.warnings.insert(result.warnings.begin(), searchNotes.begin(), searchNotes.end());
         for (auto& item : result.morph_candidates) {
             item.selected = item.valid && item.candidate_id == finalCandidateId;
@@ -1435,7 +1470,11 @@ CompositeWavConversionResult convertCompositeWave(
         if (diagnosticLimitReached)
             result.warnings.push_back("Morph candidate diagnostics reached their bounded 8192-record limit.");
         result.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-        if (cancelled(cancel)) { result.completion = CompositeWavConversionCompletion::Cancelled; stage(CompositeWavStage::Cancelled); }
+        if (cancelled(cancel)) {
+            result.completion = CompositeWavConversionCompletion::Cancelled;
+            result.retained_candidates.clear();
+            stage(CompositeWavStage::Cancelled);
+        }
         else stage(CompositeWavStage::Completed);
         return std::move(result);
     };
@@ -1541,6 +1580,22 @@ CompositeWavConversionResult convertCompositeWave(
     };
     std::optional<RetainedSharedCandidate> bestShared;
     std::uint64_t lastEvaluatedId{};
+    displayArchive.reserve(options.max_evaluations);
+    const auto retainCandidate = [&](const CompositeTimbre& tone, const CompositeTimbre& renderKey,
+        const CompositeWavResourcePlan& resources, const CompositeWavQualityMetrics& quality, std::uint64_t id) {
+        const auto duplicate = std::find_if(displayArchive.begin(), displayArchive.end(),
+            [&](const auto& other) { return other.render_key == renderKey || other.candidate.tone == tone; });
+        if (duplicate != displayArchive.end()) {
+            duplicate->evaluated_ids.push_back(id);
+            if (std::tie(quality.total, id)
+                < std::tie(duplicate->candidate.quality.total, duplicate->candidate.candidate_id))
+                duplicate->candidate = {tone, resources, quality, id};
+            return;
+        }
+        // Every entry has already consumed one existing candidate evaluation.
+        if (displayArchive.size() < options.max_evaluations)
+            displayArchive.push_back({{tone, resources, quality, id}, renderKey, {id}});
+    };
     const auto pcmStorage = [](const CompositeWavRenderResult& pcm) {
         return (pcm.mono_pcm.capacity() + pcm.stereo_pcm.capacity()) * sizeof(float);
     };
@@ -1553,6 +1608,14 @@ CompositeWavConversionResult convertCompositeWave(
         result.morph_search.source_cache_bytes = sourceSpectra.bytes
             + sourceWaves.values.size() * (sizeof(WaveShapeCache::Key) + sizeof(WaveShape) + 64);
         if (result.composite_tone) bytes += wavToneStorage(*result.composite_tone);
+        bytes += result.retained_candidates.capacity() * sizeof(CompositeWavRetainedCandidate);
+        for (const auto& item : result.retained_candidates)
+            bytes += wavToneStorage(item.tone) + item.resources.scc_numbers.capacity() * sizeof(std::uint8_t);
+        bytes += displayArchive.capacity() * sizeof(EvaluatedDisplayCandidate);
+        for (const auto& item : displayArchive)
+            bytes += wavToneStorage(item.candidate.tone) + wavToneStorage(item.render_key)
+                + item.candidate.resources.scc_numbers.capacity() * sizeof(std::uint8_t)
+                + item.evaluated_ids.capacity() * sizeof(std::uint64_t);
         if (bestShared) bytes += wavToneStorage(bestShared->tone) + pcmStorage(*bestShared->pcm);
         for (const auto& entry : neighbourCache)
             bytes += wavToneStorage(entry.key) + pcmStorage(*entry.pcm) + sizeof(entry);
@@ -1981,6 +2044,9 @@ CompositeWavConversionResult convertCompositeWave(
         lastEvaluatedResources = resources;
         lastEvaluatedPcm = rendered;
         lastEvaluatedId = candidateSerial;
+        // Only candidates past every existing validity/safety rejection reach
+        // this display-only retention. It does not participate in winner choice.
+        retainCandidate(candidate, renderKey, resources, quality, candidateSerial);
         for (const auto index : diagnosticIndices) {
             auto& item = result.morph_candidates[index];
             item.valid = true;

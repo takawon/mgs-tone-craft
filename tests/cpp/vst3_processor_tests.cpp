@@ -11,6 +11,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <limits>
 #include <numbers>
@@ -98,6 +99,7 @@ struct CompositeEditorComponentTestAccess {
         editor.bindWaveConversionAudition(content);
     }
     static bool hasWavePreview(const CompositeEditorComponent& editor) { return editor.wave_conversion_preview_.has_value(); }
+    static bool waveAuditionPending(const CompositeEditorComponent& editor) { return editor.wave_preview_audition_pending_; }
     static const mgstc::engine::CompositeTimbre& wavePreview(const CompositeEditorComponent& editor) { return *editor.wave_conversion_preview_; }
     static void undo(CompositeEditorComponent& editor) { editor.undo(); }
     static void redo(CompositeEditorComponent& editor) { editor.redo(); }
@@ -199,6 +201,37 @@ struct CompositeWavConversionTestAccess {
     static void clickConvert(CompositeWavConversionContent& content) { content.convert_.onClick(); }
     static void clickApply(CompositeWavConversionContent& content) { content.apply_.onClick(); }
     static void clickCancel(CompositeWavConversionContent& content) { content.cancel_.onClick(); }
+    static void selectCandidate(CompositeWavConversionContent& content, int row) { content.candidates_.selectRow(row); }
+    static int selectedCandidate(const CompositeWavConversionContent& content) { return content.selected_candidate_; }
+    static auto selectedTone(const CompositeWavConversionContent& content) { return content.selectedCandidate()->tone; }
+    static void previewSelected(CompositeWavConversionContent& content) { content.previewResult(); }
+    static void previewSource(CompositeWavConversionContent& content) { content.previewSource(); }
+    static void releaseRangeHandle(CompositeWavConversionContent& content, bool start) { content.range_.changed(start); }
+    static void stopPreview(CompositeWavConversionContent& content) { content.stop_.onClick(); }
+    static bool moveCandidate(CompositeWavConversionContent& content, int key) { return content.candidates_.keyPressed(juce::KeyPress(key)); }
+    static bool previewPending(const CompositeWavConversionContent& content) { return content.preview_dialog_ != nullptr; }
+    static auto alternatePcm(const CompositeWavConversionContent& content) { return content.alternate_pcm_; }
+    static bool candidateLayout(const CompositeWavConversionContent& content) {
+        const auto right = content.candidates_.getBounds(); const auto left = content.status_.getBounds();
+        const auto width = left.getWidth() + right.getWidth();
+        std::array<const juce::Component*, 10> controls{&content.begin_, &content.end_, &content.pitch_, &content.key_off_, &content.budget_,
+            &content.configuration_, &content.strategy_, &content.fixed_tone_, &content.preference_, &content.sustain_};
+        for (std::size_t i = 0; i < controls.size(); ++i) {
+            const auto label = content.labels_[i].getBounds(); const auto field = controls[i]->getBounds();
+            if (label.getY() != field.getY() || label.getHeight() != UiLayout::fieldH
+                || field.getHeight() != UiLayout::fieldH || label.getRight() + UiLayout::controlGap != field.getX()) return false;
+        }
+        const int former_result_height = left.getHeight() - (UiLayout::fieldH - UiLayout::panelPad * 2) * 5 + UiLayout::panelGap;
+        return former_result_height > 0 && left.getHeight() >= former_result_height * 125 / 100
+            && left.getHeight() <= former_result_height * 140 / 100
+            && left.getY() - content.budget_.getBottom() >= UiLayout::panelGap
+            && content.candidates_.getRowHeight() == UiLayout::fieldH + UiLayout::xs * 2
+            && left.getHeight() >= UiScale::sx(100) && right.getHeight() > 0
+            && content.getLocalBounds().contains(right) && !left.intersects(right)
+            && right.getX() == left.getRight() + UiLayout::panelGap
+            && std::abs(right.getWidth() - width * 35 / 100) <= 1;
+    }
+    static bool candidatesEmpty(const CompositeWavConversionContent& content) { return content.candidates_empty_.isVisible(); }
     static int waveMethod(const CompositeWavConversionContent& content) { return content.wave_method_.getSelectedId(); }
     static void setWaveMethod(CompositeWavConversionContent& content, int id) { content.wave_method_.setSelectedId(id, juce::sendNotificationSync); }
     static bool hasAudacityBesideLoad(const CompositeWavConversionContent& content) {
@@ -4725,6 +4758,11 @@ void testCompositeWavCandidateAudition() {
                 && plan.audible_layers.front().source == mgstc::engine::TimbreSource::Scc
                 && plan.audible_layers.front().relative_semitones == candidate.layers.front().relative_semitones,
             "host MIDI uses the candidate's layers and transposition before Apply");
+        require(EditorAccess::scheduled(editor) == 1 && EditorAccess::startsAndStopsShiftedEqually(editor, 1000.0)
+            && !EditorAccess::waveAuditionPending(editor), "initial candidate selection starts the existing one-second note audition");
+        WavAccess::stopPreview(content);
+        require(EditorAccess::scheduled(editor) == 0 && !EditorAccess::waveAuditionPending(editor)
+            && EditorAccess::wavePreview(editor) == candidate, "Stop cancels one-second notes without clearing selected performance tone");
         require(content.keyPressed(pc_z), "WAV window forwards PC performance keys through existing mapping");
         require(!content.keyPressed(juce::KeyPress('z', juce::ModifierKeys::ctrlModifier, 'z')),
             "WAV window preserves modified editing shortcuts");
@@ -4740,6 +4778,19 @@ void testCompositeWavCandidateAudition() {
         require(EditorAccess::sound(editor) == before && EditorAccess::historySize(editor) == history_before
                 && sameBlock(saved_state, stateBytes(processor)),
             "candidate keyboard and host MIDI audition preserve authoring data, Undo and serialized Plugin State");
+        auto selected_list = valid;
+        auto alternate_tone = candidate; alternate_tone.layers.front().relative_semitones += 7;
+        selected_list.retained_candidates = {{candidate, {}, {}, 1}, {alternate_tone, {}, {}, 2}};
+        require(WavAccess::accept(content, selected_list, pcm), "install existing evaluated alternates into performance dialog");
+        processEmpty(processor, 512); WavAccess::selectCandidate(content, 1); processEmpty(processor, 512);
+        require(EditorAccess::scheduled(editor) == 1 && EditorAccess::startsAndStopsShiftedEqually(editor, 1000.0),
+            "alternate selection restarts the existing one-second audition with a clean note lifetime");
+        require(EditorAccess::wavePreview(editor) == alternate_tone
+            && ProcessorAccess::plan(processor).audible_layers.front().relative_semitones == alternate_tone.layers.front().relative_semitones
+            && peakOf(captureHostNotePcm(processor, 8192)) > 0.001
+            && EditorAccess::historySize(editor) == history_before && sameBlock(saved_state, stateBytes(processor)),
+            "alternate selection changes actual host MIDI plan/audio without changing Undo or Plugin State");
+        WavAccess::selectCandidate(content, 0); processEmpty(processor, 512);
         require(!WavAccess::accept(content, {}, {}) && !WavAccess::accept(content, valid, pcm, true),
             "failed or cancelled reconversion is not a candidate replacement");
         require(EditorAccess::wavePreview(editor) == candidate, "failed reconversion retains prior performance candidate");
@@ -4747,17 +4798,27 @@ void testCompositeWavCandidateAudition() {
         // Multiple valid conversions must leave one slot for Cancel restoration.
         processEmpty(processor, 512);
         const auto stopped_compiles = ProcessorAccess::stateCompileCount(processor);
-        require(WavAccess::accept(content, valid, pcm), "publish first stopped-host candidate");
         auto latest = valid;
         latest.composite_tone->layers.front().relative_semitones += 7;
-        require(WavAccess::accept(content, latest, pcm), "retain newest stopped-host candidate");
+        auto list = valid;
+        list.retained_candidates = {{candidate, {}, {}, 1}, {*latest.composite_tone, {}, {}, 2}};
+        require(WavAccess::accept(content, list, pcm), "publish stopped-host list winner");
+        WavAccess::selectCandidate(content, 1);
+        WavAccess::selectCandidate(content, 0);
+        WavAccess::selectCandidate(content, 1);
+        require(EditorAccess::wavePreview(editor) == *latest.composite_tone
+                && EditorAccess::sound(editor) == before && EditorAccess::historySize(editor) == history_before
+                && sameBlock(saved_state, stateBytes(processor)),
+            "rapid list selection uses latest pending candidate and preserves authoring, Undo and state");
+        require(EditorAccess::waveAuditionPending(editor) && EditorAccess::scheduled(editor) == 0,
+            "deferred latest candidate does not start a note on the old runtime program");
         EditorAccess::pollOwned(editor);
         require(ProcessorAccess::stateCompileCount(processor) == stopped_compiles + 1,
             "capacity wait neither compiles nor consumes restoration slot");
         WavAccess::clickCancel(content);
         processEmpty(processor, 512);
         EditorAccess::pollOwned(editor);
-        require(!EditorAccess::hasWavePreview(editor) && EditorAccess::scheduled(editor) == 0
+        require(!EditorAccess::hasWavePreview(editor) && !EditorAccess::waveAuditionPending(editor) && EditorAccess::scheduled(editor) == 0
                 && EditorAccess::voices(editor) == 0 && ProcessorAccess::plan(processor).audible_layers.size() == 3,
             "Cancel stops candidate notes and restores the original host MIDI playback plan");
         require(sameBlock(saved_state, stateBytes(processor)) && EditorAccess::sound(editor) == before,
@@ -4770,10 +4831,12 @@ void testCompositeWavCandidateAudition() {
         require(ProcessorAccess::plan(processor).audible_layers.front().relative_semitones
                 == latest.composite_tone->layers.front().relative_semitones,
             "timer publishes the latest candidate when actual program capacity returns");
-        require(WavAccess::accept(content, valid, pcm), "restore Apply candidate");
-        processEmpty(processor, 512);
+        require(!EditorAccess::waveAuditionPending(editor) && EditorAccess::scheduled(editor) == 1
+            && EditorAccess::startsAndStopsShiftedEqually(editor, 1000.0), "latest deferred candidate starts one-second audition after publication succeeds");
+        require(WavAccess::accept(content, selected_list, pcm), "restore Apply candidate list");
+        processEmpty(processor, 512); WavAccess::selectCandidate(content, 1);
         WavAccess::clickApply(content);
-        require(!EditorAccess::hasWavePreview(editor) && processor.copyPluginState().sound == candidate
+        require(!EditorAccess::hasWavePreview(editor) && processor.copyPluginState().sound == alternate_tone
                 && EditorAccess::historySize(editor) == history_before + 1,
             "Apply clears temporary preview before committing exactly one Undo transaction");
         processEmpty(processor, 512);
@@ -4811,6 +4874,127 @@ void testCompositeWavCandidateAudition() {
             && ProcessorAccess::plan(processor).audible_layers.size() == 3
             && sameBlock(closed_state, stateBytes(processor)),
         "closing stopped-host converter restores author program and discards deferred candidate");
+}
+
+void testCompositeWavRetainedSelectionAndPreview() {
+    using Access = mgstc::app::CompositeWavConversionTestAccess;
+    struct RecordingPcm final : mgstc::app::PcmPreviewBoundary {
+        std::shared_ptr<const mgstc::engine::SourcePcm> played;
+        int plays{}, stops{};
+        bool play(std::shared_ptr<const mgstc::engine::SourcePcm> pcm, std::size_t, std::size_t, float) override {
+            played = std::move(pcm); ++plays; return true;
+        }
+        void stop() noexcept override { played.reset(); ++stops; }
+    } playback;
+    MgstcAudioProcessor processor;
+    mgstc::plugin::PluginEditorContext context(processor);
+    std::optional<mgstc::engine::CompositeTimbre> published, applied;
+    mgstc::app::CompositeWavConversionContent content(
+        [&](const mgstc::engine::CompositeTimbre& tone, std::function<void()>) { applied = tone; },
+        &playback, context.backgroundTasks());
+    int single_note_previews = 0, single_note_stops = 0;
+    std::optional<mgstc::engine::CompositeTimbre> preview_tone;
+    content.setAuditionCallbacks([&](const auto* tone) {
+        if (tone) published = *tone; else published.reset();
+    }, [](const juce::KeyPress&) { return true; }, [] {}, [&] {
+        preview_tone = published; ++single_note_previews;
+    }, [&] { ++single_note_stops; });
+    require(Access::candidatesEmpty(content), "candidate region is present before conversion");
+    auto winner = sccOnlyTimbre(); winner.name = "winner";
+    auto alternate = winner; alternate.name = "alternate"; alternate.layers.front().relative_semitones = 7;
+    auto third = alternate; third.name = "third"; third.layers.front().relative_semitones = -5;
+    mgstc::engine::CompositeWavConversionResult result;
+    result.completion = mgstc::engine::CompositeWavConversionCompletion::Completed;
+    result.composite_tone = winner;
+    result.preview.requested_key_off_frame = 4000;
+    result.retained_candidates = {{winner, {}, {}, 10}, {alternate, {}, {}, 11}, {third, {}, {}, 12}};
+    result.retained_candidates[0].resources.scc_waveforms = 1;
+    result.retained_candidates[1].resources.scc_waveforms = 3;
+    auto winnerPcm = std::make_shared<mgstc::engine::SourcePcm>();
+    winnerPcm->sample_rate = 48000; winnerPcm->channels = 2;
+    winnerPcm->mono_samples.assign(4800, 0.0f); winnerPcm->interleaved_samples.assign(9600, 0.0f);
+    auto completedAnalysis = std::make_shared<mgstc::engine::SourceAnalysis>();
+    completedAnalysis->source = winnerPcm; completedAnalysis->selection = {0, 4800};
+    completedAnalysis->reference_pitch_hz = 523.251130601;
+    result.analysis_reference = completedAnalysis;
+    require(Access::accept(content, result, winnerPcm) && Access::selectedCandidate(content) == 0
+        && published == winner, "completion initially selects and publishes unchanged automatic winner");
+    require(single_note_previews == 1 && preview_tone == winner && !playback.played && !Access::previewPending(content),
+        "initial row selection triggers one-second note callback without source-duration PCM rendering");
+    Access::previewSelected(content);
+    require(playback.played == winnerPcm && !Access::previewPending(content) && single_note_stops == 1,
+        "converted play stops one-second notes before playing existing winner PCM directly");
+    require(Access::moveCandidate(content, juce::KeyPress::downKey) && Access::selectedCandidate(content) == 1,
+        "list supports down-arrow selection through ordinary JUCE keyboard handling");
+    require(Access::moveCandidate(content, juce::KeyPress::upKey) && Access::selectedCandidate(content) == 0,
+        "list supports up-arrow selection");
+    Access::selectCandidate(content, 1);
+    require(published == alternate && preview_tone == alternate && single_note_previews == 4
+        && !playback.played && !Access::alternatePcm(content),
+        "selection stops old PCM, publishes alternate before one-second audition and retains no PCM");
+    Access::selectCandidate(content, 1);
+    require(single_note_previews == 4, "selecting the same row does not duplicate one-second audition");
+    require(content.keyPressed(juce::KeyPress('Z', {}, 'z')), "selected candidate retains PC-key routing");
+    require(!Access::accept(content, {}, {}) && !Access::accept(content, result, winnerPcm, true)
+        && Access::selectedCandidate(content) == 1 && published == alternate,
+        "failed and cancelled reconversion preserve prior list, selection and audition");
+    Access::previewSelected(content);
+    require(Access::previewPending(content), "alternate PCM starts only on explicit converted-play request");
+    Access::selectCandidate(content, 2);
+    Access::previewSelected(content); // Queue latest explicit request behind cancelled worker.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (Access::previewPending(content) && std::chrono::steady_clock::now() < deadline)
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+    require(!Access::previewPending(content) && Access::alternatePcm(content)
+        && playback.played == Access::alternatePcm(content) && published == third,
+        "cancelled old preview cannot overwrite newest selection; latest request renders and plays");
+    mgstc::engine::CompositeWavRenderOptions options;
+    options.frame_count = 4800; options.key_off_frame = 4000; options.midi_note = 72;
+    const auto expected = mgstc::engine::renderCompositeWav(third, options);
+    require(expected.ok() && playback.played->mono_samples == expected.mono_pcm,
+        "converted PCM is exactly the selected completed tone's Engine rendering");
+    const auto cached = playback.played; Access::previewSelected(content);
+    require(playback.played == cached && !Access::previewPending(content), "current alternate cache replays without another render");
+    Access::clickApply(content);
+    require(applied == third, "Apply passes currently selected completed tone");
+    Access::selectCandidate(content, 0);
+    require(!Access::alternatePcm(content), "switching away discards alternate PCM cache");
+    require(Access::accept(content, result, winnerPcm) && Access::selectedCandidate(content) == 0 && published == winner,
+        "successful reconversion reselects candidate one even when old row zero was selected");
+    const auto savedScale = UiScale::active_percent;
+    for (const int scale : {75, 100, 125}) {
+        UiScale::setActivePercent(scale);
+        content.setSize(UiScale::sx(1080), UiScale::sx(900)); content.resized();
+        require(Access::candidateLayout(content), "inline fields, result margin, approximately 1.3x result height and compact 65/35 candidate layout hold at supported scales");
+    }
+    UiScale::setActivePercent(savedScale);
+    Access::source(content, winnerPcm);
+    Access::selectCandidate(content, 1);
+    const auto handle_note_stops = single_note_stops;
+    Access::releaseRangeHandle(content, true);
+    require(single_note_stops == handle_note_stops + 1 && playback.played == winnerPcm && published == alternate,
+        "start-handle source preview stops one-second notes while preserving the selected candidate");
+    Access::releaseRangeHandle(content, false);
+    require(single_note_stops == handle_note_stops + 2 && playback.played == winnerPcm && published == alternate,
+        "end-handle source preview stops one-second notes while preserving the selected candidate");
+    Access::selectCandidate(content, 1); Access::previewSelected(content); Access::previewSource(content);
+    const auto source_plays = playback.plays;
+    const auto source_note_stops = single_note_stops;
+    require(source_note_stops > 1, "Original stops the candidate one-second audition");
+    while (Access::previewPending(content) && std::chrono::steady_clock::now() < deadline)
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+    require(playback.played == winnerPcm && playback.plays == source_plays && !Access::alternatePcm(content),
+        "Original cancels pending converted render and prevents late autoplay");
+    Access::previewSelected(content); Access::stopPreview(content);
+    require(single_note_stops >= source_note_stops + 2, "Converted and Stop both route to existing note-stop callback");
+    const auto stopped_plays = playback.plays;
+    while (Access::previewPending(content) && std::chrono::steady_clock::now() < deadline)
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+    require(!playback.played && playback.plays == stopped_plays && !Access::alternatePcm(content),
+        "Stop cancels pending render without late autoplay");
+    Access::previewSelected(content); Access::clickCancel(content);
+    require(!published && !Access::hasResult(content) && !Access::alternatePcm(content),
+        "Cancel discards temporary candidates and cache and restores performance audition");
 }
 
 void testCompositeWavRangeInteractions() {
@@ -5230,6 +5414,15 @@ void testPluginSoundAuthority() {
 int main() {
     juce::ScopedJuceInitialiser_GUI juce_init;
     try {
+        if (std::getenv("MGSTC_WAV_CANDIDATE_UI_ONLY")) {
+            testConversionOwnerClose();
+            testConversionCompletionCancellation();
+            testCompositeWavUiTransactions();
+            testCompositeWavCandidateAudition();
+            testCompositeWavRetainedSelectionAndPreview();
+            testCompositeWavRangeInteractions();
+            return 0;
+        }
         testSincRingMatchesLinearShift();
         testNoteOnAtSample128DoesNotAffectPrefix();
         testInvalidSampleRateIsSilentAndDoesNotAdvanceEngine();
@@ -5300,6 +5493,7 @@ int main() {
         testCompositeWavSourceImportTransactions();
         testCompositeWavUiTransactions();
         testCompositeWavCandidateAudition();
+        testCompositeWavRetainedSelectionAndPreview();
         testCompositeWavRangeInteractions();
         testCompositeWavActualUiWorkerAndApply();
         testWavMorphPlanVstStateAndReediting();

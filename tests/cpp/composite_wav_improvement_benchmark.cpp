@@ -340,14 +340,15 @@ void writeBaseWaveMetrics(std::ostream& out, const std::optional<WaveCounts>& wa
 }
 void run(const std::filesystem::path& outputDirectory,
          const std::vector<CompositeWavConfiguration>& configurations,
-         const std::optional<std::filesystem::path>& baselineDirectory) {
+         const std::optional<std::filesystem::path>& baselineDirectory, const std::optional<double>& durationFilter) {
     std::filesystem::create_directories(outputDirectory);
     std::ofstream csv(outputDirectory / "composite_wav_improvement.csv", std::ios::binary);
     if (!csv) throw std::runtime_error("cannot create benchmark CSV");
-    csv << "duration_s,configuration,analysis_s,converter_wall_s,reported_elapsed_s,planning_s,evaluation_s,adaptive_candidate_s,adaptive_refinement_s,wave_generation_s,direct_extraction_s,rendering_s,scoring_s,evaluations,loop_probe_renders,morph_cache_hits,morph_cache_misses,render_cache_hits,render_cache_misses,stft,harmonic,erb,attack,volume,transition,complexity,total,selected_morph_ns,resource_scc_waveforms,scc_snapshot_count,scc_unique_waveforms,scc_reused_snapshots,layer_loop_flags,opll_register_write_counts,layer_detune,layer_micro_detune,search_family_trials,search_family_accepted,morph_mode_trials,morph_mode_accepted,complete_comparisons,incomplete_comparisons,global_combo_trials,global_combo_accepted,retained_segment_pools,candidate_pool_peak,working_set_bytes,scc_morph_intermediate_total,scc_morph_intermediate_unique,scc_morph_intermediate_reused,scc_compiled_unique_bank,max_adjacent_signed_sample,max_adjacent_signed_rms,worst_circular32_minimum_rms,max_adjacent_magnitude_rms,max_adjacent_harmonic,max_adjacent_log_spectrum,source_spectrum_cache_hits,source_spectrum_cache_misses,source_wave_cache_hits,source_wave_cache_misses,source_cache_bytes,same_wave_trials,detune_trials,near_wave_trials,mixed_role_trials,approximate_reuse_trials,approximate_reuse_accepted,dynamic_opll_trials,dynamic_opll_accepted,neighbour_pitch_probe_renders,neighbour_pitch_penalty,opll_contour_probe_renders,opll_counterfactual_probe_renders,source_feature_s,keyframe_s,reuse_s,loop_s,detune_s,opll_s,serialization_s,common_base_stft,common_base_harmonic,common_base_erb,common_base_attack,common_base_volume,common_base_transition,common_base_complexity,common_base_max_wave_sample,common_base_max_wave_aligned,common_base_max_wave_harmonic,common_base_max_wave_log_spectrum,common_base_max_wave_rms,common_base_max_transition,common_base_max_pcm_discontinuity,common_base_max_pcm_spectral_change,common_base_loop_entry,common_base_loop_boundary,common_base_loop_steady,common_base_total,base_scc_definitions,base_envelope_definitions,base_envelope_track_references,base_selected_morph_ns,base_resource_scc_waveforms,base_scc_snapshot_count,base_scc_unique_waveforms,base_scc_reused_snapshots,base_morph_intermediate_total,base_morph_intermediate_unique,base_morph_intermediate_reused,base_max_adjacent_signed_sample,base_max_adjacent_signed_rms,base_worst_circular32_minimum_rms,base_max_adjacent_magnitude_rms,base_max_adjacent_harmonic,base_max_adjacent_log_spectrum,base_layer_loop_flags,base_opll_register_write_counts,base_layer_detune,base_layer_micro_detune,current_scc_definitions,current_envelope_definitions,current_envelope_track_references,common_current_stft,common_current_harmonic,common_current_erb,common_current_attack,common_current_volume,common_current_transition,common_current_complexity,common_current_max_wave_sample,common_current_max_wave_aligned,common_current_max_wave_harmonic,common_current_max_wave_log_spectrum,common_current_max_wave_rms,common_current_max_transition,common_current_max_pcm_discontinuity,common_current_max_pcm_spectral_change,common_current_loop_entry,common_current_loop_boundary,common_current_loop_steady,common_current_total,completion,error\n";
+    csv << "duration_s,configuration,analysis_s,converter_wall_s,reported_elapsed_s,planning_s,evaluation_s,adaptive_candidate_s,adaptive_refinement_s,wave_generation_s,direct_extraction_s,rendering_s,scoring_s,evaluations,loop_probe_renders,morph_cache_hits,morph_cache_misses,render_cache_hits,render_cache_misses,stft,harmonic,erb,attack,volume,transition,complexity,total,selected_morph_ns,resource_scc_waveforms,scc_snapshot_count,scc_unique_waveforms,scc_reused_snapshots,layer_loop_flags,opll_register_write_counts,layer_detune,layer_micro_detune,search_family_trials,search_family_accepted,morph_mode_trials,morph_mode_accepted,complete_comparisons,incomplete_comparisons,global_combo_trials,global_combo_accepted,retained_segment_pools,candidate_pool_peak,working_set_bytes,scc_morph_intermediate_total,scc_morph_intermediate_unique,scc_morph_intermediate_reused,scc_compiled_unique_bank,max_adjacent_signed_sample,max_adjacent_signed_rms,worst_circular32_minimum_rms,max_adjacent_magnitude_rms,max_adjacent_harmonic,max_adjacent_log_spectrum,source_spectrum_cache_hits,source_spectrum_cache_misses,source_wave_cache_hits,source_wave_cache_misses,source_cache_bytes,same_wave_trials,detune_trials,near_wave_trials,mixed_role_trials,approximate_reuse_trials,approximate_reuse_accepted,dynamic_opll_trials,dynamic_opll_accepted,neighbour_pitch_probe_renders,neighbour_pitch_penalty,opll_contour_probe_renders,opll_counterfactual_probe_renders,source_feature_s,keyframe_s,reuse_s,loop_s,detune_s,opll_s,serialization_s,common_base_stft,common_base_harmonic,common_base_erb,common_base_attack,common_base_volume,common_base_transition,common_base_complexity,common_base_max_wave_sample,common_base_max_wave_aligned,common_base_max_wave_harmonic,common_base_max_wave_log_spectrum,common_base_max_wave_rms,common_base_max_transition,common_base_max_pcm_discontinuity,common_base_max_pcm_spectral_change,common_base_loop_entry,common_base_loop_boundary,common_base_loop_steady,common_base_total,base_scc_definitions,base_envelope_definitions,base_envelope_track_references,base_selected_morph_ns,base_resource_scc_waveforms,base_scc_snapshot_count,base_scc_unique_waveforms,base_scc_reused_snapshots,base_morph_intermediate_total,base_morph_intermediate_unique,base_morph_intermediate_reused,base_max_adjacent_signed_sample,base_max_adjacent_signed_rms,base_worst_circular32_minimum_rms,base_max_adjacent_magnitude_rms,base_max_adjacent_harmonic,base_max_adjacent_log_spectrum,base_layer_loop_flags,base_opll_register_write_counts,base_layer_detune,base_layer_micro_detune,current_scc_definitions,current_envelope_definitions,current_envelope_track_references,common_current_stft,common_current_harmonic,common_current_erb,common_current_attack,common_current_volume,common_current_transition,common_current_complexity,common_current_max_wave_sample,common_current_max_wave_aligned,common_current_max_wave_harmonic,common_current_max_wave_log_spectrum,common_current_max_wave_rms,common_current_max_transition,common_current_max_pcm_discontinuity,common_current_max_pcm_spectral_change,common_current_loop_entry,common_current_loop_boundary,common_current_loop_steady,common_current_total,completion,error,retained_candidate_ids,retained_score_targets_percent,retained_actual_score_gaps_percent\n";
     csv << std::setprecision(10);
 
     for (const auto duration : kDurations) {
+        if (durationFilter && duration != *durationFilter) continue;
         const auto source = makeFixture(duration);
         SourceAnalysisOptions analysisOptions;
         analysisOptions.reference_pitch_hz = kReferencePitchHz;
@@ -466,7 +467,21 @@ void run(const std::filesystem::path& outputDirectory,
             else csv << ",,";
             csv << ',';
             writeCommonMetrics(csv, currentCommonScore);
-            csv << ',' << static_cast<unsigned>(result.completion) << ',' << csvQuote(result.error) << '\n';
+            std::ostringstream candidateIds, targetGaps, actualGaps;
+            actualGaps << std::setprecision(10);
+            for (std::size_t i = 0; i < result.retained_candidates.size(); ++i) {
+                if (i) { candidateIds << ';'; targetGaps << ';'; actualGaps << ';'; }
+                const auto& candidate = result.retained_candidates[i];
+                candidateIds << candidate.candidate_id;
+                targetGaps << static_cast<unsigned>(candidate.target_score_increase_percent);
+                if (result.quality.total > 0)
+                    actualGaps << (candidate.quality.total / result.quality.total - 1) * 100;
+                else if (candidate.quality.total == 0) actualGaps << 0;
+                else actualGaps << "undefined";
+            }
+            csv << ',' << static_cast<unsigned>(result.completion) << ',' << csvQuote(result.error)
+                << ',' << csvQuote(candidateIds.str()) << ',' << csvQuote(targetGaps.str())
+                << ',' << csvQuote(actualGaps.str()) << '\n';
 
             if (result.composite_tone) {
                 const auto durationText = duration < 1.0 ? "0.25" : duration < 2.0 ? "1.0" : "2.0";
@@ -491,18 +506,24 @@ struct Arguments {
     std::filesystem::path output;
     std::vector<CompositeWavConfiguration> configurations;
     std::optional<std::filesystem::path> baseline;
+    std::optional<double> durationFilter;
 };
 Arguments parseArgs(int argc, char** argv) {
     std::filesystem::path output = "composite-wav-improvement-output";
     std::vector<CompositeWavConfiguration> configurations{CompositeWavConfiguration::Scc};
     bool haveExplicitConfig{};
     std::optional<std::filesystem::path> baseline;
+    std::optional<double> durationFilter;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--output" && i + 1 < argc) {
             output = argv[++i];
         } else if (arg == "--baseline" && i + 1 < argc) {
             baseline = argv[++i];
+        } else if (arg == "--duration" && i + 1 < argc) {
+            durationFilter = std::stod(argv[++i]);
+            if (std::find(kDurations.begin(), kDurations.end(), *durationFilter) == kDurations.end())
+                throw std::runtime_error("--duration must be 0.25, 1 or 2");
         } else if (arg == "--config" && i + 1 < argc) {
             if (!haveExplicitConfig) {
                 configurations.clear();
@@ -510,17 +531,17 @@ Arguments parseArgs(int argc, char** argv) {
             }
             configurations.push_back(parseConfiguration(argv[++i]));
         } else {
-            throw std::runtime_error("usage: benchmark [--output DIR] [--baseline DIR] [--config scc|scc_scc|scc_opll_rom|scc_opll_original ...]");
+            throw std::runtime_error("usage: benchmark [--output DIR] [--baseline DIR] [--duration 0.25|1|2] [--config scc|scc_scc|scc_opll_rom|scc_opll_original ...]");
         }
     }
-    return {output, configurations, baseline};
+    return {output, configurations, baseline, durationFilter};
 }
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const auto args = parseArgs(argc, argv);
-        run(args.output, args.configurations, args.baseline);
+        run(args.output, args.configurations, args.baseline, args.durationFilter);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "composite WAV improvement benchmark failed: " << error.what() << '\n';
