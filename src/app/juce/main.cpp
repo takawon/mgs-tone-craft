@@ -3029,7 +3029,8 @@ private:
             return;
         }
         auto& window = windowSlot(editor);
-        if (window == nullptr || !window->hasUnsavedChanges()) {
+        if (window == nullptr || !window->hasUnsavedChanges()
+            || editor == "scc-envelope" || editor == "opll-envelope") {
             if (window != nullptr) {
                 window->prepareToHide();
                 window->setVisible(false);
