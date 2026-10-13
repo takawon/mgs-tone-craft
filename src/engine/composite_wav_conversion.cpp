@@ -401,6 +401,20 @@ SavedTimbreReference referenceFor(CompositeTimbre& tone, const SccWaveform& wave
     return ref;
 }
 
+std::size_t sccSourceWaveformCount(const CompositeTimbre& tone) {
+    std::set<std::array<std::uint8_t, 32>> waves;
+    for (const auto& layer : tone.layers) {
+        if (layer.source != TimbreSource::Scc) continue;
+        if (layer.base_timbre) waves.insert(layer.base_timbre->scc_waveform);
+        for (const auto& event : layer.timbre_automation) {
+            if (event.kind != EnvelopeEventKind::Timbre) continue;
+            const auto* ref = findEmbeddedTimbreSnapshot(tone, event.target_library_id);
+            if (ref && ref->source == TimbreSource::Scc) waves.insert(ref->scc_waveform);
+        }
+    }
+    return waves.size();
+}
+
 void assignSourceNumbers(CompositeTimbre& tone, std::uint8_t start) {
     std::map<std::uint64_t, std::uint8_t> numbers;
     const auto assign = [&](SavedTimbreReference& ref) {
@@ -521,6 +535,22 @@ CompositeTimbre generateCandidate(const SourceAnalysis& analysis,
     const auto sustain = analysis.sustain_region;
     const bool loop = options.loop_mode == CompositeWavLoopMode::Automatic && sustain
         && sustain->confidence >= 0.5 && countAt(analysis, sustain->selection.begin) + 1 < keyoff;
+    // Seed a valid palette even when two independent SCC parts would exceed
+    // the source limit. Subsequent proposals are checked without modification
+    // by the evaluator; only constrained seeds reuse the closest prior source.
+    std::vector<SccWaveform> sourcePalette;
+    const auto sourceReference = [&](const SccWaveform& wave) {
+        if (!options.max_scc_source_waveforms) return referenceFor(tone, wave);
+        if (std::find(sourcePalette.begin(), sourcePalette.end(), wave) != sourcePalette.end())
+            return referenceFor(tone, wave);
+        if (sourcePalette.size() < *options.max_scc_source_waveforms) {
+            sourcePalette.push_back(wave);
+            return referenceFor(tone, wave);
+        }
+        const auto closest = std::min_element(sourcePalette.begin(), sourcePalette.end(),
+            [&](const auto& a, const auto& b) { return shapeDistance(wave, a) < shapeDistance(wave, b); });
+        return referenceFor(tone, *closest);
+    };
     for (std::size_t part = 0; part < (dualScc ? 2U : 1U); ++part) {
         const std::optional<std::size_t> wavePart = dualScc ? std::optional<std::size_t>(part)
             : opll && (strategy == CompositeWavStrategy::FundamentalResidual
@@ -535,7 +565,7 @@ CompositeTimbre generateCandidate(const SourceAnalysis& analysis,
         layer.envelope_timeline.length_counts = total;
         const auto first = waveAt(analysis, keyframes.front(), strategy,
             wavePart);
-        layer.base_timbre = referenceFor(tone, first.wave);
+        layer.base_timbre = sourceReference(first.wave);
         tone.layers.push_back(layer); // Reserve ID before event-only snapshots.
         auto& dest = tone.layers.back();
         EnvelopeEvent initial;
@@ -546,7 +576,7 @@ CompositeTimbre generateCandidate(const SourceAnalysis& analysis,
         for (std::size_t i = 1; i < keyframes.size(); ++i) {
             const auto shape = waveAt(analysis, keyframes[i], strategy,
                 wavePart);
-            auto ref = referenceFor(tone, shape.wave);
+            auto ref = sourceReference(shape.wave);
             if (!findEmbeddedTimbreSnapshot(tone, ref.library_id)) tone.embedded_timbres.push_back(ref);
             EnvelopeEvent event;
             event.kind = EnvelopeEventKind::Timbre;
@@ -1516,6 +1546,8 @@ CompositeWavConversionResult convertCompositeWave(
         || static_cast<unsigned>(options.loop_mode) > static_cast<unsigned>(CompositeWavLoopMode::None)
         || static_cast<unsigned>(options.scc_wave_method) > static_cast<unsigned>(CompositeWavSccWaveMethod::DirectPeriodic)
         || !options.max_scc_waveforms || options.max_scc_waveforms > 32
+        || (options.max_scc_source_waveforms
+            && (!*options.max_scc_source_waveforms || *options.max_scc_source_waveforms > 32))
         || !options.max_evaluations || options.max_evaluations > 4096
         || (options.scc_start_number && *options.scc_start_number > 31)
         || (options.fixed_opll_tone && *options.fixed_opll_tone > 14)
@@ -1712,6 +1744,9 @@ CompositeWavConversionResult convertCompositeWave(
             for (const auto index : diagnosticIndices) result.morph_candidates[index].reason = reason;
             return false;
         };
+        if (options.max_scc_source_waveforms
+            && sccSourceWaveformCount(candidate) > *options.max_scc_source_waveforms)
+            return reject("Unique SCC source waveform count exceeds the requested source limit");
         if (!comparingModes && result.composite_tone)
             invalidateChangedWavPlans(candidate, *result.composite_tone);
         candidate.scc_morph_algorithm_version = kSccMorphAlgorithmVersion;
@@ -1762,6 +1797,11 @@ CompositeWavConversionResult convertCompositeWave(
             if (!compiled->valid) return reject(compiled->error);
         }
         (void)seedSccMorphCache(candidate, compiled);
+        // Start normalization can promote an effective phase-aligned wave into
+        // an author source. Check the author result again before retaining it.
+        if (options.max_scc_source_waveforms
+            && sccSourceWaveformCount(candidate) > *options.max_scc_source_waveforms)
+            return reject("Normalized SCC source waveform count exceeds the requested source limit");
         const auto resources = resourcePlan(compiled->timbre);
         if (!resources.scc_waveforms || resources.scc_waveforms > options.max_scc_waveforms)
             return reject("Whole-composite SCC Bank requirement exceeds the requested waveform budget");

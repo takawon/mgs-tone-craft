@@ -1150,6 +1150,66 @@ void constantEnvelopeConversionRegressions() {
             "all returned fixed-volume candidates use no ENV");
 }
 
+std::size_t sourceWaveCount(const CompositeTimbre& tone) {
+    std::set<std::array<std::uint8_t, 32>> waves;
+    for (const auto& layer : tone.layers) {
+        if (layer.source != TimbreSource::Scc) continue;
+        if (layer.base_timbre) waves.insert(layer.base_timbre->scc_waveform);
+        for (const auto& event : layer.timbre_automation) {
+            if (event.kind != EnvelopeEventKind::Timbre) continue;
+            const auto* ref = findEmbeddedTimbreSnapshot(tone, event.target_library_id);
+            require(ref && ref->source == TimbreSource::Scc, "SCC source reference resolves");
+            waves.insert(ref->scc_waveform);
+        }
+    }
+    return waves.size();
+}
+
+void sourceLimitRegressions() {
+    const auto analysis = fixture();
+    CompositeWavConversionOptions options;
+    options.max_scc_waveforms = 16;
+    options.max_evaluations = 48;
+    options.loop_mode = CompositeWavLoopMode::None;
+    require(!options.max_scc_source_waveforms, "default source limit is automatic");
+    for (const auto configuration : {CompositeWavConfiguration::Scc, CompositeWavConfiguration::SccScc,
+            CompositeWavConfiguration::SccOpllRom, CompositeWavConfiguration::SccOpllOriginal}) {
+        options.configuration = configuration;
+        options.fixed_opll_tone = 0;
+        for (const std::size_t limit : {1U, 2U}) {
+            options.max_scc_source_waveforms = limit;
+            const auto result = convertCompositeWave(analysis, options);
+            validate(result, configuration == CompositeWavConfiguration::Scc ? 1 : 2, 16);
+            require(sourceWaveCount(*result.composite_tone) <= limit,
+                "winner respects whole-composite unique source cap after search");
+            for (const auto& retained : result.retained_candidates)
+                require(sourceWaveCount(retained.tone) <= limit,
+                    "all retained alternatives respect the source cap");
+            if (configuration == CompositeWavConfiguration::SccScc && limit == 1) {
+                require(result.composite_tone->layers[0].base_timbre->scc_waveform
+                    == result.composite_tone->layers[1].base_timbre->scc_waveform,
+                    "one source definition can be shared by two physical channels");
+            }
+        }
+    }
+    options.configuration = CompositeWavConfiguration::Scc;
+    options.max_evaluations = 18;
+    options.max_scc_source_waveforms.reset();
+    const auto automatic = convertCompositeWave(analysis, options);
+    options.max_scc_source_waveforms = 32;
+    const auto unrestricted = convertCompositeWave(analysis, options);
+    require(automatic.composite_tone == unrestricted.composite_tone
+        && automatic.preview.mono_pcm == unrestricted.preview.mono_pcm
+        && automatic.evaluations == unrestricted.evaluations,
+        "nonbinding source limit preserves automatic search and PCM");
+    for (const std::size_t invalid : {0U, 33U}) {
+        options.max_scc_source_waveforms = invalid;
+        const auto result = convertCompositeWave(analysis, options);
+        require(!result.composite_tone && result.evaluations == 0 && !result.error.empty(),
+            "invalid source limits are rejected before evaluation");
+    }
+}
+
 void run() {
     const auto analysis = fixture();
     const auto sourceBefore = analysis->source->interleaved_samples;
@@ -1272,6 +1332,7 @@ int main() {
     check("normalized candidate refill", normalizedCandidateRefillRegressions);
     check("score spaced candidates", scoreSpacedCandidateRegressions);
     check("existing conversion", run);
+    check("whole-composite SCC source limit", sourceLimitRegressions);
     check("local discontinuity", localDiscontinuityRegressions);
     check("waveform methods", waveformMethodRegressions);
     check("latent zero wave", latentZeroWaveRegressions);

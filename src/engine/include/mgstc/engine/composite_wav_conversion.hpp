@@ -33,6 +33,9 @@ struct CompositeWavConversionOptions {
     CompositeWavLoopMode loop_mode{CompositeWavLoopMode::Automatic};
     CompositeWavSccWaveMethod scc_wave_method{CompositeWavSccWaveMethod::Reconstructed};
     std::size_t max_scc_waveforms{16};
+    // Unique author/source waveforms across all SCC layers, excluding generated
+    // morph intermediates and phase variants. Unset preserves automatic search.
+    std::optional<std::size_t> max_scc_source_waveforms;
     // Selected by the composite editor's allocation control, not duplicated UI.
     std::optional<std::uint8_t> scc_start_number;
     std::optional<std::uint8_t> fixed_opll_tone; // MGSTC ROM @0..14.
