@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "mgstc/engine/scc_waveform.hpp"
+#include "mgstc/engine/composite_modulation.hpp"
 
 namespace mgstc::engine {
 namespace {
@@ -63,7 +64,8 @@ bool layerUsesSequenceEnvelope(const CompositeLayer& layer) noexcept {
     if (layer.volume_envelope.kind != EnvelopeKind::Sequence) {
         return false;
     }
-    if (layer.volume_modulation.enabled || layer.pitch_modulation.enabled
+    if (!layer.modulation_profiles.empty() || !layer.register_auto_profiles.empty()
+        || layer.volume_modulation.enabled || layer.pitch_modulation.enabled
         || layer.opll_tl_modulation.enabled || layer.opll_fb_modulation.enabled
         || layer.opll_tl_auto.active() || layer.opll_fb_auto.active()) {
         return true;
@@ -287,6 +289,9 @@ std::optional<std::size_t> duplicateCompositeLayer(
     // TL/FB auto is chip-wide exclusive; the original keeps ownership.
     layer.opll_tl_auto = {};
     layer.opll_fb_auto = {};
+    layer.register_auto_profiles.clear();
+    disableCompositeModulation(layer, CompositeModulationTarget::TotalLevel);
+    disableCompositeModulation(layer, CompositeModulationTarget::Feedback);
     layer.envelope_number = layer.volume_envelope.kind == EnvelopeKind::Rate
             || layerUsesSequenceEnvelope(layer)
         ? nextFreeEnvelopeNumber(timbre) : 0;
@@ -454,20 +459,39 @@ const SavedTimbreReference* findEmbeddedTimbreSnapshot(
     return nullptr;
 }
 
-TimbreNumberResolution resolveTimbreNumbers(
+namespace {
+
+TimbreNumberResolution resolveTimbreNumbersImpl(
     const CompositeTimbre& timbre,
     std::uint8_t minimum_number,
-    std::uint8_t maximum_number) {
+    std::uint8_t maximum_number,
+    bool use_session_starts) {
     TimbreNumberResolution result;
     if (minimum_number > maximum_number) {
         result.warnings.emplace_back(
             "Timbre number range is invalid");
         return result;
     }
+    const auto starts = use_session_starts
+        ? timbre.original_timbre_allocation_starts
+        : std::optional<OriginalTimbreAllocationStarts>{};
+    if (starts && (starts->scc > 31 || starts->opll < 16 || starts->opll > 31)) {
+        result.warnings.emplace_back(
+            "Original timbre allocation starts must be SCC @0..@31 and OPLL @16..@31");
+        return result;
+    }
+    const auto automatic_minimum = [&](TimbreSource source) {
+        if (starts) {
+            if (source == TimbreSource::Scc) return starts->scc;
+            if (source == TimbreSource::Opll) return starts->opll;
+        }
+        return minimum_number;
+    };
 
     using TimbreKey = std::pair<TimbreSource, std::uint64_t>;
     std::map<TimbreKey, std::uint8_t> assigned;
     std::array<std::map<std::uint8_t, std::uint64_t>, 3> occupied;
+    std::map<std::array<std::uint8_t, 32>, std::uint8_t> scc_wave_numbers;
 
     const auto in_range = [&](TimbreSource source, std::uint8_t number) {
         return number <= maximum_number
@@ -491,6 +515,8 @@ TimbreNumberResolution resolveTimbreNumbers(
                 .number = number,
                 .manually_assigned = manual,
             });
+        if (starts && reference.source == TimbreSource::Scc)
+            scc_wave_numbers.try_emplace(reference.scc_waveform, number);
     };
 
     for (std::size_t index = 0;
@@ -593,6 +619,27 @@ TimbreNumberResolution resolveTimbreNumbers(
         }
     }
 
+    // Report the same allocator's demand and initial free pool, including
+    // failed attempts. Shared references require only one automatic slot.
+    for (const auto source : {TimbreSource::Scc, TimbreSource::Opll}) {
+        TimbreAutomaticAllocationCapacity capacity;
+        capacity.source = source;
+        capacity.start = automatic_minimum(source);
+        for (unsigned int number = capacity.start; number <= maximum_number; ++number)
+            if (!occupied[sourceIndex(source)].contains(static_cast<std::uint8_t>(number)))
+                ++capacity.available;
+        result.automatic_allocations.push_back(capacity);
+    }
+    std::map<TimbreKey, bool> automatic_demand;
+    std::map<std::array<std::uint8_t, 32>, bool> scc_wave_demand;
+    const auto require_automatic_slot = [&](const TimbreKey& key, const SavedTimbreReference* reference) {
+        if (!automatic_demand.emplace(key, true).second) return;
+        if (starts && reference && reference->source == TimbreSource::Scc
+            && !scc_wave_demand.emplace(reference->scc_waveform, true).second) return;
+        for (auto& capacity : result.automatic_allocations)
+            if (capacity.source == key.first) ++capacity.required;
+    };
+
     for (std::size_t index = 0;
          index < timbre.layers.size();
          ++index) {
@@ -632,9 +679,17 @@ TimbreNumberResolution resolveTimbreNumbers(
             }
             continue;
         }
+        if (starts && reference.source == TimbreSource::Scc) {
+            const auto shared = scc_wave_numbers.find(reference.scc_waveform);
+            if (shared != scc_wave_numbers.end()) {
+                assign(index, reference, shared->second, false);
+                continue;
+            }
+        }
+        require_automatic_slot(key, &reference);
         const auto source = sourceIndex(reference.source);
         std::optional<std::uint8_t> available;
-        for (unsigned int candidate = minimum_number;
+        for (unsigned int candidate = automatic_minimum(reference.source);
              candidate <= maximum_number;
              ++candidate) {
             const auto number =
@@ -672,9 +727,18 @@ TimbreNumberResolution resolveTimbreNumbers(
             if (assigned.contains(key)) {
                 continue;
             }
+            const auto* snapshot = findEmbeddedTimbreSnapshot(timbre, event.target_library_id);
+            if (starts && layer.source == TimbreSource::Scc && snapshot && snapshot->source == layer.source) {
+                const auto shared = scc_wave_numbers.find(snapshot->scc_waveform);
+                if (shared != scc_wave_numbers.end()) {
+                    assign(index, *snapshot, shared->second, false);
+                    continue;
+                }
+            }
+            require_automatic_slot(key, snapshot);
             const auto source = sourceIndex(layer.source);
             std::optional<std::uint8_t> available;
-            for (unsigned int candidate = minimum_number;
+            for (unsigned int candidate = automatic_minimum(layer.source);
                  candidate <= maximum_number;
                  ++candidate) {
                 const auto number =
@@ -693,6 +757,7 @@ TimbreNumberResolution resolveTimbreNumbers(
             SavedTimbreReference reference;
             reference.library_id = event.target_library_id;
             reference.source = layer.source;
+            if (snapshot && snapshot->source == layer.source) reference.scc_waveform = snapshot->scc_waveform;
             assign(index, reference, *available, false);
         }
     }
@@ -704,6 +769,17 @@ TimbreNumberResolution resolveTimbreNumbers(
             return left.layer_index < right.layer_index;
         });
     return result;
+}
+
+} // namespace
+
+TimbreNumberResolution resolveTimbreNumbers(const CompositeTimbre& timbre) {
+    return resolveTimbreNumbersImpl(timbre, 15, 31, true);
+}
+
+TimbreNumberResolution resolveTimbreNumbers(const CompositeTimbre& timbre,
+    std::uint8_t minimum_number, std::uint8_t maximum_number) {
+    return resolveTimbreNumbersImpl(timbre, minimum_number, maximum_number, false);
 }
 
 bool reconcileLayerTimbreIdentity(
@@ -887,9 +963,10 @@ bool layerEnvelopeNeedsOriginalToneRestore(
     if (layerUsesOpllRomBase(layer) || !layer.base_timbre) {
         return false;
     }
-    if (layer.opll_tl_auto.active() || layer.opll_fb_auto.active()
-        || layer.opll_tl_modulation.enabled
-        || layer.opll_fb_modulation.enabled) {
+    if (compositeHasRegisterAuto(layer, OpllRegisterAutoTarget::TotalLevel)
+        || compositeHasRegisterAuto(layer, OpllRegisterAutoTarget::Feedback)
+        || compositeHasModulation(layer, CompositeModulationTarget::TotalLevel)
+        || compositeHasModulation(layer, CompositeModulationTarget::Feedback)) {
         return true;
     }
     for (const auto& event : layer.timbre_automation) {

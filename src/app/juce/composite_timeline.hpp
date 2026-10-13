@@ -132,9 +132,13 @@ public:
     void setLfoPollKeysCallback(LfoPollKeysCallback callback);
     void setEditorSession(EditorSession* session) noexcept;
     void setPlaybackTempo(int tempo_bpm);
+    void applySessionAllocationStarts(engine::CompositeTimbre& timbre) const;
     void setTimbre(
         const engine::CompositeTimbre& timbre,
         bool reset_scroll_extent = false);
+    // Shared commands used by timeline gestures and keyboard/menu actions.
+    [[nodiscard]] bool setLoopStart(std::size_t layer, int count);
+    void clearLoop(std::size_t layer);
     void cancelPendingDialogs();
     void refreshUiScaleFonts();
     void setInspectorVisible(bool visible);

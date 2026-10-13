@@ -5,6 +5,7 @@
 #include "plugin_editor_context.hpp"
 #include "mgstc_editor_view.hpp"
 #include "ui_layout.hpp"
+#include "tone_library_session.hpp"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,8 @@
 #include "mgstc/engine/chip_rack.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
+#include "mgstc/engine/composite_envelope_compile.hpp"
+#include "mgstc/engine/envelope_sequence.hpp"
 #include "plugin_state.hpp"
 #include "mgstc/engine/dc_blocker.hpp"
 #include "mgstc/engine/engine_core.hpp"
@@ -92,6 +95,40 @@ struct CompositeEditorComponentTestAccess {
         return editor.last_audition_note_;
     }
     static const mgstc::engine::CompositeTimbre& sound(const CompositeEditorComponent& editor) { return editor.timbre_; }
+    static juce::ComboBox* originalAllocationCombo(
+        CompositeEditorComponent& editor, int item_count) {
+        const auto find = [item_count](const auto& self, juce::Component& parent) -> juce::ComboBox* {
+            for (int index = 0; index < parent.getNumChildComponents(); ++index) {
+                auto* child = parent.getChildComponent(index);
+                auto* combo = dynamic_cast<juce::ComboBox*>(child);
+                if (combo != nullptr && combo->getNumItems() == item_count
+                    && combo->getItemText(0) == (item_count == 32 ? "@0" : "@16")
+                    && combo->getItemText(item_count - 1) == "@31") return combo;
+                if (auto* found = self(self, *child)) return found;
+            }
+            return nullptr;
+        };
+        return find(find, editor.timeline_);
+    }
+    static void setOriginalAllocationStart(
+        CompositeEditorComponent& editor, int item_count, int number) {
+        auto* combo = originalAllocationCombo(editor, item_count);
+        if (combo == nullptr)
+            throw std::runtime_error("original allocation selector is missing");
+        combo->setSelectedId(number + 1, juce::sendNotificationSync);
+    }
+    static int originalAllocationStart(
+        CompositeEditorComponent& editor, int item_count) {
+        auto* combo = originalAllocationCombo(editor, item_count);
+        return combo == nullptr ? -1 : combo->getSelectedId() - 1;
+    }
+    static bool setLoopStart(CompositeEditorComponent& editor, std::size_t layer,
+                             int count) {
+        return editor.timeline_.setLoopStart(layer, count);
+    }
+    static void clearLoop(CompositeEditorComponent& editor, std::size_t layer) {
+        editor.timeline_.clearLoop(layer);
+    }
     static bool wavEnabled(const CompositeEditorComponent& editor) { return editor.import_wave_.isEnabled(); }
     static bool hasWaveConversionCaption(const CompositeEditorComponent& editor) {
         return editor.import_wave_.getButtonText() == juce::String::fromUTF8("WAV変換");
@@ -107,6 +144,13 @@ struct CompositeEditorComponentTestAccess {
     static const mgstc::engine::CompositeTimbre& wavePreview(const CompositeEditorComponent& editor) { return *editor.wave_conversion_preview_; }
     static void undo(CompositeEditorComponent& editor) { editor.undo(); }
     static void redo(CompositeEditorComponent& editor) { editor.redo(); }
+    static void restoreHostState(CompositeEditorComponent& editor,
+        const mgstc::engine::CompositeTimbre& sound) {
+        editor.restoreHostState(sound);
+    }
+    static void recordHistory(CompositeEditorComponent& editor) {
+        editor.recordHistory();
+    }
     static bool matches(const CompositeEditorComponent& editor, const mgstc::engine::CompositeTimbre& snapshot) {
         return editor.waveConversionSnapshotMatches(snapshot, {});
     }
@@ -3192,6 +3236,15 @@ std::string soundBytes(const mgstc::engine::CompositeTimbre& timbre) {
     return mgstc::engine::serializeCompositeSoundPayload(timbre);
 }
 
+// Author-state restoration must retain every sound/metadata field, while
+// allocation starts belong to the current editor and are never saved.
+bool sameAuthoringSound(mgstc::engine::CompositeTimbre left,
+                       mgstc::engine::CompositeTimbre right) {
+    left.original_timbre_allocation_starts.reset();
+    right.original_timbre_allocation_starts.reset();
+    return left == right;
+}
+
 mgstc::engine::CompositeTimbre psgOnlyTimbre() {
     auto timbre = mgstc::engine::defaultCompositeTimbre();
     timbre.name = "PSG only";
@@ -3624,22 +3677,32 @@ void testSccMorphPluginStateCompatibility() {
     layer.opll_tl_modulation = {};
     layer.opll_fb_modulation = {};
     document.sound.embedded_timbres.clear();
-    // One event-free layer: v22 adds two allocation bytes before the embedded
-    // count; no manual start is present in this legacy-mode fixture.
+    // One event-free layer: v24 adds three empty profile/placement vector
+    // counts before the embedded count; v22 adds two allocation bytes there.
+    // No manual start or event fields are present in this legacy-mode fixture.
     layer.scc_output_allocation = SccOutputAllocationMode::LegacyBank;
     layer.scc_output_start.reset();
     const auto original = toBytes(soundBytes(document.sound));
     const auto framed = mgstc::plugin::serializePluginState(document);
     // v21 adds only the five global morph bytes.
     // v20 adds four six-byte modulation settings before the embedded count.
-    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3}, std::uint8_t{4}}) {
+    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3}, std::uint8_t{4}, std::uint8_t{5}}) {
         auto legacy = original;
-        require(legacy.size() >= 33, "legacy sound fixture tail exists");
+        require(legacy.size() >= 45, "legacy sound fixture tail exists");
+        legacy.erase(legacy.end() - 21, legacy.end() - 9);
         if (version <= 3) legacy.erase(legacy.end() - 11, legacy.end() - 9);
         if (version <= 2) legacy.resize(legacy.size() - 5);
         if (version == 1) {
             legacy.erase(legacy.end() - 28, legacy.end() - 4);
         }
+        std::string legacy_error;
+        const auto legacy_sound = deserializeCompositeSoundPayload(
+            std::string(legacy.begin(), legacy.end()), version, &legacy_error);
+        if (!legacy_sound) {
+            std::fprintf(stderr, "legacy sound payload v%u fixture: %s\n",
+                static_cast<unsigned>(version), legacy_error.c_str());
+        }
+        require(legacy_sound.has_value(), "legacy sound payload fixture is valid");
         auto blob = replacePayload(framed, original, legacy);
         const auto found = std::search(blob.begin(), blob.end(), legacy.begin(), legacy.end());
         require(found != blob.end(), "legacy payload framed");
@@ -3648,8 +3711,12 @@ void testSccMorphPluginStateCompatibility() {
         blob[at - 8] = version;
         blob[at - 7] = blob[at - 6] = blob[at - 5] = 0;
         const auto parsed = mgstc::plugin::parsePluginState(blob.data(), blob.size());
+        if (parsed.status != mgstc::plugin::PluginStateStatus::Ok) {
+            std::fprintf(stderr, "legacy plugin sound payload v%u status=%u\n",
+                static_cast<unsigned>(version), static_cast<unsigned>(parsed.status));
+        }
         require(parsed.status == mgstc::plugin::PluginStateStatus::Ok,
-                "legacy v1/v2/v3/v4 plugin sound payload readable");
+                "legacy v1/v2/v3/v4/v5 plugin sound payload readable");
         auto expected_legacy_sound = document.sound;
         if (version <= 2) expected_legacy_sound.scc_morph_algorithm_version = 1;
         require(soundBytes(parsed.document.sound) == soundBytes(expected_legacy_sound),
@@ -4027,7 +4094,7 @@ void testEditorParityCorrections() {
         == mgstc::engine::encodeOpllPatch(patch), "OPLL destination gets converted bytes");
     require(EditorAccess::historySize(component) == history + 1, "conversion is one undo transaction");
     EditorAccess::undo(component);
-    require(EditorAccess::sound(component) == original, "conversion undo restores original");
+    require(sameAuthoringSound(EditorAccess::sound(component), original), "conversion undo restores original");
     auto no_opll = sccOnlyTimbre();
     no_opll.layers[0].envelope_number = 2;
     component.restoreHostState(no_opll);
@@ -4040,7 +4107,7 @@ void testEditorParityCorrections() {
         "added OPLL channel uses a free envelope number");
     require(EditorAccess::historySize(component) == 2, "add and candidate replacement are one undo transaction");
     EditorAccess::undo(component);
-    require(EditorAccess::sound(component) == no_opll, "one undo removes added OPLL channel");
+    require(sameAuthoringSound(EditorAccess::sound(component), no_opll), "one undo removes added OPLL channel");
     {
         const auto open = [](const juce::String&, std::optional<std::uint64_t>) {};
         mgstc::app::SccEditorComponent scc_editor(context, link, open, [] {},
@@ -4600,7 +4667,7 @@ void testCompositeWavSourceImportTransactions() {
     content.reset();
     pending->released.store(true);
     juce::MessageManager::getInstance()->runDispatchLoopUntil(60);
-    require(!applied && processor.copyPluginState().sound == authoring,
+    require(!applied && sameAuthoringSound(processor.copyPluginState().sound, authoring),
         "source inspection/failure/cancellation/editor close never applies or changes VST3 authoring state");
 }
 
@@ -4626,7 +4693,7 @@ void testCompositeWavUiTransactions() {
     // before taking the authoring-state baseline for this transaction test.
     juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
     const auto before = EditorAccess::sound(editor);
-    require(processor.copyPluginState().sound == before,
+    require(sameAuthoringSound(processor.copyPluginState().sound, before),
         "editor baseline begins from the committed VST3 Plugin State");
     auto converted = sccOnlyTimbre(); converted.name = "WAV result";
     const auto history_before = EditorAccess::historySize(editor);
@@ -4683,8 +4750,8 @@ void testCompositeWavUiTransactions() {
         }
         UiScale::setActivePercent(old_scale);
     }
-    require(EditorAccess::sound(editor) == before && EditorAccess::historySize(editor) == history_before
-            && processor.copyPluginState().sound == before,
+    require(sameAuthoringSound(EditorAccess::sound(editor), before) && EditorAccess::historySize(editor) == history_before
+            && sameAuthoringSound(processor.copyPluginState().sound, before),
         "closing converter without Apply preserves complete authoring state and history");
     require(EditorAccess::matches(editor, before), "unchanged conversion snapshot accepted");
     EditorAccess::editName(editor, "Changed while converting");
@@ -4693,20 +4760,20 @@ void testCompositeWavUiTransactions() {
     EditorAccess::editName(editor, before.name);
     processEmpty(processor, 512);
     EditorAccess::applyWave(editor, converted);
-    require(EditorAccess::sound(editor) == converted && EditorAccess::sound(editor).layers.size() == 1,
+    require(sameAuthoringSound(EditorAccess::sound(editor), converted) && EditorAccess::sound(editor).layers.size() == 1,
         "WAV Apply fully replaces all old channels");
-    require(processor.copyPluginState().sound == converted,
+    require(sameAuthoringSound(processor.copyPluginState().sound, converted),
         "shared editor Apply publishes converted sound into VST3 Plugin State");
     processEmpty(processor, 512);
     require(EditorAccess::historySize(editor) == history_before + 1, "WAV replacement is one history operation");
     EditorAccess::undo(editor);
-    require(EditorAccess::sound(editor) == before, "Undo restores all previous authoring data");
-    require(processor.copyPluginState().sound == before,
+    require(sameAuthoringSound(EditorAccess::sound(editor), before), "Undo restores all previous authoring data");
+    require(sameAuthoringSound(processor.copyPluginState().sound, before),
         "Undo republishes the previous complete sound into VST3 Plugin State");
     processEmpty(processor, 512);
     EditorAccess::redo(editor);
-    require(EditorAccess::sound(editor) == converted, "Redo restores entire converted data");
-    require(processor.copyPluginState().sound == converted,
+    require(sameAuthoringSound(EditorAccess::sound(editor), converted), "Redo restores entire converted data");
+    require(sameAuthoringSound(processor.copyPluginState().sound, converted),
         "Redo republishes the converted sound into VST3 Plugin State");
     processEmpty(processor, 512);
 }
@@ -4795,7 +4862,7 @@ void testCompositeStepSlideVstTransactions() {
     step_button->setToggleState(true, juce::dontSendNotification);
     step_button->onClick();
     require(step_button->getToggleState()
-            && EditorAccess::sound(editor) == initial_sound
+            && sameAuthoringSound(EditorAccess::sound(editor), initial_sound)
             && EditorAccess::historySize(editor) == initial_history
             && sameBlock(initial_state, stateBytes(processor)),
         "toggling step edit mode changes no authoring data, history, or Plugin State");
@@ -4808,7 +4875,7 @@ void testCompositeStepSlideVstTransactions() {
     step_button->onClick();
     require(step_button->getToggleState()
             && sameBlock(initial_state, stateBytes(processor))
-            && EditorAccess::sound(editor) == initial_sound,
+            && sameAuthoringSound(EditorAccess::sound(editor), initial_sound),
         "step edit mode can be enabled without changing authoring data");
 
     const auto pointFor = [&](int count, int lane_y) {
@@ -4848,7 +4915,7 @@ void testCompositeStepSlideVstTransactions() {
     const auto command_to = pointFor(8, command_y);
     const auto untouched_layer = initial_sound.layers.at(1);
     drag(command_from, command_to, false, false);
-    require(EditorAccess::sound(editor) == initial_sound
+    require(sameAuthoringSound(EditorAccess::sound(editor), initial_sound)
             && sameBlock(initial_state, stateBytes(processor))
             && EditorAccess::historySize(editor) == initial_history,
         "step slide candidate remains local to the timeline until mouse-up");
@@ -4873,7 +4940,7 @@ void testCompositeStepSlideVstTransactions() {
         "one completed 命令-row slide publishes one VST Plugin State transaction");
     EditorAccess::undo(editor);
     processEmpty(processor, 512);
-    require(EditorAccess::sound(editor) == initial_sound
+    require(sameAuthoringSound(EditorAccess::sound(editor), initial_sound)
             && sameBlock(initial_state, stateBytes(processor)),
         "Undo restores the entire pre-slide VST sound and state");
     EditorAccess::redo(editor);
@@ -4948,7 +5015,7 @@ void testCompositeStepSlideVstTransactions() {
     const auto cancel_sound = EditorAccess::sound(editor);
     const auto cancel_history = EditorAccess::historySize(editor);
     drag(volume_from, volume_to, true, false);
-    require(EditorAccess::sound(editor) == cancel_sound
+    require(sameAuthoringSound(EditorAccess::sound(editor), cancel_sound)
             && sameBlock(before_cancel, stateBytes(processor))
             && EditorAccess::historySize(editor) == cancel_history,
         "Ctrl-drag works with mode off while its individual-row candidate remains local");
@@ -4956,7 +5023,7 @@ void testCompositeStepSlideVstTransactions() {
         "Escape is consumed while cancelling a provisional step slide");
     timeline_impl->mouseUp(eventAt(timeline_impl, volume_to, volume_from,
         true, true));
-    require(EditorAccess::sound(editor) == cancel_sound
+    require(sameAuthoringSound(EditorAccess::sound(editor), cancel_sound)
             && sameBlock(before_cancel, stateBytes(processor))
             && EditorAccess::historySize(editor) == cancel_history,
         "Escape cancels Ctrl-drag without changing VST state or history");
@@ -4972,7 +5039,7 @@ void testCompositeStepSlideVstTransactions() {
                 != cancel_sound.layers[0].volume_envelope.events
             && volume_edited.layers[1] == cancel_sound.layers[1]
             && EditorAccess::historySize(editor) == cancel_history + 1
-            && processor.copyPluginState().sound == volume_edited,
+            && sameAuthoringSound(processor.copyPluginState().sound, volume_edited),
         "Ctrl-drag commits one individual-row edit without moving END, pitch, or another channel");
 
     MgstcAudioProcessor restored;
@@ -4987,9 +5054,586 @@ void testCompositeStepSlideVstTransactions() {
         [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, saved_document.sound);
     EditorAccess::size(reopened, 1600, 1050);
     juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
-    require(EditorAccess::sound(reopened) == volume_edited
-            && restored.copyPluginState().sound == volume_edited,
+    require(sameAuthoringSound(EditorAccess::sound(reopened), volume_edited)
+            && sameAuthoringSound(restored.copyPluginState().sound, volume_edited),
         "VST Plugin State and a recreated shared editor preserve step-slide results");
+}
+
+void testCompositeLoopVstTransactions() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+
+    auto original = mgstc::engine::defaultCompositeTimbre();
+    original.layers = {opllOnlyTimbre().layers.front()};
+    auto& layer = original.layers.front();
+    layer.envelope_timeline.length_counts = 24;
+    layer.envelope_timeline.loop_start_count.reset();
+    layer.envelope_timeline.loop_end_count.reset();
+    layer.pitch_envelope.kind = mgstc::engine::EnvelopeKind::Sequence;
+    using Event = mgstc::engine::EnvelopeEvent;
+    using Kind = mgstc::engine::EnvelopeEventKind;
+    const auto pitch = [](std::uint32_t count, std::int32_t value, bool after,
+                          std::uint32_t order = 0) {
+        Event event;
+        event.kind = Kind::Pitch;
+        event.count = count;
+        event.value = value;
+        event.after_loop_start = after;
+        event.command_order = order;
+        return event;
+    };
+    const auto write = [](std::uint32_t count, std::int32_t reg,
+                          std::int32_t data, bool after,
+                          std::uint32_t order = 0) {
+        Event event;
+        event.kind = Kind::RegisterWrite;
+        event.count = count;
+        event.value = reg;
+        event.secondary = data;
+        event.after_loop_start = after;
+        event.command_order = order;
+        return event;
+    };
+    layer.pitch_envelope.events = {
+        pitch(4, -2, false), pitch(4, 3, true),
+        pitch(10, 5, false), pitch(10, -7, true),
+    };
+    layer.timbre_automation = {
+        write(4, 0x20, 0x11, false), write(4, 0x20, 0x12, true),
+        write(10, 0x20, 0x21, false), write(10, 0x20, 0x22, true),
+    };
+
+    require(processor.replacePluginState(documentFrom(original, 0, {})),
+        "seed VST loop transaction state");
+    processEmpty(processor, 512);
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {}, [] {},
+        [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, original);
+    EditorAccess::size(editor, 1600, 1050);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+
+    const auto no_loop = EditorAccess::sound(editor);
+    const auto no_loop_state = stateBytes(processor);
+    const auto history_before = EditorAccess::historySize(editor);
+    require(EditorAccess::setLoopStart(editor, 0, 4),
+        "VST shared timeline accepts a loop start at an authored step");
+    processEmpty(processor, 512);
+    const auto started = EditorAccess::sound(editor);
+    const auto start_state = stateBytes(processor);
+    require(started.layers[0].envelope_timeline.loop_start_count == 4
+            && started.layers[0].envelope_timeline.loop_end_count == 24,
+        "setting the first loop start defaults the end marker to END");
+    require(EditorAccess::historySize(editor) == history_before + 1
+            && sameAuthoringSound(processor.copyPluginState().sound, started)
+            && !sameBlock(no_loop_state, start_state),
+        "loop start is one committed VST authoring and Plugin State transaction");
+    EditorAccess::undo(editor);
+    processEmpty(processor, 512);
+    require(sameAuthoringSound(EditorAccess::sound(editor), no_loop)
+            && sameAuthoringSound(processor.copyPluginState().sound, no_loop)
+            && sameBlock(no_loop_state, stateBytes(processor)),
+        "Undo restores the complete pre-loop VST sound and serialized state");
+    EditorAccess::redo(editor);
+    processEmpty(processor, 512);
+    require(sameAuthoringSound(EditorAccess::sound(editor), started)
+            && sameAuthoringSound(processor.copyPluginState().sound, started)
+            && sameBlock(start_state, stateBytes(processor)),
+        "Redo restores the auto-END loop start and serialized VST state");
+    const auto history_after_start = EditorAccess::historySize(editor);
+
+    require(EditorAccess::setLoopStart(editor, 0, 10),
+        "VST shared timeline accepts moving the loop start");
+    processEmpty(processor, 512);
+    const auto moved = EditorAccess::sound(editor);
+    const auto moved_state = stateBytes(processor);
+    require(moved.layers[0].envelope_timeline.loop_start_count == 10
+            && moved.layers[0].envelope_timeline.loop_end_count == 24,
+        "moving loop start preserves the existing END marker");
+    require(moved.layers[0].pitch_envelope.events == std::vector<Event>{
+                pitch(4, -2, false, 2), pitch(4, 3, false, 4),
+                pitch(10, 5, true, 2), pitch(10, -7, true, 4)}
+            && moved.layers[0].timbre_automation == std::vector<Event>{
+                write(4, 0x20, 0x11, false, 1), write(4, 0x20, 0x12, false, 3),
+                write(10, 0x20, 0x21, true, 1), write(10, 0x20, 0x22, true, 3)},
+        "moving the start puts every destination pitch and y command inside without merging or reordering");
+    require(sameAuthoringSound(processor.copyPluginState().sound, moved),
+        "moved loop and command zones are published to the VST processor");
+    require(EditorAccess::historySize(editor) == history_after_start + 1,
+        "moving the loop start is one VST Undo transaction");
+    EditorAccess::undo(editor);
+    processEmpty(processor, 512);
+    require(sameAuthoringSound(EditorAccess::sound(editor), started)
+            && sameAuthoringSound(processor.copyPluginState().sound, started)
+            && sameBlock(start_state, stateBytes(processor)),
+        "Undo restores the prior loop boundary and destination command zones");
+    EditorAccess::redo(editor);
+    processEmpty(processor, 512);
+    require(sameAuthoringSound(EditorAccess::sound(editor), moved)
+            && sameAuthoringSound(processor.copyPluginState().sound, moved)
+            && sameBlock(moved_state, stateBytes(processor)),
+        "Redo restores the moved boundary and exact command order");
+    const auto history_after_move = EditorAccess::historySize(editor);
+
+    EditorAccess::clearLoop(editor, 0);
+    processEmpty(processor, 512);
+    const auto cleared = EditorAccess::sound(editor);
+    const auto cleared_state = stateBytes(processor);
+    require(!cleared.layers[0].envelope_timeline.loop_start_count
+            && !cleared.layers[0].envelope_timeline.loop_end_count,
+        "clearing the loop removes both markers");
+    require(cleared.layers[0].pitch_envelope.events == std::vector<Event>{
+                pitch(4, -2, false, 2), pitch(4, 3, false, 4),
+                pitch(10, 5, false, 2), pitch(10, -7, false, 4)}
+            && cleared.layers[0].timbre_automation == std::vector<Event>{
+                write(4, 0x20, 0x11, false, 1), write(4, 0x20, 0x12, false, 3),
+                write(10, 0x20, 0x21, false, 1), write(10, 0x20, 0x22, false, 3)},
+        "clearing the loop flattens before/after in order and preserves relative pitch and y commands");
+    require(sameAuthoringSound(processor.copyPluginState().sound, cleared),
+        "cleared loop and flattened commands are committed to VST Plugin State");
+    require(EditorAccess::historySize(editor) == history_after_move + 1,
+        "clearing the loop is one VST Undo transaction");
+    EditorAccess::undo(editor);
+    processEmpty(processor, 512);
+    require(sameAuthoringSound(EditorAccess::sound(editor), moved)
+            && sameAuthoringSound(processor.copyPluginState().sound, moved)
+            && sameBlock(moved_state, stateBytes(processor)),
+        "Undo restores the loop and its ordered command zones after clear");
+    EditorAccess::redo(editor);
+    processEmpty(processor, 512);
+    require(sameAuthoringSound(EditorAccess::sound(editor), cleared)
+            && sameAuthoringSound(processor.copyPluginState().sound, cleared)
+            && sameBlock(cleared_state, stateBytes(processor)),
+        "Redo restores the flattened no-loop VST state");
+
+    MgstcAudioProcessor restored;
+    restored.prepareToPlay(48'000.0, 512);
+    restored.setStateInformation(cleared_state.getData(),
+        static_cast<int>(cleared_state.getSize()));
+    processEmpty(restored, 512);
+    require(sameAuthoringSound(restored.copyPluginState().sound, cleared),
+        "VST state save/restore preserves flattened pitch and y command order");
+    std::unique_ptr<juce::AudioProcessorEditor> reopened(restored.createEditor());
+    require(reopened != nullptr, "VST editor recreates after loop state restore");
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    require(sameAuthoringSound(restored.copyPluginState().sound, cleared),
+        "reopening the VST editor keeps the restored loop-cleared author state");
+    requireWorkingCompositeMatchesProcessor(reopened.get(), restored,
+        "reopened VST editor hydrates the restored loop-cleared author state");
+}
+
+void testPhaseIncompatibleModulationLoopRunsInVst() {
+    using namespace mgstc::engine;
+    using Access = mgstc::plugin::MgstcAudioProcessorTestAccess;
+
+    auto sound = defaultCompositeTimbre();
+    for (auto& layer : sound.layers) layer.enabled = false;
+    auto& layer = sound.layers[2];
+    layer.enabled = true;
+    // defaultCompositeTimbre() intentionally leaves the OPLL base unset.
+    // Give the audio assertion an explicit audible ROM patch instead of
+    // relying on the emulator's reset patch state.
+    layer.base_opll_rom = std::uint8_t{4};
+    layer.base_timbre.reset();
+    layer.volume = 15;
+    layer.start_delay_value = 0;
+    layer.opll_sustain = true;
+    layer.envelope_timeline = {
+        .length_counts = 3,
+        .loop_start_count = 0,
+        .loop_end_count = 2,
+    };
+    layer.pitch_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::StepUp,
+        .delay = 0,
+        .depth = 8,
+        .speed = 0,
+        .roughness = 1,
+    };
+    layer.volume_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::StepDown,
+        .delay = 0,
+        .depth = 8,
+        .speed = 0,
+        .roughness = 1,
+    };
+    require(!compositeModulationLoopRepresentable(layer),
+        "fixture exercises modulation whose later loop phase differs");
+
+    const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+    require(formatted.valid() && formatted.body.find('[') != std::string::npos
+            && formatted.body.find(']') != std::string::npos,
+        "MGSC preview formats a phase-incompatible authored loop");
+
+    const TimbreNumberResolution numbers{};
+    const auto sampleCommands = [&](CompositeEnvelopeLane lane_kind,
+                                    MeaningEventKind command_kind) {
+        SequenceEnvelopeRuntime runtime(compileCompositeEnvelopeLane(
+            layer, lane_kind, numbers));
+        runtime.resetForKeyOn(12);
+        EventBuffer events(32);
+        std::vector<std::vector<std::int32_t>> commands;
+        for (int tick = 0; tick < 24; ++tick) {
+            events.clear();
+            require(runtime.processTick(events) == SequenceError::None,
+                "phase-incompatible loop command stream executes");
+            std::vector<std::int32_t> current;
+            for (const auto& event : events.events()) {
+                if (event.kind == command_kind) current.push_back(event.arg0);
+            }
+            commands.push_back(std::move(current));
+        }
+        return commands;
+    };
+    const auto pitch_commands = sampleCommands(
+        CompositeEnvelopeLane::Pitch, MeaningEventKind::FrequencyDelta);
+    const auto volume_commands = sampleCommands(
+        CompositeEnvelopeLane::Volume, MeaningEventKind::Volume);
+    require(pitch_commands[0] == pitch_commands[2]
+            && pitch_commands[1] == pitch_commands[3]
+            && volume_commands[0] == volume_commands[2]
+            && volume_commands[1] == volume_commands[3],
+        "the first loop's pitch and absolute tremolo commands repeat in the next pass");
+    const auto pitchDelta = [](const auto& commands, std::size_t begin,
+                               std::size_t end) {
+        std::int64_t sum = 0;
+        for (auto tick = begin; tick < end; ++tick)
+            for (const auto value : commands[tick]) sum += value;
+        return sum;
+    };
+    const auto first_pass_delta = pitchDelta(pitch_commands, 0, 2);
+    const auto second_pass_delta = pitchDelta(pitch_commands, 2, 4);
+    const auto accumulated_after_first = first_pass_delta;
+    const auto accumulated_after_second = first_pass_delta + second_pass_delta;
+    require(first_pass_delta > 0 && second_pass_delta == first_pass_delta,
+        "repeated relative Pitch commands add the same positive drift each loop pass");
+    require(accumulated_after_second > accumulated_after_first,
+        "relative Pitch frequency state accumulates across repeated loop passes");
+
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    const auto compiles_before = Access::stateCompileCount(processor);
+    require(processor.replacePluginState(documentFrom(sound, 0, {})),
+        "VST accepts a phase-incompatible modulation loop for audition");
+    require(Access::stateCompileCount(processor) == compiles_before + 1,
+        "VST submits the edited loop through the shared composite compiler");
+    processEmpty(processor, 512);
+    require(Access::plan(processor).audible_layers.size() == 1,
+        "VST active program contains the looped OPLL layer");
+    juce::AudioBuffer<float> audio(2, 2048);
+    juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(
+        1, 60, static_cast<juce::uint8>(100)), 0);
+    processor.processBlock(audio, midi);
+    require(channelPeak(audio, 0, audio.getNumSamples()) > 0.001,
+        "VST produces audio from the phase-incompatible loop");
+}
+
+void testVstOpllStepPickerCreatesAndOpensOriginalTimbre() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    using Source = mgstc::engine::TimbreSource;
+    using Kind = mgstc::engine::EnvelopeEventKind;
+
+    auto sound = opllOnlyTimbre();
+    auto& layer = sound.layers.front();
+    layer.envelope_timeline.length_counts = 8;
+    layer.timbre_automation.clear();
+    layer.base_timbre.reset();
+    layer.base_opll_rom = 4;
+
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    require(processor.replacePluginState(documentFrom(sound, 0, {})),
+        "seed an OPLL ROM base with an empty step @ lane");
+    processEmpty(processor, 512);
+
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    std::optional<std::uint64_t> opened_timbre;
+    juce::String opened_context;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [&](const juce::String& scope, std::optional<std::uint64_t> id) {
+            opened_context = scope;
+            opened_timbre = id;
+        }, [] {}, [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, sound);
+    EditorAccess::size(editor, 1600, 1050);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+
+    std::function<juce::Component*(juce::Component&, const juce::String&)>
+        findComponentWithText = [&](juce::Component& root,
+                                    const juce::String& text) -> juce::Component* {
+        if (auto* button = dynamic_cast<juce::Button*>(&root);
+            button != nullptr && button->getButtonText() == text) {
+            return &root;
+        }
+        if (auto* combo = dynamic_cast<juce::ComboBox*>(&root)) {
+            for (int id = 1; id <= combo->getNumItems(); ++id) {
+                if (combo->getItemText(id - 1) == text) return combo;
+            }
+        }
+        for (int index = 0; index < root.getNumChildComponents(); ++index) {
+            if (auto* found = findComponentWithText(*root.getChildComponent(index), text))
+                return found;
+        }
+        return nullptr;
+    };
+    auto* parameter = dynamic_cast<juce::ComboBox*>(
+        findComponentWithText(editor, juce::String::fromUTF8("@音色")));
+    auto* step_button = dynamic_cast<juce::TextButton*>(
+        findComponentWithText(editor, juce::String::fromUTF8("削除/挿入")));
+    require(parameter != nullptr && step_button != nullptr,
+        "VST shared editor exposes the OPLL @ lane and timeline controls");
+
+    auto* timeline_impl = step_button->getParentComponent();
+    const auto findScrollBar = [](juce::Component& root, bool vertical,
+                                  const auto& self) -> juce::ScrollBar* {
+        for (int index = 0; index < root.getNumChildComponents(); ++index) {
+            auto* child = root.getChildComponent(index);
+            if (auto* bar = dynamic_cast<juce::ScrollBar*>(child);
+                bar != nullptr && bar->isVertical() == vertical) return bar;
+            if (auto* found = self(*child, vertical, self)) return found;
+        }
+        return nullptr;
+    };
+    auto* horizontal = findScrollBar(*timeline_impl, false, findScrollBar);
+    auto* vertical = findScrollBar(*timeline_impl, true, findScrollBar);
+    require(horizontal != nullptr && vertical != nullptr,
+        "OPLL timeline exposes count and graph scroll boundaries");
+
+    parameter->setSelectedId(3, juce::sendNotificationSync);
+    const auto step_bounds = step_button->getBounds();
+    const int graph_x = step_bounds.getX() - UiLayout::textButtonH
+        - UiLayout::controlGap * 2 - UiLayout::xs;
+    const int plot_x = graph_x + UiLayout::compositeOverviewLabelW;
+    const int plot_width = vertical->getX() - plot_x;
+    const double count_start = horizontal->getCurrentRangeStart();
+    const double visible_counts = juce::jmax(1.0,
+        horizontal->getCurrentRangeSize());
+    const int x = plot_x + juce::roundToInt(
+        (0.5 - count_start) * plot_width / visible_counts);
+    const int y = step_bounds.getY() - UiLayout::xs
+        + UiLayout::commandSummaryH + UiLayout::editMarkerLaneH / 2;
+    const auto now = juce::Time::getCurrentTime();
+    const juce::Point<int> point{x, y};
+    const juce::MouseEvent click(
+        juce::Desktop::getInstance().getMainMouseSource(), point.toFloat(),
+        juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),
+        1.0f, 0.0f, 0.0f, 0.0f, 0.0f, timeline_impl, timeline_impl,
+        now, point.toFloat(), now, 1, false);
+    timeline_impl->mouseDown(click);
+    timeline_impl->mouseUp(click);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+
+    juce::TopLevelWindow* picker_window = nullptr;
+    for (int index = 0; index < juce::TopLevelWindow::getNumTopLevelWindows(); ++index) {
+        auto* window = juce::TopLevelWindow::getTopLevelWindow(index);
+        if (window != nullptr
+            && findComponentWithText(*window,
+                juce::String::fromUTF8("オリジナルを追加")) != nullptr) {
+            picker_window = window;
+            break;
+        }
+    }
+    require(picker_window != nullptr,
+        "clicking an OPLL step opens a picker that can create an original timbre");
+    auto* add_original = dynamic_cast<juce::Button*>(
+        findComponentWithText(*picker_window,
+            juce::String::fromUTF8("オリジナルを追加")));
+    require(add_original != nullptr && add_original->isEnabled(),
+        "the step picker enables original OPLL timbre creation");
+
+    const auto history_before = EditorAccess::historySize(editor);
+    add_original->triggerClick();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    processEmpty(processor, 512);
+    const auto edited = processor.copyPluginState().sound;
+    require(edited.layers.size() == 1
+            && edited.layers[0].base_opll_rom == 4
+            && edited.layers[0].timbre_automation.size() == 1,
+        "adding a step original keeps the channel base ROM and creates one @ event");
+    const auto& event = edited.layers[0].timbre_automation.front();
+    require(event.kind == Kind::Timbre && event.count == 0
+            && event.timbre_pick == mgstc::engine::TimbrePick::Library
+            && event.target_library_id != 0,
+        "the new original is assigned to the clicked envelope step");
+    const auto* embedded = mgstc::engine::findEmbeddedTimbreSnapshot(
+        edited, event.target_library_id);
+    require(embedded != nullptr && embedded->source == Source::Opll
+            && embedded->opll_registers == mgstc::engine::encodeOpllPatch(
+                mgstc::engine::defaultOpllPatch()),
+        "the step assignment owns editable original OPLL registers in Plugin State");
+    require(EditorAccess::historySize(editor) == history_before + 1
+            && sameAuthoringSound(EditorAccess::sound(editor), edited),
+        "creating the step original is published as one VST authoring edit");
+
+    auto* edit_original = dynamic_cast<juce::Button*>(
+        findComponentWithText(*picker_window,
+            juce::String::fromUTF8("音色を編集")));
+    require(edit_original != nullptr && edit_original->isEnabled(),
+        "the newly assigned original remains editable from its step picker");
+    edit_original->triggerClick();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    require(opened_context == "opll-envelope"
+            && opened_timbre == event.target_library_id,
+        "step picker opens the editor for the exact original OPLL snapshot");
+}
+
+void testOriginalTimbreAllocationSessionControls() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    using NumberMode = mgstc::engine::TimbreNumberMode;
+    using Source = mgstc::engine::TimbreSource;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+
+    auto original = mgstc::engine::defaultCompositeTimbre();
+    auto scc_auto = sccOnlyTimbre().layers.front();
+    scc_auto.channel = 0;
+    scc_auto.base_timbre->number_mode = NumberMode::Automatic;
+    scc_auto.base_timbre->manual_number.reset();
+    auto scc_manual = scc_auto;
+    scc_manual.channel = 1;
+    scc_manual.base_timbre->library_id = 0xff00000000000031ULL;
+    scc_manual.base_timbre->number_mode = NumberMode::Manual;
+    scc_manual.base_timbre->manual_number = 7;
+    scc_manual.scc_output_start = 7;
+    scc_manual.base_timbre->scc_waveform[0] ^= 1;
+
+    auto opll_rom = opllOnlyTimbre().layers.front();
+    opll_rom.channel = 1;
+    auto opll_auto = opll_rom;
+    opll_auto.channel = 0;
+    opll_auto.base_opll_rom.reset();
+    mgstc::engine::SavedTimbreReference opll_reference;
+    opll_reference.library_id = 0xff00000000000032ULL;
+    opll_reference.name = "Automatic OPLL original";
+    opll_reference.source = Source::Opll;
+    opll_reference.number_mode = NumberMode::Automatic;
+    opll_reference.opll_registers = {0x71, 0x61, 0x1e, 0x17,
+        0xd0, 0x78, 0, 0x17};
+    opll_auto.base_timbre = opll_reference;
+    original.layers = {scc_auto, scc_manual, opll_auto, opll_rom};
+
+    require(processor.replacePluginState(documentFrom(original, 0, {})),
+        "seed automatic and fixed timbre allocation inputs");
+    processEmpty(processor, 512);
+    const auto authored_payload = soundBytes(original);
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {}, [] {},
+        [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, original);
+    EditorAccess::size(editor, 1600, 1050);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    const auto initial_state = stateBytes(processor);
+
+    auto* scc_start = EditorAccess::originalAllocationCombo(editor, 32);
+    auto* opll_start = EditorAccess::originalAllocationCombo(editor, 16);
+    require(scc_start != nullptr && scc_start->getItemText(0) == "@0"
+            && scc_start->getItemText(31) == "@31"
+            && opll_start != nullptr && opll_start->getItemText(0) == "@16"
+            && opll_start->getItemText(15) == "@31",
+        "session selectors expose the full SCC @0..@31 and OPLL @16..@31 ranges");
+
+    const auto checkAssignments = [&](std::uint8_t expected_scc,
+                                      std::uint8_t expected_opll) {
+        const auto sound = processor.copyPluginState().sound;
+        const auto numbers = mgstc::engine::resolveTimbreNumbers(sound);
+        const auto find = [&](std::size_t layer) ->
+                const mgstc::engine::ResolvedTimbreNumber* {
+            const auto it = std::find_if(numbers.assignments.begin(),
+                numbers.assignments.end(), [layer](const auto& item) {
+                    return item.layer_index == layer;
+                });
+            return it == numbers.assignments.end() ? nullptr : &*it;
+        };
+        const auto* automatic_scc = find(0);
+        const auto* manual_scc = find(1);
+        const auto* automatic_opll = find(2);
+        const bool matches = numbers.valid() && sound.original_timbre_allocation_starts
+            && sound.original_timbre_allocation_starts->scc == expected_scc
+            && sound.original_timbre_allocation_starts->opll == expected_opll
+            && automatic_scc != nullptr && automatic_scc->number == expected_scc
+            && !automatic_scc->manually_assigned
+            && manual_scc != nullptr && manual_scc->number == 7
+            && manual_scc->manually_assigned
+            && automatic_opll != nullptr && automatic_opll->number == expected_opll
+            && !automatic_opll->manually_assigned
+            && sound.layers[3].base_opll_rom == 4;
+        if (!matches) {
+            std::fprintf(stderr, "Allocation publication expected=%u,%u editor=%d,%d processor=%d,%d valid=%d assignments=%zu\n",
+                expected_scc, expected_opll, EditorAccess::originalAllocationStart(editor, 32),
+                EditorAccess::originalAllocationStart(editor, 16),
+                sound.original_timbre_allocation_starts ? sound.original_timbre_allocation_starts->scc : -1,
+                sound.original_timbre_allocation_starts ? sound.original_timbre_allocation_starts->opll : -1,
+                numbers.valid(), numbers.assignments.size());
+            for (const auto& assignment : numbers.assignments)
+                std::fprintf(stderr, "  layer=%zu number=%u manual=%d\n", assignment.layer_index, assignment.number, assignment.manually_assigned);
+        }
+        return matches;
+    };
+
+    EditorAccess::setOriginalAllocationStart(editor, 32, 31);
+    EditorAccess::setOriginalAllocationStart(editor, 16, 31);
+    processEmpty(processor, 512);
+    require(checkAssignments(31, 31),
+        "upper-bound session starts reach published core assignments while preserving manual and ROM bases");
+    require(EditorAccess::historySize(editor) == 1
+            && EditorAccess::historyCursor(editor) == 0
+            && sameBlock(initial_state, stateBytes(processor))
+            && soundBytes(processor.copyPluginState().sound) == authored_payload,
+        "changing allocation starts updates the working program without saving or creating tone Undo entries");
+
+    EditorAccess::setOriginalAllocationStart(editor, 32, 0);
+    EditorAccess::setOriginalAllocationStart(editor, 16, 16);
+    processEmpty(processor, 512);
+    require(checkAssignments(0, 16),
+        "lower-bound session starts allocate SCC @0 and OPLL @16");
+    require(EditorAccess::historySize(editor) == 1
+            && sameBlock(initial_state, stateBytes(processor)),
+        "changing between allocation starts leaves saved Plugin State unchanged");
+
+    EditorAccess::editName(editor, "Authored edit after allocation");
+    EditorAccess::recordHistory(editor);
+    processEmpty(processor, 512);
+    require(EditorAccess::historySize(editor) == 2
+            && EditorAccess::historyCursor(editor) == 1,
+        "authored edits still create an Undo transaction beside session-only settings");
+    EditorAccess::undo(editor);
+    processEmpty(processor, 512);
+    require(EditorAccess::historyCursor(editor) == 0
+            && EditorAccess::originalAllocationStart(editor, 32) == 0
+            && EditorAccess::originalAllocationStart(editor, 16) == 16
+            && EditorAccess::sound(editor).original_timbre_allocation_starts
+            && EditorAccess::sound(editor).original_timbre_allocation_starts->scc == 0
+            && EditorAccess::sound(editor).original_timbre_allocation_starts->opll == 16,
+        "Undo restores authored tone state and retains the current editor allocation starts");
+    EditorAccess::recordHistory(editor); // unchanged name-field focus loss
+    require(EditorAccess::historySize(editor) == 2
+            && EditorAccess::historyCursor(editor) == 0,
+        "a no-op history notification after a session change keeps Redo available");
+    EditorAccess::redo(editor);
+    processEmpty(processor, 512);
+    require(EditorAccess::sound(editor).name == "Authored edit after allocation"
+            && EditorAccess::originalAllocationStart(editor, 32) == 0
+            && checkAssignments(0, 16),
+        "Redo restores the authored edit and reapplies the current session numbering");
+
+    EditorAccess::restoreHostState(editor, original);
+    require(EditorAccess::sound(editor).name == original.name,
+        "host load replaces the authored composite in the editor");
+    require(EditorAccess::rebuild(editor),
+        "restored sound can rebuild with the retained session allocation starts");
+    processEmpty(processor, 512);
+    require(EditorAccess::historySize(editor) == 1
+            && EditorAccess::originalAllocationStart(editor, 32) == 0
+            && EditorAccess::originalAllocationStart(editor, 16) == 16
+            && EditorAccess::sound(editor).original_timbre_allocation_starts
+            && checkAssignments(0, 16),
+        "loading a host sound keeps the editor's current allocation starts out of the saved sound");
 }
 
 void testCompositeWavCandidateAudition() {
@@ -5036,7 +5680,7 @@ void testCompositeWavCandidateAudition() {
         require(!content.keyPressed(pc_z), "no candidate does not capture PC performance keys");
         require(WavAccess::accept(content, valid, pcm), "install completed WAV audition candidate");
         processEmpty(processor, 512);
-        require(EditorAccess::hasWavePreview(editor) && EditorAccess::wavePreview(editor) == candidate,
+        require(EditorAccess::hasWavePreview(editor) && sameAuthoringSound(EditorAccess::wavePreview(editor), candidate),
             "actual dialog callback binding publishes a separate temporary candidate");
         const auto& plan = ProcessorAccess::plan(processor);
         require(plan.audible_layers.size() == 1
@@ -5047,7 +5691,7 @@ void testCompositeWavCandidateAudition() {
             && !EditorAccess::waveAuditionPending(editor), "initial candidate selection starts the existing one-second note audition");
         WavAccess::stopPreview(content);
         require(EditorAccess::scheduled(editor) == 0 && !EditorAccess::waveAuditionPending(editor)
-            && EditorAccess::wavePreview(editor) == candidate, "Stop cancels one-second notes without clearing selected performance tone");
+            && sameAuthoringSound(EditorAccess::wavePreview(editor), candidate), "Stop cancels one-second notes without clearing selected performance tone");
         require(content.keyPressed(pc_z), "WAV window forwards PC performance keys through existing mapping");
         require(!content.keyPressed(juce::KeyPress('z', juce::ModifierKeys::ctrlModifier, 'z')),
             "WAV window preserves modified editing shortcuts");
@@ -5060,7 +5704,7 @@ void testCompositeWavCandidateAudition() {
             "candidate audition preserves layer delays and key release timing");
         require(peakOf(captureHostNotePcm(processor, 8192)) > 0.001,
             "actual DAW MIDI input sounds the temporary candidate through EngineCore");
-        require(EditorAccess::sound(editor) == before && EditorAccess::historySize(editor) == history_before
+        require(sameAuthoringSound(EditorAccess::sound(editor), before) && EditorAccess::historySize(editor) == history_before
                 && sameBlock(saved_state, stateBytes(processor)),
             "candidate keyboard and host MIDI audition preserve authoring data, Undo and serialized Plugin State");
         auto selected_list = valid;
@@ -5070,7 +5714,7 @@ void testCompositeWavCandidateAudition() {
         processEmpty(processor, 512); WavAccess::selectCandidate(content, 1); processEmpty(processor, 512);
         require(EditorAccess::scheduled(editor) == 1 && EditorAccess::startsAndStopsShiftedEqually(editor, 1000.0),
             "alternate selection restarts the existing one-second audition with a clean note lifetime");
-        require(EditorAccess::wavePreview(editor) == alternate_tone
+        require(sameAuthoringSound(EditorAccess::wavePreview(editor), alternate_tone)
             && ProcessorAccess::plan(processor).audible_layers.front().relative_semitones == alternate_tone.layers.front().relative_semitones
             && peakOf(captureHostNotePcm(processor, 8192)) > 0.001
             && EditorAccess::historySize(editor) == history_before && sameBlock(saved_state, stateBytes(processor)),
@@ -5078,7 +5722,7 @@ void testCompositeWavCandidateAudition() {
         WavAccess::selectCandidate(content, 0); processEmpty(processor, 512);
         require(!WavAccess::accept(content, {}, {}) && !WavAccess::accept(content, valid, pcm, true),
             "failed or cancelled reconversion is not a candidate replacement");
-        require(EditorAccess::wavePreview(editor) == candidate, "failed reconversion retains prior performance candidate");
+        require(sameAuthoringSound(EditorAccess::wavePreview(editor), candidate), "failed reconversion retains prior performance candidate");
         // A stopped host has no audio consumer to retire pending programs.
         // Multiple valid conversions must leave one slot for Cancel restoration.
         processEmpty(processor, 512);
@@ -5091,8 +5735,8 @@ void testCompositeWavCandidateAudition() {
         WavAccess::selectCandidate(content, 1);
         WavAccess::selectCandidate(content, 0);
         WavAccess::selectCandidate(content, 1);
-        require(EditorAccess::wavePreview(editor) == *latest.composite_tone
-                && EditorAccess::sound(editor) == before && EditorAccess::historySize(editor) == history_before
+        require(sameAuthoringSound(EditorAccess::wavePreview(editor), *latest.composite_tone)
+                && sameAuthoringSound(EditorAccess::sound(editor), before) && EditorAccess::historySize(editor) == history_before
                 && sameBlock(saved_state, stateBytes(processor)),
             "rapid list selection uses latest pending candidate and preserves authoring, Undo and state");
         require(EditorAccess::waveAuditionPending(editor) && EditorAccess::scheduled(editor) == 0,
@@ -5106,7 +5750,7 @@ void testCompositeWavCandidateAudition() {
         require(!EditorAccess::hasWavePreview(editor) && !EditorAccess::waveAuditionPending(editor) && EditorAccess::scheduled(editor) == 0
                 && EditorAccess::voices(editor) == 0 && ProcessorAccess::plan(processor).audible_layers.size() == 3,
             "Cancel stops candidate notes and restores the original host MIDI playback plan");
-        require(sameBlock(saved_state, stateBytes(processor)) && EditorAccess::sound(editor) == before,
+        require(sameBlock(saved_state, stateBytes(processor)) && sameAuthoringSound(EditorAccess::sound(editor), before),
             "Cancel restores only runtime program and leaves state bytes unchanged");
         require(WavAccess::accept(content, valid, pcm), "candidate can be installed again after cancellation");
         require(WavAccess::accept(content, latest, pcm), "retain latest candidate for resumed host");
@@ -5121,12 +5765,12 @@ void testCompositeWavCandidateAudition() {
         require(WavAccess::accept(content, selected_list, pcm), "restore Apply candidate list");
         processEmpty(processor, 512); WavAccess::selectCandidate(content, 1);
         WavAccess::clickApply(content);
-        require(!EditorAccess::hasWavePreview(editor) && processor.copyPluginState().sound == alternate_tone
+        require(!EditorAccess::hasWavePreview(editor) && sameAuthoringSound(processor.copyPluginState().sound, alternate_tone)
                 && EditorAccess::historySize(editor) == history_before + 1,
             "Apply clears temporary preview before committing exactly one Undo transaction");
         processEmpty(processor, 512);
         EditorAccess::undo(editor);
-        require(EditorAccess::sound(editor) == before && processor.copyPluginState().sound == before,
+        require(sameAuthoringSound(EditorAccess::sound(editor), before) && sameAuthoringSound(processor.copyPluginState().sound, before),
             "Undo after candidate audition and Apply restores complete original sound");
         processEmpty(processor, 512);
         require(WavAccess::accept(content, valid, pcm), "candidate is available for host-restore lifecycle test");
@@ -5137,7 +5781,7 @@ void testCompositeWavCandidateAudition() {
         editor.restoreHostState(processor.copyPluginState().sound);
         require(!EditorAccess::hasWavePreview(editor), "host restore drops stale candidate without resubmission");
         WavAccess::clickCancel(content);
-        require(processor.copyPluginState().sound == restored && EditorAccess::sound(editor) == restored,
+        require(sameAuthoringSound(processor.copyPluginState().sound, restored) && sameAuthoringSound(EditorAccess::sound(editor), restored),
             "old converter cancellation cannot overwrite a newer DAW state");
     }
     processEmpty(processor, 512);
@@ -5326,7 +5970,7 @@ void testCompositeWavActualUiWorkerAndApply() {
         [](juce::Component*) {}, [] {}, original);
     juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
     const auto previous = EditorAccess::sound(editor);
-    require(processor.copyPluginState().sound == previous,
+    require(sameAuthoringSound(processor.copyPluginState().sound, previous),
         "actual conversion editor baseline matches committed VST3 state");
     auto pcm = std::make_shared<mgstc::engine::SourcePcm>();
     pcm->sample_rate = 48'000; pcm->channels = 1; pcm->bit_depth = 32;
@@ -5366,8 +6010,8 @@ void testCompositeWavActualUiWorkerAndApply() {
     for (int wait = 0; wait < 15000 && !WavAccess::hasResult(content); ++wait)
         juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
     require(WavAccess::hasResult(content), "Convert button runs actual optimizer and publishes its completed result");
-    require(EditorAccess::hasWavePreview(editor) && EditorAccess::sound(editor) == previous
-            && processor.copyPluginState().sound == previous,
+    require(EditorAccess::hasWavePreview(editor) && sameAuthoringSound(EditorAccess::sound(editor), previous)
+            && sameAuthoringSound(processor.copyPluginState().sound, previous),
         "actual direct-periodic conversion publishes candidate for performance without committing it");
     // Deliberately keep the candidate pending: Apply must commit directly even
     // when the host has not consumed another block after worker completion.
@@ -5381,7 +6025,7 @@ void testCompositeWavActualUiWorkerAndApply() {
         "actual WAV conversion is reflected in VST3 Plugin State");
     processEmpty(processor, 512);
     EditorAccess::undo(editor);
-    require(EditorAccess::sound(editor) == previous && processor.copyPluginState().sound == previous,
+    require(sameAuthoringSound(EditorAccess::sound(editor), previous) && sameAuthoringSound(processor.copyPluginState().sound, previous),
         "Undo restores pre-conversion authoring and VST3 program state");
     processEmpty(processor, 512);
     EditorAccess::redo(editor);
@@ -5447,7 +6091,7 @@ void testWavMorphPlanVstStateAndReediting() {
         [](juce::Component*) {}, [] {}, original);
     juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
     EditorAccess::applyWave(editor, confirmed);
-    require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
+    require(sameAuthoringSound(EditorAccess::sound(editor), confirmed) && sameAuthoringSound(processor.copyPluginState().sound, confirmed),
         "actual WAV three-mode output applies through shared editor and VST state");
     processEmpty(processor, 512);
     const auto stored = stateBytes(processor);
@@ -5458,7 +6102,7 @@ void testWavMorphPlanVstStateAndReediting() {
     restored.setStateInformation(stored.getData(), static_cast<int>(stored.getSize()));
     processEmpty(restored, 512);
     const auto restored_sound = restored.copyPluginState().sound;
-    require(restored_sound == confirmed, "VST state preserves confirmed plan without original WAV");
+    require(sameAuthoringSound(restored_sound, confirmed), "VST state preserves confirmed plan without original WAV");
     require(compileSccMorph(restored_sound).timbre == compiled.timbre
             && formatMgsComposite(restored_sound).source == exported.source,
         "WAV-free VST load generates bit-identical SCC waves and MGSC output");
@@ -5468,15 +6112,15 @@ void testWavMorphPlanVstStateAndReediting() {
         std::unique_ptr<juce::AudioProcessorEditor> recreated(restored.createEditor());
         require(recreated != nullptr, "VST editor recreation succeeds with confirmed WAV morph plan");
         juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
-        require(restored.copyPluginState().sound == confirmed,
+        require(sameAuthoringSound(restored.copyPluginState().sound, confirmed),
             "VST editor open/close hydration preserves saved u/count plan");
     }
     EditorAccess::undo(editor);
-    require(EditorAccess::sound(editor) == original && processor.copyPluginState().sound == original,
+    require(sameAuthoringSound(EditorAccess::sound(editor), original) && sameAuthoringSound(processor.copyPluginState().sound, original),
         "Undo of actual WAV mode selection restores complete prior VST author state");
     processEmpty(processor, 512);
     EditorAccess::redo(editor);
-    require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
+    require(sameAuthoringSound(EditorAccess::sound(editor), confirmed) && sameAuthoringSound(processor.copyPluginState().sound, confirmed),
         "Redo restores converter-confirmed plans exactly");
     processEmpty(processor, 512);
 
@@ -5510,7 +6154,7 @@ void testWavMorphPlanVstStateAndReediting() {
     require(reassigned.layers.front().timbre_automation == confirmed.layers.front().timbre_automation,
         "base picker preserves explicit @ author intent and unchanged confirmed WAV plans");
     require(compileSccMorph(reassigned).valid && formatMgsComposite(reassigned).valid()
-            && processor.copyPluginState().sound == reassigned,
+            && sameAuthoringSound(processor.copyPluginState().sound, reassigned),
         "base reassignment keeps all WAV event sources resolvable in common DSP and VST state");
     require(EditorAccess::historySize(editor) == base_history + 1,
         "actual base source reassignment creates one author history transaction");
@@ -5519,18 +6163,18 @@ void testWavMorphPlanVstStateAndReediting() {
     const auto reassigned_parse = mgstc::plugin::parsePluginState(
         reassigned_blob.getData(), reassigned_blob.getSize());
     require(reassigned_parse.status == mgstc::plugin::PluginStateStatus::Ok
-            && reassigned_parse.document.sound == reassigned,
+            && sameAuthoringSound(reassigned_parse.document.sound, reassigned),
         "retained old base and confirmed plans survive WAV-free Plugin State serialization");
     EditorAccess::undo(editor);
-    require(EditorAccess::sound(editor) == picker_source && processor.copyPluginState().sound == picker_source,
+    require(sameAuthoringSound(EditorAccess::sound(editor), picker_source) && sameAuthoringSound(processor.copyPluginState().sound, picker_source),
         "Undo of base selection removes the retained copy and restores original confirmed WAV state");
     processEmpty(processor, 512);
     EditorAccess::redo(editor);
-    require(EditorAccess::sound(editor) == reassigned && processor.copyPluginState().sound == reassigned,
+    require(sameAuthoringSound(EditorAccess::sound(editor), reassigned) && sameAuthoringSound(processor.copyPluginState().sound, reassigned),
         "Redo restores the referenced old base snapshot and unchanged plans");
     processEmpty(processor, 512);
     EditorAccess::assignBase(editor, 0, replacement->library_id);
-    require(EditorAccess::sound(editor) == reassigned
+    require(sameAuthoringSound(EditorAccess::sound(editor), reassigned)
             && EditorAccess::historySize(editor) == base_history + 1,
         "reselecting the same base neither duplicates retained sources nor adds history");
     processEmpty(processor, 512);
@@ -5539,17 +6183,17 @@ void testWavMorphPlanVstStateAndReediting() {
     require(!reset_base.layers.front().base_timbre
             && findEmbeddedTimbreSnapshot(reset_base, original_base.library_id)
             && reset_base.layers.front().timbre_automation == confirmed.layers.front().timbre_automation
-            && compileSccMorph(reset_base).valid && processor.copyPluginState().sound == reset_base,
+            && compileSccMorph(reset_base).valid && sameAuthoringSound(processor.copyPluginState().sound, reset_base),
         "base reset keeps all explicit WAV keyframe sources and confirmed plans intact in VST state");
     processEmpty(processor, 512);
     EditorAccess::undo(editor); // reset -> reassigned
     processEmpty(processor, 512);
     EditorAccess::undo(editor); // reassigned -> base-only picker source
-    require(EditorAccess::sound(editor) == picker_source && processor.copyPluginState().sound == picker_source,
+    require(sameAuthoringSound(EditorAccess::sound(editor), picker_source) && sameAuthoringSound(processor.copyPluginState().sound, picker_source),
         "Undo of base reset and reassignment restores the complete base-only picker input");
     processEmpty(processor, 512);
     if (picker_source != confirmed) EditorAccess::undo(editor); // remove redundant-copy setup
-    require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
+    require(sameAuthoringSound(EditorAccess::sound(editor), confirmed) && sameAuthoringSound(processor.copyPluginState().sound, confirmed),
         "Undo of base reset and reassignment restores complete WAV-free conversion state");
     processEmpty(processor, 512);
 
@@ -5568,7 +6212,7 @@ void testWavMorphPlanVstStateAndReediting() {
         for (const auto& event : layer.timbre_automation)
             if (event.scc_morph.explicit_plan) ++retained_intervals;
     require(retained_intervals < confirmed_intervals && changed != confirmed
-            && processor.copyPluginState().sound == changed,
+            && sameAuthoringSound(processor.copyPluginState().sound, changed),
         "actual owned SCC waveform edit invalidates dependent WAV plans and republishes VST state");
     require(compileSccMorph(changed).valid
             && EditorAccess::historyCursor(editor) == history_cursor_before + 1
@@ -5576,11 +6220,11 @@ void testWavMorphPlanVstStateAndReediting() {
         "edited WAV endpoints regenerate through common DSP with one Undo transaction and truncate the old Redo branch");
     processEmpty(processor, 512);
     EditorAccess::undo(editor);
-    require(EditorAccess::sound(editor) == confirmed && processor.copyPluginState().sound == confirmed,
+    require(sameAuthoringSound(EditorAccess::sound(editor), confirmed) && sameAuthoringSound(processor.copyPluginState().sound, confirmed),
         "Undo of waveform editing restores original waves and confirmed WAV plans");
     processEmpty(processor, 512);
     EditorAccess::redo(editor);
-    require(EditorAccess::sound(editor) == changed && processor.copyPluginState().sound == changed,
+    require(sameAuthoringSound(EditorAccess::sound(editor), changed) && sameAuthoringSound(processor.copyPluginState().sound, changed),
         "Redo preserves invalidated plan state after waveform editing");
     processEmpty(processor, 512);
 }
@@ -5694,6 +6338,81 @@ void testPluginSoundAuthority() {
         "closing both editors stops both scopes");
 }
 
+void testToneLibrarySessionFallback() {
+    // Run last: startup fallback deliberately lasts until process exit.
+    const auto lock_name = "MGSTCStartupLibraryLockTest_" + juce::Uuid().toString();
+    juce::WaitableEvent holder_ready;
+    juce::WaitableEvent release_holder;
+    std::atomic<bool> holder_locked{};
+    std::jthread holder([&] {
+        juce::InterProcessLock held_lock(lock_name);
+        holder_locked.store(held_lock.enter(1000));
+        holder_ready.signal();
+        if (holder_locked.load()) {
+            static_cast<void>(release_holder.wait(10000));
+            held_lock.exit();
+        }
+    });
+    require(holder_ready.wait(2000) && holder_locked.load(),
+            "startup recovery lock test holder acquires shared lock");
+    juce::InterProcessLock startup_lock(lock_name);
+    std::string error;
+    const auto begin = std::chrono::steady_clock::now();
+    const bool loaded = mgstc::app::initialiseToneLibrarySession(startup_lock, &error);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - begin).count();
+    release_holder.signal();
+    holder.join();
+    require(!loaded && error == "failed to acquire shared tone library lock",
+            "startup does not read the DB while another instance owns the library lock");
+    require(elapsed_ms >= mgstc::app::kLibraryIpcLockTimeoutMs - 300
+                && elapsed_ms < mgstc::app::kLibraryIpcLockTimeoutMs + 4000,
+            "startup library lock uses the existing bounded timeout");
+    require(startup_lock.enter(0), "startup lock is available after holder releases it");
+    startup_lock.exit();
+    error.clear();
+    const auto snapshot = mgstc::app::loadToneLibraries(&error);
+    const auto timbres = mgstc::app::loadSharedTimbreLibrary(&error);
+    const auto composites =
+        mgstc::app::loadSharedCompositeTimbreLibrary(&error);
+    require(snapshot && snapshot->timbres.entries().empty()
+                && snapshot->composites.entries().empty(),
+            "disabled DB yields one empty combined library snapshot");
+    require(timbres && timbres->entries().empty()
+                && composites && composites->entries().empty(),
+            "disabled DB yields empty libraries in all editors without reload errors");
+    require(error.empty(), "disabled DB fallback does not repeat startup errors");
+    require(!mgstc::app::persistTimbreLibrary(*timbres)
+                && !mgstc::app::persistCompositeTimbreLibrary(*composites)
+                && !mgstc::app::persistToneLibraries(*timbres, *composites),
+            "disabled DB rejects every persistence path instead of replacing unreadable data");
+    mgstc::app::ToneLibrarySnapshot available;
+    mgstc::engine::TimbreLibraryEntry single;
+    single.name = "Recovered OPLL";
+    single.opll_registers = {0x21, 0x24, 0x0A, 0x02, 0xF3, 0xAF, 0x60, 0x26};
+    const auto single_id = available.timbres.add(single, 1);
+    auto sound = mgstc::engine::defaultCompositeTimbre();
+    sound.name = "Recovered Composite";
+    const auto composite_id = available.composites.add(sound, 1);
+    mgstc::app::disableToneLibraryForSession(std::move(available));
+    const auto recovered = mgstc::app::loadToneLibraries(&error);
+    const auto recovered_singles = mgstc::app::loadSharedTimbreLibrary(&error);
+    const auto recovered_composites =
+        mgstc::app::loadSharedCompositeTimbreLibrary(&error);
+    require(recovered && recovered->timbres.find(single_id)
+                && recovered->composites.find(composite_id)
+                && recovered_singles && recovered_singles->find(single_id)
+                && recovered_composites && recovered_composites->find(composite_id),
+            "partial startup snapshot remains available through every editor load path");
+    require(recovered_singles->find(single_id)->opll_registers == single.opll_registers
+                && recovered_composites->find(composite_id)->timbre.name == sound.name,
+            "partial startup snapshot retains readable sound data and metadata");
+    require(!mgstc::app::persistTimbreLibrary(*recovered_singles)
+                && !mgstc::app::persistCompositeTimbreLibrary(*recovered_composites)
+                && !mgstc::app::persistToneLibraries(*recovered_singles, *recovered_composites),
+            "partial startup snapshot cannot overwrite rows that failed to load");
+}
+
 }  // namespace
 
 int main() {
@@ -5707,6 +6426,7 @@ int main() {
             testCompositeWavCandidateAudition();
             testCompositeWavRetainedSelectionAndPreview();
             testCompositeWavRangeInteractions();
+            testToneLibrarySessionFallback();
             return 0;
         }
         testSincRingMatchesLinearShift();
@@ -5779,11 +6499,16 @@ int main() {
         testCompositeWavSourceImportTransactions();
         testCompositeWavUiTransactions();
         testCompositeStepSlideVstTransactions();
+        testCompositeLoopVstTransactions();
+        testPhaseIncompatibleModulationLoopRunsInVst();
+        testVstOpllStepPickerCreatesAndOpensOriginalTimbre();
+        testOriginalTimbreAllocationSessionControls();
         testCompositeWavCandidateAudition();
         testCompositeWavRetainedSelectionAndPreview();
         testCompositeWavRangeInteractions();
         testCompositeWavActualUiWorkerAndApply();
         testWavMorphPlanVstStateAndReediting();
+        testToneLibrarySessionFallback();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

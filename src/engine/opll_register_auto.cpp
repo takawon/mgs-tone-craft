@@ -192,6 +192,165 @@ struct AutomationAtCount {
 };
 
 [[nodiscard]] std::map<std::uint32_t, AutomationAtCount> groupAutomation(
+    const CompositeLayer& layer);
+
+// Profile evaluation is compilation/authoring work, never an audio callback.
+// Schedules are expanded once; evaluating a point does not regenerate curves.
+[[nodiscard]] std::vector<EnvelopeEvent> expandProfileRegisterAutos(
+    const CompositeLayer& layer, const TimbreLibrary* library,
+    bool expand_tl, bool expand_fb) {
+    using Schedule = std::map<std::uint32_t, std::uint8_t>;
+    std::vector<std::pair<const OpllRegisterAutoLane*, Schedule>> schedules;
+    const auto add_schedule = [&](const OpllRegisterAutoLane& lane,
+                                  OpllRegisterAutoTarget target) {
+        schedules.emplace_back(&lane,
+            fieldSchedule(lane, target, layer.envelope_timeline.length_counts));
+    };
+    add_schedule(layer.opll_tl_auto, OpllRegisterAutoTarget::TotalLevel);
+    add_schedule(layer.opll_fb_auto, OpllRegisterAutoTarget::Feedback);
+    for (const auto& profile : layer.register_auto_profiles)
+        add_schedule(profile.lane, profile.target);
+    const auto auto_value = [&](const OpllRegisterAutoLane& lane,
+                                std::uint32_t count) -> std::optional<std::uint8_t> {
+        for (const auto& [owner, schedule] : schedules) {
+            if (owner != &lane) continue;
+            auto it = schedule.upper_bound(count);
+            if (it == schedule.begin()) return std::nullopt;
+            return std::prev(it)->second;
+        }
+        return std::nullopt;
+    };
+    std::array<std::uint8_t, 8> registers{};
+    bool have_image = layer.base_timbre && layer.base_timbre->source == TimbreSource::Opll;
+    bool on_rom = !have_image;
+    if (have_image) registers = layer.base_timbre->opll_registers;
+    const auto automation = groupAutomation(layer);
+    std::array<std::optional<std::uint8_t>, 2> last_values;
+    std::vector<EnvelopeEvent> events;
+    struct Action {
+        const EnvelopeEvent* manual{};
+        const OpllRegisterAutoProfile* automatic{};
+        const CompositeModulationProfile* modulation{};
+        OpllRegisterAutoTarget target{OpllRegisterAutoTarget::TotalLevel};
+        bool after{};
+        std::uint32_t order{};
+        bool generator{};
+    };
+    std::map<std::uint32_t, std::vector<Action>> profile_actions;
+    for (const auto& profile : layer.register_auto_profiles)
+        profile_actions[profile.count].push_back({nullptr, &profile, nullptr,
+            profile.target, profile.after_loop_start, profile.command_order});
+    for (const auto& profile : layer.modulation_profiles) {
+        if (profile.target != CompositeModulationTarget::TotalLevel
+            && profile.target != CompositeModulationTarget::Feedback) continue;
+        profile_actions[profile.count].push_back({nullptr, nullptr, &profile,
+            profile.target == CompositeModulationTarget::TotalLevel
+                ? OpllRegisterAutoTarget::TotalLevel : OpllRegisterAutoTarget::Feedback,
+            profile.after_loop_start, profile.command_order});
+    }
+    std::map<std::uint32_t, std::array<const CompositeDerivedCommandPlacement*, 2>> placements;
+    for (const auto& placement : layer.derived_command_placements) {
+        if (placement.target != CompositeModulationTarget::TotalLevel
+            && placement.target != CompositeModulationTarget::Feedback) continue;
+        const auto index = placement.target == CompositeModulationTarget::TotalLevel ? 0U : 1U;
+        if (!placements[placement.count][index]) placements[placement.count][index] = &placement;
+    }
+    std::array<const OpllRegisterAutoLane*, 2> lanes{&layer.opll_tl_auto, &layer.opll_fb_auto};
+    std::array<const ModulationParameters*, 2> mods{&layer.opll_tl_modulation, &layer.opll_fb_modulation};
+    for (std::uint32_t count = 0; count <= layer.envelope_timeline.length_counts; ++count) {
+        std::vector<Action> actions;
+        if (const auto found = profile_actions.find(count); found != profile_actions.end())
+            actions = found->second;
+        if (const auto found = automation.find(count); found != automation.end()) {
+            for (const auto* event : found->second.timbres)
+                actions.push_back({event, nullptr, nullptr, {}, event->after_loop_start, event->command_order});
+            for (const auto* event : found->second.register_writes)
+                actions.push_back({event, nullptr, nullptr, {}, event->after_loop_start, event->command_order});
+        }
+        for (auto target : {OpllRegisterAutoTarget::TotalLevel, OpllRegisterAutoTarget::Feedback}) {
+            const auto index = static_cast<std::size_t>(target);
+            const auto found = placements.find(count);
+            const auto* placement = found == placements.end() ? nullptr : found->second[index];
+            const auto& lane = *lanes[index];
+            const auto& mod = *mods[index];
+            const bool anchor = layer.envelope_timeline.loop_start_count
+                && count == *layer.envelope_timeline.loop_start_count;
+            const bool has_profile = std::any_of(actions.begin(), actions.end(), [target](const auto& action) {
+                    return !action.manual && action.target == target;
+                });
+            actions.push_back({nullptr, nullptr, nullptr, target,
+                placement ? placement->after_loop_start : !has_profile && anchor && mod.enabled && !lane.active(),
+                placement ? placement->command_order : 0, true});
+        }
+        const bool loop_end = layer.envelope_timeline.loop_start_count
+            && layer.envelope_timeline.loop_end_count
+            && *layer.envelope_timeline.loop_start_count < *layer.envelope_timeline.loop_end_count
+            && *layer.envelope_timeline.loop_end_count <= layer.envelope_timeline.length_counts
+            && count == *layer.envelope_timeline.loop_end_count;
+        std::stable_sort(actions.begin(), actions.end(), [loop_end](const Action& a, const Action& b) {
+            // At ], true denotes an inside command. The unreachable outside
+            // side must not change the register image used for inside y.
+            if (a.after != b.after) return loop_end ? a.after : !a.after;
+            if (a.order && b.order) return a.order < b.order;
+            if (a.order != b.order) return a.order != 0;
+            if (bool(a.manual) != bool(b.manual)) return bool(a.manual);
+            if (a.generator != b.generator) return a.generator;
+            return a.manual && b.manual && a.manual->kind == EnvelopeEventKind::Timbre
+                && b.manual->kind != EnvelopeEventKind::Timbre;
+        });
+        for (const auto& action : actions) {
+            if (action.manual) {
+                const auto& event = *action.manual;
+                if (event.kind == EnvelopeEventKind::Timbre) {
+                    last_values = {};
+                    if (event.timbre_pick == TimbrePick::OpllRom) on_rom = true;
+                    else if (const auto image = opllOriginalRegistersForLibraryId(layer, event.target_library_id, library)) {
+                        registers = *image; have_image = true; on_rom = false;
+                    } else have_image = false;
+                } else if (event.value >= 0 && event.value <= 7 && event.secondary >= 0 && event.secondary <= 255) {
+                    registers[static_cast<std::size_t>(event.value)] = static_cast<std::uint8_t>(event.secondary);
+                    if (event.value == 2 || event.value == 3) last_values[static_cast<std::size_t>(event.value - 2)].reset();
+                }
+                continue;
+            }
+            const auto target = action.target;
+            if ((target == OpllRegisterAutoTarget::TotalLevel && !expand_tl)
+                || (target == OpllRegisterAutoTarget::Feedback && !expand_fb)) continue;
+            const auto index = static_cast<std::size_t>(target);
+            if (action.automatic) lanes[index] = &action.automatic->lane;
+            if (action.modulation) mods[index] = &action.modulation->parameters;
+            const auto& lane = *lanes[index];
+            const auto& mod = *mods[index];
+            if (!have_image || on_rom) continue;
+            if (action.generator && lane.active()) {
+                const auto schedule = std::find_if(schedules.begin(), schedules.end(),
+                    [&lane](const auto& entry) { return entry.first == &lane; });
+                if (schedule == schedules.end() || !schedule->second.contains(count)) continue;
+            }
+            const auto reg = opllRegisterAutoRegisterNumber(target);
+            const auto base = fieldValueFromPacked(target, registers[reg]);
+            if (action.modulation && !mod.enabled && !lane.active()
+                && (!last_values[index] || *last_values[index] == base)) continue;
+            const auto value = lane.active() ? auto_value(lane, count)
+                : (mod.enabled || action.modulation) ? std::optional<std::uint8_t>{clampValue(target,
+                    base + modulationOffsetAtCount(mod, count))} : std::nullopt;
+            if (!value || (action.generator && last_values[index] == value)) continue;
+            if (action.generator && !lane.active() && !last_values[index] && *value == base) {
+                last_values[index] = value;
+                continue;
+            }
+            const auto packed = packOpllRegisterAutoByte(target, registers[reg], *value);
+            events.push_back({.kind = EnvelopeEventKind::RegisterWrite, .value = reg,
+                .secondary = packed, .count = count, .after_loop_start = action.after,
+                .command_order = action.order});
+            last_values[index] = value;
+            if (lane.active()) registers[reg] = packed;
+        }
+    }
+    return events;
+}
+
+[[nodiscard]] std::map<std::uint32_t, AutomationAtCount> groupAutomation(
     const CompositeLayer& layer) {
     std::map<std::uint32_t, AutomationAtCount> by_count;
     for (const auto& event : layer.timbre_automation) {
@@ -244,7 +403,8 @@ std::optional<std::array<std::uint8_t, 8>> opllOriginalRegistersForLibraryId(
 
 OpllActiveTimbreAtCount opllActiveTimbreAt(
     const CompositeLayer& layer,
-    std::uint32_t count) noexcept {
+    std::uint32_t count,
+    bool after_loop_start) noexcept {
     OpllActiveTimbreAtCount active;
     if (layer.base_timbre
         && layer.base_timbre->source == TimbreSource::Opll) {
@@ -254,7 +414,8 @@ OpllActiveTimbreAtCount opllActiveTimbreAt(
     std::vector<const EnvelopeEvent*> timbres;
     for (const auto& event : layer.timbre_automation) {
         if (event.kind == EnvelopeEventKind::Timbre
-            && event.count <= count) {
+            && event.count <= count
+            && (event.count != count || after_loop_start || !event.after_loop_start)) {
             timbres.push_back(&event);
         }
     }
@@ -264,7 +425,7 @@ OpllActiveTimbreAtCount opllActiveTimbreAt(
             if (left->count != right->count) {
                 return left->count < right->count;
             }
-            return false;
+            return compositeProfilePrecedes(*left, *right);
         });
     for (const auto* event : timbres) {
         if (event->timbre_pick == TimbrePick::OpllRom) {
@@ -288,7 +449,9 @@ std::optional<std::array<std::uint8_t, 8>> opllOriginalRegisterImageAt(
     std::uint32_t count,
     const TimbreLibrary* library,
     bool include_manual_y_at_count,
-    bool include_register_auto) noexcept {
+    bool include_register_auto,
+    bool after_loop_start,
+    const std::vector<EnvelopeEvent>* expanded_register_events) noexcept {
     if (layer.source != TimbreSource::Opll) {
         return std::nullopt;
     }
@@ -319,6 +482,55 @@ std::optional<std::array<std::uint8_t, 8>> opllOriginalRegisterImageAt(
             on_rom = false;
             have_image = true;
         }
+    }
+
+    if (!after_loop_start || !layer.modulation_profiles.empty() || !layer.register_auto_profiles.empty()
+        || !layer.derived_command_placements.empty()
+        || std::any_of(layer.timbre_automation.begin(), layer.timbre_automation.end(),
+            [](const auto& event) { return event.command_order != 0; })) {
+        struct ImageEvent { const EnvelopeEvent* event; bool derived; };
+        std::vector<ImageEvent> ordered;
+        const auto owned_derived = include_register_auto && !expanded_register_events
+            ? expandOpllLayerRegisterAutos(layer, library) : std::vector<EnvelopeEvent>{};
+        const auto& derived = expanded_register_events && include_register_auto
+            ? *expanded_register_events : owned_derived;
+        for (const auto& event : layer.timbre_automation) {
+            if (event.count <= count && (event.kind == EnvelopeEventKind::Timbre
+                || event.kind == EnvelopeEventKind::RegisterWrite))
+                ordered.push_back({&event, false});
+        }
+        for (const auto& event : derived)
+            if (event.count <= count) ordered.push_back({&event, true});
+        std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+            if (a.event->count != b.event->count) return a.event->count < b.event->count;
+            if (a.event->after_loop_start != b.event->after_loop_start)
+                return !a.event->after_loop_start;
+            if (a.event->command_order && b.event->command_order)
+                return a.event->command_order < b.event->command_order;
+            if (a.event->command_order != b.event->command_order)
+                return a.event->command_order != 0;
+            if (a.derived != b.derived) return !a.derived;
+            return a.event->kind == EnvelopeEventKind::Timbre
+                && b.event->kind != EnvelopeEventKind::Timbre;
+        });
+        for (const auto& item : ordered) {
+            const auto& event = *item.event;
+            if (event.count == count && event.after_loop_start && !after_loop_start) continue;
+            if (event.kind == EnvelopeEventKind::Timbre) {
+                if (event.timbre_pick == TimbrePick::OpllRom) {
+                    on_rom = true;
+                    have_image = false;
+                } else load_original(event.target_library_id);
+            } else if ((event.count < count || include_manual_y_at_count || item.derived)
+                && event.value >= 0 && event.value <= 7
+                && event.secondary >= 0 && event.secondary <= 255) {
+                registers[static_cast<std::size_t>(event.value)] =
+                    static_cast<std::uint8_t>(event.secondary);
+                if (!on_rom) have_image = true;
+            }
+        }
+        if (on_rom || !have_image) return std::nullopt;
+        return registers;
     }
 
     const auto automation = groupAutomation(layer);
@@ -385,8 +597,9 @@ std::optional<std::array<std::uint8_t, 8>> opllOriginalRegisterImageAt(
 
 bool opllRegisterAutoAvailableAt(
     const CompositeLayer& layer,
-    std::uint32_t count) noexcept {
-    return opllActiveTimbreAt(layer, count).kind
+    std::uint32_t count,
+    bool after_loop_start) noexcept {
+    return opllActiveTimbreAt(layer, count, after_loop_start).kind
         == OpllActiveTimbreKind::Original;
 }
 
@@ -404,7 +617,10 @@ std::optional<std::size_t> opllRegisterAutoOwnerLayer(
         const auto& modulation = target == OpllRegisterAutoTarget::TotalLevel
             ? layer.opll_tl_modulation
             : layer.opll_fb_modulation;
-        if (lane.active() || modulation.enabled) {
+        const auto mod_target = target == OpllRegisterAutoTarget::TotalLevel
+            ? CompositeModulationTarget::TotalLevel : CompositeModulationTarget::Feedback;
+        if (lane.active() || modulation.enabled || compositeHasRegisterAuto(layer, target)
+            || compositeHasModulation(layer, mod_target)) {
             return index;
         }
     }
@@ -432,6 +648,24 @@ bool enforceOpllRegisterAutoExclusivity(CompositeTimbre& timbre) {
         if (layer.source != TimbreSource::Opll) {
             continue;
         }
+        const auto profiles_claim = [&](OpllRegisterAutoTarget target,
+                                         std::optional<std::size_t>& owner) {
+            const auto mod_target = target == OpllRegisterAutoTarget::TotalLevel
+                ? CompositeModulationTarget::TotalLevel : CompositeModulationTarget::Feedback;
+            const bool profile_active = std::any_of(layer.register_auto_profiles.begin(),
+                layer.register_auto_profiles.end(), [target](const auto& profile) {
+                    return profile.target == target && profile.lane.active();
+                }) || std::any_of(layer.modulation_profiles.begin(), layer.modulation_profiles.end(),
+                    [mod_target](const auto& profile) {
+                        return profile.target == mod_target && profile.parameters.enabled;
+                    });
+            if (!profile_active) return;
+            if (owner && *owner != index) {
+                disableCompositeRegisterAuto(layer, target);
+                disableCompositeModulation(layer, mod_target);
+                changed = true;
+            } else owner = index;
+        };
         if (layer.opll_tl_auto.active()) {
             if (tl_owner.has_value()) {
                 layer.opll_tl_auto = {};
@@ -464,6 +698,8 @@ bool enforceOpllRegisterAutoExclusivity(CompositeTimbre& timbre) {
                 fb_owner = index;
             }
         }
+        profiles_claim(OpllRegisterAutoTarget::TotalLevel, tl_owner);
+        profiles_claim(OpllRegisterAutoTarget::Feedback, fb_owner);
     }
     return changed;
 }
@@ -500,6 +736,9 @@ std::vector<EnvelopeEvent> expandOpllLayerRegisterAutos(
     if (layer.source != TimbreSource::Opll) {
         return {};
     }
+    if (!layer.modulation_profiles.empty() || !layer.register_auto_profiles.empty()
+        || !layer.derived_command_placements.empty())
+        return expandProfileRegisterAutos(layer, library, expand_tl, expand_fb);
     const auto length = layer.envelope_timeline.length_counts;
     std::map<std::uint32_t, std::uint8_t> tl_schedule;
     std::map<std::uint32_t, std::uint8_t> fb_schedule;

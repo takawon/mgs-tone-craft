@@ -35,6 +35,13 @@ public:
         TimbreLibrary& timbres,
         CompositeTimbreLibrary& composites,
         std::string* error = nullptr);
+    // Startup recovery only. Publish all readable rows from both tables;
+    // false means some data failed and the caller must prohibit persistence.
+    // Strict load() retains its all-or-nothing semantics.
+    [[nodiscard]] bool loadAvailable(
+        TimbreLibrary& timbres,
+        CompositeTimbreLibrary& composites,
+        std::string* error = nullptr);
     // Timbres table + timbre_tags only. Does not garbage-collect `tags`
     // (composites may still reference the same names).
     [[nodiscard]] bool replaceTimbres(
@@ -72,10 +79,12 @@ private:
     [[nodiscard]] bool pruneUnusedTags(std::string* error);
     [[nodiscard]] bool loadTimbres(
         TimbreLibrary& timbres,
-        std::string* error);
+        std::string* error,
+        bool allow_partial = false);
     [[nodiscard]] bool loadComposites(
         CompositeTimbreLibrary& composites,
-        std::string* error);
+        std::string* error,
+        bool allow_partial = false);
 
     sqlite3* db_{};
     int user_version_{};

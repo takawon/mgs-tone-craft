@@ -2,6 +2,7 @@
 
 #include "mgstc/engine/envelope_sequence.hpp"
 #include "mgstc/engine/composite_envelope_compile.hpp"
+#include "mgstc/engine/composite_modulation.hpp"
 #include "mgstc/engine/opll_register_auto.hpp"
 
 #include <algorithm>
@@ -31,6 +32,14 @@ struct CountState {
     std::vector<std::string> after_timbre_tokens;
     std::vector<std::string> after_pitch_tokens;
     std::optional<VolumeSpec> volume;
+    struct OrderedCommand {
+        std::string token;
+        std::uint32_t order{};
+        bool after{};
+        bool pitch{};
+        bool leading{};
+    };
+    std::vector<OrderedCommand> ordered_commands;
 
     [[nodiscard]] bool boundary() const noexcept {
         return !before_timbre_tokens.empty()
@@ -541,17 +550,17 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
     bool optimize_loop,
     bool allow_prefix) {
     if (source_layer.volume_envelope.kind == EnvelopeKind::Sequence
-        && source_layer.volume_modulation.enabled) {
+        && compositeHasModulation(source_layer, CompositeModulationTarget::Volume)) {
         // Tremolo replaces the authored volume events with sampled values.
         // Validate that source first, so malformed values/ramps cannot turn
         // into a valid silent sample and disappear during the replacement.
         // Disable modulation to terminate this preflight recursion, and use
         // an unlimited budget: capacity alone is recoverable after expansion.
         auto base_layer = source_layer;
-        base_layer.pitch_modulation.enabled = false;
-        base_layer.volume_modulation.enabled = false;
-        base_layer.opll_tl_modulation.enabled = false;
-        base_layer.opll_fb_modulation.enabled = false;
+        disableCompositeModulation(base_layer, CompositeModulationTarget::Pitch);
+        disableCompositeModulation(base_layer, CompositeModulationTarget::Volume);
+        disableCompositeModulation(base_layer, CompositeModulationTarget::TotalLevel);
+        disableCompositeModulation(base_layer, CompositeModulationTarget::Feedback);
         const auto base = formatMgsCompositeEnvelopeImpl(
             base_layer, definition_number,
             std::numeric_limits<std::size_t>::max(), numbers, library,
@@ -582,11 +591,10 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
         return result;
     }
 
-    if (!compositeModulationLoopRepresentable(source_layer, library)) {
-        result.issues.push_back(
-            MgsEnvelopeIssue::UnrepresentableModulationLoop);
-        return result;
-    }
+    // Authored [] repeats the first traversal's command stream. MGSDRV's
+    // jump preserves accumulated pitch and the last volume/register state;
+    // matching an indefinitely continuous authoring LFO is not required.
+    // The phase classification remains available to the editor's graph.
     const bool looping = has_loop_start;
     const auto effective_end = looping
         ? *timeline.loop_end_count
@@ -629,6 +637,9 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
             ? states[event.count].after_pitch_tokens
             : states[event.count].before_pitch_tokens;
         appendToken(tokens, "\\" + std::to_string(event.value));
+        states[event.count].ordered_commands.push_back({
+            "\\" + std::to_string(event.value), event.command_order,
+            event.after_loop_start, true});
     }
 
     for (const auto& event : layer.timbre_automation) {
@@ -645,6 +656,9 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
                 continue;
             }
             appendToken(tokens, "@" + std::to_string(*number));
+            states[event.count].ordered_commands.push_back({
+                "@" + std::to_string(*number), event.command_order,
+                event.after_loop_start, false});
         } else if (event.kind == EnvelopeEventKind::RegisterWrite) {
             const auto maximum_register =
                 layer.source == TimbreSource::Psg ? 15 : 56;
@@ -661,6 +675,9 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
                 tokens,
                 "y" + std::to_string(event.value)
                     + "," + std::to_string(event.secondary));
+            states[event.count].ordered_commands.push_back({
+                "y" + std::to_string(event.value) + "," + std::to_string(event.secondary),
+                event.command_order, event.after_loop_start, false});
         }
     }
     // TL/FB auto authoring expands to standard yreg,data after manual y
@@ -672,7 +689,7 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
         for (const auto& event :
              expandOpllLayerRegisterAutos(layer, library)) {
             if (event.count > effective_end
-                || (looping && event.count == effective_end)
+                || (looping && event.count == effective_end && !event.after_loop_start)
                 || event.kind != EnvelopeEventKind::RegisterWrite) {
                 continue;
             }
@@ -688,6 +705,9 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
             appendToken(tokens,
                 "y" + std::to_string(event.value)
                     + "," + std::to_string(event.secondary));
+            states[event.count].ordered_commands.push_back({
+                "y" + std::to_string(event.value) + "," + std::to_string(event.secondary),
+                event.command_order, event.after_loop_start, false});
         }
     }
     // §6.5.1: prepend track-side base `@` at count 0 when the envelope
@@ -701,6 +721,8 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
             const bool already = !leading.empty() && leading.front() == token;
             if (!already) {
                 leading.insert(leading.begin(), token);
+                states[0].ordered_commands.insert(states[0].ordered_commands.begin(),
+                    {token, 0, false, false, true});
             }
         }
     }
@@ -734,13 +756,42 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
         }
         return std::nullopt;
     };
-    const auto append_zero_time = [&](std::uint32_t count) {
-        // §6.2.3: before-`[` zero-time commands, then `[`, then after-`[`.
-        for (const auto& token : states[count].before_timbre_tokens) {
-            appendToken(tokens, token);
+    const auto append_zero_time = [&](std::uint32_t count, bool inside_only = false) {
+        if (std::any_of(states[count].ordered_commands.begin(),
+                        states[count].ordered_commands.end(),
+                        [inside_only](const auto& command) {
+                            return command.order != 0 && (!inside_only || command.after);
+                        })) {
+            auto commands = states[count].ordered_commands;
+            if (inside_only) std::erase_if(commands, [](const auto& command) { return !command.after; });
+            const bool anchor = looping && count == *timeline.loop_start_count;
+            std::stable_sort(commands.begin(), commands.end(),
+                [anchor](const auto& a, const auto& b) {
+                    if (anchor && a.after != b.after) return !a.after;
+                    if (a.leading != b.leading) return a.leading;
+                    if (a.order && b.order) return a.order < b.order;
+                    if (a.order != b.order) return a.order != 0;
+                    return a.pitch < b.pitch;
+                });
+            bool bracket = false;
+            for (const auto& command : commands) {
+                if (anchor && command.after && !bracket) {
+                    appendToken(tokens, "[");
+                    bracket = true;
+                }
+                appendToken(tokens, command.token);
+            }
+            if (anchor && !bracket) appendToken(tokens, "[");
+            return;
         }
-        for (const auto& token : states[count].before_pitch_tokens) {
-            appendToken(tokens, token);
+        // §6.2.3: before-`[` zero-time commands, then `[`, then after-`[`.
+        if (!inside_only) {
+            for (const auto& token : states[count].before_timbre_tokens) {
+                appendToken(tokens, token);
+            }
+            for (const auto& token : states[count].before_pitch_tokens) {
+                appendToken(tokens, token);
+            }
         }
         if (looping && count == *timeline.loop_start_count) {
             appendToken(tokens, "[");
@@ -949,26 +1000,10 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
 
     if (looping) {
         // L<: only `[`内（`]`直前）の after_* を `]` の前へ。`]以降`は §6.2.3 で出力しない。
-        for (const auto& token : states[effective_end].after_timbre_tokens) {
-            appendToken(tokens, token);
-        }
-        for (const auto& token : states[effective_end].after_pitch_tokens) {
-            appendToken(tokens, token);
-        }
+        append_zero_time(effective_end, true);
         appendToken(tokens, "]");
     } else {
-        for (const auto& token : states[effective_end].before_timbre_tokens) {
-            appendToken(tokens, token);
-        }
-        for (const auto& token : states[effective_end].before_pitch_tokens) {
-            appendToken(tokens, token);
-        }
-        for (const auto& token : states[effective_end].after_timbre_tokens) {
-            appendToken(tokens, token);
-        }
-        for (const auto& token : states[effective_end].after_pitch_tokens) {
-            appendToken(tokens, token);
-        }
+        append_zero_time(effective_end);
         if (states[effective_end].volume) {
             const auto spec = *states[effective_end].volume;
             appendHold(tokens, spec.value, 1);

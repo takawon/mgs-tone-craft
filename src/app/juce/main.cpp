@@ -2286,6 +2286,51 @@ public:
             quit();
             return;
         }
+        std::string library_error;
+        if (!mgstc::app::initialiseToneLibrarySession(
+                tag_management_lock_, &library_error)) {
+            juce::AlertWindow::showAsync(
+                juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::WarningIcon)
+                    .withTitle(juce::String::fromUTF8("音色ライブラリ"))
+                    .withMessage(juce::String::fromUTF8(
+                        "SQLiteの音色ライブラリの一部データを読み込めない可能性があります。\n"
+                        "読み込めるデータは読み込んでいます。OKで起動を続けます。\n"
+                        "この起動中は元のDBを保護するためライブラリの保存を行いません。"))
+                    .withButton("OK"),
+                [this, command_line](int) {
+                    continueInitialisation(command_line);
+                });
+            return;
+        }
+        continueInitialisation(command_line);
+    }
+
+    void shutdown() override {
+        stopTimer();
+        hang_watchdog_.stop();
+        snapshot_window_ = nullptr;
+        spectrogram_window_.reset();
+        library_manager_window_.reset();
+        opll_envelope_window_.reset();
+        scc_envelope_window_.reset();
+        opll_window_.reset();
+        scc_window_.reset();
+        main_window_.reset();
+        editor_session_.reset();
+        midi_service_.reset();
+        audio_service_.reset();
+        juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
+    }
+
+    void systemRequestedQuit() override {
+        requestApplicationQuit();
+    }
+
+private:
+    void continueInitialisation(const juce::String& command_line) {
+        const juce::ArgumentList arguments(
+            getApplicationName(), command_line);
         hang_watchdog_.start();
         const auto snapshot_target = arguments
             .getValueForOption("--capture-target")
@@ -2381,28 +2426,6 @@ public:
         }
     }
 
-    void shutdown() override {
-        stopTimer();
-        hang_watchdog_.stop();
-        snapshot_window_ = nullptr;
-        spectrogram_window_.reset();
-        library_manager_window_.reset();
-        opll_envelope_window_.reset();
-        scc_envelope_window_.reset();
-        opll_window_.reset();
-        scc_window_.reset();
-        main_window_.reset();
-        editor_session_.reset();
-        midi_service_.reset();
-        audio_service_.reset();
-        juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
-    }
-
-    void systemRequestedQuit() override {
-        requestApplicationQuit();
-    }
-
-private:
     static constexpr int kMaxActivationPasses = 8;
 
     [[nodiscard]] static juce::String canonicalEditor(

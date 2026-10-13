@@ -805,6 +805,11 @@ std::size_t wavToneStorage(const CompositeTimbre& tone) {
             + layer.pitch_envelope.events.capacity() * sizeof(EnvelopeEvent)
             + layer.name.capacity() + layer.opll_tl_auto.free_curve.capacity()
             + layer.opll_fb_auto.free_curve.capacity();
+        bytes += layer.modulation_profiles.capacity() * sizeof(CompositeModulationProfile)
+            + layer.register_auto_profiles.capacity() * sizeof(OpllRegisterAutoProfile)
+            + layer.derived_command_placements.capacity() * sizeof(CompositeDerivedCommandPlacement);
+        for (const auto& profile : layer.register_auto_profiles)
+            bytes += profile.lane.free_curve.capacity();
         for (const auto& event : layer.timbre_automation)
             if (event.scc_morph.explicit_plan)
                 bytes += event.scc_morph.explicit_plan->points.capacity() * sizeof(SccMorphPoint);
@@ -1030,6 +1035,7 @@ bool stationaryLoop(const CompositeLayer& layer) {
     const auto& timeline = layer.envelope_timeline;
     if (!timeline.loop_start_count || !timeline.loop_end_count) return false;
     return layer.pitch_envelope.events.empty()
+        && layer.modulation_profiles.empty() && layer.register_auto_profiles.empty()
         && !layer.software_lfo.enabled && !layer.pitch_sweep.enabled
         && !layer.pitch_modulation.enabled && !layer.volume_modulation.enabled
         && !layer.opll_tl_modulation.enabled && !layer.opll_fb_modulation.enabled

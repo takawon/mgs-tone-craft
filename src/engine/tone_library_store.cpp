@@ -643,7 +643,8 @@ bool ToneLibraryDatabase::writeComposites(
 
 bool ToneLibraryDatabase::loadTimbres(
     TimbreLibrary& timbres,
-    std::string* error) {
+    std::string* error,
+    bool allow_partial) {
     SqliteStatement select_rows;
     SqliteStatement select_tags;
     if (!select_rows.prepare(
@@ -651,22 +652,28 @@ bool ToneLibraryDatabase::loadTimbres(
             "SELECT id, category, name, memo, favorite, created_at, "
             "updated_at, last_used_at, use_count, revision, payload "
             "FROM timbres ORDER BY id;",
-            error)
-        || !select_tags.prepare(
+            error)) {
+        return false;
+    }
+    bool read_tags = select_tags.prepare(
             db_,
             "SELECT tags.name FROM timbre_tags "
             "JOIN tags ON tags.id = timbre_tags.tag_id "
             "WHERE timbre_tags.timbre_id = ? "
             "ORDER BY tags.name COLLATE NOCASE, tags.id;",
-            error)) {
+            error);
+    if (!read_tags && !allow_partial) {
         return false;
     }
+    bool complete = read_tags;
 
     std::vector<TimbreLibraryEntry> entries;
     for (;;) {
         bool has_row = false;
         if (!select_rows.stepRow(has_row, db_, error)) {
-            return false;
+            if (!allow_partial) { return false; }
+            complete = false;
+            break;
         }
         if (!has_row) {
             break;
@@ -674,12 +681,16 @@ bool ToneLibraryDatabase::loadTimbres(
         TimbreLibraryEntry entry;
         if (!fromSqliteId(sqlite3_column_int64(select_rows.get(), 0), entry.id)) {
             setError(error, "invalid timbre id");
-            return false;
+            if (!allow_partial) { return false; }
+            complete = false;
+            continue;
         }
         const auto category = sqlite3_column_int64(select_rows.get(), 1);
         if (category != 0 && category != 1) {
             setError(error, "invalid timbre category");
-            return false;
+            if (!allow_partial) { return false; }
+            complete = false;
+            continue;
         }
         entry.category = static_cast<TimbreCategory>(category);
         const auto* name = sqlite3_column_text(select_rows.get(), 2);
@@ -705,39 +716,49 @@ bool ToneLibraryDatabase::loadTimbres(
                 sqlite3_column_blob(select_rows.get(), 10),
                 sqlite3_column_bytes(select_rows.get(), 10),
                 error)) {
-            return false;
+            if (!allow_partial) { return false; }
+            complete = false;
+            continue;
         }
-        sqlite3_int64 sqlite_id = 0;
-        if (!toSqliteId(entry.id, sqlite_id)
-            || !select_tags.bindInt64(1, sqlite_id, db_, error)) {
-            return false;
-        }
-        for (;;) {
-            bool has_tag = false;
-            if (!select_tags.stepRow(has_tag, db_, error)) {
-                return false;
+        if (read_tags) {
+            sqlite3_int64 sqlite_id = 0;
+            if (!toSqliteId(entry.id, sqlite_id)
+                || !select_tags.bindInt64(1, sqlite_id, db_, error)) {
+                if (!allow_partial) { return false; }
+                complete = false;
+                read_tags = false;
+            } else {
+                for (;;) {
+                    bool has_tag = false;
+                    if (!select_tags.stepRow(has_tag, db_, error)) {
+                        if (!allow_partial) { return false; }
+                        complete = false;
+                        break;
+                    }
+                    if (!has_tag) { break; }
+                    const auto* tag = sqlite3_column_text(select_tags.get(), 0);
+                    if (tag != nullptr) {
+                        entry.tags.emplace_back(
+                            reinterpret_cast<const char*>(tag));
+                    }
+                }
+                if (!select_tags.reset(db_, error)) {
+                    if (!allow_partial) { return false; }
+                    complete = false;
+                    read_tags = false;
+                }
             }
-            if (!has_tag) {
-                break;
-            }
-            const auto* tag = sqlite3_column_text(select_tags.get(), 0);
-            if (tag != nullptr) {
-                entry.tags.emplace_back(
-                    reinterpret_cast<const char*>(tag));
-            }
-        }
-        if (!select_tags.reset(db_, error)) {
-            return false;
         }
         entries.push_back(std::move(entry));
     }
     timbres.installEntries(std::move(entries));
-    return true;
+    return complete;
 }
 
 bool ToneLibraryDatabase::loadComposites(
     CompositeTimbreLibrary& composites,
-    std::string* error) {
+    std::string* error,
+    bool allow_partial) {
     SqliteStatement select_rows;
     SqliteStatement select_tags;
     if (!select_rows.prepare(
@@ -745,22 +766,28 @@ bool ToneLibraryDatabase::loadComposites(
             "SELECT id, name, memo, favorite, created_at, updated_at, "
             "last_used_at, use_count, revision, payload_version, payload "
             "FROM composite_timbres ORDER BY id;",
-            error)
-        || !select_tags.prepare(
+            error)) {
+        return false;
+    }
+    bool read_tags = select_tags.prepare(
             db_,
             "SELECT tags.name FROM composite_tags "
             "JOIN tags ON tags.id = composite_tags.tag_id "
             "WHERE composite_tags.composite_id = ? "
             "ORDER BY tags.name COLLATE NOCASE, tags.id;",
-            error)) {
+            error);
+    if (!read_tags && !allow_partial) {
         return false;
     }
+    bool complete = read_tags;
 
     std::vector<CompositeTimbreLibraryEntry> entries;
     for (;;) {
         bool has_row = false;
         if (!select_rows.stepRow(has_row, db_, error)) {
-            return false;
+            if (!allow_partial) { return false; }
+            complete = false;
+            break;
         }
         if (!has_row) {
             break;
@@ -769,7 +796,9 @@ bool ToneLibraryDatabase::loadComposites(
         if (!fromSqliteId(
                 sqlite3_column_int64(select_rows.get(), 0), entry.id)) {
             setError(error, "invalid composite timbre id");
-            return false;
+            if (!allow_partial) { return false; }
+            complete = false;
+            continue;
         }
         const auto* name = sqlite3_column_text(select_rows.get(), 1);
         const auto* memo = sqlite3_column_text(select_rows.get(), 2);
@@ -778,14 +807,18 @@ bool ToneLibraryDatabase::loadComposites(
         const auto blob_size = sqlite3_column_bytes(select_rows.get(), 10);
         if (blob == nullptr || blob_size <= 0) {
             setError(error, "missing composite sound payload");
-            return false;
+            if (!allow_partial) { return false; }
+            complete = false;
+            continue;
         }
         if (payload_version != 1 && payload_version != 2 && payload_version != 3
-            && payload_version != 4
+            && payload_version != 4 && payload_version != 5
             && payload_version
                 != static_cast<sqlite3_int64>(kCompositeSoundPayloadVersion)) {
             setError(error, "unsupported composite sound payload version");
-            return false;
+            if (!allow_partial) { return false; }
+            complete = false;
+            continue;
         }
         const auto payload = std::string_view(
             static_cast<const char*>(blob),
@@ -795,7 +828,9 @@ bool ToneLibraryDatabase::loadComposites(
             static_cast<std::uint32_t>(payload_version),
             error);
         if (!timbre) {
-            return false;
+            if (!allow_partial) { return false; }
+            complete = false;
+            continue;
         }
         entry.timbre = std::move(*timbre);
         entry.timbre.name = name != nullptr
@@ -814,33 +849,40 @@ bool ToneLibraryDatabase::loadComposites(
         entry.revision = static_cast<std::uint32_t>(
             sqlite3_column_int64(select_rows.get(), 8));
 
-        sqlite3_int64 sqlite_id = 0;
-        if (!toSqliteId(entry.id, sqlite_id)
-            || !select_tags.bindInt64(1, sqlite_id, db_, error)) {
-            return false;
-        }
         entry.timbre.tags.clear();
-        for (;;) {
-            bool has_tag = false;
-            if (!select_tags.stepRow(has_tag, db_, error)) {
-                return false;
+        if (read_tags) {
+            sqlite3_int64 sqlite_id = 0;
+            if (!toSqliteId(entry.id, sqlite_id)
+                || !select_tags.bindInt64(1, sqlite_id, db_, error)) {
+                if (!allow_partial) { return false; }
+                complete = false;
+                read_tags = false;
+            } else {
+                for (;;) {
+                    bool has_tag = false;
+                    if (!select_tags.stepRow(has_tag, db_, error)) {
+                        if (!allow_partial) { return false; }
+                        complete = false;
+                        break;
+                    }
+                    if (!has_tag) { break; }
+                    const auto* tag = sqlite3_column_text(select_tags.get(), 0);
+                    if (tag != nullptr) {
+                        entry.timbre.tags.emplace_back(
+                            reinterpret_cast<const char*>(tag));
+                    }
+                }
+                if (!select_tags.reset(db_, error)) {
+                    if (!allow_partial) { return false; }
+                    complete = false;
+                    read_tags = false;
+                }
             }
-            if (!has_tag) {
-                break;
-            }
-            const auto* tag = sqlite3_column_text(select_tags.get(), 0);
-            if (tag != nullptr) {
-                entry.timbre.tags.emplace_back(
-                    reinterpret_cast<const char*>(tag));
-            }
-        }
-        if (!select_tags.reset(db_, error)) {
-            return false;
         }
         entries.push_back(std::move(entry));
     }
     composites.installEntries(std::move(entries));
-    return true;
+    return complete;
 }
 
 bool ToneLibraryDatabase::load(
@@ -863,6 +905,26 @@ bool ToneLibraryDatabase::load(
     timbres = std::move(loaded_timbres);
     composites = std::move(loaded_composites);
     return true;
+}
+
+bool ToneLibraryDatabase::loadAvailable(
+    TimbreLibrary& timbres,
+    CompositeTimbreLibrary& composites,
+    std::string* error) {
+    timbres = {};
+    composites = {};
+    if (error) { error->clear(); }
+    if (db_ == nullptr) {
+        setError(error, "tone library is not open");
+        return false;
+    }
+    if (!enableForeignKeys(error)) {
+        return false;
+    }
+    // Do not short-circuit: a broken table must not discard the other one.
+    const bool timbres_complete = loadTimbres(timbres, error, true);
+    const bool composites_complete = loadComposites(composites, error, true);
+    return timbres_complete && composites_complete;
 }
 
 bool ToneLibraryDatabase::replaceTimbres(

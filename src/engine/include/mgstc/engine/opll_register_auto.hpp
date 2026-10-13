@@ -38,7 +38,8 @@ opllOriginalRegistersForLibraryId(
 // Active @ (or base) at the given count: ROM vs original library id.
 [[nodiscard]] OpllActiveTimbreAtCount opllActiveTimbreAt(
     const CompositeLayer& layer,
-    std::uint32_t count) noexcept;
+    std::uint32_t count,
+    bool after_loop_start = true) noexcept;
 
 // Original-tone register image (regs 0–7) at `count`: base / @-slide
 // originals + manual y. When `include_manual_y_at_count` is false, y at
@@ -53,11 +54,14 @@ opllOriginalRegisterImageAt(
     std::uint32_t count,
     const TimbreLibrary* library = nullptr,
     bool include_manual_y_at_count = true,
-    bool include_register_auto = false) noexcept;
+    bool include_register_auto = false,
+    bool after_loop_start = true,
+    const std::vector<EnvelopeEvent>* expanded_register_events = nullptr) noexcept;
 
 [[nodiscard]] bool opllRegisterAutoAvailableAt(
     const CompositeLayer& layer,
-    std::uint32_t count) noexcept;
+    std::uint32_t count,
+    bool after_loop_start = true) noexcept;
 
 // YM2413 original-tone registers 0–7 are chip-wide. Product rule: at most
 // one OPLL layer may own TL auto, and at most one may own FB auto (they may
