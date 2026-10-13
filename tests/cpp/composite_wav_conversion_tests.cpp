@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "mgstc/engine/composite_wav_conversion.hpp"
 #include "mgstc/engine/detail/composite_wav_candidate_retention.hpp"
+#include "mgstc/engine/detail/composite_wav_envelope_normalization.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/mgs_composite_io.hpp"
 #include "mgstc/engine/scc_morph.hpp"
@@ -24,6 +25,98 @@ namespace {
 using namespace mgstc::engine;
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+CompositeTimbre constantEnvelopeTone(TimbreSource source, int envelopeVolume, int trackVolume) {
+    CompositeTimbre tone;
+    CompositeLayer layer;
+    layer.source = source;
+    layer.volume = static_cast<std::uint8_t>(trackVolume);
+    layer.envelope_timeline.length_counts = 120;
+    SavedTimbreReference ref;
+    ref.library_id = allocateCompositeOwnedTimbreId(tone);
+    ref.source = source;
+    for (std::size_t i = 0; i < ref.scc_waveform.size(); ++i)
+        ref.scc_waveform[i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(
+            std::lround(80 * std::sin(2 * std::numbers::pi * i / 32))));
+    auto patch = defaultOpllPatch();
+    patch.modulator.attack_rate = patch.carrier.attack_rate = 15;
+    ref.opll_registers = encodeOpllPatch(patch);
+    layer.base_timbre = ref;
+    layer.volume_envelope.events = {
+        EnvelopeEvent{.kind = EnvelopeEventKind::Volume, .value = envelopeVolume, .count = 0}};
+    EnvelopeEvent initial;
+    initial.kind = EnvelopeEventKind::Timbre;
+    initial.target_library_id = ref.library_id;
+    layer.timbre_automation.push_back(initial);
+    tone.layers.push_back(layer);
+    return tone;
+}
+
+void constantEnvelopeRegressions() {
+    for (const auto source : {TimbreSource::Scc, TimbreSource::Opll})
+        for (const int env : {15, 14, 9, 0}) for (const int track : {15, 10})
+            for (const int hang : {0, 2}) {
+                auto original = constantEnvelopeTone(source, env, track);
+                original.layers.front().key_off_hang = static_cast<std::uint8_t>(hang);
+                auto normalized = original;
+                require(detail::normalizeWavConstantEnvelopes(normalized), "constant ENV is normalized");
+                const auto& layer = normalized.layers.front();
+                require(layer.volume == std::max(0, env + track - 15)
+                    && layer.base_timbre == original.layers.front().base_timbre
+                    && layer.timbre_automation.empty() && !layerUsesSequenceEnvelope(layer),
+                    "constant volume moves to v with no used ENV or lost base tone");
+                require(!detail::normalizeWavConstantEnvelopes(normalized), "normalization is idempotent");
+                CompositeWavRenderOptions options;
+                options.key_off_frame = 3201;
+                options.frame_count = 48'000;
+                const auto before = renderCompositeWav(original, options);
+                const auto after = renderCompositeWav(normalized, options);
+                require(before.ok() && after.ok()
+                        && before.effective_key_off_frame == after.effective_key_off_frame
+                        && before.mono_pcm == after.mono_pcm && before.stereo_pcm == after.stereo_pcm,
+                    "constant ENV removal preserves exact PCM through key-off and release");
+                const auto mgs = formatMgsComposite(normalized);
+                require(mgs.valid() && extractMgsSourceDefinitions(mgs.source, 'e').empty(),
+                    "constant WAV tone exports without an @e definition");
+                const auto saved = CompositeTimbreLibrary::serializeTimbreFile(normalized, 0);
+                const auto loaded = CompositeTimbreLibrary::deserializeTimbreFile(saved);
+                require(loaded && *loaded == normalized && !layerUsesSequenceEnvelope(loaded->layers.front()),
+                    "normalized WAV tone retains unused ENV and volume on save/restore");
+            }
+
+    const auto original = constantEnvelopeTone(TimbreSource::Scc, 9, 15);
+    const auto preserve = [&](const std::function<void(CompositeLayer&)>& modify) {
+        auto tone = original;
+        modify(tone.layers.front());
+        const auto before = tone;
+        require(!detail::normalizeWavConstantEnvelopes(tone) && tone == before,
+            "dynamic or unsupported WAV ENV remains unchanged");
+    };
+    preserve([](auto& l) { l.volume_envelope.events.push_back(
+        EnvelopeEvent{.kind = EnvelopeEventKind::Volume, .value = 8, .count = 4}); });
+    preserve([](auto& l) { l.volume_envelope.events.front().automatic = true; });
+    preserve([](auto& l) { auto event = l.timbre_automation.front(); event.count = 4;
+        ++event.target_library_id; l.timbre_automation.push_back(event); });
+    preserve([](auto& l) { l.timbre_automation.front().count = 4; });
+    preserve([](auto& l) { l.timbre_automation.front().kind = EnvelopeEventKind::RegisterWrite; });
+    preserve([](auto& l) { l.timbre_automation.front().scc_morph.enabled = true; });
+    preserve([](auto& l) { l.pitch_envelope.events.push_back(
+        EnvelopeEvent{.kind = EnvelopeEventKind::Pitch, .value = 1, .count = 0}); });
+    preserve([](auto& l) { l.volume_modulation.enabled = true; });
+    preserve([](auto& l) { l.opll_tl_modulation.enabled = true; });
+    preserve([](auto& l) { l.envelope_timeline.loop_start_count = 0; l.envelope_timeline.loop_end_count = 4; });
+    preserve([](auto& l) { l.volume_envelope.kind = EnvelopeKind::Rate; });
+
+    auto mixed = original;
+    auto dynamic = original.layers.front();
+    dynamic.channel = 1;
+    dynamic.volume_envelope.events.push_back(
+        EnvelopeEvent{.kind = EnvelopeEventKind::Volume, .value = 8, .count = 4});
+    mixed.layers.push_back(dynamic);
+    require(detail::normalizeWavConstantEnvelopes(mixed)
+        && !layerUsesSequenceEnvelope(mixed.layers.front()) && mixed.layers[1] == dynamic,
+        "each WAV channel is normalized independently of a dynamic neighbour");
 }
 std::shared_ptr<const SourceAnalysis> fixture() {
     auto pcm = std::make_shared<SourcePcm>();
@@ -1012,6 +1105,51 @@ void scoreSpacedCandidateRegressions() {
         "joint five-percent spacing minimizes total target deviation among existing candidates");
 }
 
+void normalizedCandidateRefillRegressions() {
+    const std::array<int, 7> env{9, 14, 15, 13, 12, 11, 12};
+    const std::array<int, 7> track{15, 15, 14, 15, 15, 15, 12};
+    std::vector<CompositeTimbre> keys;
+    for (std::size_t i = 0; i < env.size(); ++i) {
+        auto key = constantEnvelopeTone(TimbreSource::Scc, env[i], track[i]);
+        require(detail::normalizeWavConstantEnvelopes(key), "refill fixture normalizes each fixed ENV");
+        keys.push_back(std::move(key));
+    }
+    require(keys[0] == keys[6] && keys[1] == keys[2],
+        "distinct ENV/v parameters collapse to the same completed candidate key");
+    const std::array<detail::WavRetainedScore, 7> scores{{
+        {100, 0}, {105, 1}, {110, 2}, {115, 3}, {120, 4}, {125, 5}, {106, 6}}};
+    const auto isWinner = [&](std::size_t i) { return keys[i] == keys.front(); };
+    const auto same = [&](std::size_t a, std::size_t b) { return keys[a] == keys[b]; };
+    const auto selected = detail::selectDistinctWavScoreSpacedAlternatives(scores, 100, isWinner, same);
+    require(selected == std::vector<std::size_t>{1, 3, 4, 5},
+        "normalized winner/alternative duplicates are excluded and an already evaluated fifth result fills the slot");
+    require(detail::selectDistinctWavScoreSpacedAlternatives(
+            std::span<const detail::WavRetainedScore>(scores).first(3), 100, isWinner, same)
+            == std::vector<std::size_t>{1},
+        "an exhausted distinct evaluated pool returns only real candidates");
+    const auto distinct = [](std::size_t a, std::size_t b) { return a == b; };
+    require(detail::selectDistinctWavScoreSpacedAlternatives(scores, 100,
+            [](std::size_t) { return false; }, distinct)
+            == detail::selectWavScoreSpacedAlternatives(scores, 100),
+        "a pool without duplicates retains the existing score-spaced selection");
+}
+
+void constantEnvelopeConversionRegressions() {
+    auto analysis = std::make_shared<SourceAnalysis>(*fixture());
+    for (auto& frame : analysis->amplitude_envelope) frame.rms = frame.peak = .5;
+    CompositeWavConversionOptions options;
+    options.max_evaluations = 1;
+    options.max_scc_waveforms = 1;
+    options.loop_mode = CompositeWavLoopMode::None;
+    const auto result = convertCompositeWave(analysis, options);
+    validate(result, 1, 1);
+    require(!layerUsesSequenceEnvelope(result.composite_tone->layers.front()),
+        "completed single-original fixed-volume WAV result uses no ENV");
+    for (const auto& candidate : result.retained_candidates)
+        require(!layerUsesSequenceEnvelope(candidate.tone.layers.front()),
+            "all returned fixed-volume candidates use no ENV");
+}
+
 void run() {
     const auto analysis = fixture();
     const auto sourceBefore = analysis->source->interleaved_samples;
@@ -1129,6 +1267,9 @@ int main() {
             std::fprintf(stderr, "WAV conversion regression [%s]: %s\n", name, error.what());
         }
     };
+    check("constant ENV PCM and export", constantEnvelopeRegressions);
+    check("constant ENV completed candidates", constantEnvelopeConversionRegressions);
+    check("normalized candidate refill", normalizedCandidateRefillRegressions);
     check("score spaced candidates", scoreSpacedCandidateRegressions);
     check("existing conversion", run);
     check("local discontinuity", localDiscontinuityRegressions);

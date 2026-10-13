@@ -885,13 +885,15 @@ public:
     }
 
     bool verifyPresetSelection() {
-        for (int id = 1; id <= 6; ++id) {
+        const bool scc = source_ == mgstc::engine::TimbreSource::Scc;
+        for (int id = 1; id <= (scc ? 6 : 15); ++id) {
             preset_.setSelectedId(id, juce::dontSendNotification);
             preset_.onChange();
             const auto choice = selectedChoice();
-            if (!choice || !choice->scc_preset || !load_.isEnabled()
-                || static_cast<int>(*choice->scc_preset) != id - 1
-                || list_.getSelectedId() != 0) return false;
+            if (!choice || !load_.isEnabled() || list_.getSelectedId() != 0) return false;
+            if (scc ? (!choice->scc_preset || static_cast<int>(*choice->scc_preset) != id - 1)
+                    : (choice->pick != mgstc::engine::TimbrePick::OpllRom || choice->rom_number != id - 1))
+                return false;
         }
         load_.onClick();
         if (layer_base_ && preview_.onClick) preview_.onClick();
@@ -5697,11 +5699,12 @@ public:
             };
             EnvelopeTimbreChoice choice;
             choice.library_id = target.library_id;
-            previewTimbreChoice(1, choice, 60);
-            check(played && played->layers[1].base_timbre
-                    && played->layers[1].base_timbre->scc_waveform == target.scc_waveform
-                    && played->layers[1].timbre_automation.empty(),
-                "picker did not audition selected embedded tone from key-on");
+            previewTimbreChoice(1, 12, choice, 60);
+            const auto* selected = played ? timbreEventAt(played->layers[1], 12) : nullptr;
+            check(selected && selected->target_library_id == target.library_id
+                    && timbreEventAt(played->layers[1], 8)
+                    && played->layers[1].base_timbre == before.layers[1].base_timbre,
+                "picker did not preserve the ENV when applying the selected embedded tone at its step");
             check(timbre_ == before && played && played->layers[0] == before.layers[0]
                     && played->layers[2] == before.layers[2]
                     && played->layers[1].volume_envelope == before.layers[1].volume_envelope,
@@ -5709,10 +5712,12 @@ public:
             choice.pick = mgstc::engine::TimbrePick::OpllRom;
             choice.rom_number = 4;
             played.reset();
-            previewTimbreChoice(2, choice, 60);
-            check(played && !played->layers[2].base_timbre
-                    && played->layers[2].base_opll_rom == 4 && timbre_ == before,
-                "picker ROM audition changed authored state or retained original base");
+            previewTimbreChoice(2, 12, choice, 60);
+            const auto* rom = played ? timbreEventAt(played->layers[2], 12) : nullptr;
+            check(rom && rom->timbre_pick == mgstc::engine::TimbrePick::OpllRom
+                    && rom->value == 4 && timbre_ == before
+                    && played->layers[2].base_timbre == before.layers[2].base_timbre,
+                "picker ROM audition changed authored state or lost the original base");
             manual_y_preview_ = saved_preview;
         }
         setTimbre(model, true); selectOverviewLayer(0);
@@ -5742,6 +5747,12 @@ public:
                 [&](auto choice) { if (choice.scc_preset) ++selected_previews; });
             check(picker.verifyPresetSelection() && selected_previews == 6 && loaded == 1,
                 "SCC preset controls did not select, preview and load all six presets");
+            int rom_previews = 0;
+            EnvelopeTimbrePickContent rom_picker(mgstc::engine::TimbreSource::Opll,
+                {}, {}, [](auto) {}, {}, {}, {}, {}, {}, {}, false, nullptr, {}, {}, {}, {}, {}, {},
+                [&](auto choice) { if (choice.pick == mgstc::engine::TimbrePick::OpllRom) ++rom_previews; });
+            check(rom_picker.verifyPresetSelection() && rom_previews == 15,
+                "OPLL preset selection did not use the existing one-second preview callback");
             setTimbre(model, true); selectOverviewLayer(1);
             const auto before = timbre_;
             applyTimbreChoice(12, preset_choice);
@@ -5759,11 +5770,14 @@ public:
                 played = std::move(candidate);
             };
             const auto authored = timbre_;
-            previewTimbreChoice(1, preset_choice, 60, true);
-            check(played && played->layers.size() == 1
-                && played->layers[0].source == mgstc::engine::TimbreSource::Scc
-                && played->layers[0].base_timbre && timbre_ == authored,
-                "preset selection preview was not a temporary single tone");
+            previewTimbreChoice(1, 12, preset_choice, 60, true);
+            check(played && played->layers.size() == authored.layers.size()
+                && played->layers[0] == authored.layers[0]
+                && played->layers[2] == authored.layers[2]
+                && timbreEventAt(played->layers[1], 12)
+                && played->layers[1].volume_envelope == authored.layers[1].volume_envelope
+                && timbre_ == authored,
+                "preset selection preview did not retain the temporary composite mix and ENV");
             manual_y_preview_ = saved_preview;
             setTimbre(before, true); selectOverviewLayer(1);
             timbre_.layers[1].base_timbre = presetReference(timbre_, mgstc::engine::SccWavePreset::Triangle);
@@ -12166,45 +12180,14 @@ private:
         return result;
     }
 
-    void previewTimbreChoice(std::size_t layer_index,
+    void previewTimbreChoice(std::size_t layer_index, int count,
         const EnvelopeTimbreChoice& choice, std::uint8_t note, bool one_second = false) {
         if (!manual_y_preview_ || layer_index >= timbre_.layers.size()) return;
         auto preview = timbre_;
-        auto& layer = preview.layers[layer_index];
-        if (choice.scc_preset && layer.source == mgstc::engine::TimbreSource::Scc) {
-            layer.base_timbre = presetReference(preview, *choice.scc_preset);
-            layer.base_opll_rom.reset();
-        } else if (choice.pick == mgstc::engine::TimbrePick::OpllRom) {
-            layer.base_timbre.reset();
-            layer.base_opll_rom = choice.rom_number;
-        } else if (choice.pick == mgstc::engine::TimbrePick::Library) {
-            std::optional<mgstc::engine::SavedTimbreReference> snapshot;
-            if (const auto* embedded = mgstc::engine::findEmbeddedTimbreSnapshot(
-                    preview, choice.library_id)) snapshot = *embedded;
-            else if (const auto* library = timbreLibrary()) {
-                if (const auto* entry = library->find(choice.library_id))
-                    snapshot = mgstc::engine::makeSavedTimbreReference(*entry);
-            }
-            if (!snapshot || snapshot->source != layer.source) return;
-            layer.base_timbre = std::move(snapshot);
-            layer.base_opll_rom.reset();
-        } else return;
-        // Audition the selected source from key-on through the existing ENV,
-        // pitch and modulation paths, without earlier @/manual-y replacing it.
-        std::erase_if(layer.timbre_automation, [](const auto& event) {
-            return event.kind == mgstc::engine::EnvelopeEventKind::Timbre
-                || (event.kind == mgstc::engine::EnvelopeEventKind::RegisterWrite
-                    && event.value >= 0 && event.value <= 7);
-        });
-        if (one_second) {
-            // Selection audition is a single neutral tone, independent of the ENV.
-            const auto defaults = mgstc::engine::defaultCompositeTimbre();
-            auto plain = *std::find_if(defaults.layers.begin(), defaults.layers.end(),
-                [&](const auto& candidate) { return candidate.source == layer.source; });
-            plain.base_timbre = layer.base_timbre;
-            plain.base_opll_rom = layer.base_opll_rom;
-            preview.layers = {std::move(plain)};
-        }
+        // Use the same step assignment as Load, on a temporary UI-thread copy.
+        // Keep the complete mix, ENV, earlier/later @, y and modulation paths.
+        setStepTimbreChoice(preview, layer_index, count, choice);
+        static_cast<void>(mgstc::app::invalidateEditedSccMorphPlans(timbre_, preview));
         manual_y_preview_(std::move(preview), note, one_second);
     }
 
@@ -12301,19 +12284,18 @@ private:
             [this, count, layer_index = static_cast<std::size_t>(selected_layer_)] {
                 return addBlankOriginalAtStep(layer_index, count);
             },
-            [this, layer_index = static_cast<std::size_t>(selected_layer_)](
+            [this, count, layer_index = static_cast<std::size_t>(selected_layer_)](
                 EnvelopeTimbreChoice choice, std::uint8_t note) {
-                previewTimbreChoice(layer_index, choice, note);
+                previewTimbreChoice(layer_index, count, choice, note);
             },
             [this] { if (manual_y_end_) manual_y_end_(); },
-            [this, layer_index = static_cast<std::size_t>(selected_layer_)](
+            [this, count, layer_index = static_cast<std::size_t>(selected_layer_)](
                 EnvelopeTimbreChoice choice) {
-                if (timbre_.layers[layer_index].source != mgstc::engine::TimbreSource::Scc) return;
                 const auto note = session_ != nullptr
                     && !standaloneHostPreferences(session_->snapshot().capabilities)
                     ? session_->auditionPreferences().last_note
                     : LastAuditionNoteStore::instance().get();
-                previewTimbreChoice(layer_index, choice, note, true);
+                previewTimbreChoice(layer_index, count, choice, note, true);
             });
         bool has_morph_settings = false;
         if (layer.source == mgstc::engine::TimbreSource::Scc) {
@@ -12927,24 +12909,21 @@ private:
             + juce::String::fromUTF8(" を追加しました"));
     }
 
-    void applyTimbreChoice(int timeline_count, const EnvelopeTimbreChoice& choice) {
-        if (selected_layer_ < 0
-            || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
-            return;
-        }
+    void setStepTimbreChoice(mgstc::engine::CompositeTimbre& sound,
+        std::size_t layer_index, int timeline_count, const EnvelopeTimbreChoice& choice) {
         auto& events =
-            timbre_.layers[static_cast<std::size_t>(selected_layer_)]
+            sound.layers[layer_index]
                 .timbre_automation;
         EnvelopeTimbrePickContent::MorphSettings morph_settings;
         if (const auto* existing = timbreEventAt(
-                timbre_.layers[static_cast<std::size_t>(selected_layer_)],
+                sound.layers[layer_index],
                 static_cast<std::uint32_t>(timeline_count),
-                isLoopStartCount(timbre_.layers[static_cast<std::size_t>(selected_layer_)], timeline_count)
+                isLoopStartCount(sound.layers[layer_index], timeline_count)
                     ? std::optional<bool>{loop_insert_after_} : std::nullopt))
             morph_settings = existing->scc_morph;
-        const auto& layer = timbre_.layers[static_cast<std::size_t>(selected_layer_)];
+        const auto& layer = sound.layers[layer_index];
         const bool split = isLoopStartCount(layer, timeline_count);
-        const bool after = newCommandAfterLoopStart(static_cast<std::uint32_t>(timeline_count));
+        const bool after = split && loop_insert_after_;
         std::erase_if(events, [timeline_count, split, after](const auto& event) {
             return event.kind == mgstc::engine::EnvelopeEventKind::Timbre
                 && event.count == static_cast<std::uint32_t>(timeline_count)
@@ -12957,11 +12936,11 @@ private:
         event.timbre_pick = choice.pick;
         event.target_library_id = choice.library_id;
         if (choice.scc_preset
-            && timbre_.layers[static_cast<std::size_t>(selected_layer_)].source
+            && sound.layers[layer_index].source
                 == mgstc::engine::TimbreSource::Scc) {
-            auto snapshot = presetReference(timbre_, *choice.scc_preset);
+            auto snapshot = presetReference(sound, *choice.scc_preset);
             event.target_library_id = snapshot.library_id;
-            timbre_.embedded_timbres.push_back(std::move(snapshot));
+            sound.embedded_timbres.push_back(std::move(snapshot));
         }
         if (choice.pick == mgstc::engine::TimbrePick::Library
             && mgstc::engine::isStandaloneLibraryTimbreId(choice.library_id)
@@ -12969,8 +12948,8 @@ private:
             if (const auto* library = timbre_library_callback_()) {
                 if (const auto* entry = library->find(choice.library_id)) {
                     auto adopted =
-                        mgstc::engine::adoptLibraryTimbre(timbre_, *entry);
-                    timbre_.embedded_timbres.push_back(adopted);
+                        mgstc::engine::adoptLibraryTimbre(sound, *entry);
+                    sound.embedded_timbres.push_back(adopted);
                     event.target_library_id = adopted.library_id;
                 }
             }
@@ -12978,14 +12957,21 @@ private:
         event.value = choice.pick == mgstc::engine::TimbrePick::OpllRom
             ? static_cast<std::int32_t>(choice.rom_number)
             : 0;
-        event.after_loop_start = newCommandAfterLoopStart(event.count);
+        event.after_loop_start = after;
         events.push_back(event);
         std::stable_sort(
             events.begin(), events.end(),
             [](const auto& left, const auto& right) {
                 return left.count < right.count;
             });
-        notifyLayerEdit(timeline_count, event.value, true);
+    }
+
+    void applyTimbreChoice(int timeline_count, const EnvelopeTimbreChoice& choice) {
+        if (selected_layer_ < 0
+            || selected_layer_ >= static_cast<int>(timbre_.layers.size())) return;
+        setStepTimbreChoice(timbre_, static_cast<std::size_t>(selected_layer_), timeline_count, choice);
+        notifyLayerEdit(timeline_count,
+            choice.pick == mgstc::engine::TimbrePick::OpllRom ? choice.rom_number : 0, true);
     }
 
     void removeTimbreAt(int timeline_count) {

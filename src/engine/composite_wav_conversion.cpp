@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "mgstc/engine/composite_wav_conversion.hpp"
 #include "mgstc/engine/detail/composite_wav_candidate_retention.hpp"
+#include "mgstc/engine/detail/composite_wav_envelope_normalization.hpp"
 
 #include "mgstc/engine/scc_morph.hpp"
 #include "mgstc/engine/wave_import.hpp"
@@ -1452,19 +1453,42 @@ CompositeWavConversionResult convertCompositeWave(
                     != item.evaluated_ids.end();
             });
             std::vector<detail::WavRetainedScore> scores;
-            std::vector<std::size_t> archiveIndices;
-            for (std::size_t i = 0; i < displayArchive.size(); ++i) {
-                const auto& item = displayArchive[i];
-                if (item.candidate.tone == *result.composite_tone
-                    || (winner != displayArchive.end() && item.render_key == winner->render_key)) continue;
+            // Only the finished display keys change. Search/winner decisions,
+            // evaluated scores, and the original fallback tones stay intact.
+            for (auto& item : displayArchive) {
+                detail::normalizeWavConstantEnvelopes(item.render_key);
                 scores.push_back({item.candidate.quality.total, item.candidate.candidate_id});
-                archiveIndices.push_back(i);
             }
-            for (const auto index : detail::selectWavScoreSpacedAlternatives(scores, result.quality.total)) {
-                auto candidate = std::move(displayArchive[archiveIndices[index]].candidate);
+            const auto alternatives = detail::selectDistinctWavScoreSpacedAlternatives(
+                scores, result.quality.total,
+                [&](std::size_t index) {
+                    const auto& item = displayArchive[index];
+                    return item.candidate.tone == *result.composite_tone
+                        || (winner != displayArchive.end() && item.render_key == winner->render_key);
+                },
+                [&](std::size_t a, std::size_t b) {
+                    return displayArchive[a].render_key == displayArchive[b].render_key;
+                });
+            for (const auto index : alternatives) {
+                auto candidate = std::move(displayArchive[index].candidate);
                 candidate.target_score_increase_percent = static_cast<std::uint8_t>(retained.size() * 5);
                 retained.push_back(std::move(candidate));
             }
+            // Search and score-spaced selection see the original evaluated
+            // representation. Only completed, returned candidates are simplified.
+            for (auto& item : retained) {
+                auto normalized = item.tone;
+                if (!detail::normalizeWavConstantEnvelopes(normalized)) continue;
+                const auto prepared = compileSccMorph(normalized);
+                if (!prepared.valid) {
+                    result.warnings.push_back("Constant-envelope simplification failed: " + prepared.error);
+                    continue; // Keep the already valid evaluated candidate intact.
+                }
+                item.resources = resourcePlan(prepared.timbre);
+                item.tone = std::move(normalized);
+            }
+            result.composite_tone = retained.front().tone;
+            result.resource_plan = retained.front().resources;
         } else result.retained_candidates.clear();
         result.warnings.insert(result.warnings.begin(), searchNotes.begin(), searchNotes.end());
         for (auto& item : result.morph_candidates) {
