@@ -1225,6 +1225,8 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
     SccMorphCompileResult result;
     result.authored_input = std::make_shared<const CompositeTimbre>(input);
     result.timbre = input;
+    const auto bank_start = input.original_timbre_allocation_starts
+        ? input.original_timbre_allocation_starts->scc : input.scc_morph_bank_base;
     if (cancellation.stop_requested()) {
         result.valid = false; result.cancelled = true;
         result.error = "SCC morph generation cancelled"; return result;
@@ -1242,6 +1244,14 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
         });
     if ((!active && !channel_allocation) || input.scc_morph_materialized) {
         const auto numbers = resolveTimbreNumbers(input);
+        // Session numbering is also used by ordinary, non-morph programs.
+        // Reject it before audition can substitute a fallback patch for an
+        // original that could not be assigned within the selected range.
+        if (input.original_timbre_allocation_starts && !numbers.valid()) {
+            result.valid = false;
+            result.error = "Original timbre allocation: " + numbers.warnings.front();
+            return result;
+        }
         std::array<bool,32> reserved{};
         for (const auto& assignment : numbers.assignments) {
             const auto* reference = findEmbeddedTimbreSnapshot(input,assignment.library_id);
@@ -1257,7 +1267,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
                     && event.value >= 0 && event.value <= 31)
                     reserved[static_cast<std::size_t>(event.value)] = true;
         }
-        for (std::size_t number = input.scc_morph_bank_base;
+        for (std::size_t number = bank_start;
              number < 32; ++number)
             if (!reserved[number]) ++result.capacity;
         return result;
@@ -1269,7 +1279,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
         result.used = 0;
         return result;
     };
-    if (input.scc_morph_bank_base > 31)
+    if (bank_start > 31)
         return fail("SCC Morph Bank start must be @0 through @31");
     if (!isSupportedSccMorphAlgorithmVersion(input.scc_morph_algorithm_version))
         return fail("Unsupported SCC morph algorithm version");
@@ -1314,7 +1324,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
                 && event.value >= 0 && event.value <= 31)
                 occupied[static_cast<std::size_t>(event.value)] = true;
     }
-    for (std::size_t number = input.scc_morph_bank_base; number < 32; ++number)
+    for (std::size_t number = bank_start; number < 32; ++number)
         if (!occupied[number]) ++result.capacity;
     const auto freeze = [&](SavedTimbreReference& reference) {
         if (reference.source != TimbreSource::Scc) return;
@@ -1550,7 +1560,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
         auto& node = item.node;
         auto allocation = materialized.find(node.wave);
         if (allocation == materialized.end()) {
-            std::size_t number = input.scc_morph_bank_base;
+            std::size_t number = bank_start;
             while (number < 32 && occupied[number]) ++number;
             occupied[number] = true;
             SavedTimbreReference reference;
@@ -1755,11 +1765,21 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
                 if (!bank.contains(wave)) missing.push_back(wave);
             if (!missing.empty()) {
                 std::optional<std::size_t> start;
-                for (std::size_t n = 0; n < 32; ++n)
+                const auto automatic_start = input.original_timbre_allocation_starts
+                    ? input.original_timbre_allocation_starts->scc : 0;
+                for (std::size_t n = automatic_start; n < 32; ++n)
                     if (fits(n, missing.size())) { start = n; break; }
-                if (!start)
+                if (!start) {
+                    result.required = missing.size();
+                    result.capacity = 0;
+                    std::size_t run = 0;
+                    for (std::size_t n = automatic_start; n < 32; ++n) {
+                        run = occupied[n] ? 0 : run + 1;
+                        result.capacity = std::max(result.capacity, run);
+                    }
                     return fail("SCC automatic allocation has no contiguous range of "
                         + std::to_string(missing.size()) + " new waveforms");
+                }
                 for (std::size_t offset = 0; offset < missing.size(); ++offset)
                     define_wave(missing[offset], static_cast<std::uint8_t>(*start + offset));
             }

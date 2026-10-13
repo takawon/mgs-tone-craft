@@ -1957,6 +1957,135 @@ void testCacheInvalidationAndSaveRoundTrips() {
             "reordering tone events invalidates the cache");
 }
 
+void testSessionAllocationStarts() {
+    auto source = morphProgram(sawWave(), sawWave(3, 8), 0, 20, 2, 3);
+    source.original_timbre_allocation_starts = OriginalTimbreAllocationStarts{20, 24};
+    auto automatic = source;
+    automatic.layers[0].base_timbre->number_mode = TimbreNumberMode::Automatic;
+    automatic.layers[0].base_timbre->manual_number.reset();
+    for (auto& reference : automatic.embedded_timbres) {
+        reference.number_mode = TimbreNumberMode::Automatic;
+        reference.manual_number.reset();
+    }
+    const auto normal = resolveTimbreNumbers(automatic);
+    require(normal.valid() && normal.assignments.front().number == 20,
+            "session start applies to automatic SCC source definitions");
+    const auto generated = compileSccMorph(automatic);
+    require(generated.valid && generated.used > 0,
+            "session SCC bank supports source and derived automatic waves");
+    for (const auto& assignment : resolveTimbreNumbers(generated.timbre).assignments)
+        require(assignment.number >= 20,
+                "automatic source and derived SCC definitions respect session minimum");
+    const auto explicit_source = compileSccMorph(source);
+    require(explicit_source.valid
+                && explicit_source.timbre.layers[0].base_timbre->manual_number == 15,
+            "session start does not relocate legacy manual SCC definitions");
+    for (const auto& diagnostic : explicit_source.diagnostics)
+        if (diagnostic.generated)
+            require(diagnostic.output_number >= 20,
+                    "new derived SCC waves use session start instead of persisted bank start");
+    require(automatic.scc_morph_bank_base == 3,
+            "transient allocation never overwrites persisted legacy Morph Bank");
+
+    automatic.layers[0].scc_output_allocation = SccOutputAllocationMode::Contiguous;
+    const auto contiguous = compileSccMorph(automatic);
+    require(contiguous.valid && contiguous.channel_allocations.front().start == 20,
+            "automatic contiguous SCC output starts at session minimum");
+    automatic.layers[0].scc_output_start = 4;
+    const auto manual_channel = compileSccMorph(automatic);
+    require(manual_channel.valid && manual_channel.channel_allocations.front().start == 4
+                && manual_channel.channel_allocations.front().manual,
+            "explicit SCC channel start overrides session numbering");
+    automatic.layers[0].scc_output_start.reset();
+    automatic.original_timbre_allocation_starts->scc = 31;
+    const auto overflow = compileSccMorph(automatic);
+    require(!overflow.valid && overflow.timbre == automatic,
+            "session minimum capacity exhaustion rejects without publishing partial output");
+
+    auto plain = source;
+    plain.layers[0].base_timbre->number_mode = TimbreNumberMode::Automatic;
+    plain.layers[0].base_timbre->manual_number.reset();
+    plain.layers[0].volume_envelope.kind = EnvelopeKind::Rate;
+    plain.layers[0].timbre_automation.clear();
+    auto second_layer = plain.layers[0];
+    second_layer.channel = 1;
+    second_layer.envelope_number = 1;
+    second_layer.base_timbre = plain.embedded_timbres.front();
+    second_layer.base_timbre->number_mode = TimbreNumberMode::Automatic;
+    second_layer.base_timbre->manual_number.reset();
+    plain.layers.push_back(second_layer);
+    plain.embedded_timbres.clear();
+    plain.original_timbre_allocation_starts->scc = 31;
+    const auto plain_overflow = compileSccMorph(plain);
+    require(!plain_overflow.valid && plain_overflow.timbre == plain,
+            "ordinary rate-envelope SCC originals reject session allocation overflow");
+    EngineCore preview_engine;
+    CompositePlaybackPlan preview_plan = buildCompositePlaybackPlan(plain);
+    require(!compileCompositeProgram(preview_engine, plain, {}, &preview_plan)
+                && preview_plan.audible_layers.empty(),
+            "ordinary audition rejects overflow rather than playing a fallback patch");
+    require(!formatMgsComposite(plain).valid(),
+            "ordinary MGSC export and audition agree on session allocation overflow");
+    plain.original_timbre_allocation_starts->scc = 30;
+    require(compileSccMorph(plain).valid, "ordinary source allocation accepts the fitting session range");
+    require(compileCompositeProgram(preview_engine, plain), "ordinary audition accepts the fitting session range");
+    require(formatMgsComposite(plain).valid(), "ordinary MGSC export accepts the fitting session range");
+    plain.original_timbre_allocation_starts.reset();
+    require(compileSccMorph(plain).valid && compileCompositeProgram(preview_engine, plain),
+            "legacy non-session ordinary audition remains valid");
+
+    auto legacy = source;
+    legacy.original_timbre_allocation_starts.reset();
+    CompositeTimbreLibrary library;
+    const auto id = library.add(source, 1);
+    require(!library.find(id)->timbre.original_timbre_allocation_starts,
+            "in-memory library add omits editor-session allocation starts");
+    auto new_session = source;
+    new_session.original_timbre_allocation_starts->scc = 21;
+    require(library.update(id, new_session, 2)
+                && !library.find(id)->timbre.original_timbre_allocation_starts
+                && library.find(id)->revision == 1,
+            "session-only library update omits starts and does not revise authored sound");
+    auto installed = library.entries();
+    installed.front().timbre.original_timbre_allocation_starts =
+        OriginalTimbreAllocationStarts{23, 26};
+    library.installEntries(std::move(installed));
+    require(!library.find(id)->timbre.original_timbre_allocation_starts,
+            "installing library rows omits editor-session allocation starts");
+    require(CompositeTimbreLibrary::serializeTimbreFile(source, 1)
+                == CompositeTimbreLibrary::serializeTimbreFile(legacy, 1)
+                && serializeCompositeSoundPayload(source) == serializeCompositeSoundPayload(legacy),
+            "editor-session allocation starts change neither portable nor SQLite bytes");
+    const auto restored = CompositeTimbreLibrary::deserializeTimbreFile(
+        CompositeTimbreLibrary::serializeTimbreFile(source, 1));
+    require(restored && !restored->original_timbre_allocation_starts,
+            "portable load does not restore an editor-session allocation start");
+    const auto payload = deserializeCompositeSoundPayload(
+        serializeCompositeSoundPayload(source), kCompositeSoundPayloadVersion);
+    require(payload && !payload->original_timbre_allocation_starts,
+            "SQLite payload load does not restore an editor-session allocation start");
+    const auto first_cache = compileSccMorphCached(source);
+    require(compileSccMorphCached(source) == first_cache,
+            "identical session starts reuse prepared morph output");
+    auto changed = source;
+    changed.original_timbre_allocation_starts->scc = 22;
+    require(compileSccMorphCached(changed) != first_cache,
+            "SCC session start invalidates morph cache independently of sound serialization");
+    changed = source;
+    changed.original_timbre_allocation_starts->opll = 25;
+    require(compileSccMorphCached(changed) != first_cache,
+            "OPLL session start invalidates morph cache independently of sound serialization");
+    const auto formatted = formatMgsComposite(source);
+    require(formatted.valid(), "MGSC output compiles with session allocation context");
+    const auto definitions = extractMgsSourceDefinitions(formatted.source, 's');
+    for (const auto& diagnostic : explicit_source.diagnostics) {
+        if (!diagnostic.generated) continue;
+        require(std::any_of(definitions.begin(), definitions.end(), [&](const auto& definition) {
+                return definition.number == diagnostic.output_number;
+            }), "MGSC emits derived SCC definitions at their session-assigned numbers");
+    }
+}
+
 void testMaterializedMgscOutput() {
     for (int fixture = 0; fixture < 3; ++fixture) {
     const auto bank_base = static_cast<std::uint8_t>(fixture == 1 ? 16 : 0);
@@ -2253,6 +2382,7 @@ int main() {
         testSeparateMorphBlocksKeepNormalTransition();
         testDormantRateMorph();
         testCacheInvalidationAndSaveRoundTrips();
+        testSessionAllocationStarts();
         testMaterializedMgscOutput();
         testSccMorphDiagnosticFixture();
         printSccMorphDigest();

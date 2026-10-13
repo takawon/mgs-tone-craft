@@ -9,10 +9,16 @@
 namespace mgstc::app {
 namespace {
 
+// Only startup and the message-thread library operations access this snapshot.
+std::optional<ToneLibrarySnapshot> tone_library_session_fallback;
+
 [[nodiscard]] bool openToneLibraryDatabase(
     engine::ToneLibraryDatabase& database,
     bool create_if_missing,
     std::string* error) {
+    if (tone_library_session_fallback) {
+        return false;
+    }
     const auto target = toneLibraryFile();
     if (!target.existsAsFile()) {
         if (!create_if_missing) {
@@ -63,8 +69,38 @@ LibraryFileFingerprint libraryFileFingerprint(const juce::File& file) {
     };
 }
 
+bool initialiseToneLibrarySession(
+    juce::InterProcessLock& library_lock,
+    std::string* error) {
+    if (error) { error->clear(); }
+    ScopedLibraryIpcLock lock(library_lock);
+    if (!lock.isLocked()) {
+        if (error) { *error = "failed to acquire shared tone library lock"; }
+        disableToneLibraryForSession();
+        return false;
+    }
+    if (!toneLibraryFile().existsAsFile()) {
+        return true;
+    }
+    engine::ToneLibraryDatabase database;
+    ToneLibrarySnapshot available;
+    if (!database.open(toneLibraryUtf8Path(), error)
+        || !database.loadAvailable(available.timbres, available.composites, error)) {
+        disableToneLibraryForSession(std::move(available));
+        return false;
+    }
+    return true;
+}
+
+void disableToneLibraryForSession(ToneLibrarySnapshot available) {
+    tone_library_session_fallback = std::move(available);
+}
+
 std::optional<ToneLibrarySnapshot> loadToneLibraries(std::string* error) {
     ToneLibrarySnapshot snapshot;
+    if (tone_library_session_fallback) {
+        return *tone_library_session_fallback;
+    }
     if (!toneLibraryFile().existsAsFile()) {
         return snapshot;
     }

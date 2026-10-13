@@ -4292,6 +4292,8 @@ public:
                 }
                 const bool structure_changed =
                     edited.layers.size() != timbre_.layers.size();
+                const bool allocation_only = timbre_.original_timbre_allocation_starts != edited.original_timbre_allocation_starts
+                    && sameCompositeAuthoring(timbre_, edited);
                 timbre_ = edited;
                 composite_program_stale_ = true;
                 if (structure_changed) {
@@ -4305,7 +4307,7 @@ public:
                             "共通時間軸をマウス編集中"));
                     return;
                 }
-                recordHistory();
+                if (!allocation_only) recordHistory();
                 if (!structure_changed) {
                     refreshValidationSummary();
                 }
@@ -4506,7 +4508,7 @@ public:
             });
         addAndMakeVisible(performance_keyboard_);
 
-        timeline_.setTimbre(timbre_, true);
+        syncTimelineTimbre(true);
         static_cast<void>(loadCompositeLibrary());
         refreshTimbreSelectors();
         refreshCompositeSelector();
@@ -4587,7 +4589,7 @@ public:
         applied_owned_revision_ = ++link_.owned_revision;
         timbre_ = sound;
         syncControlsFromModel();
-        timeline_.setTimbre(timbre_, true);
+        syncTimelineTimbre(true);
         setEditorBaseline();
         resetHistoryToCurrent();
         const auto plan = mgstc::engine::buildCompositePlaybackPlan(timbre_);
@@ -4625,7 +4627,7 @@ public:
         recordHistory();
         refreshTimbreSelectors();
         syncControlsFromModel();
-        timeline_.setTimbre(timbre_);
+        syncTimelineTimbre();
         static_cast<void>(configureEngine());
         openOwnedLayerTimbreEditor(index);
         return true;
@@ -4782,7 +4784,7 @@ public:
         if (!mgstc::engine::replaceOwnedTimbreSnapshot(timbre_, *snap)) {
             return false;
         }
-        timeline_.setTimbre(timbre_);
+        syncTimelineTimbre();
         syncControlsFromModel();
         composite_program_stale_ = true;
         applied_owned_revision_ =
@@ -4912,8 +4914,18 @@ public:
         composite_program_stale_ = true;
     }
 
+    [[nodiscard]] static bool sameCompositeAuthoring(
+        const mgstc::engine::CompositeTimbre& before, const mgstc::engine::CompositeTimbre& after) {
+        if (before.original_timbre_allocation_starts == after.original_timbre_allocation_starts)
+            return before == after;
+        auto authored_before = before, authored_after = after;
+        authored_before.original_timbre_allocation_starts.reset();
+        authored_after.original_timbre_allocation_starts.reset();
+        return authored_before == authored_after;
+    }
+
     [[nodiscard]] bool hasUnsavedChanges() const {
-        return timbre_ != editor_baseline_
+        return !sameCompositeAuthoring(timbre_, editor_baseline_)
             || selected_composite_id_ != editor_baseline_id_;
     }
 
@@ -5321,7 +5333,7 @@ private:
     [[nodiscard]] bool waveConversionSnapshotMatches(
         const mgstc::engine::CompositeTimbre& snapshot,
         const std::optional<std::uint64_t>& selected) const {
-        return timbre_ == snapshot && selected_composite_id_ == selected;
+        return sameCompositeAuthoring(timbre_, snapshot) && selected_composite_id_ == selected;
     }
 
     void showWaveConverter() {
@@ -5369,7 +5381,7 @@ private:
             updateHistoryButtons();
             return;
         }
-        if (history_[history_cursor_] == timbre_) {
+        if (sameCompositeAuthoring(history_[history_cursor_], timbre_)) {
             return;
         }
         history_.erase(
@@ -5403,7 +5415,7 @@ private:
             timbre_.favorite, juce::dontSendNotification);
         refreshTimbreSelectors();
         syncControlsFromModel();
-        timeline_.setTimbre(timbre_);
+        syncTimelineTimbre();
         updateHistoryButtons();
         resized();
         composite_program_stale_ = true;
@@ -5465,7 +5477,7 @@ private:
         composite_program_stale_ = true;
         refreshTimbreSelectors();
         syncControlsFromModel();
-        timeline_.setTimbre(timbre_, true);
+        syncTimelineTimbre(true);
         resetHistoryToCurrent();
         setEditorBaseline();
         resized();
@@ -5837,7 +5849,7 @@ private:
         composite_select_.setSelectedId(
             0, juce::dontSendNotification);
         syncControlsFromModel();
-        timeline_.setTimbre(timbre_, true);
+        syncTimelineTimbre(true);
         setEditorBaseline();
         resetHistoryToCurrent();
         static_cast<void>(configureEngine());
@@ -5856,7 +5868,7 @@ private:
         timbre_ = std::move(timbre);
         composite_program_stale_ = true;
         syncControlsFromModel();
-        timeline_.setTimbre(timbre_, true);
+        syncTimelineTimbre(true);
         editor_baseline_ = mgstc::engine::defaultCompositeTimbre();
         editor_baseline_.layers.clear();
         editor_baseline_id_.reset();
@@ -5996,7 +6008,7 @@ private:
         refreshTimbreSelectors();
         refreshCompositeSelector();
         syncControlsFromModel();
-        timeline_.setTimbre(timbre_, true);
+        syncTimelineTimbre(true);
         setEditorBaseline();
         resetHistoryToCurrent();
         static_cast<void>(configureEngine());
@@ -6411,7 +6423,7 @@ private:
             static_cast<void>(invalidateEditedSccMorphPlans(before, timbre_));
             refreshTimbreSelectors();
             syncControlsFromModel();
-            timeline_.setTimbre(timbre_);
+            syncTimelineTimbre();
             recordHistory();
             static_cast<void>(configureEngine());
             return;
@@ -6434,7 +6446,7 @@ private:
             static_cast<void>(invalidateEditedSccMorphPlans(before, timbre_));
             refreshTimbreSelectors();
             syncControlsFromModel();
-            timeline_.setTimbre(timbre_);
+            syncTimelineTimbre();
             recordHistory();
             static_cast<void>(configureEngine());
             auditionAfterEdit();
@@ -6451,7 +6463,7 @@ private:
         static_cast<void>(invalidateEditedSccMorphPlans(before, timbre_));
         refreshTimbreSelectors();
         syncControlsFromModel();
-        timeline_.setTimbre(timbre_);
+        syncTimelineTimbre();
         recordHistory();
         static_cast<void>(configureEngine());
         auditionAfterEdit();
@@ -6470,7 +6482,7 @@ private:
         timbre_.layers[index].base_opll_rom = rom;
         refreshTimbreSelectors();
         syncControlsFromModel();
-        timeline_.setTimbre(timbre_);
+        syncTimelineTimbre();
         recordHistory();
         static_cast<void>(configureEngine());
         auditionAfterEdit();
@@ -6818,7 +6830,7 @@ private:
     }
 
     void refreshModelViews() {
-        timeline_.setTimbre(timbre_);
+        syncTimelineTimbre();
         publishSpectrogramSourceMask();
         refreshValidationSummary();
     }
@@ -6894,10 +6906,7 @@ private:
                 envelope_limit_error = true;
                 envelope_limit_notices.add(
                     juce::String::charToString(track)
-                    + (formatted.hasIssue(
-                           mgstc::engine::MgsEnvelopeIssue::UnrepresentableModulationLoop)
-                        ? juce::String::fromUTF8("ch は変調と手動[]ループの位相を正確に表せません。試聴を停止します")
-                        : juce::String::fromUTF8("ch のエンベロープ設定を@eに変換できません。試聴を停止します")));
+                    + juce::String::fromUTF8("ch のエンベロープ設定を@eに変換できません。試聴を停止します"));
             } else {
                 envelope_limit_notices.add(
                     juce::String::charToString(track)
@@ -6986,7 +6995,15 @@ private:
         }
     }
 
+    void syncTimelineTimbre(bool reset_scroll_extent = false) {
+        timeline_.applySessionAllocationStarts(timbre_);
+        timeline_.setTimbre(timbre_, reset_scroll_extent);
+    }
+
     bool configureEngine(bool temporary_restore = false) {
+        timeline_.applySessionAllocationStarts(timbre_);
+        if (wave_conversion_preview_) timeline_.applySessionAllocationStarts(*wave_conversion_preview_);
+        if (manual_y_preview_timbre_) timeline_.applySessionAllocationStarts(*manual_y_preview_timbre_);
         if (hydrating_) {
             return false;
         }
@@ -7048,6 +7065,7 @@ private:
             return;
         }
         timbre_ = std::move(*import_preview_saved_);
+        timeline_.applySessionAllocationStarts(timbre_);
         import_preview_saved_.reset();
         composite_program_stale_ = true;
     }
@@ -7395,7 +7413,7 @@ private:
                 if (mgstc::engine::replaceOwnedTimbreSnapshot(timbre_, *snap)) {
                     const bool invalidated = invalidateEditedSccMorphPlans(before, timbre_);
                     recordHistory();
-                    timeline_.setTimbre(timbre_);
+                    syncTimelineTimbre();
                     syncControlsFromModel();
                     static_cast<void>(configureEngine());
                     if (invalidated) updateStatus(juce::String::fromUTF8(

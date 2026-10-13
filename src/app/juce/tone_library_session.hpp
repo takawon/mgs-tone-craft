@@ -56,6 +56,14 @@ struct ToneLibrarySnapshot {
     engine::CompositeTimbreLibrary composites;
 };
 
+// Startup/message-thread recovery. False requests one startup warning;
+// readable rows are retained in a session snapshot with writes prohibited.
+[[nodiscard]] bool initialiseToneLibrarySession(
+    juce::InterProcessLock& library_lock,
+    std::string* error = nullptr);
+// Stop DB access for this process while keeping whatever could be read.
+void disableToneLibraryForSession(ToneLibrarySnapshot available = {});
+
 // One SQLite open. Single-side editors may take only one member.
 [[nodiscard]] std::optional<ToneLibrarySnapshot> loadToneLibraries(
     std::string* error = nullptr);

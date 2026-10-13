@@ -147,6 +147,7 @@ public:
                 unsignedInteger(point.event_count, 4);
             }
         }
+        unsignedInteger(value.command_order, 4);
     }
 
     void timeline(const EnvelopeTimeline& value) {
@@ -255,6 +256,29 @@ public:
             enumeration(layer.scc_output_allocation);
             boolean(layer.scc_output_start.has_value());
             if (layer.scc_output_start) unsignedInteger(*layer.scc_output_start, 1);
+            unsignedInteger(layer.modulation_profiles.size(), 4);
+            for (const auto& profile : layer.modulation_profiles) {
+                enumeration(profile.target);
+                unsignedInteger(profile.count, 4);
+                boolean(profile.after_loop_start);
+                modulation(profile.parameters);
+                unsignedInteger(profile.command_order, 4);
+            }
+            unsignedInteger(layer.register_auto_profiles.size(), 4);
+            for (const auto& profile : layer.register_auto_profiles) {
+                enumeration(profile.target);
+                unsignedInteger(profile.count, 4);
+                boolean(profile.after_loop_start);
+                registerAuto(profile.lane);
+                unsignedInteger(profile.command_order, 4);
+            }
+            unsignedInteger(layer.derived_command_placements.size(), 4);
+            for (const auto& placement : layer.derived_command_placements) {
+                unsignedInteger(placement.count, 4);
+                enumeration(placement.target);
+                boolean(placement.after_loop_start);
+                unsignedInteger(placement.command_order, 4);
+            }
         }
         unsignedInteger(value.embedded_timbres.size(), 4);
         for (const auto& reference_value : value.embedded_timbres) {
@@ -375,6 +399,7 @@ public:
     bool event(EnvelopeEvent& value) {
         value.scc_morph = {};
         value.scc_morph.distribution_mode = SccMorphDistributionMode::ToneDistribution;
+        value.command_order = 0;
         if (!enumeration(value.kind, 6)
             || !integer(value.value, 4)
             || !integer(value.secondary, 4)
@@ -450,6 +475,11 @@ public:
                 }
                 if (!isValidSccMorphPlan(plan, value.scc_morph.intermediate_count)) return false;
                 value.scc_morph.explicit_plan = std::move(plan);
+            }
+        }
+        if (format_version_ >= 24) {
+            if (!integer(value.command_order, 4)) {
+                return false;
             }
         }
         return true;
@@ -584,16 +614,17 @@ public:
     bool soundPayload(
         CompositeTimbre& value,
         std::uint32_t payload_version) {
-        if (payload_version != 1 && payload_version != 2 && payload_version != 3 && payload_version != 4
-            && payload_version != kCompositeSoundPayloadVersion) {
+        if (payload_version < 1
+            || payload_version > kCompositeSoundPayloadVersion) {
             return false;
         }
         // Each SQLite payload version names a fixed portable sound layout:
-        // v1=v19, v2=v20 modulation, v3=v21 morphing, v4=v22 channel ranges, v5=v23 distribution/plans.
+        // v1=v19, v2=v20 modulation, v3=v21 morphing, v4=v22 channel ranges,
+        // v5=v23 distribution/plans, v6=v24 modulation/register-auto profiles.
         // The DB schema version and the portable file header are separate.
         format_version_ = payload_version == 1 ? 19
             : payload_version == 2 ? 20 : payload_version == 3 ? 21
-            : payload_version == 4 ? 22 : 23;
+            : payload_version == 4 ? 22 : payload_version == 5 ? 23 : 24;
         return soundBody(value);
     }
 
@@ -808,6 +839,56 @@ public:
                     layer.scc_output_start = start;
                 }
             }
+            layer.modulation_profiles.clear();
+            layer.register_auto_profiles.clear();
+            layer.derived_command_placements.clear();
+            if (format_version_ >= 24) {
+                std::uint32_t profile_count{};
+                if (!integer(profile_count, 4)
+                    || profile_count > kMaximumCollectionSize) {
+                    return false;
+                }
+                layer.modulation_profiles.resize(profile_count);
+                for (auto& profile : layer.modulation_profiles) {
+                    if (!enumeration(profile.target, 3)
+                        || !integer(profile.count, 4)
+                        || profile.count > 65535
+                        || !boolean(profile.after_loop_start)
+                        || !modulation(profile.parameters)
+                        || !integer(profile.command_order, 4)) {
+                        return false;
+                    }
+                }
+                if (!integer(profile_count, 4)
+                    || profile_count > kMaximumCollectionSize) {
+                    return false;
+                }
+                layer.register_auto_profiles.resize(profile_count);
+                for (auto& profile : layer.register_auto_profiles) {
+                    if (!enumeration(profile.target, 1)
+                        || !integer(profile.count, 4)
+                        || profile.count > 65535
+                        || !boolean(profile.after_loop_start)
+                        || !registerAuto(profile.lane)
+                        || !integer(profile.command_order, 4)) {
+                        return false;
+                    }
+                }
+                if (!integer(profile_count, 4)
+                    || profile_count > kMaximumCollectionSize) {
+                    return false;
+                }
+                layer.derived_command_placements.resize(profile_count);
+                for (auto& placement : layer.derived_command_placements) {
+                    if (!integer(placement.count, 4)
+                        || placement.count > 65535
+                        || !enumeration(placement.target, 3)
+                        || !boolean(placement.after_loop_start)
+                        || !integer(placement.command_order, 4)) {
+                        return false;
+                    }
+                }
+            }
         }
         if (format_version_ < 15) {
             for (std::size_t index = 0; index < value.layers.size(); ++index) {
@@ -967,6 +1048,7 @@ std::uint64_t CompositeTimbreLibrary::add(
     entry.id = next_id_++;
     entry.created_unix_seconds = now_unix_seconds;
     entry.updated_unix_seconds = now_unix_seconds;
+    timbre.original_timbre_allocation_starts.reset();
     entry.timbre = std::move(timbre);
     entries_.push_back(std::move(entry));
     return entries_.back().id;
@@ -982,10 +1064,13 @@ bool CompositeTimbreLibrary::update(
     }
     auto previous = current->timbre;
     previous.favorite = false;
+    previous.original_timbre_allocation_starts.reset();
     auto incoming = replacement;
     incoming.favorite = false;
+    incoming.original_timbre_allocation_starts.reset();
     const bool data_changed = previous != incoming;
     current->timbre = replacement;
+    current->timbre.original_timbre_allocation_starts.reset();
     current->updated_unix_seconds = now_unix_seconds;
     if (data_changed
         && current->revision
@@ -1203,7 +1288,8 @@ void CompositeTimbreLibrary::installEntries(
     std::vector<CompositeTimbreLibraryEntry> entries) {
     entries_ = std::move(entries);
     next_id_ = 1;
-    for (const auto& entry : entries_) {
+    for (auto& entry : entries_) {
+        entry.timbre.original_timbre_allocation_starts.reset();
         if (entry.id != 0
             && entry.id
                 != std::numeric_limits<std::uint64_t>::max()) {

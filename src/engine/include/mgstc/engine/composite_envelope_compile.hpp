@@ -51,9 +51,17 @@ enum class CompositeEnvelopeLane : std::uint8_t {
     const TimbreLibrary* library = nullptr,
     bool optimize_loop = true);
 
-// An authored permanent loop must preserve modulation phase indefinitely.
+// Whether repeating the authored body matches continuous modulation phase.
+// This is a display classification, not an authored-loop export restriction.
 [[nodiscard]] bool compositeModulationLoopRepresentable(
     const CompositeLayer& layer,
+    const TimbreLibrary* library = nullptr);
+
+// A first-traversal graph cannot describe later passes when the target's
+// phase changes or relative Pitch commands accumulate across the jump.
+[[nodiscard]] bool compositeLoopEffectiveWaveformFirstPassOnly(
+    const CompositeLayer& layer,
+    CompositeModulationTarget target,
     const TimbreLibrary* library = nullptr);
 
 }  // namespace mgstc::engine

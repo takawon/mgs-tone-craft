@@ -325,7 +325,7 @@ PluginStateParseResult parsePluginState(const void* data, std::size_t size) {
         return fail(PluginStateStatus::Truncated);
     }
     if (*payload_version != 1 && *payload_version != 2 && *payload_version != 3
-        && *payload_version != 4
+        && *payload_version != 4 && *payload_version != 5
         && *payload_version != mgstc::engine::kCompositeSoundPayloadVersion) {
         return fail(PluginStateStatus::UnsupportedVersion);
     }

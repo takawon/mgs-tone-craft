@@ -10,6 +10,131 @@
 
 namespace mgstc::engine {
 
+[[nodiscard]] inline const ModulationParameters& compositeBaseModulation(
+    const CompositeLayer& layer, CompositeModulationTarget target) noexcept {
+    switch (target) {
+    case CompositeModulationTarget::Pitch: return layer.pitch_modulation;
+    case CompositeModulationTarget::Volume: return layer.volume_modulation;
+    case CompositeModulationTarget::TotalLevel: return layer.opll_tl_modulation;
+    case CompositeModulationTarget::Feedback: return layer.opll_fb_modulation;
+    }
+    return layer.pitch_modulation;
+}
+
+template<class Profile>
+[[nodiscard]] inline bool compositeProfilePrecedes(const Profile& left, const Profile& right) noexcept {
+    if (left.count != right.count) return left.count < right.count;
+    if (left.after_loop_start != right.after_loop_start) return !left.after_loop_start;
+    if (left.command_order && right.command_order) return left.command_order < right.command_order;
+    return left.command_order != right.command_order && left.command_order != 0;
+}
+
+[[nodiscard]] inline const ModulationParameters& compositeModulationAt(
+    const CompositeLayer& layer, CompositeModulationTarget target,
+    std::uint32_t count, bool after = true) noexcept {
+    const CompositeModulationProfile* selected = nullptr;
+    for (const auto& profile : layer.modulation_profiles) {
+        if (profile.target != target || profile.count > count
+            || (profile.count == count && !after && profile.after_loop_start))
+            continue;
+        if (!selected || !compositeProfilePrecedes(profile, *selected))
+            selected = &profile;
+    }
+    return selected ? selected->parameters : compositeBaseModulation(layer, target);
+}
+
+[[nodiscard]] inline ModulationParameters& editCompositeModulationAt(
+    CompositeLayer& layer, CompositeModulationTarget target,
+    std::uint32_t count, bool after) {
+    // Volume itself advances the envelope, so its loop anchor and tremolo
+    // settings have one body side rather than a zero-time prefix value.
+    if (target == CompositeModulationTarget::Volume
+        && layer.envelope_timeline.loop_start_count == count) after = true;
+    CompositeModulationProfile* selected = nullptr;
+    for (auto& profile : layer.modulation_profiles)
+        if (profile.target == target && profile.count == count && profile.after_loop_start == after
+            && (!selected || !compositeProfilePrecedes(profile, *selected))) selected = &profile;
+    if (selected) return selected->parameters;
+    const auto current = compositeModulationAt(layer, target, count, after);
+    layer.modulation_profiles.push_back({target, count, after, current});
+    return layer.modulation_profiles.back().parameters;
+}
+
+[[nodiscard]] inline const OpllRegisterAutoLane& compositeRegisterAutoAt(
+    const CompositeLayer& layer, OpllRegisterAutoTarget target,
+    std::uint32_t count, bool after = true) noexcept {
+    const OpllRegisterAutoProfile* selected = nullptr;
+    for (const auto& profile : layer.register_auto_profiles) {
+        if (profile.target != target || profile.count > count
+            || (profile.count == count && !after && profile.after_loop_start))
+            continue;
+        if (!selected || !compositeProfilePrecedes(profile, *selected))
+            selected = &profile;
+    }
+    return selected ? selected->lane
+        : target == OpllRegisterAutoTarget::TotalLevel
+            ? layer.opll_tl_auto : layer.opll_fb_auto;
+}
+
+[[nodiscard]] inline OpllRegisterAutoLane& editCompositeRegisterAutoAt(
+    CompositeLayer& layer, OpllRegisterAutoTarget target,
+    std::uint32_t count, bool after) {
+    OpllRegisterAutoProfile* selected = nullptr;
+    for (auto& profile : layer.register_auto_profiles)
+        if (profile.target == target && profile.count == count && profile.after_loop_start == after
+            && (!selected || !compositeProfilePrecedes(profile, *selected))) selected = &profile;
+    if (selected) return selected->lane;
+    const auto current = compositeRegisterAutoAt(layer, target, count, after);
+    layer.register_auto_profiles.push_back({target, count, after, current});
+    return layer.register_auto_profiles.back().lane;
+}
+
+[[nodiscard]] inline bool compositeHasModulation(
+    const CompositeLayer& layer, CompositeModulationTarget target) noexcept {
+    if (compositeBaseModulation(layer, target).enabled) return true;
+    return std::any_of(layer.modulation_profiles.begin(),
+        layer.modulation_profiles.end(), [target](const auto& profile) {
+            return profile.target == target && profile.parameters.enabled;
+        });
+}
+
+inline void disableCompositeModulation(
+    CompositeLayer& layer, CompositeModulationTarget target) {
+    switch (target) {
+    case CompositeModulationTarget::Pitch: layer.pitch_modulation.enabled = false; break;
+    case CompositeModulationTarget::Volume: layer.volume_modulation.enabled = false; break;
+    case CompositeModulationTarget::TotalLevel: layer.opll_tl_modulation.enabled = false; break;
+    case CompositeModulationTarget::Feedback: layer.opll_fb_modulation.enabled = false; break;
+    }
+    std::erase_if(layer.modulation_profiles,
+        [target](const auto& profile) { return profile.target == target; });
+}
+
+inline void disableCompositeRegisterAuto(
+    CompositeLayer& layer, OpllRegisterAutoTarget target) {
+    (target == OpllRegisterAutoTarget::TotalLevel
+        ? layer.opll_tl_auto : layer.opll_fb_auto) = {};
+    std::erase_if(layer.register_auto_profiles,
+        [target](const auto& profile) { return profile.target == target; });
+}
+
+[[nodiscard]] inline bool compositeHasRegisterAuto(
+    const CompositeLayer& layer, OpllRegisterAutoTarget target) noexcept {
+    if ((target == OpllRegisterAutoTarget::TotalLevel
+            ? layer.opll_tl_auto : layer.opll_fb_auto).active()) return true;
+    return std::any_of(layer.register_auto_profiles.begin(),
+        layer.register_auto_profiles.end(), [target](const auto& profile) {
+            return profile.target == target && profile.lane.active();
+        });
+}
+
+[[nodiscard]] inline const CompositeDerivedCommandPlacement* compositeDerivedPlacementAt(
+    const CompositeLayer& layer, CompositeModulationTarget target, std::uint32_t count) noexcept {
+    for (const auto& placement : layer.derived_command_placements)
+        if (placement.count == count && placement.target == target) return &placement;
+    return nullptr;
+}
+
 [[nodiscard]] inline ModulationParameters clampModulation(
     ModulationParameters settings) noexcept {
     settings.depth = std::min<std::uint8_t>(settings.depth, 127);
