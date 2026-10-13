@@ -245,6 +245,8 @@ struct CompositeWavConversionTestAccess {
         content.configuration_.setSelectedId(id, juce::sendNotificationSync);
     }
     static void setBudget(CompositeWavConversionContent& content, int count) { content.budget_.setText(juce::String(count), false); }
+    static void setSourceBudget(CompositeWavConversionContent& content, int count) { content.source_budget_.setSelectedId(count + 1, juce::sendNotificationSync); }
+    static int sourceBudget(const CompositeWavConversionContent& content) { return content.source_budget_.getSelectedId() - 1; }
     static void clickAnalyze(CompositeWavConversionContent& content) { content.analyze_.onClick(); }
     static void clickConvert(CompositeWavConversionContent& content) { content.convert_.onClick(); }
     static void clickApply(CompositeWavConversionContent& content) { content.apply_.onClick(); }
@@ -262,17 +264,20 @@ struct CompositeWavConversionTestAccess {
     static bool candidateLayout(const CompositeWavConversionContent& content) {
         const auto right = content.candidates_.getBounds(); const auto left = content.status_.getBounds();
         const auto width = left.getWidth() + right.getWidth();
-        std::array<const juce::Component*, 10> controls{&content.begin_, &content.end_, &content.pitch_, &content.key_off_, &content.budget_,
-            &content.configuration_, &content.strategy_, &content.fixed_tone_, &content.preference_, &content.sustain_};
+        std::array<const juce::Component*, 12> controls{&content.begin_, &content.end_, &content.pitch_, &content.key_off_, &content.budget_, &content.source_budget_,
+            &content.configuration_, &content.strategy_, &content.fixed_tone_, &content.preference_, &content.sustain_, &content.wave_method_};
         for (std::size_t i = 0; i < controls.size(); ++i) {
             const auto label = content.labels_[i].getBounds(); const auto field = controls[i]->getBounds();
             if (label.getY() != field.getY() || label.getHeight() != UiLayout::fieldH
                 || field.getHeight() != UiLayout::fieldH || label.getRight() + UiLayout::controlGap != field.getX()) return false;
         }
-        const int former_result_height = left.getHeight() - (UiLayout::fieldH - UiLayout::panelPad * 2) * 5 + UiLayout::panelGap;
-        return former_result_height > 0 && left.getHeight() >= former_result_height * 125 / 100
-            && left.getHeight() <= former_result_height * 140 / 100
-            && left.getY() - content.budget_.getBottom() >= UiLayout::panelGap
+        return content.level_match_.getX() == content.stop_.getRight() + UiLayout::controlGap
+            && content.level_match_.getY() == content.stop_.getY()
+            && !content.level_match_.getBounds().intersects(content.zoom_in_.getBounds())
+            && content.begin_.getY() == content.stop_.getBottom() + UiLayout::sm
+            && content.source_budget_.getX() == content.budget_.getX()
+            && content.source_budget_.getY() == content.budget_.getBottom() + UiLayout::sm
+            && left.getY() - content.source_budget_.getBottom() >= UiLayout::panelGap
             && content.candidates_.getRowHeight() == UiLayout::fieldH + UiLayout::xs * 2
             && left.getHeight() >= UiScale::sx(100) && right.getHeight() > 0
             && content.getLocalBounds().contains(right) && !left.intersects(right)
@@ -317,7 +322,7 @@ struct CompositeWavConversionTestAccess {
             && content.level_match_.getWidth() >= UiScale::sx(250)
             && content.getLocalBounds().contains(content.wave_method_.getBounds())
             && !content.wave_method_.getBounds().intersects(content.level_match_.getBounds())
-            && content.wave_method_.getWidth() >= UiScale::sx(250)
+            && content.wave_method_.getWidth() >= UiScale::sx(180)
             && content.getLocalBounds().contains(content.analyze_.getBounds())
             && content.status_.getHeight() >= UiScale::sx(100)
             && content.getLocalBounds().contains(content.apply_.getBounds());
@@ -5894,7 +5899,7 @@ void testCompositeWavRetainedSelectionAndPreview() {
     for (const int scale : {75, 100, 125}) {
         UiScale::setActivePercent(scale);
         content.setSize(UiScale::sx(1080), UiScale::sx(900)); content.resized();
-        require(Access::candidateLayout(content), "inline fields, result margin, approximately 1.3x result height and compact 65/35 candidate layout hold at supported scales");
+        require(Access::candidateLayout(content), "source limit below total limit, level match beside Stop, compact settings and 65/35 result layout hold at supported scales");
     }
     UiScale::setActivePercent(savedScale);
     Access::source(content, winnerPcm);
@@ -5992,7 +5997,9 @@ void testCompositeWavActualUiWorkerAndApply() {
     EditorAccess::bindWaveAudition(editor, content);
     WavAccess::source(content, pcm);
     WavAccess::setWaveMethod(content, 2);
-    WavAccess::setBudget(content, 1);
+    WavAccess::setBudget(content, 8);
+    require(WavAccess::sourceBudget(content) == 0, "source limit defaults to automatic");
+    WavAccess::setSourceBudget(content, 1);
     WavAccess::clickAnalyze(content);
     for (int wait = 0; wait < 400 && !WavAccess::analysis(content); ++wait)
         juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
@@ -6010,6 +6017,19 @@ void testCompositeWavActualUiWorkerAndApply() {
     for (int wait = 0; wait < 15000 && !WavAccess::hasResult(content); ++wait)
         juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
     require(WavAccess::hasResult(content), "Convert button runs actual optimizer and publishes its completed result");
+    std::set<std::array<std::uint8_t, 32>> source_waves;
+    const auto& converted_tone = *WavAccess::result(content)->composite_tone;
+    for (const auto& layer : converted_tone.layers) {
+        if (layer.source != mgstc::engine::TimbreSource::Scc) continue;
+        if (layer.base_timbre) source_waves.insert(layer.base_timbre->scc_waveform);
+        for (const auto& event : layer.timbre_automation) {
+            if (event.kind != mgstc::engine::EnvelopeEventKind::Timbre) continue;
+            const auto* ref = mgstc::engine::findEmbeddedTimbreSnapshot(converted_tone, event.target_library_id);
+            require(ref != nullptr, "converted UI source resolves");
+            source_waves.insert(ref->scc_waveform);
+        }
+    }
+    require(source_waves.size() == 1, "UI source limit reaches optimizer independently of total Bank limit");
     require(EditorAccess::hasWavePreview(editor) && sameAuthoringSound(EditorAccess::sound(editor), previous)
             && sameAuthoringSound(processor.copyPluginState().sound, previous),
         "actual direct-periodic conversion publishes candidate for performance without committing it");

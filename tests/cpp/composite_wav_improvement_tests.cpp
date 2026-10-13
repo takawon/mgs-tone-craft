@@ -416,8 +416,23 @@ void testSameWaveDetuneIsAdoptedAndShared() {
     require(mgs.valid() && parsed.valid(), "same-wave dual-SCC MGSC output parses");
     const auto parsedScc = std::count_if(parsed.timbre.layers.begin(), parsed.timbre.layers.end(),
         [](const auto& layer) { return layer.source == TimbreSource::Scc; });
-    require(parsedScc == 2 && extractMgsSourceDefinitions(mgs.source, 'e').size() == 1,
-        "two shared-wave SCC tracks serialize one common @e definition");
+    const auto fixedDefinitions = extractMgsSourceDefinitions(mgs.source, 'e');
+    std::printf("H detune ENV: expected=0 actual=%zu active=(%d,%d)\n", fixedDefinitions.size(),
+        layerUsesSequenceEnvelope(layers[0]), layerUsesSequenceEnvelope(layers[1]));
+    require(parsedScc == 2 && !layerUsesSequenceEnvelope(layers[0])
+        && !layerUsesSequenceEnvelope(layers[1]) && fixedDefinitions.empty(),
+        "fixed-wave fixed-volume SCC tracks omit unused ENV definitions");
+    // Completed fixed tones have used no ENV since 0.343. Still exercise the
+    // shared-command export contract on an explicitly time-varying copy.
+    auto dynamic = *result.composite_tone;
+    for (auto& layer : dynamic.layers)
+        layer.volume_envelope.events.push_back(
+            EnvelopeEvent{.kind = EnvelopeEventKind::Volume, .value = 12, .count = 4});
+    const auto dynamicMgs = formatMgsComposite(dynamic);
+    const auto dynamicParsed = parseMgsComposite(dynamicMgs.source);
+    require(dynamicMgs.valid() && dynamicParsed.valid()
+        && extractMgsSourceDefinitions(dynamicMgs.source, 'e').size() == 1,
+        "two shared-wave SCC tracks with changing volume serialize one common ENV definition");
     require(std::any_of(parsed.timbre.layers.begin(), parsed.timbre.layers.end(), [&](const auto& layer) {
         return layer.source == TimbreSource::Scc && layer.micro_detune == plusEightCents;
     }), "MGSC parse preserves the selected micro-detune");

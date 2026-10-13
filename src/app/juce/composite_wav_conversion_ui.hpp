@@ -252,10 +252,13 @@ public:
         preference_.addItem(juce::String::fromUTF8("音色数優先"), 3);
         sustain_.addItem(juce::String::fromUTF8("サステイン自動"), 1);
         sustain_.addItem(juce::String::fromUTF8("ループなし"), 2);
-        wave_method_.addItem(juce::String::fromUTF8("SCC波形：解析再構成"), 1);
-        wave_method_.addItem(juce::String::fromUTF8("SCC波形：周期直接抽出"), 2);
+        wave_method_.addItem(juce::String::fromUTF8("解析再構成"), 1);
+        wave_method_.addItem(juce::String::fromUTF8("周期直接抽出"), 2);
         wave_method_.setTooltip(juce::String::fromUTF8("キーフレーム波形の生成方式。どちらも既存のMorphを使用します。"));
-        for (auto* combo : {&configuration_, &strategy_, &fixed_tone_, &preference_, &sustain_, &wave_method_}) {
+        source_budget_.addItem(juce::String::fromUTF8("自動設定"), 1);
+        for (int i = 1; i <= 32; ++i) source_budget_.addItem(juce::String(i), i + 1);
+        source_budget_.setTooltip(juce::String::fromUTF8("基準となるSCC音色定義数の上限。初期音色を含め、2チャンネル全体で同じ波形は1と数えます。中間音色は含みません。自動設定は従来動作です。"));
+        for (auto* combo : {&configuration_, &strategy_, &fixed_tone_, &preference_, &sustain_, &wave_method_, &source_budget_}) {
             combo->setSelectedId(1, juce::dontSendNotification); addAndMakeVisible(combo);
         }
         configuration_.onChange = [this] { refreshEnabled(); };
@@ -271,7 +274,7 @@ public:
         candidates_.setModel(this); candidates_.setMultipleSelectionEnabled(false);
         candidates_.setColour(juce::ListBox::backgroundColourId, juce::Colour(UiLayout::panelFill));
         addAndMakeVisible(candidates_);
-        const char* labels[] = {"開始サンプル / 秒", "終了サンプル / 秒", "基準音高 Hz", "キーオフ秒", "最大SCC音色数", "音源構成", "2ch分担", "OPLL固定音色", "最適化方針", "サステイン"};
+        const char* labels[] = {"開始サンプル / 秒", "終了サンプル / 秒", "基準音高 Hz", "キーオフ秒", "最大SCC音色数", "最大ポイント音色数", "音源構成", "2ch分担", "OPLL固定音色", "最適化方針", "サステイン", "SCC波形生成"};
         for (std::size_t i = 0; i < labels_.size(); ++i) {
             labels_[i].setText(juce::String::fromUTF8(labels[i]), juce::dontSendNotification);
             labels_[i].setFont(UiFonts::body()); addAndMakeVisible(labels_[i]);
@@ -279,7 +282,8 @@ public:
         labels_[1].setTooltip(juce::String::fromUTF8("終了サンプル / 秒（終端を含まない）"));
         pitch_.setTooltip(juce::String::fromUTF8("基準音高 Hz（autoで推定）"));
         key_off_.setTooltip(juce::String::fromUTF8("キーオフ秒（autoで推定）"));
-        budget_.setTooltip(juce::String::fromUTF8("最大SCC音色数（1〜32）"));
+        budget_.setTooltip(juce::String::fromUTF8("中間音色・位相派生を含む全体のユニークSCC音色数（1〜32）"));
+        labels_[5].setTooltip(source_budget_.getTooltip());
         range_.setTooltip(juce::String::fromUTF8("開始・終了ハンドルをドラッグ。左右キーで1サンプル、Shiftで10ms調整。"));
         range_.changed = [this](bool start) {
             const bool invalidated = analysis_ != nullptr;
@@ -290,7 +294,7 @@ public:
         addAndMakeVisible(range_);
         int order = 1;
         for (auto* c : std::initializer_list<juce::Component*>{&load_, &audacity_, &range_, &zoom_in_, &zoom_out_, &begin_, &end_,
-                &pitch_, &key_off_, &configuration_, &strategy_, &fixed_tone_, &budget_, &preference_, &sustain_,
+                &pitch_, &key_off_, &configuration_, &strategy_, &fixed_tone_, &budget_, &source_budget_, &preference_, &sustain_,
                 &original_, &converted_, &stop_, &level_match_, &wave_method_, &candidates_, &analyze_, &convert_, &apply_, &cancel_}) c->setExplicitFocusOrder(order++);
         setWantsKeyboardFocus(true);
         refreshEnabled();
@@ -320,20 +324,15 @@ public:
         for (auto* b : {&original_, &converted_, &stop_}) {
             b->setBounds(row.removeFromLeft(UiScale::sx(130))); row.removeFromLeft(UiLayout::controlGap);
         }
+        level_match_.setBounds(row.removeFromLeft(UiScale::sx(260)));
         zoom_out_.setBounds(row.removeFromRight(UiLayout::iconButton)); row.removeFromRight(UiLayout::controlGap);
         zoom_in_.setBounds(row.removeFromRight(UiLayout::iconButton));
-        area.removeFromTop(UiLayout::xs);
-        auto comparison = area.removeFromTop(UiLayout::fieldH);
-        wave_method_.setBounds(comparison.removeFromRight((comparison.getWidth() - UiLayout::controlGap) / 2));
-        comparison.removeFromRight(UiLayout::controlGap);
-        level_match_.setBounds(comparison);
         area.removeFromTop(UiLayout::sm);
-        std::array<juce::Component*, 10> controls{&begin_, &end_, &pitch_, &key_off_, &budget_,
-            &configuration_, &strategy_, &fixed_tone_, &preference_, &sustain_};
-        for (std::size_t i = 0; i < 5; ++i) {
+        std::array<juce::Component*, 12> controls{&begin_, &end_, &pitch_, &key_off_, &budget_, &source_budget_,
+            &configuration_, &strategy_, &fixed_tone_, &preference_, &sustain_, &wave_method_};
+        for (std::size_t i = 0; i < 6; ++i) {
             // Keep the body-sized fields, with label and input on the same row.
-            auto settings = area.removeFromTop(UiLayout::fieldH + UiLayout::panelPad * 2)
-                .reduced(0, UiLayout::panelPad);
+            auto settings = area.removeFromTop(UiLayout::fieldH);
             auto left = settings.removeFromLeft((settings.getWidth() - UiLayout::panelGap) / 2);
             settings.removeFromLeft(UiLayout::panelGap);
             auto place = [&](std::size_t index, juce::Rectangle<int> cell) {
@@ -341,8 +340,8 @@ public:
                 cell.removeFromLeft(UiLayout::controlGap);
                 controls[index]->setBounds(cell);
             };
-            place(i, left); place(i + 5, settings);
-            area.removeFromTop(UiLayout::xs);
+            place(i, left); place(i + 6, settings);
+            area.removeFromTop(UiLayout::sm);
         }
         area.removeFromTop(UiLayout::panelGap);
         auto buttons = area.removeFromBottom(UiLayout::textButtonH);
@@ -701,11 +700,11 @@ private:
     CompositeWavRange range_;
     juce::TextButton load_, audacity_, original_, converted_, stop_, zoom_in_, zoom_out_, analyze_, convert_, apply_, cancel_;
     juce::TextEditor begin_, end_, pitch_, key_off_, budget_, status_;
-    juce::ComboBox configuration_, strategy_, fixed_tone_, preference_, sustain_;
+    juce::ComboBox configuration_, strategy_, fixed_tone_, preference_, sustain_, source_budget_;
     juce::ToggleButton level_match_;
     juce::Label metadata_, metadata_detail_, candidates_title_, candidates_empty_;
     juce::ListBox candidates_;
-    std::array<juce::Label, 10> labels_;
+    std::array<juce::Label, 12> labels_;
     std::shared_ptr<const mgstc::engine::SourcePcm> source_, result_pcm_, alternate_pcm_;
     std::shared_ptr<std::atomic<bool>> preview_cancel_;
     std::uint64_t preview_generation_{};
@@ -838,6 +837,8 @@ inline void CompositeWavConversionContent::convert() {
         : mgstc::engine::CompositeWavSccWaveMethod::Reconstructed;
     options.loop_mode = sustain_.getSelectedId() == 1 ? mgstc::engine::CompositeWavLoopMode::Automatic : mgstc::engine::CompositeWavLoopMode::None;
     options.max_scc_waveforms = static_cast<std::size_t>(max_waves);
+    if (source_budget_.getSelectedId() > 1)
+        options.max_scc_source_waveforms = static_cast<std::size_t>(source_budget_.getSelectedId() - 1);
     if (options.configuration == mgstc::engine::CompositeWavConfiguration::SccOpllRom && fixed_tone_.getSelectedId() > 1)
         options.fixed_opll_tone = static_cast<std::uint8_t>(fixed_tone_.getSelectedId() - 2);
     if (!keyoff_auto) options.key_off_position = static_cast<std::size_t>(std::llround(keyoff * source_->sample_rate));
