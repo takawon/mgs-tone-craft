@@ -11,6 +11,7 @@
 /.site-tools/
 /.agents/
 /.cursor/
+/.codex/
 
 # 内部向け文書（公開リポジトリには含めない。作業ツリーには残す）
 /SPECIFICATION.md

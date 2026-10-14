@@ -647,6 +647,23 @@ MapError RegisterMapper::writePsgToneNoise(
         output);
 }
 
+MapError RegisterMapper::writePsgSccModulationPeriod(
+    std::uint8_t track,
+    std::uint16_t period,
+    Tick tick,
+    RegisterWriteBuffer& output) {
+    if (track >= 8) {
+        return MapError::InvalidTrack;
+    }
+    const auto current = track < 3
+        ? static_cast<std::uint16_t>(psg_mirror_[track * 2]
+            | (static_cast<unsigned>(psg_mirror_[track * 2 + 1]) << 8))
+        : scc_period_[track - 3];
+    return mapMeaningEvent(track,
+        {tick, MeaningEventKind::TrackMicroDetune,
+         static_cast<std::int32_t>(period) - current, 0}, tick, output);
+}
+
 MapError RegisterMapper::writePsgPeriod(
     std::uint8_t track,
     std::uint16_t period,

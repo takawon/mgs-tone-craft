@@ -466,6 +466,11 @@ public:
         const juce::String& finish, int maximum_intermediates,
         std::function<MorphChangeResult(MorphSettings, bool)> on_change,
         bool focus_morph) {
+        // Older unedited steps carry the fixed model default. Adapt that
+        // default locally; opening the picker must not edit authored data.
+        if (settings == MorphSettings{} && maximum_intermediates >= 0)
+            settings.intermediate_count = static_cast<std::uint8_t>(
+                juce::jmin(6, maximum_intermediates));
         morph_settings_ = settings;
         morph_change_ = std::move(on_change);
         morph_available_ = maximum_intermediates >= 0;
@@ -546,7 +551,8 @@ public:
             juce::String::fromUTF8("開始音色より後のカウントを選んでください。同じカウントではモーフィングできません。"),
             juce::dontSendNotification);
         syncMorphEnabled();
-        setSize(getWidth(), getHeight() + (UiLayout::fieldH + UiLayout::sm) * 10);
+        setSize(UiLayout::compositeTimbrePickW * 2 - UiLayout::panelPad * 2 + UiLayout::panelGap,
+            pickerHeight());
         if (focus_morph) juce::MessageManager::callAsync(
             [safe = juce::Component::SafePointer<EnvelopeTimbrePickContent>(this)] {
                 if (safe != nullptr && safe->morph_enabled_.isEnabled())
@@ -571,6 +577,11 @@ public:
         if (morph_count_.isEnabled()) return "Morph OFF leaves intermediate count enabled";
         if (morph_curve_.isEnabled()) return "Morph OFF leaves curve enabled";
         if (morph_curve_.getWidth() < UiLayout::libraryButtonMinW * 2) return "curve track is too narrow";
+        if (morph_enabled_.getRight() + UiLayout::panelGap > current_label_.getX()
+            || morph_enabled_.getY() != current_label_.getY())
+            return "morph settings are not beside the tone controls in the left column";
+        if (getHeight() - memo_.getBottom() != UiLayout::panelPad)
+            return "unused gap remains below timbre memo";
         for (const auto* control : std::initializer_list<const juce::Component*>{
                  &morph_enabled_, &morph_endpoints_, &morph_distribution_label_,
                  &morph_count_, &morph_curve_, &morph_error_})
@@ -630,6 +641,13 @@ public:
         morph_distribution_[1].setToggleState(true, juce::dontSendNotification);
         morph_distribution_[1].onClick();
         return morph_settings_.intermediate_count == count;
+    }
+
+    [[nodiscard]] bool verifyDefaultMorphCount(int expected) {
+        if (morph_settings_.enabled || morph_count_.getValue() != expected) return false;
+        morph_enabled_.setToggleState(true, juce::dontSendNotification);
+        morph_enabled_.onClick();
+        return morph_settings_.enabled && morph_settings_.intermediate_count == expected;
     }
 
     EnvelopeTimbrePickContent(
@@ -878,10 +896,7 @@ public:
         refreshList();
         syncDetailFromSelection();
         live_apply_armed_ = true;
-        const int extra = blank_.isVisible() ? UiLayout::textButtonH + UiLayout::sm : 0;
-        setSize(
-            UiLayout::compositeTimbrePickW,
-            UiLayout::compositeTimbrePickH + extra);
+        setSize(UiLayout::compositeTimbrePickW, pickerHeight());
     }
 
     bool verifyPresetSelection() {
@@ -934,34 +949,35 @@ public:
     void resized() override {
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(panelPad);
-        current_label_.setBounds(area.removeFromTop(fieldH));
-        area.removeFromTop(sm);
         if (morph_change_) {
-            morph_enabled_.setBounds(area.removeFromTop(fieldH));
-            area.removeFromTop(sm);
-            morph_endpoints_.setBounds(area.removeFromTop(fieldH));
-            area.removeFromTop(sm);
-            morph_distribution_label_.setBounds(area.removeFromTop(fieldH));
-            area.removeFromTop(sm);
+            auto morph_area = area.removeFromLeft((area.getWidth() - panelGap) / 2);
+            area.removeFromLeft(panelGap);
+            morph_enabled_.setBounds(morph_area.removeFromTop(fieldH));
+            morph_area.removeFromTop(sm);
+            morph_endpoints_.setBounds(morph_area.removeFromTop(fieldH));
+            morph_area.removeFromTop(sm);
+            morph_distribution_label_.setBounds(morph_area.removeFromTop(fieldH));
+            morph_area.removeFromTop(sm);
             for (auto& button : morph_distribution_) {
-                button.setBounds(area.removeFromTop(fieldH));
-                area.removeFromTop(sm);
+                button.setBounds(morph_area.removeFromTop(fieldH));
+                morph_area.removeFromTop(sm);
             }
-            auto count_row = area.removeFromTop(fieldH);
+            auto count_row = morph_area.removeFromTop(fieldH);
             morph_count_label_.setBounds(count_row.removeFromLeft(compositeInspectorLabelW));
             morph_count_.setBounds(count_row);
-            area.removeFromTop(sm);
-            auto curve_row = area.removeFromTop(fieldH);
+            morph_area.removeFromTop(sm);
+            auto curve_row = morph_area.removeFromTop(fieldH);
             morph_curve_label_.setBounds(curve_row.removeFromLeft(compositeInspectorLabelW));
             morph_front_.setBounds(curve_row.removeFromLeft(libraryButtonMinW));
             morph_back_.setBounds(curve_row.removeFromRight(libraryButtonMinW));
             morph_uniform_.setBounds(curve_row);
-            area.removeFromTop(sm);
-            morph_curve_.setBounds(area.removeFromTop(fieldH));
-            area.removeFromTop(sm);
-            morph_error_.setBounds(area.removeFromTop(fieldH));
-            area.removeFromTop(sm);
+            morph_area.removeFromTop(sm);
+            morph_curve_.setBounds(morph_area.removeFromTop(fieldH));
+            morph_area.removeFromTop(sm);
+            morph_error_.setBounds(morph_area.removeFromTop(fieldH));
         }
+        current_label_.setBounds(area.removeFromTop(fieldH));
+        area.removeFromTop(sm);
         auto preset_row = area.removeFromTop(fieldH);
         preset_label_.setBounds(preset_row.removeFromLeft(UiScale::sx(108)));
         preset_row.removeFromLeft(controlGap);
@@ -996,6 +1012,15 @@ public:
     }
 
 private:
+    [[nodiscard]] int pickerHeight() const noexcept {
+        using namespace UiLayout;
+        // Size to the actual rows and memo, leaving only the standard inset.
+        return panelPad * 2 + (fieldH + sm) * 2 + textButtonH + sm
+            + (blank_.isVisible() ? textButtonH + sm : 0)
+            + fieldH * 6 + xs + sm * 6 + libraryMemoH
+            + (layer_base_ ? textButtonH + sm : 0);
+    }
+
     [[nodiscard]] static mgstc::engine::SccMorphDistributionMode distributionMode(std::size_t index) {
         constexpr std::array modes{
             mgstc::engine::SccMorphDistributionMode::AdaptiveDistribution,
@@ -5401,6 +5426,31 @@ public:
             }
         }
         save("workspace-17-count");
+        {
+            auto lfo_layer = mgstc::engine::defaultCompositeTimbre().layers[1];
+            lfo_layer.software_lfo.enabled = true;
+            lfo_layer.software_lfo.delay = 4;
+            lfo_layer.software_lfo.speed = 2;
+            lfo_layer.software_lfo.extra_roughness = 5;
+            const auto first = mgstc::engine::softwareLfoFirstUpdateTick(4, 2);
+            lfo_layer.pitch_envelope.events = {
+                {.kind = mgstc::engine::EnvelopeEventKind::Pitch, .value = 7, .count = first - 1},
+                {.kind = mgstc::engine::EnvelopeEventKind::Pitch, .value = 3, .count = first},
+                {.kind = mgstc::engine::EnvelopeEventKind::Pitch, .value = 2, .count = first + 1},
+                {.kind = mgstc::engine::EnvelopeEventKind::Pitch, .value = 4, .count = first + 3}};
+            check(softwareLfoEnvelopePitchAt(lfo_layer, first - 1) == 7
+                && softwareLfoEnvelopePitchAt(lfo_layer, first) == 0
+                && softwareLfoEnvelopePitchAt(lfo_layer, first + 1) == 2
+                && softwareLfoEnvelopePitchAt(lfo_layer, first + 3) == 0,
+                "wide @p overlay does not replace ENV on update ticks or retain intervening ENV");
+            lfo_layer.software_lfo.extra_roughness = 0;
+            check(softwareLfoEnvelopePitchAt(lfo_layer, first + 3) == 16,
+                "narrow LFO overlay lost accumulated ENV pitch");
+            lfo_layer.software_lfo.extra_roughness = 5;
+            lfo_layer.source = mgstc::engine::TimbreSource::Opll;
+            check(softwareLfoEnvelopePitchAt(lfo_layer, first + 3) == 16,
+                "OPLL LFO overlay incorrectly applied wide @p ENV replacement");
+        }
         focus_.setToggleState(true, juce::dontSendNotification); focus_.onClick();
         save("workspace-focus");
         {
@@ -5519,8 +5569,50 @@ public:
                     [](auto, bool) { return EnvelopeTimbrePickContent::MorphChangeResult{}; }, false);
                 check(impossible_picker.verifyUnavailableMorphCount(),
                     "changing distribution mode silently reduced an impossible authored count");
+                for (const int available : {0, 1, 3, 6, 20}) {
+                    EnvelopeTimbrePickContent default_picker(mgstc::engine::TimbreSource::Scc,
+                        {}, {}, [](auto) {}, {}, {});
+                    const int expected = juce::jmin(6, available);
+                    int changes{};
+                    default_picker.configureMorph({}, "Sine", "Original", available,
+                        [&](auto settings, bool) {
+                            ++changes;
+                            return EnvelopeTimbrePickContent::MorphChangeResult{
+                                settings.intermediate_count == expected, {}};
+                        }, false);
+                    check(changes == 0 && default_picker.verifyDefaultMorphCount(expected) && changes == 1,
+                        "default intermediate count did not adapt before enabling, or opening edited author data");
+                }
+                EnvelopeTimbrePickContent custom_picker(mgstc::engine::TimbreSource::Scc,
+                    {}, {}, [](auto) {}, {}, {});
+                auto custom_settings = picker_settings;
+                custom_settings.intermediate_count = 5;
+                custom_picker.configureMorph(custom_settings, "A", "B", 2,
+                    [](auto, bool) { return EnvelopeTimbrePickContent::MorphChangeResult{}; }, false);
+                check(custom_picker.verifyUnavailableMorphCount(),
+                    "opening disabled custom morph silently reduced authored intermediate count");
             }
             UiScale::setActivePercent(picker_scale);
+            {
+                auto insertion_model = morph_model;
+                auto& layer = insertion_model.layers[1];
+                layer.timbre_automation.clear();
+                const EnvelopeTimbreChoice choice{mgstc::engine::TimbrePick::Library, first_wave.library_id};
+                for (const auto [count, expected] : {std::pair{0, 0}, std::pair{4, 3},
+                        std::pair{5, 0}, std::pair{20, 6}}) {
+                    setStepTimbreChoice(insertion_model, 1, count, choice);
+                    check(timbreEventAt(layer, count)->scc_morph.intermediate_count == expected,
+                        "new SCC event default ignores previous timbre gap");
+                }
+                layer.timbre_automation[1].scc_morph.intermediate_count = 2;
+                setStepTimbreChoice(insertion_model, 1, 4, choice);
+                check(timbreEventAt(layer, 4)->scc_morph.intermediate_count == 2,
+                    "replacing a timbre resets existing morph settings");
+                layer.timbre_automation.clear();
+                setStepTimbreChoice(insertion_model, 1, 4, choice);
+                check(layer.timbre_automation.size() == 1 && layer.timbre_automation[0].scc_morph.intermediate_count == 3,
+                    "first SCC event default did not use initial tone at count zero");
+            }
             auto apply_verified_morph = [&](std::size_t layer_index, int count, auto settings) {
                 std::optional<EnvelopeTimbrePickContent::MorphChangeResult> completed;
                 auto result = applyIncomingMorph(layer_index, count, settings, true,
@@ -6695,7 +6787,22 @@ public:
             // column width. Restore this fixture's wide view before testing
             // an END-column mouse-down, particularly at 125%.
             horizontal_scroll_.setCurrentRange(0.0, 32.0, juce::dontSendNotification);
-            const auto overlap = point_at(24), separate = point_at(20);
+            const auto end_bar = endMarkerBounds(ruler, timbre_.layers[0]);
+            const auto loop_bar = loopMarkerBounds(ruler, 24, "LOOP ]");
+            check(ruler.contains(end_bar) && !end_bar.intersects(loop_bar),
+                "END bar escaped command row or overlaps LOOP end label");
+            juce::Image command_image(juce::Image::ARGB, getWidth(), getHeight(), true);
+            {
+                juce::Graphics graphics(command_image);
+                drawCommandSummary(graphics, ruler, timbre_.layers[0], sourceColour(timbre_.layers[0].source));
+            }
+            int gold_pixels{};
+            for (int y = end_bar.getY(); y < end_bar.getBottom(); ++y)
+                for (int x = end_bar.getX(); x < end_bar.getRight(); ++x)
+                    if (command_image.getPixelAt(x, y) == juce::Colour(0xFFFFD166)) ++gold_pixels;
+            check(gold_pixels > end_bar.getWidth(), "END bar was not painted in command row");
+            const auto overlap = juce::Point<int>(loopStartX(ruler, 24), end_bar.getCentreY());
+            const auto separate = point_at(20);
             mouseDown(mouse(overlap, overlap, false));
             mouseDrag(mouse(separate, overlap, true));
             mouseUp(mouse(separate, overlap, true));
@@ -6706,9 +6813,13 @@ public:
             horizontal_scroll_.setCurrentRange(0.0, 32.0, juce::dontSendNotification);
             const auto extend_end = point_at(28);
             const int before_length = commits;
-            mouseDown(mouse(overlap, overlap, false));
-            mouseDrag(mouse(extend_end, overlap, true));
-            mouseUp(mouse(extend_end, overlap, true));
+            const auto standalone_end = endMarkerBounds(ruler, timbre_.layers[0]);
+            check(standalone_end.getY() == loop_bar.getY(),
+                "separate END bar does not occupy marker ruler");
+            const auto end_point = juce::Point<int>(loopStartX(ruler, 24), standalone_end.getCentreY());
+            mouseDown(mouse(end_point, end_point, false));
+            mouseDrag(mouse(extend_end, end_point, true));
+            mouseUp(mouse(extend_end, end_point, true));
             check(timbre_.layers[0].envelope_timeline.length_counts == 28
                     && timbre_.layers[0].envelope_timeline.loop_end_count == 20
                     && timbre_.layers[0].pitch_envelope.events == author_counts
@@ -10496,6 +10607,16 @@ private:
             summary.getBottom() - ruler_h, width, ruler_h};
     }
 
+    [[nodiscard]] juce::Rectangle<int> endMarkerBounds(juce::Rectangle<int> summary,
+        const mgstc::engine::CompositeLayer& layer) const {
+        auto handle = loopMarkerBounds(summary, layer.envelope_timeline.length_counts, "[END]");
+        // Keep the existing LOOP ] priority for the complete shared column.
+        // Separate the visual bars without introducing another drag mode.
+        if (layer.envelope_timeline.loop_end_count == layer.envelope_timeline.length_counts)
+            handle.translate(0, -handle.getHeight());
+        return handle;
+    }
+
     bool deleteLoopMarkerAt(juce::Point<int> point) {
         const int index = layerAt(point);
         if (index < 0 || index != selected_layer_) return false;
@@ -11441,6 +11562,14 @@ private:
                 graphics.drawText(boundary.second, handle, juce::Justification::centred);
             }
         }
+        const auto end_handle = endMarkerBounds(bounds, layer);
+        if (timeline.length_counts >= visible.getStart() && timeline.length_counts <= visible.getEnd()
+            && end_handle.intersects(bounds)) {
+            graphics.setColour(juce::Colour(0xFFFFD166));
+            graphics.fillRoundedRectangle(end_handle.toFloat(), static_cast<float>(UiLayout::xs));
+            graphics.setColour(juce::Colour(0xFF1B222A));
+            graphics.drawText("[END]", end_handle, juce::Justification::centred);
+        }
     }
 
     [[nodiscard]] static juce::Colour sourceColour(
@@ -11825,7 +11954,7 @@ private:
             bool started = false;
             float previous_y = 0.0F;
             for (int count = start; count <= end; ++count) {
-                const int value = cumulativePitchAt(expanded, count)
+                const int value = softwareLfoEnvelopePitchAt(expanded, static_cast<std::uint32_t>(count))
                     + static_cast<int>(
                         mgstc::engine::softwareLfoOffsetAtTick(
                             layer.software_lfo,
@@ -12909,18 +13038,30 @@ private:
             + juce::String::fromUTF8(" を追加しました"));
     }
 
+    [[nodiscard]] static int softwareLfoEnvelopePitchAt(
+        const mgstc::engine::CompositeLayer& layer, std::uint32_t count) noexcept {
+        auto pitch = cumulativePitchAt(layer, static_cast<int>(count));
+        if (layer.source != mgstc::engine::TimbreSource::Opll && layer.software_lfo.extra_roughness != 0)
+            if (const auto last = mgstc::engine::softwareLfoLastUpdateTick(layer.software_lfo, count))
+                pitch -= cumulativePitchAt(layer, static_cast<int>(*last));
+        return pitch;
+    }
+
     void setStepTimbreChoice(mgstc::engine::CompositeTimbre& sound,
         std::size_t layer_index, int timeline_count, const EnvelopeTimbreChoice& choice) {
         auto& events =
             sound.layers[layer_index]
                 .timbre_automation;
         EnvelopeTimbrePickContent::MorphSettings morph_settings;
+        bool existing_settings = false;
         if (const auto* existing = timbreEventAt(
                 sound.layers[layer_index],
                 static_cast<std::uint32_t>(timeline_count),
                 isLoopStartCount(sound.layers[layer_index], timeline_count)
-                    ? std::optional<bool>{loop_insert_after_} : std::nullopt))
+                    ? std::optional<bool>{loop_insert_after_} : std::nullopt)) {
             morph_settings = existing->scc_morph;
+            existing_settings = true;
+        }
         const auto& layer = sound.layers[layer_index];
         const bool split = isLoopStartCount(layer, timeline_count);
         const bool after = split && loop_insert_after_;
@@ -12964,6 +13105,20 @@ private:
             [](const auto& left, const auto& right) {
                 return left.count < right.count;
             });
+        if (!existing_settings && layer.source == mgstc::engine::TimbreSource::Scc) {
+            const auto inserted = std::find_if(events.begin(), events.end(), [&](const auto& value) {
+                return value.kind == mgstc::engine::EnvelopeEventKind::Timbre
+                    && value.count == static_cast<std::uint32_t>(timeline_count)
+                    && (!split || value.after_loop_start == after);
+            });
+            if (inserted != events.end()) {
+                const auto previous = morphStartEvent(layer, *inserted);
+                const auto available = previous && previous->count < inserted->count
+                    ? inserted->count - previous->count - 1 : 0;
+                inserted->scc_morph.intermediate_count = static_cast<std::uint8_t>(
+                    std::min<std::uint32_t>(6, available));
+            }
+        }
     }
 
     void applyTimbreChoice(int timeline_count, const EnvelopeTimbreChoice& choice) {

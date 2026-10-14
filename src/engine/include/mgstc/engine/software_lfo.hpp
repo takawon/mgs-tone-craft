@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 
 namespace mgstc::engine {
 
@@ -13,7 +14,8 @@ namespace mgstc::engine {
 // Integrating triangle: n4 is the signed pitch-up step. Non-zero `@p` on
 // PSG/SCC is a signed add to the pre-octave period instead (pitch falls
 // when the value is positive).
-// Applied as period/F-number FrequencyDelta each 60 Hz interrupt.
+// Applied as period/F-number delta, or absolute PSG/SCC period for non-zero
+// @p, on the 60 Hz interrupt.
 // Not chip hardware AM/PM, and not OPLL built-in vibrato.
 // Delay/speed use the public MGS stored-byte encoding (param+1, 0 ⇒ 256).
 struct SoftwareLfoSettings {
@@ -77,6 +79,22 @@ constexpr int kSoftwareLfoPreviewExtent = 127;
             static_cast<std::int32_t>(32767));
     }
     return settings;
+}
+
+// Last update tick in the key-on's first passage; waiting ticks do not reset
+// the output. Used to show which ENV changes a wide @p update replaces.
+[[nodiscard]] inline std::optional<std::uint32_t> softwareLfoLastUpdateTick(
+    const SoftwareLfoSettings& settings,
+    std::uint32_t tick_from_key_on) noexcept {
+    if (!settings.enabled) {
+        return std::nullopt;
+    }
+    const auto first = softwareLfoFirstUpdateTick(settings.delay, settings.speed);
+    if (tick_from_key_on < first) {
+        return std::nullopt;
+    }
+    const auto period = softwareLfoSpeedPeriod(settings.speed);
+    return first + ((tick_from_key_on - first) / period) * period;
 }
 
 // 8-bit n4, added to the current output as a pitch-up step.
@@ -226,8 +244,13 @@ public:
     }
 
     void resetForKeyOn() noexcept {
-        tick_ = 0;
         applied_ = 0;
+        counter_ = (softwareLfoStoredParam(settings_.delay)
+            + softwareLfoStoredParam(settings_.speed)) & 0xFFU;
+        depth_count_ = ((static_cast<unsigned>(settings_.depth) + 1U) >> 1) + 1U;
+        step_ = wide() ? settings_.extra_roughness : settings_.roughness;
+        pre_ = base_.unshifted;
+        period_update_.reset();
     }
 
     void clear() noexcept {
@@ -236,14 +259,39 @@ public:
         resetForKeyOn();
     }
 
-    // Advance one interrupt. Returns FrequencyDelta vs last applied offset.
+    // Advance one interrupt in bounded time. Returns the standalone offset
+    // delta; wide @p callers must use periodUpdate() to replace ENV pitch.
     [[nodiscard]] std::int32_t advance() noexcept {
-        const auto next = softwareLfoOffsetAtTick(
-            settings_, tick_, apply_extra_roughness_, base_, detune_pitch_up_);
-        ++tick_;
+        period_update_.reset();
+        if (!enabled()) {
+            return 0;
+        }
+        counter_ = (counter_ - 1U) & 0xFFU;
+        if (counter_ != 0U) {
+            return 0;
+        }
+        counter_ = softwareLfoStoredParam(settings_.speed);
+        if (--depth_count_ == 0U) {
+            depth_count_ = static_cast<unsigned>(settings_.depth) + 1U;
+            step_ = wide() ? softwareLfoNegate16(step_) : -step_;
+        }
+        auto next = applied_ + step_;
+        if (wide()) {
+            pre_ = static_cast<std::uint16_t>(static_cast<int>(pre_) + step_);
+            const auto octave = static_cast<unsigned>(base_.octave & 7);
+            period_update_ = static_cast<std::uint16_t>(pre_ >> octave);
+            next = static_cast<std::int32_t>(base_.unshifted >> octave)
+                - detune_pitch_up_ - *period_update_;
+        }
         const auto delta = next - applied_;
         applied_ = next;
         return delta;
+    }
+
+    // Non-zero @p replaces the current period on an update tick. ENV pitch
+    // changes do not modify the driver's separate pre-octave accumulator.
+    [[nodiscard]] std::optional<std::uint16_t> periodUpdate() const noexcept {
+        return period_update_;
     }
 
     [[nodiscard]] bool enabled() const noexcept {
@@ -255,11 +303,19 @@ public:
     }
 
 private:
+    [[nodiscard]] bool wide() const noexcept {
+        return apply_extra_roughness_ && settings_.extra_roughness != 0;
+    }
+
     SoftwareLfoSettings settings_{};
     PsgSccModulationBase base_{};
     std::int32_t detune_pitch_up_{};
     bool apply_extra_roughness_{true};
-    std::uint32_t tick_{};
+    unsigned counter_{};
+    unsigned depth_count_{};
+    std::int32_t step_{};
+    std::uint16_t pre_{};
+    std::optional<std::uint16_t> period_update_{};
     std::int32_t applied_{};
 };
 
