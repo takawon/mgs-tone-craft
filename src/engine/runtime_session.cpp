@@ -859,6 +859,9 @@ MapError RuntimeSession::applyTrackLfo(std::uint8_t track) {
         return MapError::None;
     }
     const auto delta = track_lfo_[track].advance();
+    if (const auto period = track_lfo_[track].periodUpdate()) {
+        return mapper_.writePsgSccModulationPeriod(track, *period, tick_, writes_);
+    }
     if (delta == 0) {
         return MapError::None;
     }

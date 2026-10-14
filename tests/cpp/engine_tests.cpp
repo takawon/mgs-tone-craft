@@ -7319,6 +7319,48 @@ void testSoftwareLfoTrackSetupAndLibraryRoundTrip() {
         layer.software_lfo);
 }
 
+void testSoftwareLfoStatefulUpdatesAndReset() {
+    using namespace mgstc::engine;
+    // Checked against original-driver 744D/748C: mode 0 reverses before
+    // the update; -32768 keeps its sign under 16-bit negation.
+    for (const bool wide : {false, true}) {
+        for (const auto extra : {-32768, -5, 0, 5, 32767}) {
+            for (const auto delay : {0, 2, 254, 255}) {
+                SoftwareLfoSettings settings{
+                    .enabled = true, .delay = static_cast<std::uint8_t>(delay),
+                    .depth = 10, .speed = 2, .roughness = 3,
+                    .extra_roughness = extra};
+                const PsgSccModulationBase base{3424, 3};
+                SoftwareLfoRuntime runtime;
+                runtime.setSettings(settings, wide);
+                runtime.bindPitchBase(base, 7);
+                runtime.resetForKeyOn();
+                for (std::uint32_t tick = 0; tick < 800; ++tick) {
+                    static_cast<void>(runtime.advance());
+                    REQUIRE_EQ(runtime.applied(),
+                        softwareLfoOffsetAtTick(settings, tick, wide, base, 7));
+                    const auto last = softwareLfoLastUpdateTick(settings, tick);
+                    const bool updated = last && *last == tick;
+                    REQUIRE_EQ(runtime.periodUpdate().has_value(),
+                        wide && extra != 0 && updated);
+                }
+                runtime.resetForKeyOn();
+                REQUIRE_EQ(runtime.applied(), 0);
+                REQUIRE_EQ(runtime.periodUpdate().has_value(), false);
+                REQUIRE_EQ(runtime.advance(), 0);
+                runtime.clear();
+                REQUIRE_EQ(runtime.enabled(), false);
+                REQUIRE_EQ(runtime.advance(), 0);
+            }
+        }
+    }
+    SoftwareLfoSettings slow{.enabled = true, .delay = 255, .speed = 255};
+    REQUIRE_EQ(softwareLfoLastUpdateTick(slow, 254).has_value(), false);
+    REQUIRE_EQ(*softwareLfoLastUpdateTick(slow, 255), 255U);
+    REQUIRE_EQ(*softwareLfoLastUpdateTick(slow, 510), 255U);
+    REQUIRE_EQ(*softwareLfoLastUpdateTick(slow, 511), 511U);
+}
+
 void testCompositeModulationStepModesRespectDelayAndDirection() {
     using namespace mgstc::engine;
     ModulationParameters settings;
@@ -8387,6 +8429,96 @@ void testRuntimeSoftwareLfoWritesFrequencyDeltas() {
     const auto second_period = read_period(session.writes());
     REQUIRE_EQ(second_period.has_value(), true);
     REQUIRE_EQ(*second_period != *first_period, true);
+}
+
+void testRuntimeWideLfoReplacesEnvelopePitch() {
+    using namespace mgstc::engine;
+    for (const std::uint8_t track : {std::uint8_t{0}, std::uint8_t{3}}) {
+        RuntimeSession session(64, 256);
+        REQUIRE_EQ(session.setSequenceEnvelope(track,
+            {0x12, 10, 0x0F, 0x12, 20, 0x0F,
+             0x12, 30, 0x0F, 0x12, 40, 0x0F}), true);
+        REQUIRE_EQ(session.setTrackDetune(track, 7, 3), true);
+        REQUIRE_EQ(session.setTrackKeyOffHang(track, 8), true);
+        REQUIRE_EQ(session.setTrackSoftwareLfo(track,
+            {.enabled = true, .depth = 20, .speed = 1,
+             .roughness = 3, .extra_roughness = 5}), true);
+        REQUIRE_EQ(session.queueNoteOn(track, 60), true);
+        const auto periods = [&]() {
+            std::vector<std::uint16_t> result;
+            int low = -1;
+            for (const auto& write : session.writes()) {
+                if (write.track != track || write.reason != WriteReason::Frequency) {
+                    continue;
+                }
+                if (write.address == 0) {
+                    low = write.value;
+                } else if (write.address == 1 && low >= 0) {
+                    result.push_back(static_cast<std::uint16_t>(
+                        low | (static_cast<unsigned>(write.value) << 8)));
+                    low = -1;
+                }
+            }
+            return result;
+        };
+        // C4: (3421 + @\3) >> 3 = 428. Track \7 applies only
+        // initially. ENV deltas precede each same-tick @p replacement.
+        REQUIRE_EQ(session.processTick().ok(), true);
+        REQUIRE_EQ(periods().back(), std::uint16_t{411});
+        REQUIRE_EQ(session.processTick().ok(), true);
+        REQUIRE_EQ(periods().back(), std::uint16_t{391});
+        REQUIRE_EQ(session.processTick().ok(), true);
+        REQUIRE_EQ(periods(), (std::vector<std::uint16_t>{361, 428}));
+        REQUIRE_EQ(session.processTick().ok(), true);
+        REQUIRE_EQ(periods().back(), std::uint16_t{388});
+        // k release freezes ENV but keeps wide LFO phase running.
+        REQUIRE_EQ(session.queueKeyOff(track), true);
+        REQUIRE_EQ(session.processTick().ok(), true);
+        REQUIRE_EQ(periods(), (std::vector<std::uint16_t>{429}));
+        REQUIRE_EQ(session.processTick().ok(), true);
+        REQUIRE_EQ(periods().empty(), true);
+        // New key-on resets both the pre-shift word and LFO counters.
+        REQUIRE_EQ(session.queueNoteOn(track, 72), true);
+        REQUIRE_EQ(session.processTick().ok(), true);
+        REQUIRE_EQ(periods().back(), std::uint16_t{197});
+        REQUIRE_EQ(session.processTick().ok(), true);
+        REQUIRE_EQ(periods().back(), std::uint16_t{177});
+        REQUIRE_EQ(session.processTick().ok(), true);
+        REQUIRE_EQ(periods(), (std::vector<std::uint16_t>{147, 214}));
+    }
+}
+
+void testRuntimeWideLfoPreservesRawPeriodAndZeroN4() {
+    using namespace mgstc::engine;
+    for (const std::uint8_t track : {std::uint8_t{0}, std::uint8_t{3}}) {
+        for (const int note : {24, 108}) {
+            for (const int extra : {1, 32767, -32768, -3421}) {
+                RuntimeSession session(64, 256);
+                REQUIRE_EQ(session.setSequenceEnvelope(track, {0x12, 10, 0x0F}), true);
+                REQUIRE_EQ(session.setTrackSoftwareLfo(track,
+                    {.enabled = true, .depth = 20, .roughness = 0,
+                     .extra_roughness = extra}), true);
+                REQUIRE_EQ(session.queueNoteOn(track, static_cast<std::uint8_t>(note)), true);
+                REQUIRE_EQ(session.processTick().ok(), true);
+                REQUIRE_EQ(session.processTick().ok(), true);
+                int low = -1;
+                int high = -1;
+                for (const auto& write : session.writes()) {
+                    if (write.track != track || write.reason != WriteReason::Frequency) {
+                        continue;
+                    }
+                    if (write.address == 0) low = write.value;
+                    if (write.address == 1) high = write.value;
+                }
+                REQUIRE_EQ(low >= 0 && high >= 0, true);
+                // MGSDRV keeps full 16-bit output, including zero and high bits
+                // beyond the chip's effective 12-bit period. No clamping.
+                const auto expected = static_cast<std::uint16_t>(3421 + extra)
+                    >> ((note - 24) / 12);
+                REQUIRE_EQ(low | (high << 8), static_cast<int>(expected));
+            }
+        }
+    }
 }
 
 void testUnusedSequenceEnvelopeIsOmittedWithoutReservingNumber() {
@@ -9739,6 +9871,7 @@ int main(int argc, char** argv) {
         {"CompositeTimbreDependencyUpdatePreservesAssignment", testCompositeTimbreDependencyUpdatePreservesAssignment},
         {"SoftwareLfoTriangleDelayAndRoughness", testSoftwareLfoTriangleDelayAndRoughness},
         {"SoftwareLfoTrackSetupAndLibraryRoundTrip", testSoftwareLfoTrackSetupAndLibraryRoundTrip},
+        {"SoftwareLfoStatefulUpdatesAndReset", testSoftwareLfoStatefulUpdatesAndReset},
         {"CompositeModulationStepModesRespectDelayAndDirection", testCompositeModulationStepModesRespectDelayAndDirection},
         {"CompositeModulationClampsStoredRangeBoundaries", testCompositeModulationClampsStoredRangeBoundaries},
         {"CompositeModulationOscillateIsBoundedAndRepeats", testCompositeModulationOscillateIsBoundedAndRepeats},
@@ -9760,6 +9893,8 @@ int main(int argc, char** argv) {
         {"AuthoredLoopRegisterStateAndFirstPassWaveformClassification", testAuthoredLoopRegisterStateAndFirstPassWaveformClassification},
         {"AllCompositeModulationOffPreservesBaseEnvelopeOutput", testAllCompositeModulationOffPreservesBaseEnvelopeOutput},
         {"RuntimeSoftwareLfoWritesFrequencyDeltas", testRuntimeSoftwareLfoWritesFrequencyDeltas},
+        {"RuntimeWideLfoReplacesEnvelopePitch", testRuntimeWideLfoReplacesEnvelopePitch},
+        {"RuntimeWideLfoPreservesRawPeriodAndZeroN4", testRuntimeWideLfoPreservesRawPeriodAndZeroN4},
         {"UnusedSequenceEnvelopeIsOmittedWithoutReservingNumber",
          testUnusedSequenceEnvelopeIsOmittedWithoutReservingNumber},
         {"TrackSetupEnvelopeNumberAndPreKeyOnCommands",

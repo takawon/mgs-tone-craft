@@ -95,6 +95,14 @@ public:
         Tick tick,
         RegisterWriteBuffer& output);
 
+    // Driver modulation output retains the complete 16-bit period, including
+    // zero and bits outside the chip's effective 12-bit frequency registers.
+    [[nodiscard]] MapError writePsgSccModulationPeriod(
+        std::uint8_t track,
+        std::uint16_t period,
+        Tick tick,
+        RegisterWriteBuffer& output);
+
     [[nodiscard]] MapError writeSccKey(
         std::uint8_t track,
         bool key_on,

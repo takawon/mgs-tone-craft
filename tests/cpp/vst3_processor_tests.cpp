@@ -28,6 +28,7 @@
 #include "mgstc/engine/composite_timbre.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/composite_envelope_compile.hpp"
+#include "mgstc/engine/composite_program_compiler.hpp"
 #include "mgstc/engine/envelope_sequence.hpp"
 #include "plugin_state.hpp"
 #include "mgstc/engine/dc_blocker.hpp"
@@ -3237,6 +3238,44 @@ void renderMidiNote(
     processor.processBlock(out, on);
 }
 
+juce::AudioBuffer<float> renderEngineCoreMidiNote(
+    const mgstc::engine::CompositeTimbre& timbre,
+    int total_frames) {
+    using namespace mgstc::engine;
+    constexpr int block_frames = 256;
+    require(total_frames > 0 && total_frames % block_frames == 0,
+        "direct EngineCore frame count uses whole blocks");
+    EngineCore core;
+    CompositePlaybackPlan plan;
+    require(compileCompositeProgram(core, timbre, {}, &plan),
+        "direct EngineCore compiles the same composite program");
+    core.hardReset();
+    core.session().gateUntilNoteOn();
+
+    std::array<float, block_frames * 2> interleaved{};
+    require(core.render(interleaved).ok(), "EngineCore warmup renders");
+    const auto layer = std::find_if(
+        plan.audible_layers.begin(), plan.audible_layers.end(),
+        [](const auto& binding) { return binding.layer_index == 0; });
+    require(layer != plan.audible_layers.end(), "EngineCore test layer is audible");
+    const auto note = transposedMidiNote(60, layer->relative_semitones);
+    require(note.has_value(), "EngineCore test note remains in range after transpose");
+    require(core.session().queueNoteOn(plan.physicalTrack(*layer, 0), *note),
+        "EngineCore accepts the matching MIDI note");
+    juce::AudioBuffer<float> out(2, total_frames);
+    for (int block = 0; block < total_frames / block_frames; ++block) {
+        interleaved.fill(0.0F);
+        require(core.render(interleaved).ok(), "EngineCore note block renders");
+        const auto block_start = block * block_frames;
+        for (int frame = 0; frame < block_frames; ++frame) {
+            const auto source = static_cast<std::size_t>(frame) * 2;
+            out.setSample(0, block_start + frame, interleaved[source]);
+            out.setSample(1, block_start + frame, interleaved[source + 1]);
+        }
+    }
+    return out;
+}
+
 std::string soundBytes(const mgstc::engine::CompositeTimbre& timbre) {
     return mgstc::engine::serializeCompositeSoundPayload(timbre);
 }
@@ -3667,6 +3706,87 @@ void testPluginStateFoundation() {
         peak = channelPeak(more, 0, 512);
     }
     require(peak > 0.001, "restored PSG is audible at 44.1 kHz");
+}
+
+void testWideSoftwareLfoMatchesDirectEngineCoreWithPitchEnvelope() {
+    using namespace mgstc::engine;
+    constexpr int block_frames = 256;
+    constexpr int rendered_frames = 12'288;
+    for (const auto source : {TimbreSource::Psg, TimbreSource::Scc}) {
+        auto timbre = source == TimbreSource::Psg
+            ? psgOnlyTimbre()
+            : sccOnlyTimbre();
+        auto& layer = timbre.layers.front();
+        // This test drives the shared EngineCore directly after key-on; layer
+        // delay scheduling has separate coverage and is not part of @p parity.
+        layer.start_delay_form = StartDelayForm::AbsoluteTicks;
+        layer.start_delay_value = 0;
+        layer.pitch_envelope.events.clear();
+        EnvelopeEvent pitch;
+        pitch.kind = EnvelopeEventKind::Pitch;
+        pitch.value = -3;
+        pitch.count = 8;
+        layer.pitch_envelope.events.push_back(pitch);
+        layer.software_lfo.enabled = true;
+        layer.software_lfo.delay = 0;
+        layer.software_lfo.depth = 20;
+        layer.software_lfo.speed = 1;
+        layer.software_lfo.roughness = 0;
+        layer.software_lfo.extra_roughness = 5;
+
+        MgstcAudioProcessor processor;
+        require(processor.replacePluginState(documentFrom(timbre, 0, {})),
+            "plugin applies the composite program carrying ENV pitch and @p");
+        processor.prepareToPlay(48'000.0, block_frames);
+        juce::AudioBuffer<float> warm(2, block_frames);
+        juce::MidiBuffer empty;
+        processor.processBlock(warm, empty);
+
+        juce::AudioBuffer<float> plugin_pcm(2, rendered_frames);
+        for (int block = 0; block < rendered_frames / block_frames; ++block) {
+            juce::AudioBuffer<float> chunk(2, block_frames);
+            juce::MidiBuffer midi;
+            if (block == 0) {
+                midi.addEvent(
+                    juce::MidiMessage::noteOn(
+                        1, 60, static_cast<juce::uint8>(100)),
+                    0);
+            }
+            processor.processBlock(chunk, midi);
+            plugin_pcm.copyFrom(0, block * block_frames, chunk, 0, 0, block_frames);
+            plugin_pcm.copyFrom(1, block * block_frames, chunk, 1, 0, block_frames);
+        }
+
+        const auto core_pcm = renderEngineCoreMidiNote(timbre, rendered_frames);
+        require(bufferAllFinite(plugin_pcm), "@p processor output is finite");
+        require(channelPeak(plugin_pcm, 0, rendered_frames) > 0.001,
+            "@p processor output remains audible through the first update");
+        if (!sameBuffer(plugin_pcm, core_pcm)) {
+            float max_difference = 0.0F;
+            int first_difference = -1;
+            for (int frame = 0; frame < rendered_frames; ++frame) {
+                const auto difference = std::abs(
+                    plugin_pcm.getSample(0, frame)
+                    - core_pcm.getSample(0, frame));
+                if (difference > 0.0F && first_difference < 0) {
+                    first_difference = frame;
+                }
+                max_difference = std::max(max_difference, difference);
+            }
+            std::fprintf(stderr,
+                "@p PCM mismatch source=%s first_frame=%d max_abs_diff=%.9g "
+                "plugin_peak=%.9g engine_peak=%.9g\n",
+                source == TimbreSource::Psg ? "PSG" : "SCC",
+                first_difference,
+                static_cast<double>(max_difference),
+                channelPeak(plugin_pcm, 0, rendered_frames),
+                channelPeak(core_pcm, 0, rendered_frames));
+        }
+        require(sameBuffer(plugin_pcm, core_pcm),
+            source == TimbreSource::Psg
+                ? "PSG DAW MIDI @p+ENV output matches direct EngineCore"
+                : "SCC DAW MIDI @p+ENV output matches direct EngineCore");
+    }
 }
 
 void testSccMorphPluginStateCompatibility() {
@@ -6500,6 +6620,7 @@ int main() {
         testBlockBoundaryMidiStaysOnItsFrame();
         testHostRateOverdueNoteIsAppliedNow();
         testPluginStateFoundation();
+        testWideSoftwareLfoMatchesDirectEngineCoreWithPitchEnvelope();
         testSccMorphPluginStateCompatibility();
         testPluginProjectRestore();
         testPluginEditor();
