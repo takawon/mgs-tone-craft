@@ -60,7 +60,10 @@
 #include "library_browser_chrome.hpp"
 #include "library_manager.hpp"
 #include "tone_library_session.hpp"
+#include "tone_set_filter.hpp"
 #include "tone_import_tab.hpp"
+#include "tone_export_tab.hpp"
+#include "mgstc/engine/mgstc_tone_set.hpp"
 #include "switch_look_and_feel.hpp"
 #include "mgstc_look_and_feel.hpp"
 #include "about_panel.hpp"
@@ -1779,6 +1782,7 @@ inline void synchronizeMasterVolumeSlider(
 struct TimbreLibraryWidgets {
     juce::Label& title;
     juce::TextEditor& filter;
+    juce::ComboBox& set_filter;
     juce::TextButton& tag_filter;
     juce::TextButton& tag_manage;
     juce::ToggleButton& favorite_only;
@@ -1825,7 +1829,8 @@ inline void layoutTimbreLibraryPanel(
             widgets.name,
             widgets.library_rename,
             widgets.tags,
-            &widgets.memo});
+            &widgets.memo,
+            &widgets.set_filter});
     area.removeFromTop(xs + xs / 2);
     widgets.favorite.setBounds(area.removeFromTop(fieldH));
     area.removeFromTop(sm);
@@ -1866,6 +1871,7 @@ inline void layoutTimbreLibraryPanel(
 struct CompositeLibraryWidgets {
     juce::Label& title;
     juce::TextEditor& filter;
+    juce::ComboBox& set_filter;
     juce::TextButton& tag_filter;
     juce::TextButton& tag_manage;
     juce::ToggleButton& favorite_only;
@@ -1906,7 +1912,8 @@ inline void layoutCompositeLibraryPanel(
             widgets.name,
             widgets.library_rename,
             widgets.tags,
-            nullptr});
+            nullptr,
+            &widgets.set_filter});
     area.removeFromTop(sm);
     widgets.favorite.setBounds(area.removeFromTop(fieldH));
     area.removeFromTop(sm);
@@ -3407,6 +3414,7 @@ public:
         mgstc::engine::TimbreLibrary timbres,
         mgstc::engine::CompositeTimbreLibrary composites,
         EditorSession& session,
+        juce::InterProcessLock& shared_library_lock,
         ApplyTagCallback apply_tag,
         PreviewCallback preview,
         OpenEditorCallback open_editor,
@@ -3427,6 +3435,7 @@ public:
           note_on_(std::move(note_on)),
           note_off_(std::move(note_off)),
           all_notes_off_(std::move(all_notes_off)),
+          shared_library_lock_(&shared_library_lock),
           import_preview_(std::move(import_preview)),
           import_edit_(std::move(import_edit)),
           import_note_on_(std::move(import_note_on)),
@@ -3450,6 +3459,12 @@ public:
                 if (refresh_editors_) {
                     refresh_editors_();
                 }
+            },
+            shared_library_lock_,
+            [this] { return &tone_sets_; },
+            [this] { return &tone_members_; },
+            [this] {
+                return persistToneSets(tone_sets_, tone_members_);
             });
         tabs_.addTab(
             juce::String::fromUTF8("音色一覧"),
@@ -3483,12 +3498,49 @@ public:
                 if (refresh_editors_) {
                     refresh_editors_();
                 }
-            });
+            },
+            shared_library_lock_);
         tabs_.addTab(
             juce::String::fromUTF8("インポート"),
             juce::Colour(UiLayout::panelFill),
             import_tab_.get(),
             false);
+        import_tab_->setMgstcImporter(
+            [this](const juce::File& file, juce::String& message) {
+                return importPortableMgstc(file, message);
+            });
+
+        export_tab_ = std::make_unique<ToneExportTab>(
+            *shared_library_lock_,
+            [this] { return reloadLibraries(); },
+            [this] { return &timbres_; },
+            [this] { return &composites_; },
+            [this] { return &tone_sets_; },
+            [this] { return &tone_members_; });
+        tabs_.addTab(
+            juce::String::fromUTF8("エクスポート"),
+            juce::Colour(UiLayout::panelFill),
+            export_tab_.get(),
+            false);
+        if (list_tab_ != nullptr) {
+            list_tab_->setExportHandler(
+                [this](const std::vector<LibraryManagerRow>& rows) {
+                    if (export_tab_ == nullptr) {
+                        return;
+                    }
+                    for (const auto& row : rows) {
+                        if (row.role == LibraryManagerRowRole::SetHeader) {
+                            export_tab_->addRequest(
+                                ToneExportRequest{true, 0, row.id});
+                        } else if (libraryManagerRowIsBody(row)) {
+                            export_tab_->addRequest(ToneExportRequest{
+                                false,
+                                static_cast<std::uint8_t>(row.kind),
+                                row.id});
+                        }
+                    }
+                });
+        }
 
         performance_keyboard_.setHeadlessMode(true);
         performance_keyboard_.setCallbacks(
@@ -3551,7 +3603,7 @@ public:
 
     void setCaptureTab(int index) {
         tabs_.setCurrentTabIndex(
-            juce::jlimit(0, 2, index),
+            juce::jlimit(0, tabs_.getNumTabs() - 1, index),
             juce::dontSendNotification);
         resized();
     }
@@ -3569,6 +3621,9 @@ public:
             bar->setEnabled(!replacing);
         }
         if (auto* bar = tabs_.getTabbedButtonBar().getTabButton(2)) {
+            bar->setEnabled(!replacing);
+        }
+        if (auto* bar = tabs_.getTabbedButtonBar().getTabButton(3)) {
             bar->setEnabled(!replacing);
         }
         resized();
@@ -3658,6 +3713,121 @@ private:
         return custom_tags;
     }
 
+    bool importPortableMgstc(
+        const juce::File& file,
+        juce::String& message) {
+        const auto source = utf8String(file.loadFileAsString());
+        const auto kind = engine::detectMgstcFileKind(source);
+        if (kind == engine::MgstcPortableKind::Unknown) {
+            message = juce::String::fromUTF8(
+                "対応していない .mgstc です");
+            return false;
+        }
+        juce::String prompt = juce::String::fromUTF8(
+            "音色を新しい ID で追加します。既存の音色は変更しません。");
+        if (kind == engine::MgstcPortableKind::ToneSet) {
+            std::string error;
+            const auto document =
+                engine::deserializeMgstcToneSet(source, &error);
+            if (!document) {
+                message = juce::String::fromUTF8(
+                    "セットファイルを読み取れませんでした");
+                return false;
+            }
+            prompt = juce::String::fromUTF8("セット「")
+                + juce::String::fromUTF8(document->name.c_str())
+                + juce::String::fromUTF8(
+                    "」を新しい音色として追加します。既存の音色とセットは変更しません。");
+        }
+        if (!juce::AlertWindow::showOkCancelBox(
+                juce::MessageBoxIconType::QuestionIcon,
+                juce::String::fromUTF8("インポート"),
+                prompt)) {
+            message.clear();
+            return false;
+        }
+        if (shared_library_lock_ == nullptr) {
+            message = juce::String::fromUTF8(
+                "共有ライブラリを更新できません");
+            return false;
+        }
+        ScopedLibraryIpcLock lock(*shared_library_lock_);
+        if (!lock.isLocked() || !reloadLibraries()) {
+            message = juce::String::fromUTF8(
+                "共有ライブラリを更新できません");
+            return false;
+        }
+        std::string error;
+        const auto now = currentUnixTime();
+        bool saved = false;
+        if (kind == engine::MgstcPortableKind::ToneSet) {
+            const auto document =
+                engine::deserializeMgstcToneSet(source, &error);
+            if (!document) {
+                message = juce::String::fromUTF8(
+                    "セットファイルを読み取れませんでした");
+                return false;
+            }
+            const auto imported = engine::importMgstcToneSet(
+                *document,
+                timbres_,
+                composites_,
+                tone_sets_,
+                tone_members_,
+                now,
+                &error);
+            saved = imported.has_value()
+                && persistToneLibrariesAndSets(
+                    timbres_, composites_, tone_sets_, tone_members_);
+            if (saved) {
+                message = juce::String::fromUTF8("セット「")
+                    + juce::String::fromUTF8(imported->set_name.c_str())
+                    + juce::String::fromUTF8("」を追加しました");
+            }
+        } else if (kind == engine::MgstcPortableKind::TimbreLibrary) {
+            const auto ids =
+                timbres_.importSerialized(source, now, &error);
+            saved = ids.has_value() && persistTimbreLibrary(timbres_);
+            if (saved) {
+                message = juce::String(static_cast<int>(ids->size()))
+                    + juce::String::fromUTF8(" 件の音色を追加しました");
+            }
+        } else {
+            const auto imported =
+                engine::CompositeTimbreLibrary::deserialize(source, &error);
+            if (!imported) {
+                message = juce::String::fromUTF8(
+                    "総合音色ファイルを読み取れませんでした");
+                return false;
+            }
+            for (const auto& entry : imported->entries()) {
+                auto timbre = entry.timbre;
+                timbre.name = composites_.uniqueName(timbre.name);
+                composites_.add(std::move(timbre), now);
+            }
+            saved = persistCompositeTimbreLibrary(composites_);
+            if (saved) {
+                message = juce::String(
+                    static_cast<int>(imported->entries().size()))
+                    + juce::String::fromUTF8(" 件の総合音色を追加しました");
+            }
+        }
+        if (!saved) {
+            reloadLibraries();
+            message = juce::String::fromUTF8(
+                "ライブラリへ保存できませんでした");
+            return false;
+        }
+        if (list_tab_ != nullptr) {
+            list_tab_->reloadFromParent();
+        }
+        refreshTagManagementFromLibraries();
+        if (refresh_editors_) {
+            refresh_editors_();
+        }
+        return true;
+    }
+
     bool reloadLibraries() {
         std::string error;
         auto loaded = loadToneLibraries(&error);
@@ -3666,6 +3836,8 @@ private:
         }
         timbres_ = std::move(loaded->timbres);
         composites_ = std::move(loaded->composites);
+        tone_sets_ = std::move(loaded->sets);
+        tone_members_ = std::move(loaded->members);
         return true;
     }
 
@@ -3722,6 +3894,8 @@ private:
 
     mgstc::engine::TimbreLibrary timbres_;
     mgstc::engine::CompositeTimbreLibrary composites_;
+    std::vector<mgstc::engine::ToneSetRecord> tone_sets_;
+    std::vector<mgstc::engine::ToneSetMemberRecord> tone_members_;
     ApplyTagCallback apply_tag_;
     PreviewCallback preview_;
     OpenEditorCallback open_editor_;
@@ -3729,6 +3903,7 @@ private:
     NoteOnCallback note_on_;
     NoteOffCallback note_off_;
     AllNotesOffCallback all_notes_off_;
+    juce::InterProcessLock* shared_library_lock_{};
     ImportPreviewCallback import_preview_;
     ImportEditCallback import_edit_;
     ImportNoteOnCallback import_note_on_;
@@ -3740,6 +3915,7 @@ private:
     std::unique_ptr<LibraryManagerListTab> list_tab_;
     std::unique_ptr<TagManagementContent> tag_tab_;
     std::unique_ptr<ToneImportTab> import_tab_;
+    std::unique_ptr<ToneExportTab> export_tab_;
     std::uint64_t ui_scale_listener_{};
 };
 
@@ -4041,6 +4217,10 @@ public:
             refreshCompositeSelector();
         };
         addAndMakeVisible(composite_sort_);
+        configureEditorSetFilter(composite_set_filter_, [this] {
+            refreshCompositeSelector();
+        });
+        addAndMakeVisible(composite_set_filter_);
         layer_favorite_only_.setButtonText(
             juce::String::fromUTF8("レイヤー候補 ★のみ"));
         layer_favorite_only_.setLookAndFeel(
@@ -5042,7 +5222,8 @@ public:
         if (library_open) area.removeFromRight(panelGap);
         timeline_.setInspectorVisible(!library_open);
         for (auto* c : std::initializer_list<juce::Component*>{
-                &composite_library_title_, &composite_filter_, &composite_tag_filter_,
+                &composite_library_title_, &composite_filter_, &composite_set_filter_,
+                &composite_tag_filter_,
                 &tag_manage_, &composite_favorite_only_, &composite_ab_, &composite_sort_,
                 &composite_select_, &load_, &delete_, &rename_, &tags_, &favorite_,
                 &save_, &save_as_, &new_, &duplicate_, &layer_library_title_,
@@ -5058,6 +5239,7 @@ public:
             CompositeLibraryWidgets{
                 composite_library_title_,
                 composite_filter_,
+                composite_set_filter_,
                 composite_tag_filter_,
                 tag_manage_,
                 composite_favorite_only_,
@@ -5494,10 +5676,17 @@ private:
             return;
         }
         const auto text = chooser.getResult().loadFileAsString();
+        const auto source = utf8Text(text);
+        if (mgstc::engine::detectMgstcFileKind(source)
+            == mgstc::engine::MgstcPortableKind::ToneSet) {
+            showCompositeError(juce::String::fromUTF8(
+                "ライブラリ管理のインポートで読み込んでください"));
+            return;
+        }
         std::string error;
         auto loaded =
             mgstc::engine::CompositeTimbreLibrary::deserializeTimbreFile(
-                utf8Text(text), &error);
+                source, &error);
         if (!loaded) {
             showCompositeError(
                 juce::String::fromUTF8(
@@ -5651,6 +5840,10 @@ private:
         if (!loaded) {
             return false;
         }
+        composite_set_filter_state_.sets = std::move(loaded->sets);
+        composite_set_filter_state_.members = std::move(loaded->members);
+        fillEditorSetFilter(
+            composite_set_filter_, composite_set_filter_state_);
         composite_library_ = std::move(loaded->composites);
         timbre_library_ = std::move(loaded->timbres);
         const auto fingerprint = libraryFileFingerprint(toneLibraryFile());
@@ -5801,6 +5994,16 @@ private:
                     entry.timbre.tags, composite_filter_tags_)) {
                 continue;
             }
+            if (!mgstc::engine::toneVisibleInSetFilter(
+                    0,
+                    entry.id,
+                    editorSetListFilter(composite_set_filter_),
+                    selectedEditorSetId(
+                        composite_set_filter_,
+                        composite_set_filter_state_),
+                    composite_set_filter_state_.members)) {
+                continue;
+            }
             composite_library_ids_.push_back(entry.id);
             auto label = juce::String::fromUTF8(
                     entry.timbre.name.c_str())
@@ -5893,8 +6096,16 @@ private:
         }
         const auto id = composite_library_ids_[
             static_cast<std::size_t>(selected - 1)];
+        mgstc::app::ScopedLibraryIpcLock lock(library_lock_);
+        if (!lock.isLocked() || !reloadCompositeLibraryFromDisk()) {
+            composite_preview_.reset();
+            composite_ab_.setEnabled(false);
+            return;
+        }
         const auto* entry = composite_library_.find(id);
         if (!entry) {
+            composite_preview_.reset();
+            composite_ab_.setEnabled(false);
             return;
         }
         composite_preview_ = entry->timbre;
@@ -6047,7 +6258,8 @@ private:
                     "共有ライブラリを更新できませんでした"));
             return;
         }
-        if (save_as || !selected_composite_id_) {
+        const bool creating = save_as || !selected_composite_id_;
+        if (creating) {
             timbre_.name =
                 composite_library_.uniqueName(timbre_.name);
             name_.setText(
@@ -6072,6 +6284,12 @@ private:
                     "総合音色ライブラリを書き込めませんでした"));
             return;
         }
+        const bool assigned = !creating || !selected_composite_id_
+            || assignNewToneToSelectedSet(
+                composite_set_filter_,
+                composite_set_filter_state_,
+                0,
+                *selected_composite_id_);
         notifyLibraryContentsChanged();
         refreshCompositeSelector();
         setEditorBaseline();
@@ -6081,6 +6299,9 @@ private:
                     "新しい総合音色として保存しました")
                 : juce::String::fromUTF8(
                     "総合音色を保存しました"));
+        if (!assigned) {
+            showCompositeError(setAssignmentFailedMessage());
+        }
     }
 
     void duplicateSelectedCompositeTimbre() {
@@ -6978,6 +7199,7 @@ private:
             greyOutHostControl(layer_library_title_);
             greyOutHostControl(layer_library_hint_);
             greyOutHostControl(composite_filter_);
+            greyOutHostControl(composite_set_filter_);
             greyOutHostControl(composite_tag_filter_);
             greyOutHostControl(tag_manage_);
             greyOutHostControl(composite_favorite_only_);
@@ -7477,6 +7699,8 @@ private:
     juce::TextButton tag_manage_;
     juce::ToggleButton favorite_;
     juce::TextEditor composite_filter_;
+    juce::ComboBox composite_set_filter_;
+    EditorSetFilterState composite_set_filter_state_;
     juce::TextButton composite_tag_filter_;
     juce::ToggleButton composite_favorite_only_;
     juce::ComboBox composite_sort_;
@@ -8381,6 +8605,10 @@ public:
         library_sort_.setSelectedId(1, juce::dontSendNotification);
         library_sort_.onChange = [this] { refreshLibraryList(); };
         addAndMakeVisible(library_sort_);
+        configureEditorSetFilter(library_set_filter_, [this] {
+            refreshLibraryList();
+        });
+        addAndMakeVisible(library_set_filter_);
 
         name_.setTextToShowWhenEmpty(
             juce::String::fromUTF8("音色名"),
@@ -8506,6 +8734,7 @@ public:
         assignExplicitFocusOrders(
             {
                 &library_filter_,
+                &library_set_filter_,
                 &library_tag_filter_,
                 &tag_manage_,
                 &favorite_only_,
@@ -9255,6 +9484,7 @@ public:
             TimbreLibraryWidgets{
                 library_title_,
                 library_filter_,
+                library_set_filter_,
                 library_tag_filter_,
                 tag_manage_,
                 favorite_only_,
@@ -10105,9 +10335,11 @@ private:
             return;
         }
         std::string error;
-        if (auto loaded = loadSharedTimbreLibrary(&error)) {
-            library_ = std::move(*loaded);
-        } else {
+        if (!takeTimbreLibraryAndSets(
+                library_,
+                set_filter_state_,
+                library_set_filter_,
+                &error)) {
             showError(
                 juce::String::fromUTF8("音色ライブラリ"),
                 juce::String::fromUTF8(
@@ -10128,12 +10360,8 @@ private:
             return false;
         }
         std::string error;
-        auto loaded = loadSharedTimbreLibrary(&error);
-        if (!loaded) {
-            return false;
-        }
-        library_ = std::move(*loaded);
-        return true;
+        return takeTimbreLibraryAndSets(
+            library_, set_filter_state_, library_set_filter_, &error);
     }
 
     void updateTagButtons() {
@@ -10251,6 +10479,15 @@ private:
                     entry.tags, selected_filter_tags_)) {
                 continue;
             }
+            if (!mgstc::engine::toneVisibleInSetFilter(
+                    entry.id,
+                    0,
+                    editorSetListFilter(library_set_filter_),
+                    selectedEditorSetId(
+                        library_set_filter_, set_filter_state_),
+                    set_filter_state_.members)) {
+                continue;
+            }
             library_ids_.push_back(entry.id);
             auto label = juce::String::fromUTF8(entry.name.c_str())
                 + " (r"
@@ -10286,10 +10523,18 @@ private:
             selected_library_id_.reset();
             return;
         }
-        selected_library_id_ =
+        const auto id =
             library_ids_[static_cast<std::size_t>(selected - 1)];
+        ScopedLibraryIpcLock lock(library_lock_);
+        if (!lock.isLocked() || !reloadLibraryFromDisk()) {
+            selected_library_id_.reset();
+            return;
+        }
+        selected_library_id_ = id;
         const auto* entry = selectedLibraryEntry();
         if (!entry) {
+            selected_library_id_.reset();
+            refreshLibraryList();
             return;
         }
         name_.setText(
@@ -10569,7 +10814,8 @@ private:
                     "共有ライブラリを更新できません"));
             return;
         }
-        if (save_as || !selected_library_id_) {
+        const bool creating = save_as || !selected_library_id_;
+        if (creating) {
             entry.name = library_.uniqueName(
                 mgstc::engine::TimbreCategory::Scc, entry.name);
             selected_library_id_ =
@@ -10585,6 +10831,12 @@ private:
             return;
         }
         const auto saved = persistLibrary();
+        const bool assigned = !saved || !creating || !selected_library_id_
+            || assignNewToneToSelectedSet(
+                library_set_filter_,
+                set_filter_state_,
+                *selected_library_id_,
+                0);
         refreshLibraryList();
         selectLibraryEntryFromList();
         if (!saved) {
@@ -10594,6 +10846,11 @@ private:
                     "音色はセッションへ保存されましたが、"
                     "ライブラリファイルを更新できませんでした"));
             return;
+        }
+        if (!assigned) {
+            showError(
+                juce::String::fromUTF8("音色ライブラリ"),
+                setAssignmentFailedMessage());
         }
         notifyLibraryContentsChanged();
         setEditorBaseline();
@@ -10735,6 +10992,14 @@ private:
         }
         const auto text = chooser.getResult().loadFileAsString();
         const auto source = utf8Text(text);
+        if (mgstc::engine::detectMgstcFileKind(source)
+            == mgstc::engine::MgstcPortableKind::ToneSet) {
+            showError(
+                juce::String::fromUTF8("ライブラリ取込"),
+                juce::String::fromUTF8(
+                    "ライブラリ管理のインポートで読み込んでください"));
+            return;
+        }
         ScopedLibraryIpcLock lock(
             library_lock_);
         if (!lock.isLocked() || !reloadLibraryFromDisk()) {
@@ -11211,6 +11476,7 @@ private:
         }
         if (!caps.tone_library) {
             greyOutHostControl(library_filter_);
+            greyOutHostControl(library_set_filter_);
             greyOutHostControl(library_tag_filter_);
             greyOutHostControl(tag_manage_);
             greyOutHostControl(favorite_only_);
@@ -11487,6 +11753,8 @@ private:
     juce::Label library_title_;
     juce::ComboBox library_list_;
     juce::TextEditor library_filter_;
+    juce::ComboBox library_set_filter_;
+    EditorSetFilterState set_filter_state_;
     juce::TextButton library_tag_filter_;
     juce::TextButton tag_manage_;
     juce::ToggleButton favorite_only_;
@@ -12176,6 +12444,10 @@ public:
         library_sort_.setSelectedId(1, juce::dontSendNotification);
         library_sort_.onChange = [this] { refreshLibraryList(); };
         addAndMakeVisible(library_sort_);
+        configureEditorSetFilter(library_set_filter_, [this] {
+            refreshLibraryList();
+        });
+        addAndMakeVisible(library_set_filter_);
         library_list_.setTextWhenNothingSelected(
             juce::String::fromUTF8("保存済み音色を選択"));
         library_list_.setTooltip(
@@ -12268,6 +12540,7 @@ public:
         assignExplicitFocusOrders(
             {
                 &library_filter_,
+                &library_set_filter_,
                 &library_tag_filter_,
                 &tag_manage_,
                 &favorite_only_,
@@ -12820,6 +13093,7 @@ public:
             TimbreLibraryWidgets{
                 library_title_,
                 library_filter_,
+                library_set_filter_,
                 library_tag_filter_,
                 tag_manage_,
                 favorite_only_,
@@ -13436,9 +13710,11 @@ private:
             return;
         }
         std::string error;
-        if (auto loaded = loadSharedTimbreLibrary(&error)) {
-            library_ = std::move(*loaded);
-        } else {
+        if (!takeTimbreLibraryAndSets(
+                library_,
+                set_filter_state_,
+                library_set_filter_,
+                &error)) {
             showError(
                 juce::String::fromUTF8(
                     "OPLL音色ライブラリ"),
@@ -13453,12 +13729,8 @@ private:
             return false;
         }
         std::string error;
-        auto loaded = loadSharedTimbreLibrary(&error);
-        if (!loaded) {
-            return false;
-        }
-        library_ = std::move(*loaded);
-        return true;
+        return takeTimbreLibraryAndSets(
+            library_, set_filter_state_, library_set_filter_, &error);
     }
 
     [[nodiscard]] bool persistLibrary() {
@@ -13586,6 +13858,15 @@ private:
                     entry.tags, selected_filter_tags_)) {
                 continue;
             }
+            if (!mgstc::engine::toneVisibleInSetFilter(
+                    entry.id,
+                    0,
+                    editorSetListFilter(library_set_filter_),
+                    selectedEditorSetId(
+                        library_set_filter_, set_filter_state_),
+                    set_filter_state_.members)) {
+                continue;
+            }
             library_ids_.push_back(entry.id);
             auto label =
                 juce::String::fromUTF8(entry.name.c_str())
@@ -13625,11 +13906,18 @@ private:
             selected_library_id_.reset();
             return;
         }
-        selected_library_id_ =
-            library_ids_[
-                static_cast<std::size_t>(selected - 1)];
+        const auto id = library_ids_[
+            static_cast<std::size_t>(selected - 1)];
+        ScopedLibraryIpcLock lock(library_lock_);
+        if (!lock.isLocked() || !reloadLibraryFromDisk()) {
+            selected_library_id_.reset();
+            return;
+        }
+        selected_library_id_ = id;
         const auto* entry = selectedLibraryEntry();
         if (!entry) {
+            selected_library_id_.reset();
+            refreshLibraryList();
             return;
         }
         name_.setText(
@@ -13899,7 +14187,8 @@ private:
                     "共有ライブラリを更新できません"));
             return;
         }
-        if (save_as || !selected_library_id_) {
+        const bool creating = save_as || !selected_library_id_;
+        if (creating) {
             entry.name = library_.uniqueName(
                 mgstc::engine::TimbreCategory::Opll,
                 entry.name);
@@ -13927,6 +14216,12 @@ private:
                     "ライブラリファイルを更新できませんでした"));
             return;
         }
+        const bool assigned = !creating || !selected_library_id_
+            || assignNewToneToSelectedSet(
+                library_set_filter_,
+                set_filter_state_,
+                *selected_library_id_,
+                0);
         refreshLibraryList();
         selectLibraryEntryFromList();
         notifyLibraryContentsChanged();
@@ -13937,6 +14232,11 @@ private:
                     "新しいOPLL音色として保存しました")
                 : juce::String::fromUTF8(
                     "OPLL音色を保存しました"));
+        if (!assigned) {
+            showError(
+                juce::String::fromUTF8("OPLL音色ライブラリ"),
+                setAssignmentFailedMessage());
+        }
     }
 
     void notifyLibraryContentsChanged() {
@@ -14077,6 +14377,14 @@ private:
         }
         const auto source =
             utf8Text(chooser.getResult().loadFileAsString());
+        if (mgstc::engine::detectMgstcFileKind(source)
+            == mgstc::engine::MgstcPortableKind::ToneSet) {
+            showError(
+                juce::String::fromUTF8("ライブラリ取込"),
+                juce::String::fromUTF8(
+                    "ライブラリ管理のインポートで読み込んでください"));
+            return;
+        }
         ScopedLibraryIpcLock lock(
             library_lock_);
         if (!lock.isLocked() || !reloadLibraryFromDisk()) {
@@ -14407,6 +14715,7 @@ private:
         }
         if (!caps.tone_library) {
             greyOutHostControl(library_filter_);
+            greyOutHostControl(library_set_filter_);
             greyOutHostControl(library_tag_filter_);
             greyOutHostControl(tag_manage_);
             greyOutHostControl(favorite_only_);
@@ -14630,6 +14939,8 @@ private:
     juce::TextEditor mgsc_preview_;
     juce::Label library_title_;
     juce::TextEditor library_filter_;
+    juce::ComboBox library_set_filter_;
+    EditorSetFilterState set_filter_state_;
     juce::TextButton library_tag_filter_;
     juce::TextButton tag_manage_;
     juce::ToggleButton favorite_only_;

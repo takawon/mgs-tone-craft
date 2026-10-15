@@ -2703,6 +2703,7 @@ private:
             std::move(loaded->timbres),
             std::move(loaded->composites),
             *editor_session_,
+            tag_management_lock_,
             [this](std::string source, std::string replacement) {
                 applyGlobalTagRewrite(
                     std::move(source), std::move(replacement));
@@ -3273,6 +3274,7 @@ private:
             std::move(loaded->timbres),
             std::move(loaded->composites),
             *editor_session_,
+            tag_management_lock_,
             [](std::string, std::string) {},
             [](LibraryManagerKind, std::uint64_t) {},
             [](LibraryManagerKind, std::uint64_t) {},

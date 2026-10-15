@@ -4,6 +4,8 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <ctime>
+#include <iomanip>
 #include <cmath>
 #include <condition_variable>
 #include <functional>
@@ -11,6 +13,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -59,6 +62,8 @@
 #include "mgstc/engine/timbre_library.hpp"
 #include "mgstc/engine/timbre_tags.hpp"
 #include "mgstc/engine/tone_library_store.hpp"
+#include "mgstc/engine/furnace_exchange.hpp"
+#include "mgstc/engine/mgstc_tone_set.hpp"
 #include "mgstc/engine/spsc_queue.hpp"
 #include "mgstc/engine/shared_state.hpp"
 #include "mgstc/engine/tick_clock.hpp"
@@ -3730,7 +3735,9 @@ void testToneLibrarySqliteV1RoundTripAndPortableFormat() {
         sqlite3_prepare_v2(raw, "PRAGMA user_version;", -1, &version_stmt, nullptr),
         SQLITE_OK);
     REQUIRE_EQ(sqlite3_step(version_stmt), SQLITE_ROW);
-    REQUIRE_EQ(sqlite3_column_int(version_stmt, 0), 1);
+    REQUIRE_EQ(
+        sqlite3_column_int(version_stmt, 0),
+        ToneLibraryDatabase::kSchemaVersion);
     sqlite3_finalize(version_stmt);
     sqlite3_stmt* app_stmt = nullptr;
     REQUIRE_EQ(
@@ -3764,7 +3771,7 @@ void testToneLibrarySqliteV1RoundTripAndPortableFormat() {
         std::string error;
         REQUIRE_EQ(database.open(utf8_path, &error), true);
         REQUIRE_EQ(database.load(loaded_timbres, loaded_composites, &error), true);
-        REQUIRE_EQ(database.userVersion(), 1);
+        REQUIRE_EQ(database.userVersion(), ToneLibraryDatabase::kSchemaVersion);
     }
 
     REQUIRE_EQ(loaded_timbres.entries().size(), static_cast<std::size_t>(2));
@@ -4217,7 +4224,7 @@ void testSccMorphDistributionPersistence() {
         REQUIRE_EQ(database.replaceAll(singles, saved_library, &error), true);
         CompositeTimbreLibrary restored_library;
         REQUIRE_EQ(database.load(singles, restored_library, &error), true);
-        REQUIRE_EQ(database.userVersion(), 1);
+        REQUIRE_EQ(database.userVersion(), ToneLibraryDatabase::kSchemaVersion);
         REQUIRE_EQ(restored_library.find(id) != nullptr, true);
         REQUIRE_EQ(restored_library.find(id)->timbre, original);
     }
@@ -4483,7 +4490,7 @@ void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
         ToneLibraryDatabase database;
         REQUIRE_EQ(database.open(path, &error), true);
         REQUIRE_EQ(database.load(loaded_singles, loaded, &error), true);
-        REQUIRE_EQ(database.userVersion(), 1);
+        REQUIRE_EQ(database.userVersion(), ToneLibraryDatabase::kSchemaVersion);
     }
     REQUIRE_EQ(loaded.entries().size(), static_cast<std::size_t>(2));
     const auto* old_entry = loaded.find(legacy_id);
@@ -9700,6 +9707,845 @@ void testCompositeLoopEditingPreservesEveryCommandAndZone() {
         std::optional<std::uint32_t>{12});
 }
 
+std::string readBinaryFile(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return std::string(
+        std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>());
+}
+
+std::vector<std::uint8_t> testFurnaceWaveFile(
+    int width,
+    int maximum,
+    const std::vector<int>& samples) {
+    std::vector<std::uint8_t> bytes;
+    const char magic[] = "-Furnace waveta-";
+    bytes.insert(bytes.end(), magic, magic + 16);
+    const auto push16 = [&](int value) {
+        bytes.push_back(static_cast<std::uint8_t>(value & 0xFF));
+        bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+    };
+    const auto push32 = [&](int value) {
+        push16(value);
+        push16(value >> 16);
+    };
+    push16(232);
+    push16(0);
+    bytes.insert(bytes.end(), {'W', 'A', 'V', 'E'});
+    const auto size_at = bytes.size();
+    push32(0);
+    const auto payload_at = bytes.size();
+    bytes.push_back(0);
+    push32(width);
+    push32(0);
+    push32(maximum);
+    for (const int sample : samples) {
+        push32(sample);
+    }
+    const int size = static_cast<int>(bytes.size() - payload_at);
+    bytes[size_at] = static_cast<std::uint8_t>(size & 0xFF);
+    bytes[size_at + 1] = static_cast<std::uint8_t>((size >> 8) & 0xFF);
+    bytes[size_at + 2] = static_cast<std::uint8_t>((size >> 16) & 0xFF);
+    bytes[size_at + 3] = static_cast<std::uint8_t>((size >> 24) & 0xFF);
+    return bytes;
+}
+
+void testFurnaceWavetableAndInstrumentExchange() {
+    using namespace mgstc::engine;
+    SccWaveform wave{};
+    for (std::size_t index = 0; index < wave.size(); ++index) {
+        wave[index] = static_cast<std::int8_t>(
+            static_cast<int>(index) * 8 - 128);
+    }
+    wave[0] = -128;
+    wave[16] = 0;
+    wave[31] = 127;
+    const auto written = writeFurnaceWavetable("Saw", wave);
+    const auto restored = importFurnaceTones(written, "Saw.fuw");
+    REQUIRE_EQ(restored.valid(), true);
+    REQUIRE_EQ(restored.candidates.size(), std::size_t{1});
+    REQUIRE_EQ(restored.candidates[0].furnace_wave_converted, false);
+    REQUIRE_EQ(std::get<SccWaveform>(restored.candidates[0].data), wave);
+
+    std::vector<int> coarse(8);
+    for (int index = 0; index < 8; ++index) {
+        coarse[static_cast<std::size_t>(index)] = 10 + index * 20;
+    }
+    const auto short_wave = importFurnaceTones(
+        testFurnaceWaveFile(8, 255, coarse), "coarse.fuw");
+    REQUIRE_EQ(short_wave.candidates.size(), std::size_t{1});
+    REQUIRE_EQ(short_wave.candidates[0].furnace_wave_converted, true);
+    const auto& short_samples = std::get<SccWaveform>(short_wave.candidates[0].data);
+    for (int index = 0; index < 32; ++index) {
+        const int source = coarse[static_cast<std::size_t>((index * 8) / 32)];
+        REQUIRE_EQ(static_cast<int>(short_samples[static_cast<std::size_t>(index)]), source - 128);
+    }
+
+    std::vector<int> long_wave(64);
+    for (int index = 0; index < 64; ++index) {
+        long_wave[static_cast<std::size_t>(index)] = index;
+    }
+    const auto decimated = importFurnaceTones(
+        testFurnaceWaveFile(64, 255, long_wave), "long.fuw");
+    const auto& decimated_samples = std::get<SccWaveform>(decimated.candidates[0].data);
+    for (int index = 0; index < 32; ++index) {
+        REQUIRE_EQ(
+            static_cast<int>(decimated_samples[static_cast<std::size_t>(index)]),
+            long_wave[static_cast<std::size_t>(index * 2)] - 128);
+        if (index > 0) {
+            const int previous = decimated_samples[static_cast<std::size_t>(index - 1)];
+            const int current = decimated_samples[static_cast<std::size_t>(index)];
+            REQUIRE_EQ(current - previous == 1, false);
+        }
+    }
+
+    const auto bad = importFurnaceTones(std::vector<std::uint8_t>{'F', 'I', 'N', 'S'}, "x.fui");
+    REQUIRE_EQ(bad.candidates.empty(), true);
+    REQUIRE_EQ(bad.valid(), false);
+    auto truncated = testFurnaceWaveFile(32, 255, std::vector<int>(32, 128));
+    truncated.resize(20);
+    REQUIRE_EQ(importFurnaceTones(truncated, "cut.fuw").candidates.empty(), true);
+
+    TimbreLibraryEntry opll;
+    opll.category = TimbreCategory::Opll;
+    opll.name = "Flute";
+    opll.opll_registers = encodeOpllPatch([] {
+        auto patch = defaultOpllPatch();
+        patch.feedback = 5;
+        patch.modulator.total_level = 20;
+        patch.modulator.amplitude_modulation = true;
+        patch.modulator.sustained_tone = true;
+        patch.carrier.pitch_modulation = true;
+        patch.carrier.waveform = true;
+        patch.modulator.waveform = true;
+        return patch;
+    }());
+    const auto fui = exportFurnaceInstruments(opll);
+    REQUIRE_EQ(fui.files.size(), std::size_t{1});
+    const auto opll_back = importFurnaceTones(fui.files[0].bytes, "Flute.fui");
+    REQUIRE_EQ(opll_back.candidates.size(), std::size_t{1});
+    REQUIRE_EQ(opll_back.candidates[0].type, ImportedToneType::Opll);
+    REQUIRE_EQ(
+        encodeOpllPatch(std::get<OpllPatchParameters>(opll_back.candidates[0].data)),
+        opll.opll_registers);
+
+    auto rom = defaultCompositeTimbre();
+    rom.name = "Rom";
+    rom.layers.resize(1);
+    rom.layers[0].source = TimbreSource::Opll;
+    rom.layers[0].name = "Rom";
+    rom.layers[0].base_timbre.reset();
+    rom.layers[0].base_opll_rom = 4;
+    rom.layers[0].opll_sustain = true;
+    const auto rom_file = exportFurnaceInstruments(rom);
+    const auto rom_back = importFurnaceTones(rom_file.files[0].bytes, "Rom.fui");
+    REQUIRE_EQ(rom_back.candidates[0].type, ImportedToneType::Composite);
+    const auto& rom_timbre = std::get<CompositeTimbre>(rom_back.candidates[0].data);
+    REQUIRE_EQ(rom_timbre.layers[0].base_opll_rom.has_value(), true);
+    REQUIRE_EQ(*rom_timbre.layers[0].base_opll_rom, std::uint8_t{4});
+    REQUIRE_EQ(rom_timbre.layers[0].opll_sustain, true);
+
+    std::vector<std::uint8_t> drums{'F', 'I', 'N', 'S'};
+    const auto push16 = [&](std::vector<std::uint8_t>& out, int value) {
+        out.push_back(static_cast<std::uint8_t>(value & 0xFF));
+        out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+    };
+    push16(drums, 232);
+    push16(drums, 13);
+    drums.insert(drums.end(), {'F', 'M'});
+    push16(drums, 21);
+    drums.push_back(2);
+    drums.push_back(0);
+    drums.push_back(0);
+    drums.push_back(16);
+    drums.push_back(0);
+    drums.insert(drums.end(), 16, 0);
+    const auto drum_result = importFurnaceTones(drums, "drum.fui");
+    REQUIRE_EQ(drum_result.candidates.empty(), true);
+    REQUIRE_EQ(drum_result.errors.empty(), false);
+
+    std::vector<std::uint8_t> adsr = fui.files[0].bytes;
+    std::vector<std::uint8_t> macro;
+    const auto push_macro16 = [](std::vector<std::uint8_t>& out, int value) {
+        out.push_back(static_cast<std::uint8_t>(value & 0xFF));
+        out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+    };
+    push_macro16(macro, 8);
+    macro.insert(macro.end(), {0, 2, 255, 255, 0, 0x02, 0, 1, 1, 2});
+    adsr.insert(adsr.end(), {'M', 'A'});
+    push_macro16(adsr, static_cast<int>(macro.size()));
+    adsr.insert(adsr.end(), macro.begin(), macro.end());
+    const auto adsr_result = importFurnaceTones(adsr, "adsr.fui");
+    REQUIRE_EQ(adsr_result.candidates.size(), std::size_t{1});
+    REQUIRE_EQ(adsr_result.candidates[0].warnings.empty(), false);
+
+    const auto installed = std::filesystem::path(
+        "C:/Program Files/Furnace/instruments/OPLL/Soft_Flute.fui");
+    std::error_code error;
+    if (std::filesystem::exists(installed, error)) {
+        std::ifstream input(installed, std::ios::binary);
+        const std::istreambuf_iterator<char> begin(input);
+        const std::istreambuf_iterator<char> end;
+        const std::vector<std::uint8_t> file(begin, end);
+        const auto live = importFurnaceTones(file, "Soft_Flute.fui");
+        REQUIRE_EQ(live.candidates.size(), std::size_t{1});
+        REQUIRE_EQ(live.candidates[0].type, ImportedToneType::Composite);
+        const auto& live_timbre = std::get<CompositeTimbre>(live.candidates[0].data);
+        REQUIRE_EQ(*live_timbre.layers[0].base_opll_rom, std::uint8_t{7});
+    }
+
+    std::vector<std::uint8_t> tl_macro;
+    push_macro16(tl_macro, 8);
+    tl_macro.insert(tl_macro.end(), {6, 2, 255, 255, 0, 0, 0, 1, 10, 20});
+    std::vector<std::uint8_t> tl_file = fui.files[0].bytes;
+    tl_file.insert(tl_file.end(), {'O', '1'});
+    push_macro16(tl_file, static_cast<int>(tl_macro.size()));
+    tl_file.insert(tl_file.end(), tl_macro.begin(), tl_macro.end());
+    const auto tl_result = importFurnaceTones(tl_file, "tl.fui");
+    REQUIRE_EQ(tl_result.candidates.size(), std::size_t{1});
+    REQUIRE_EQ(tl_result.candidates[0].type, ImportedToneType::Composite);
+    const auto& tl_timbre = std::get<CompositeTimbre>(tl_result.candidates[0].data);
+    REQUIRE_EQ(tl_timbre.layers[0].opll_tl_auto.mode, OpllRegisterAutoMode::FreeCurve);
+    REQUIRE_EQ(tl_timbre.layers[0].opll_tl_auto.free_curve.size(), std::size_t{2});
+    REQUIRE_EQ(tl_timbre.layers[0].opll_tl_auto.free_curve[0], std::uint8_t{10});
+    REQUIRE_EQ(tl_timbre.layers[0].opll_tl_auto.free_curve[1], std::uint8_t{20});
+
+    TimbreLibraryEntry scc_entry;
+    scc_entry.category = TimbreCategory::Scc;
+    scc_entry.name = "Wave";
+    const auto scc_file = exportFurnaceInstruments(scc_entry);
+    REQUIRE_EQ(scc_file.files.size(), std::size_t{1});
+    REQUIRE_EQ(
+        importFurnaceTones(scc_file.files[0].bytes, "Wave.fui").candidates.size(),
+        std::size_t{1});
+    SccWaveform shape{};
+    shape.fill(static_cast<std::int8_t>(10));
+    auto wave_block = writeFurnaceWavetable("Wave", shape);
+    wave_block.erase(wave_block.begin(), wave_block.begin() + 20);
+    std::vector<std::uint8_t> arp_file{'F', 'I', 'N', 'S'};
+    push_macro16(arp_file, 232);
+    push_macro16(arp_file, 18);
+    const std::vector<std::uint8_t> arp_name{'W', 'a', 'v', 'e', 0};
+    arp_file.insert(arp_file.end(), {'N', 'A'});
+    push_macro16(arp_file, static_cast<int>(arp_name.size()));
+    arp_file.insert(arp_file.end(), arp_name.begin(), arp_name.end());
+    std::vector<std::uint8_t> arp_macros;
+    push_macro16(arp_macros, 8);
+    arp_macros.insert(arp_macros.end(), {3, 1, 255, 255, 0, 0, 0, 1, 0});
+    arp_macros.insert(arp_macros.end(), {1, 2, 255, 255, 0, 0, 0, 1, 0, 3, 255});
+    arp_file.insert(arp_file.end(), {'M', 'A'});
+    push_macro16(arp_file, static_cast<int>(arp_macros.size()));
+    arp_file.insert(arp_file.end(), arp_macros.begin(), arp_macros.end());
+    arp_file.insert(arp_file.end(), {'W', 'L'});
+    push_macro16(arp_file, 6);
+    arp_file.push_back(1);
+    arp_file.push_back(0);
+    const auto pointer_at = arp_file.size();
+    push_macro16(arp_file, 0);
+    push_macro16(arp_file, 0);
+    arp_file.insert(arp_file.end(), {'E', 'N'});
+    const auto wave_at = static_cast<int>(arp_file.size());
+    arp_file.insert(arp_file.end(), wave_block.begin(), wave_block.end());
+    arp_file[pointer_at] = static_cast<std::uint8_t>(wave_at & 0xFF);
+    arp_file[pointer_at + 1] = static_cast<std::uint8_t>((wave_at >> 8) & 0xFF);
+    arp_file[pointer_at + 2] = static_cast<std::uint8_t>((wave_at >> 16) & 0xFF);
+    arp_file[pointer_at + 3] = static_cast<std::uint8_t>((wave_at >> 24) & 0xFF);
+    const auto arp_result = importFurnaceTones(arp_file, "arp.fui");
+    REQUIRE_EQ(arp_result.candidates.size(), std::size_t{1});
+    REQUIRE_EQ(arp_result.candidates[0].warnings.empty(), false);
+
+    auto two = defaultCompositeTimbre();
+    two.name = "Two";
+    two.layers.clear();
+    SavedTimbreReference moving_base{
+        .library_id = 11,
+        .revision = 1,
+        .name = "Move",
+        .source = TimbreSource::Scc,
+        .number_mode = TimbreNumberMode::Manual,
+        .manual_number = 3,
+    };
+    moving_base.scc_waveform.fill(40);
+    SavedTimbreReference moving_next{
+        .library_id = 12,
+        .revision = 1,
+        .name = "Next",
+        .source = TimbreSource::Scc,
+        .number_mode = TimbreNumberMode::Manual,
+        .manual_number = 8,
+    };
+    moving_next.scc_waveform.fill(80);
+    SavedTimbreReference still_base{
+        .library_id = 13,
+        .revision = 1,
+        .name = "Still",
+        .source = TimbreSource::Scc,
+        .number_mode = TimbreNumberMode::Manual,
+        .manual_number = 5,
+    };
+    still_base.scc_waveform.fill(120);
+    CompositeLayer moving;
+    moving.source = TimbreSource::Scc;
+    moving.name = "Move";
+    moving.base_timbre = moving_base;
+    moving.envelope_timeline.length_counts = 8;
+    moving.timbre_automation.push_back(EnvelopeEvent{
+        .kind = EnvelopeEventKind::Timbre,
+        .count = 4,
+        .target_library_id = moving_next.library_id,
+    });
+    two.embedded_timbres.push_back(moving_base);
+    two.embedded_timbres.push_back(moving_next);
+    two.layers.push_back(std::move(moving));
+    CompositeLayer still;
+    still.source = TimbreSource::Scc;
+    still.name = "Still";
+    still.base_timbre = still_base;
+    two.embedded_timbres.push_back(still_base);
+    two.layers.push_back(std::move(still));
+    const auto two_waves = exportFurnaceWavetables(two);
+    const auto has_tone = [&](int tone) {
+        const auto key = "@" + std::to_string(tone) + "_";
+        return std::any_of(
+            two_waves.files.begin(),
+            two_waves.files.end(),
+            [&](const FurnaceExportFile& file) {
+                return file.filename.find(key) != std::string::npos;
+            });
+    };
+    REQUIRE_EQ(has_tone(8), true);
+    REQUIRE_EQ(has_tone(5), true);
+}
+
+void testMgstcToneSetFileRoundTripAndFailedWrite() {
+    using namespace mgstc::engine;
+    TimbreLibraryEntry opll;
+    opll.id = 4;
+    opll.category = TimbreCategory::Opll;
+    opll.name = "Bell";
+    opll.tags = {"lead", "bright"};
+    opll.memo = "memo";
+    opll.favorite = true;
+    opll.created_unix_seconds = 10;
+    opll.updated_unix_seconds = 11;
+    opll.last_used_unix_seconds = 12;
+    opll.use_count = 3;
+    opll.data_version = 1;
+    opll.revision = 2;
+    opll.opll_registers = {1, 2, 3, 4, 5, 6, 7, 8};
+
+    TimbreLibraryEntry scc;
+    scc.id = 9;
+    scc.category = TimbreCategory::Scc;
+    scc.name = "Saw";
+    scc.memo = "scc memo";
+    scc.created_unix_seconds = 20;
+    scc.updated_unix_seconds = 21;
+    scc.data_version = 1;
+    scc.revision = 1;
+    for (std::size_t index = 0; index < scc.scc_waveform.size(); ++index) {
+        scc.scc_waveform[index] = static_cast<std::uint8_t>(index * 3);
+    }
+
+    auto composite_timbre = defaultCompositeTimbre();
+    composite_timbre.name = "Stack";
+    composite_timbre.tags = {"pad"};
+    composite_timbre.memo = "layer memo";
+    composite_timbre.favorite = true;
+    CompositeTimbreLibraryEntry composite;
+    composite.id = 6;
+    composite.revision = 2;
+    composite.created_unix_seconds = 30;
+    composite.updated_unix_seconds = 31;
+    composite.timbre = composite_timbre;
+
+    TimbreLibrary old_timbres;
+    old_timbres.installEntries({opll});
+    const auto old_text = old_timbres.serialize();
+    REQUIRE_EQ(
+        detectMgstcFileKind(old_text), MgstcPortableKind::TimbreLibrary);
+    auto old_restored = TimbreLibrary::deserialize(old_text);
+    REQUIRE_EQ(old_restored.has_value(), true);
+    REQUIRE_EQ(old_restored->entries().front().name, std::string("Bell"));
+
+    CompositeTimbreLibrary old_composites;
+    old_composites.installEntries({composite});
+    REQUIRE_EQ(
+        detectMgstcFileKind(old_composites.serialize()),
+        MgstcPortableKind::CompositeLibrary);
+
+    MgstcToneSetDocument document;
+    document.name = "Leads";
+    document.memo = "set memo";
+    document.members.emplace_back(opll);
+    document.members.emplace_back(scc);
+    document.members.emplace_back(composite);
+    std::string error;
+    const auto text = serializeMgstcToneSet(document, &error);
+    REQUIRE_EQ(text.has_value(), true);
+    REQUIRE_EQ(detectMgstcFileKind(*text), MgstcPortableKind::ToneSet);
+    auto restored = deserializeMgstcToneSet(*text, &error);
+    REQUIRE_EQ(restored.has_value(), true);
+    REQUIRE_EQ(restored->name, document.name);
+    REQUIRE_EQ(restored->memo, document.memo);
+    REQUIRE_EQ(restored->members.size(), std::size_t{3});
+    const auto* restored_opll =
+        std::get_if<TimbreLibraryEntry>(&restored->members[0]);
+    const auto* restored_scc =
+        std::get_if<TimbreLibraryEntry>(&restored->members[1]);
+    const auto* restored_composite =
+        std::get_if<CompositeTimbreLibraryEntry>(&restored->members[2]);
+    REQUIRE_EQ(restored_opll != nullptr, true);
+    REQUIRE_EQ(restored_scc != nullptr, true);
+    REQUIRE_EQ(restored_composite != nullptr, true);
+    REQUIRE_EQ(restored_opll->name, opll.name);
+    REQUIRE_EQ(restored_opll->tags, opll.tags);
+    REQUIRE_EQ(restored_opll->memo, opll.memo);
+    REQUIRE_EQ(restored_opll->favorite, true);
+    REQUIRE_EQ(restored_opll->opll_registers, opll.opll_registers);
+    REQUIRE_EQ(restored_scc->scc_waveform, scc.scc_waveform);
+    REQUIRE_EQ(restored_composite->timbre.name, composite.timbre.name);
+    REQUIRE_EQ(restored_composite->timbre.tags, composite.timbre.tags);
+    REQUIRE_EQ(restored_composite->timbre.memo, composite.timbre.memo);
+    REQUIRE_EQ(restored_composite->timbre.favorite, true);
+    REQUIRE_EQ(
+        serializeMgstcToneSet(*restored, &error).has_value(), true);
+
+    REQUIRE_EQ(deserializeMgstcToneSet("MGSTC_TONE_SET\t1\r\n", &error).has_value(), false);
+    REQUIRE_EQ(
+        deserializeMgstcToneSet("MGSTC_TONE_SET\t1\r\nSET\t\t\r\n", &error).has_value(),
+        false);
+    REQUIRE_EQ(
+        deserializeMgstcToneSet("MGSTC_TONE_SET\t1\r\nNOPE\t41\t\r\n", &error).has_value(),
+        false);
+    REQUIRE_EQ(detectMgstcFileKind("not a library"), MgstcPortableKind::Unknown);
+
+    const auto directory =
+        std::filesystem::temp_directory_path() / "mgstc_tone_set_file";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto kept = directory / "kept.mgstc";
+    {
+        std::ofstream output(kept, std::ios::binary | std::ios::trunc);
+        output << "KEEP";
+    }
+    MgstcToneSetDocument rejected;
+    REQUIRE_EQ(writeMgstcToneSetFile(kept, rejected, &error), false);
+    REQUIRE_EQ(readBinaryFile(kept), std::string("KEEP"));
+
+    const auto blocked = directory / "blocked.mgstc";
+    {
+        std::ofstream output(blocked, std::ios::binary | std::ios::trunc);
+        output << "ORIGINAL";
+    }
+    std::filesystem::create_directory(
+        directory / "blocked.mgstc.writing");
+    REQUIRE_EQ(
+        replaceFileBytesAtomically(blocked, "CHANGED", &error), false);
+    REQUIRE_EQ(readBinaryFile(blocked), std::string("ORIGINAL"));
+    std::filesystem::remove_all(directory / "blocked.mgstc.writing");
+    REQUIRE_EQ(writeMgstcToneSetFile(blocked, document, &error), true);
+    auto from_disk = deserializeMgstcToneSet(readBinaryFile(blocked), &error);
+    REQUIRE_EQ(from_disk.has_value(), true);
+    REQUIRE_EQ(from_disk->name, document.name);
+    REQUIRE_EQ(
+        std::filesystem::exists(directory / "blocked.mgstc.writing"),
+        false);
+
+    TimbreLibrary library;
+    TimbreLibraryEntry existing = opll;
+    existing.id = 1;
+    existing.name = "Bell";
+    library.add(existing, 100);
+    const auto existing_id = library.entries().front().id;
+    CompositeTimbreLibrary composites;
+    std::vector<ToneSetRecord> sets(1);
+    sets[0].id = 3;
+    sets[0].name = "Leads";
+    sets[0].memo = "stay";
+    std::vector<ToneSetMemberRecord> members;
+    auto imported = importMgstcToneSet(
+        document, library, composites, sets, members, 400, &error);
+    REQUIRE_EQ(imported.has_value(), true);
+    REQUIRE_EQ(imported->set_name, std::string("Leads (2)"));
+    REQUIRE_EQ(library.entries().front().id, existing_id);
+    REQUIRE_EQ(library.entries().front().name, std::string("Bell"));
+    REQUIRE_EQ(library.entries().size(), std::size_t{3});
+    REQUIRE_EQ(library.entries()[1].name, std::string("Bell(1)"));
+    REQUIRE_EQ(composites.entries().size(), std::size_t{1});
+    REQUIRE_EQ(sets.size(), std::size_t{2});
+    REQUIRE_EQ(sets[0].memo, std::string("stay"));
+    REQUIRE_EQ(members.size(), std::size_t{3});
+    REQUIRE_EQ(members[0].set_id, imported->set_id);
+    REQUIRE_EQ(members[0].timbre_id, library.entries()[1].id);
+    REQUIRE_EQ(members[2].composite_id, composites.entries().front().id);
+
+    const auto db_path = directory / "library.sqlite";
+    TimbreLibrary stored;
+    TimbreLibraryEntry original;
+    original.category = TimbreCategory::Scc;
+    original.name = "Original";
+    original.data_version = 1;
+    stored.add(original, 50);
+    {
+        ToneLibraryDatabase database;
+        REQUIRE_EQ(database.open(db_path.string(), &error), true);
+        REQUIRE_EQ(database.replaceAll(stored, CompositeTimbreLibrary(), &error), true);
+    }
+    TimbreLibrary changed = stored;
+    changed.find(changed.entries().front().id)->name = "Changed";
+    std::vector<ToneSetRecord> bad_sets(1);
+    bad_sets[0].id = 1;
+    bad_sets[0].name = "Bad";
+    std::vector<ToneSetMemberRecord> bad_members(1);
+    bad_members[0].set_id = 1;
+    bad_members[0].timbre_id = 999;
+    {
+        ToneLibraryDatabase database;
+        REQUIRE_EQ(database.open(db_path.string(), &error), true);
+        REQUIRE_EQ(
+            database.replaceAllAndToneSets(
+                changed, CompositeTimbreLibrary(), bad_sets, bad_members, &error),
+            false);
+    }
+    {
+        ToneLibraryDatabase database;
+        TimbreLibrary loaded_timbres;
+        CompositeTimbreLibrary loaded_composites;
+        std::vector<ToneSetRecord> loaded_sets;
+        std::vector<ToneSetMemberRecord> loaded_members;
+        REQUIRE_EQ(database.open(db_path.string(), &error), true);
+        REQUIRE_EQ(database.load(loaded_timbres, loaded_composites, &error), true);
+        REQUIRE_EQ(database.loadToneSets(loaded_sets, loaded_members, &error), true);
+        REQUIRE_EQ(loaded_timbres.entries().size(), std::size_t{1});
+        REQUIRE_EQ(loaded_timbres.entries().front().name, std::string("Original"));
+        REQUIRE_EQ(loaded_sets.empty(), true);
+    }
+    std::filesystem::remove_all(directory);
+}
+
+void testEditorSetFilterAndMembershipAppend() {
+    using namespace mgstc::engine;
+    const std::vector<ToneSetMemberRecord> members = {
+        {1, 5, 0, 0},
+        {1, 0, 8, 1},
+        {2, 9, 0, 0},
+    };
+    REQUIRE_EQ(
+        toneVisibleInSetFilter(5, 0, ToneSetListFilter::All, 0, members),
+        true);
+    REQUIRE_EQ(
+        toneVisibleInSetFilter(
+            5, 0, ToneSetListFilter::Unassigned, 0, members),
+        false);
+    REQUIRE_EQ(
+        toneVisibleInSetFilter(
+            7, 0, ToneSetListFilter::Unassigned, 0, members),
+        true);
+    REQUIRE_EQ(
+        toneVisibleInSetFilter(
+            5, 0, ToneSetListFilter::NamedSet, 1, members),
+        true);
+    REQUIRE_EQ(
+        toneVisibleInSetFilter(
+            5, 0, ToneSetListFilter::NamedSet, 2, members),
+        false);
+    REQUIRE_EQ(
+        toneVisibleInSetFilter(
+            0, 5, ToneSetListFilter::NamedSet, 1, members),
+        false);
+    REQUIRE_EQ(
+        toneVisibleInSetFilter(
+            0, 8, ToneSetListFilter::NamedSet, 1, members),
+        true);
+
+    std::vector<ToneSetMemberRecord> stored = members;
+    REQUIRE_EQ(
+        appendToneSetMember(stored, 1, 7, 0),
+        ToneSetMembershipAppend::Added);
+    REQUIRE_EQ(stored.back().position, 2);
+    REQUIRE_EQ(stored.back().timbre_id, std::uint64_t{7});
+    REQUIRE_EQ(stored.back().composite_id, std::uint64_t{0});
+    REQUIRE_EQ(
+        appendToneSetMember(stored, 1, 7, 0),
+        ToneSetMembershipAppend::AlreadyPresent);
+    REQUIRE_EQ(stored.size(), std::size_t{4});
+    REQUIRE_EQ(
+        appendToneSetMember(stored, 0, 7, 0),
+        ToneSetMembershipAppend::Rejected);
+    REQUIRE_EQ(
+        appendToneSetMember(stored, 1, 7, 8),
+        ToneSetMembershipAppend::Rejected);
+    REQUIRE_EQ(
+        appendToneSetMember(stored, 1, 0, 0),
+        ToneSetMembershipAppend::Rejected);
+    REQUIRE_EQ(stored.size(), std::size_t{4});
+
+    std::vector<ToneSetMemberRecord> empty;
+    REQUIRE_EQ(
+        appendToneSetMember(empty, 3, 0, 4),
+        ToneSetMembershipAppend::Added);
+    REQUIRE_EQ(empty.front().position, 0);
+    REQUIRE_EQ(empty.front().composite_id, std::uint64_t{4});
+}
+
+void testToneLibrarySchemaV2PreservesMembers() {
+    using namespace mgstc::engine;
+    const auto directory =
+        std::filesystem::temp_directory_path() / "mgstc_tone_library_v2";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto db_path = directory / "tone_library.sqlite";
+    const auto utf8 = db_path.string();
+
+    auto composite = defaultCompositeTimbre();
+    composite.name = "Kept Composite";
+    composite.memo = "composite memo";
+    composite.tags = {"kept"};
+    const auto payload = serializeCompositeSoundPayload(composite);
+
+    sqlite3* raw = nullptr;
+    REQUIRE_EQ(sqlite3_open(utf8.c_str(), &raw), SQLITE_OK);
+    const char* schema = R"SQL(
+CREATE TABLE timbres (
+    id INTEGER PRIMARY KEY, category INTEGER NOT NULL, name TEXT NOT NULL,
+    memo TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL DEFAULT 0, use_count INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 1, payload BLOB NOT NULL);
+CREATE TABLE composite_timbres (
+    id INTEGER PRIMARY KEY, name TEXT NOT NULL, memo TEXT NOT NULL DEFAULT '',
+    favorite INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL DEFAULT 0,
+    use_count INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1,
+    payload_version INTEGER NOT NULL, payload BLOB NOT NULL);
+CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE timbre_tags (
+    timbre_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+    PRIMARY KEY (timbre_id, tag_id));
+CREATE TABLE composite_tags (
+    composite_id INTEGER NOT NULL, tag_id INTEGER NOT NULL,
+    PRIMARY KEY (composite_id, tag_id));
+)SQL";
+    char* sql_error = nullptr;
+    REQUIRE_EQ(sqlite3_exec(raw, schema, nullptr, nullptr, &sql_error), SQLITE_OK);
+    REQUIRE_EQ(
+        sqlite3_exec(
+            raw,
+            "PRAGMA application_id = 0x4D47544C; PRAGMA user_version = 1;"
+            "INSERT INTO tags(id, name) VALUES (1, 'bright');"
+            "INSERT INTO timbre_tags(timbre_id, tag_id) VALUES (1, 1), (2, 1);"
+            "INSERT INTO composite_tags(composite_id, tag_id) VALUES (9, 1);",
+            nullptr,
+            nullptr,
+            &sql_error),
+        SQLITE_OK);
+    sqlite3_stmt* insert_timbre = nullptr;
+    REQUIRE_EQ(
+        sqlite3_prepare_v2(
+            raw,
+            "INSERT INTO timbres(id, category, name, memo, favorite, created_at, "
+            "updated_at, last_used_at, use_count, revision, payload) "
+            "VALUES (?, ?, ?, 'memo', 1, 10, 11, 12, 3, 4, ?);",
+            -1,
+            &insert_timbre,
+            nullptr),
+        SQLITE_OK);
+    const std::uint8_t opll_payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const std::uint8_t scc_payload[32] = {};
+    auto bind_timbre = [&](int id, int category, const char* name,
+                           const std::uint8_t* bytes, int size) {
+        sqlite3_reset(insert_timbre);
+        sqlite3_bind_int64(insert_timbre, 1, id);
+        sqlite3_bind_int(insert_timbre, 2, category);
+        sqlite3_bind_text(insert_timbre, 3, name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_blob(insert_timbre, 4, bytes, size, SQLITE_TRANSIENT);
+        REQUIRE_EQ(sqlite3_step(insert_timbre), SQLITE_DONE);
+    };
+    bind_timbre(1, 0, "Low OPLL", opll_payload, 8);
+    bind_timbre(2, 1, "High SCC", scc_payload, 32);
+    sqlite3_finalize(insert_timbre);
+    sqlite3_stmt* insert_composite = nullptr;
+    REQUIRE_EQ(
+        sqlite3_prepare_v2(
+            raw,
+            "INSERT INTO composite_timbres(id, name, memo, favorite, created_at, "
+            "updated_at, last_used_at, use_count, revision, payload_version, payload) "
+            "VALUES (9, 'Kept Composite', 'composite memo', 1, 20, 21, 22, 5, 6, ?, ?);",
+            -1,
+            &insert_composite,
+            nullptr),
+        SQLITE_OK);
+    sqlite3_bind_int(insert_composite, 1, kCompositeSoundPayloadVersion);
+    sqlite3_bind_blob(
+        insert_composite, 2, payload.data(), static_cast<int>(payload.size()),
+        SQLITE_TRANSIENT);
+    REQUIRE_EQ(sqlite3_step(insert_composite), SQLITE_DONE);
+    sqlite3_finalize(insert_composite);
+    sqlite3_close(raw);
+
+    const auto original = std::filesystem::file_size(db_path);
+    std::vector<char> blocked_bytes(original);
+    {
+        std::ifstream input(db_path, std::ios::binary);
+        input.read(blocked_bytes.data(), static_cast<std::streamsize>(original));
+    }
+    auto occupy = [&](std::time_t when) {
+        std::tm utc{};
+        gmtime_s(&utc, &when);
+        std::ostringstream stamp;
+        stamp << std::put_time(&utc, "%Y%m%d%H%M%S");
+        for (int index = 0; index < 50; ++index) {
+            std::string name = db_path.stem().string() + ".v1-backup-" + stamp.str();
+            if (index > 0) {
+                name += "-" + std::to_string(index);
+            }
+            name += ".sqlite";
+            std::ofstream file(directory / name, std::ios::binary);
+        }
+    };
+    const auto now = std::time(nullptr);
+    std::ofstream preferred(
+        directory / (db_path.stem().string() + ".v1-backup.sqlite"),
+        std::ios::binary);
+    preferred << "keep";
+    preferred.close();
+    for (int delta = -1; delta <= 2; ++delta) {
+        occupy(now + delta);
+    }
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(utf8, &error), false);
+    }
+    REQUIRE_EQ(std::filesystem::file_size(db_path), original);
+    sqlite3* blocked = nullptr;
+    REQUIRE_EQ(sqlite3_open(utf8.c_str(), &blocked), SQLITE_OK);
+    sqlite3_stmt* version = nullptr;
+    REQUIRE_EQ(
+        sqlite3_prepare_v2(blocked, "PRAGMA user_version;", -1, &version, nullptr),
+        SQLITE_OK);
+    REQUIRE_EQ(sqlite3_step(version), SQLITE_ROW);
+    REQUIRE_EQ(sqlite3_column_int(version, 0), 1);
+    sqlite3_finalize(version);
+    sqlite3_close(blocked);
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().filename() != "tone_library.sqlite") {
+            std::filesystem::remove(entry.path());
+        }
+    }
+
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(utf8, &error), true);
+        REQUIRE_EQ(database.userVersion(), ToneLibraryDatabase::kSchemaVersion);
+        TimbreLibrary timbres;
+        CompositeTimbreLibrary composites;
+        REQUIRE_EQ(database.load(timbres, composites, &error), true);
+        REQUIRE_EQ(timbres.entries().size(), static_cast<std::size_t>(2));
+        REQUIRE_EQ(timbres.find(1)->name, std::string("Low OPLL"));
+        REQUIRE_EQ(timbres.find(1)->memo, std::string("memo"));
+        REQUIRE_EQ(timbres.find(1)->favorite, true);
+        REQUIRE_EQ(timbres.find(1)->use_count, static_cast<std::uint32_t>(3));
+        REQUIRE_EQ(timbres.find(1)->tags, std::vector<std::string>{"bright"});
+        REQUIRE_EQ(timbres.find(2)->name, std::string("High SCC"));
+        REQUIRE_EQ(composites.find(9)->timbre.name, std::string("Kept Composite"));
+        REQUIRE_EQ(composites.find(9)->timbre.memo, std::string("composite memo"));
+        std::vector<ToneSetRecord> sets;
+        std::vector<ToneSetMemberRecord> members;
+        REQUIRE_EQ(database.loadToneSets(sets, members, &error), true);
+        REQUIRE_EQ(sets.empty(), true);
+        REQUIRE_EQ(members.empty(), true);
+        ToneSetRecord set;
+        set.id = 4;
+        set.name = "Leads";
+        set.memo = "set memo";
+        set.created_unix_seconds = 30;
+        set.updated_unix_seconds = 31;
+        set.revision = 2;
+        ToneSetRecord empty_set = set;
+        empty_set.id = 5;
+        empty_set.name = "Empty";
+        empty_set.memo = "";
+        members.push_back({.set_id = 4, .timbre_id = 1, .position = 1});
+        members.push_back({.set_id = 4, .timbre_id = 2, .position = 0});
+        members.push_back({.set_id = 4, .composite_id = 9, .position = 2});
+        REQUIRE_EQ(
+            database.replaceToneSets({set, empty_set}, members, &error),
+            true);
+        auto edited = *timbres.find(1);
+        edited.memo = "edited";
+        REQUIRE_EQ(timbres.update(1, edited, 40), true);
+        REQUIRE_EQ(database.replaceTimbres(timbres, &error), true);
+        REQUIRE_EQ(database.replaceComposites(composites, &error), true);
+        REQUIRE_EQ(database.replaceAll(timbres, composites, &error), true);
+        REQUIRE_EQ(database.loadToneSets(sets, members, &error), true);
+        REQUIRE_EQ(sets.size(), static_cast<std::size_t>(2));
+        REQUIRE_EQ(members.size(), static_cast<std::size_t>(3));
+        REQUIRE_EQ(members[0].timbre_id, static_cast<std::uint64_t>(2));
+        REQUIRE_EQ(members[0].position, 0);
+        timbres.erase(2);
+        REQUIRE_EQ(database.replaceTimbres(timbres, &error), true);
+        REQUIRE_EQ(database.loadToneSets(sets, members, &error), true);
+        REQUIRE_EQ(members.size(), static_cast<std::size_t>(2));
+        TimbreLibrary reloaded;
+        CompositeTimbreLibrary ignored;
+        REQUIRE_EQ(database.load(reloaded, ignored, &error), true);
+        TimbreLibraryEntry reused;
+        reused.category = TimbreCategory::Scc;
+        reused.name = "Reused SCC";
+        const auto reused_id = reloaded.add(reused, 50);
+        REQUIRE_EQ(reused_id, static_cast<std::uint64_t>(2));
+        REQUIRE_EQ(database.replaceTimbres(reloaded, &error), true);
+        REQUIRE_EQ(database.loadToneSets(sets, members, &error), true);
+        for (const auto& member : members) {
+            REQUIRE_EQ(member.timbre_id == 2, false);
+        }
+        REQUIRE_EQ(database.replaceToneSets({}, {}, &error), true);
+        REQUIRE_EQ(database.load(reloaded, ignored, &error), true);
+        REQUIRE_EQ(reloaded.find(1) != nullptr, true);
+        REQUIRE_EQ(reloaded.find(2) != nullptr, true);
+        REQUIRE_EQ(ignored.find(9) != nullptr, true);
+    }
+    REQUIRE_EQ(
+        std::filesystem::exists(
+            directory / (db_path.stem().string() + ".v1-backup.sqlite")),
+        true);
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(utf8, &error), true);
+    }
+    int backups = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().filename().string().find(".v1-backup") != std::string::npos) {
+            ++backups;
+        }
+    }
+    REQUIRE_EQ(backups, 1);
+    sqlite3* broken = nullptr;
+    REQUIRE_EQ(sqlite3_open(utf8.c_str(), &broken), SQLITE_OK);
+    REQUIRE_EQ(
+        sqlite3_exec(broken, "DROP TABLE tone_sets;", nullptr, nullptr, nullptr),
+        SQLITE_OK);
+    sqlite3_close(broken);
+    {
+        ToneLibraryDatabase database;
+        std::string error;
+        REQUIRE_EQ(database.open(utf8, &error), true);
+        TimbreLibrary recovered;
+        CompositeTimbreLibrary recovered_composites;
+        REQUIRE_EQ(
+            database.loadAvailable(recovered, recovered_composites, &error),
+            false);
+        REQUIRE_EQ(recovered.find(1) != nullptr, true);
+        REQUIRE_EQ(recovered_composites.find(9) != nullptr, true);
+        REQUIRE_EQ(database.load(recovered, recovered_composites, &error), false);
+    }
+    std::filesystem::remove_all(directory);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -9822,6 +10668,10 @@ int main(int argc, char** argv) {
         {"TimbreTagsNormalizeMatchAndCollectUsage", testTimbreTagsNormalizeMatchAndCollectUsage},
         {"TimbreLibrarySelectedExportAndNonDestructiveImport", testTimbreLibrarySelectedExportAndNonDestructiveImport},
         {"ToneLibrarySqliteV1RoundTripAndPortableFormat", testToneLibrarySqliteV1RoundTripAndPortableFormat},
+        {"ToneLibrarySchemaV2PreservesMembers", testToneLibrarySchemaV2PreservesMembers},
+        {"FurnaceWavetableAndInstrumentExchange", testFurnaceWavetableAndInstrumentExchange},
+        {"MgstcToneSetFileRoundTripAndFailedWrite", testMgstcToneSetFileRoundTripAndFailedWrite},
+        {"EditorSetFilterAndMembershipAppend", testEditorSetFilterAndMembershipAppend},
         {"ToneLibraryStartupRecovery", testToneLibraryStartupRecovery},
         {"SccMorphDistributionPersistence", testSccMorphDistributionPersistence},
         {"PreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave", testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave},

@@ -4,11 +4,13 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <juce_core/juce_core.h>
 
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/timbre_library.hpp"
+#include "mgstc/engine/tone_library_store.hpp"
 
 namespace mgstc::app {
 
@@ -54,6 +56,8 @@ struct LibraryFileFingerprint {
 struct ToneLibrarySnapshot {
     engine::TimbreLibrary timbres;
     engine::CompositeTimbreLibrary composites;
+    std::vector<engine::ToneSetRecord> sets;
+    std::vector<engine::ToneSetMemberRecord> members;
 };
 
 // Startup/message-thread recovery. False requests one startup warning;
@@ -80,5 +84,15 @@ loadSharedCompositeTimbreLibrary(std::string* error = nullptr);
 [[nodiscard]] bool persistToneLibraries(
     const engine::TimbreLibrary& timbres,
     const engine::CompositeTimbreLibrary& composites);
+// Sets and memberships only. Timbre bodies are left as stored.
+[[nodiscard]] bool persistToneSets(
+    const std::vector<engine::ToneSetRecord>& sets,
+    const std::vector<engine::ToneSetMemberRecord>& members);
+// Timbres, composites, and set membership in one transaction.
+[[nodiscard]] bool persistToneLibrariesAndSets(
+    const engine::TimbreLibrary& timbres,
+    const engine::CompositeTimbreLibrary& composites,
+    const std::vector<engine::ToneSetRecord>& sets,
+    const std::vector<engine::ToneSetMemberRecord>& members);
 
 }  // namespace mgstc::app

@@ -14,6 +14,8 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 
 #include "juce_utf8.hpp"
+#include "tone_library_session.hpp"
+#include "tone_mini_preview.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/opll_envelope_trace.hpp"
@@ -44,7 +46,8 @@ public:
         PersistCallback persist,
         std::function<mgstc::engine::TimbreLibrary*()> timbres,
         std::function<mgstc::engine::CompositeTimbreLibrary*()> composites,
-        LibrariesChangedCallback libraries_changed)
+        LibrariesChangedCallback libraries_changed,
+        juce::InterProcessLock* shared_library_lock = nullptr)
         : preview_(std::move(preview)),
           edit_(std::move(edit)),
           reload_(std::move(reload)),
@@ -52,6 +55,7 @@ public:
           timbres_(std::move(timbres)),
           composites_(std::move(composites)),
           libraries_changed_(std::move(libraries_changed)),
+          shared_library_lock_(shared_library_lock),
           tooltip_window_(this, 450) {
         setWantsKeyboardFocus(true);
         open_file_.setButtonText(juce::String::fromUTF8("ファイルを開く"));
@@ -137,6 +141,11 @@ public:
         return false;
     }
 
+    void setMgstcImporter(
+        std::function<bool(const juce::File&, juce::String&)> importer) {
+        mgstc_importer_ = std::move(importer);
+    }
+
 private:
     struct ImportFileGroup {
         mgstc::engine::ToneImportResult result;
@@ -180,125 +189,34 @@ private:
                 graph.getRight());
             if (const auto* wave =
                     std::get_if<mgstc::engine::SccWaveform>(&candidate_.data)) {
-                paintWave(graphics, graph, *wave);
+                mgstc::app::paintToneMiniWave(graphics, graph, *wave);
                 return;
             }
             if (std::holds_alternative<mgstc::engine::OpllPatchParameters>(
                     candidate_.data)
                 && trace_.valid) {
-                paintTrace(
-                    graphics, graph, trace_.modulator, juce::Colour(0xFF9AA8B5));
-                paintTrace(graphics, graph, trace_.carrier, juce::Colour(kUiHoverAccent));
+                mgstc::app::paintToneMiniLevels(
+                    graphics,
+                    graph,
+                    trace_.modulator,
+                    juce::Colour(0xFF9AA8B5));
+                mgstc::app::paintToneMiniLevels(
+                    graphics, graph, trace_.carrier, juce::Colour(kUiHoverAccent));
                 return;
             }
             if (const auto* timbre =
                     std::get_if<mgstc::engine::CompositeTimbre>(
                         &candidate_.data)) {
-                paintEnvelope(graphics, graph, *timbre);
+                mgstc::app::paintToneMiniEnvelope(graphics, graph, *timbre);
                 return;
             }
             if (candidate_.composite_alternative) {
-                paintEnvelope(graphics, graph, *candidate_.composite_alternative);
+                mgstc::app::paintToneMiniEnvelope(
+                    graphics, graph, *candidate_.composite_alternative);
             }
         }
 
     private:
-        static void paintWave(
-            juce::Graphics& graphics,
-            juce::Rectangle<float> graph,
-            const mgstc::engine::SccWaveform& waveform) {
-            juce::Path path;
-            for (std::size_t index = 0; index < waveform.size(); ++index) {
-                const auto x = juce::jmap(
-                    static_cast<float>(index),
-                    0.0F,
-                    static_cast<float>(waveform.size() - 1),
-                    graph.getX(),
-                    graph.getRight());
-                const auto y = juce::jmap(
-                    static_cast<float>(waveform[index]),
-                    -128.0F,
-                    127.0F,
-                    graph.getBottom(),
-                    graph.getY());
-                if (index == 0) {
-                    path.startNewSubPath(x, y);
-                } else {
-                    path.lineTo(x, y);
-                }
-            }
-            graphics.setColour(juce::Colour(kUiHoverAccent));
-            graphics.strokePath(
-                path,
-                juce::PathStrokeType(
-                    1.2F,
-                    juce::PathStrokeType::curved,
-                    juce::PathStrokeType::rounded));
-        }
-
-        static void paintTrace(
-            juce::Graphics& graphics,
-            juce::Rectangle<float> graph,
-            const std::array<float, mgstc::engine::OpllEnvelopeTrace::kPointCount>&
-                levels,
-            juce::Colour colour) {
-            juce::Path path;
-            for (std::size_t index = 0; index < levels.size(); ++index) {
-                const float x = graph.getX()
-                    + graph.getWidth() * static_cast<float>(index)
-                        / static_cast<float>(levels.size() - 1);
-                const float y = graph.getBottom()
-                    - graph.getHeight() * std::clamp(levels[index], 0.0F, 1.0F);
-                if (index == 0) {
-                    path.startNewSubPath(x, y);
-                } else {
-                    path.lineTo(x, y);
-                }
-            }
-            graphics.setColour(colour);
-            graphics.strokePath(path, juce::PathStrokeType(1.2F));
-        }
-
-        static void paintEnvelope(
-            juce::Graphics& graphics,
-            juce::Rectangle<float> graph,
-            const mgstc::engine::CompositeTimbre& timbre) {
-            if (timbre.layers.empty()) {
-                return;
-            }
-            const auto& events = timbre.layers.front().volume_envelope.events;
-            if (events.empty()) {
-                return;
-            }
-            const auto length = std::max<std::uint32_t>(
-                1, timbre.layers.front().envelope_timeline.length_counts);
-            juce::Path path;
-            bool started = false;
-            for (const auto& event : events) {
-                if (event.kind != mgstc::engine::EnvelopeEventKind::Volume) {
-                    continue;
-                }
-                const float x = graph.getX()
-                    + graph.getWidth()
-                        * static_cast<float>(event.count)
-                        / static_cast<float>(length);
-                const float y = juce::jmap(
-                    static_cast<float>(event.value),
-                    0.0F,
-                    15.0F,
-                    graph.getBottom(),
-                    graph.getY());
-                if (!started) {
-                    path.startNewSubPath(x, y);
-                    started = true;
-                } else {
-                    path.lineTo(x, y);
-                }
-            }
-            graphics.setColour(juce::Colour(kUiHoverAccent));
-            graphics.strokePath(path, juce::PathStrokeType(1.2F));
-        }
-
         mgstc::engine::ImportedToneCandidate candidate_{};
         mgstc::engine::OpllEnvelopeTrace trace_{};
     };
@@ -388,6 +306,15 @@ private:
                 candidate().name = utf8String(name_.getText());
             };
             addAndMakeVisible(name_);
+            convert_.setInterceptsMouseClicks(false, false);
+            convert_.setJustificationType(juce::Justification::centredLeft);
+            convert_.setFont(UiFonts::body());
+            convert_.setColour(
+                juce::Label::textColourId, juce::Colour(0xFF53E3A6));
+            convert_.setText(
+                juce::String::fromUTF8("[コンバート]"),
+                juce::dontSendNotification);
+            addChildComponent(convert_);
             addAndMakeVisible(preview_);
             favorite_.setJustificationType(juce::Justification::centred);
             favorite_.setFont(UiFonts::body());
@@ -445,6 +372,10 @@ private:
             edit_.setBounds(area.removeFromRight(
                 std::max(libraryButtonMinW, UiScale::sx(72))));
             area.removeFromRight(controlGap);
+            if (convert_.isVisible()) {
+                convert_.setBounds(area.removeFromRight(UiScale::sx(96)));
+                area.removeFromRight(controlGap);
+            }
             name_.setBounds(area);
             refreshNameTooltip();
         }
@@ -478,6 +409,8 @@ private:
             name_.setText(
                 juce::String::fromUTF8(item.name.c_str()),
                 juce::dontSendNotification);
+            convert_.setVisible(item.furnace_wave_converted);
+            resized();
             refreshNameTooltip();
             preview_.setCandidate(item);
             favorite_.setText(
@@ -581,6 +514,7 @@ private:
         juce::ToggleButton checked_;
         juce::Label type_;
         juce::TextEditor name_;
+        juce::Label convert_;
         MiniPreview preview_;
         juce::Label favorite_;
         juce::TextButton register_;
@@ -600,7 +534,7 @@ private:
         juce::FileChooser chooser(
             juce::String::fromUTF8("音色データをインポート"),
             {},
-            "*.mgs;*.mus;*.mml;*.vcd;*.sng;*.vgm;*.vgz");
+            "*.mgstc;*.mgs;*.mus;*.mml;*.vcd;*.sng;*.vgm;*.vgz;*.fui;*.fuw");
         if (!chooser.browseForMultipleFilesToOpen()) {
             return;
         }
@@ -614,6 +548,23 @@ private:
         int added_candidates = 0;
         int added_files = 0;
         for (const auto& file : chosen) {
+            if (file.getFileExtension().equalsIgnoreCase(".mgstc")) {
+                juce::String message;
+                if (!mgstc_importer_) {
+                    errors.add(
+                        file.getFileName()
+                        + juce::String::fromUTF8(
+                            " はライブラリ管理では読み込めません"));
+                    continue;
+                }
+                if (!mgstc_importer_(file, message) && message.isNotEmpty()) {
+                    errors.add(
+                        file.getFileName()
+                        + juce::String::fromUTF8(": ")
+                        + message);
+                }
+                continue;
+            }
             juce::MemoryBlock block;
             if (!file.loadFileAsData(block) || block.getSize() == 0) {
                 errors.add(
@@ -952,7 +903,16 @@ private:
         if (pending.empty()) {
             return;
         }
-        if (!reload_ || !reload_()) {
+        if (shared_library_lock_ == nullptr) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("インポート"),
+                juce::String::fromUTF8(
+                    "共有ライブラリを読み込めませんでした"));
+            return;
+        }
+        mgstc::app::ScopedLibraryIpcLock lock_guard(*shared_library_lock_);
+        if (!lock_guard.isLocked() || !reload_ || !reload_()) {
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::WarningIcon,
                 juce::String::fromUTF8("インポート"),
@@ -1032,6 +992,8 @@ private:
     std::function<mgstc::engine::TimbreLibrary*()> timbres_;
     std::function<mgstc::engine::CompositeTimbreLibrary*()> composites_;
     LibrariesChangedCallback libraries_changed_;
+    std::function<bool(const juce::File&, juce::String&)> mgstc_importer_;
+    juce::InterProcessLock* shared_library_lock_{};
     juce::TooltipWindow tooltip_window_;
     juce::TextButton open_file_;
     juce::Label status_;

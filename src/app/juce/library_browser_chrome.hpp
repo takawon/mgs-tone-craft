@@ -21,6 +21,7 @@ struct LibraryBrowserChromeWidgets {
     juce::TextButton& library_rename;
     juce::TextButton& tags;
     juce::TextEditor* memo = nullptr;
+    juce::ComboBox* set_filter = nullptr;
 };
 
 inline void layoutLibraryBrowserChrome(
@@ -28,6 +29,10 @@ inline void layoutLibraryBrowserChrome(
     LibraryBrowserChromeWidgets widgets) {
     using namespace UiLayout;
     widgets.filter.setBounds(area.removeFromTop(fieldH));
+    if (widgets.set_filter != nullptr) {
+        area.removeFromTop(sm);
+        widgets.set_filter->setBounds(area.removeFromTop(fieldH));
+    }
     area.removeFromTop(sm);
     auto tag_row = area.removeFromTop(fieldH);
     widgets.tag_manage.setBounds(
