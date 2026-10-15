@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/timbre_library.hpp"
@@ -9,12 +11,28 @@ struct sqlite3;
 
 namespace mgstc::engine {
 
+struct ToneSetRecord {
+    std::uint64_t id = 0;
+    std::string name;
+    std::string memo;
+    std::int64_t created_unix_seconds = 0;
+    std::int64_t updated_unix_seconds = 0;
+    std::int64_t revision = 1;
+};
+
+struct ToneSetMemberRecord {
+    std::uint64_t set_id = 0;
+    std::uint64_t timbre_id = 0;
+    std::uint64_t composite_id = 0;
+    int position = 0;
+};
+
 // SQLite-backed user tone library (`tone_library.sqlite`).
 // In-memory TimbreLibrary / CompositeTimbreLibrary remain the editing model;
 // this class is the only place that issues SQL.
 class ToneLibraryDatabase {
 public:
-    static constexpr int kSchemaVersion = 1;
+    static constexpr int kSchemaVersion = 2;
     // Four-byte magic 'MGTL' (MGSTC Tone Library). Distinct from
     // patchslide.sqlite, which will receive its own application_id.
     static constexpr int kApplicationId = 0x4D47544C;
@@ -56,9 +74,27 @@ public:
         const TimbreLibrary& timbres,
         const CompositeTimbreLibrary& composites,
         std::string* error = nullptr);
+    // Replaces set rows and memberships only. Timbre and composite rows stay.
+    [[nodiscard]] bool loadToneSets(
+        std::vector<ToneSetRecord>& sets,
+        std::vector<ToneSetMemberRecord>& members,
+        std::string* error = nullptr);
+    [[nodiscard]] bool replaceToneSets(
+        const std::vector<ToneSetRecord>& sets,
+        const std::vector<ToneSetMemberRecord>& members,
+        std::string* error = nullptr);
+    // Timbres, composites, and set membership in one transaction.
+    [[nodiscard]] bool replaceAllAndToneSets(
+        const TimbreLibrary& timbres,
+        const CompositeTimbreLibrary& composites,
+        const std::vector<ToneSetRecord>& sets,
+        const std::vector<ToneSetMemberRecord>& members,
+        std::string* error = nullptr);
 
 private:
     [[nodiscard]] bool migrate(std::string* error);
+    [[nodiscard]] bool backupExistingV1(std::string* error);
+    [[nodiscard]] bool toneSetsReadable(std::string* error);
     [[nodiscard]] bool enableForeignKeys(std::string* error);
     [[nodiscard]] bool readUserVersion(int& version, std::string* error) const;
     [[nodiscard]] bool writeUserVersion(int version, std::string* error);
@@ -77,6 +113,14 @@ private:
         const CompositeTimbreLibrary& composites,
         std::string* error);
     [[nodiscard]] bool pruneUnusedTags(std::string* error);
+    [[nodiscard]] bool validateToneSets(
+        const std::vector<ToneSetRecord>& sets,
+        const std::vector<ToneSetMemberRecord>& members,
+        std::string* error) const;
+    [[nodiscard]] bool writeToneSets(
+        const std::vector<ToneSetRecord>& sets,
+        const std::vector<ToneSetMemberRecord>& members,
+        std::string* error);
     [[nodiscard]] bool loadTimbres(
         TimbreLibrary& timbres,
         std::string* error,
@@ -88,6 +132,7 @@ private:
 
     sqlite3* db_{};
     int user_version_{};
+    std::string utf8_path_;
 };
 
 }  // namespace mgstc::engine

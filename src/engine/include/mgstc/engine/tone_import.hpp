@@ -30,6 +30,8 @@ enum class ToneImportFormat : std::uint8_t {
     SccMusixxSng,
     Vgm,
     Vgz,
+    FurnaceInstrument,
+    FurnaceWavetable,
 };
 
 enum class ImportRegisterAs : std::uint8_t {
@@ -59,6 +61,11 @@ struct ImportedToneCandidate {
     ImportRegisterAs default_register_as{ImportRegisterAs::Opll};
     std::vector<ImportRegisterAs> register_choices;
     std::vector<ImportWarning> warnings;
+    // True when a Furnace wave's sample count was not 32. The saved name
+    // stays unchanged; the import list draws the convert mark beside it.
+    bool furnace_wave_converted{};
+    std::vector<std::string> tags;
+    std::string memo;
 };
 
 struct ToneImportResult {

@@ -106,7 +106,8 @@ std::optional<ToneLibrarySnapshot> loadToneLibraries(std::string* error) {
     }
     engine::ToneLibraryDatabase database;
     if (!database.open(toneLibraryUtf8Path(), error)
-        || !database.load(snapshot.timbres, snapshot.composites, error)) {
+        || !database.load(snapshot.timbres, snapshot.composites, error)
+        || !database.loadToneSets(snapshot.sets, snapshot.members, error)) {
         return std::nullopt;
     }
     return snapshot;
@@ -161,6 +162,33 @@ bool persistToneLibraries(
         return false;
     }
     return database.replaceAll(timbres, composites);
+}
+
+bool persistToneSets(
+    const std::vector<engine::ToneSetRecord>& sets,
+    const std::vector<engine::ToneSetMemberRecord>& members) {
+    engine::ToneLibraryDatabase database;
+    std::string error;
+    if (!openToneLibraryDatabase(database, true, &error)
+        || !database.isOpen()) {
+        return false;
+    }
+    return database.replaceToneSets(sets, members);
+}
+
+bool persistToneLibrariesAndSets(
+    const engine::TimbreLibrary& timbres,
+    const engine::CompositeTimbreLibrary& composites,
+    const std::vector<engine::ToneSetRecord>& sets,
+    const std::vector<engine::ToneSetMemberRecord>& members) {
+    engine::ToneLibraryDatabase database;
+    std::string error;
+    if (!openToneLibraryDatabase(database, true, &error)
+        || !database.isOpen()) {
+        return false;
+    }
+    return database.replaceAllAndToneSets(
+        timbres, composites, sets, members);
 }
 
 }  // namespace mgstc::app

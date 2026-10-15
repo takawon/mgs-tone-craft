@@ -194,9 +194,11 @@ add_library(mgstc_engine STATIC
     src/engine/sinc_rate_conv.cpp
     src/engine/stereo_sample_rate_converter.cpp
     src/engine/timbre_library.cpp
+    src/engine/mgstc_tone_set.cpp
     src/engine/timbre_tags.cpp
     src/engine/tone_library_store.cpp
     src/engine/tone_import.cpp
+    src/engine/furnace_exchange.cpp
     src/engine/tone_import_mgs.cpp
     src/engine/tone_import_sng.cpp
     src/engine/tone_import_vcd.cpp

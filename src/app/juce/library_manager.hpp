@@ -2,6 +2,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -13,9 +14,14 @@
 
 #include "editor_icons.hpp"
 #include "juce_utf8.hpp"
+#include "library_set_model.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
+#include "mgstc/engine/opll_envelope_trace.hpp"
+#include "mgstc/engine/opll_patch.hpp"
+#include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/timbre_library.hpp"
 #include "mgstc/engine/timbre_tags.hpp"
+#include "tone_mini_preview.hpp"
 #include "switch_look_and_feel.hpp"
 #include "tag_ui.hpp"
 #include "tone_library_session.hpp"
@@ -25,10 +31,30 @@
 #include "ui_paint.hpp"
 #include "ui_scale.hpp"
 
+using mgstc::app::LibrarySetDragItem;
+using mgstc::app::LibrarySetDropPlace;
+using mgstc::app::LibrarySetDropTarget;
+using mgstc::app::applyLibrarySetDrop;
+using mgstc::app::librarySetDelete;
+using mgstc::app::librarySetNameTaken;
+using mgstc::app::librarySetNextId;
+using mgstc::app::librarySetRemoveMembership;
+using mgstc::app::librarySetUniqueName;
+using mgstc::app::paintToneMiniEnvelope;
+using mgstc::app::paintToneMiniLevels;
+using mgstc::app::paintToneMiniWave;
+
 enum class LibraryManagerKind : std::uint8_t {
     Scc,
     Opll,
     Composite,
+};
+
+enum class LibraryManagerRowRole : std::uint8_t {
+    Timbre,
+    SetHeader,
+    UnassignedHeader,
+    Member,
 };
 
 struct LibraryManagerRow {
@@ -41,7 +67,22 @@ struct LibraryManagerRow {
     std::uint32_t revision{1};
     std::int64_t updated_unix_seconds{};
     std::int64_t last_used_unix_seconds{};
+    LibraryManagerRowRole role{LibraryManagerRowRole::Timbre};
+    std::uint64_t set_id{};
+    bool expanded{false};
 };
+
+[[nodiscard]] inline bool libraryManagerRowIsBody(
+    const LibraryManagerRow& row) {
+    return row.role == LibraryManagerRowRole::Timbre
+        || row.role == LibraryManagerRowRole::Member;
+}
+
+[[nodiscard]] inline bool libraryManagerRowIsHeader(
+    const LibraryManagerRow& row) {
+    return row.role == LibraryManagerRowRole::SetHeader
+        || row.role == LibraryManagerRowRole::UnassignedHeader;
+}
 
 [[nodiscard]] inline juce::String formatLibraryManagerTime(
     std::int64_t unix_seconds) {
@@ -61,6 +102,7 @@ public:
         kTags = 3,
         kUpdated = 4,
         kFavorite = 5,
+        kMini = 6,
     };
 
     using PreviewHandler =
@@ -69,6 +111,11 @@ public:
         std::function<void(int, const LibraryManagerRow&)>;
     using SelectionHandler = std::function<void()>;
     using SortHandler = std::function<void()>;
+    using RowHandler = std::function<void(const LibraryManagerRow&)>;
+    using MiniPaintHandler = std::function<void(
+        juce::Graphics&,
+        juce::Rectangle<float>,
+        const LibraryManagerRow&)>;
 
     void setTable(juce::TableListBox* table) {
         table_ = table;
@@ -102,6 +149,18 @@ public:
         sort_handler_ = std::move(handler);
     }
 
+    void setExpandHandler(RowHandler handler) {
+        expand_handler_ = std::move(handler);
+    }
+
+    void setContextMenuHandler(RowHandler handler) {
+        context_menu_handler_ = std::move(handler);
+    }
+
+    void setMiniPaintHandler(MiniPaintHandler handler) {
+        mini_paint_handler_ = std::move(handler);
+    }
+
     void setRecentUsedMode(bool enabled) {
         recent_used_mode_ = enabled;
     }
@@ -131,12 +190,26 @@ public:
         int column_id) {
         if (column_id == kName) {
             auto text = juce::String::fromUTF8(row.name.c_str());
+            if (libraryManagerRowIsHeader(row)) {
+                const auto mark =
+                    row.expanded
+                        ? juce::String::fromUTF8("▼ ")
+                        : juce::String::fromUTF8("▶ ");
+                return mark + text;
+            }
             if (row.kind != LibraryManagerKind::Composite) {
                 text += " (r"
                     + juce::String(static_cast<int>(row.revision))
                     + ")";
             }
             return text;
+        }
+        if (libraryManagerRowIsHeader(row)) {
+            if (column_id == kTags) {
+                return juce::String(static_cast<int>(row.revision))
+                    + juce::String::fromUTF8(" 件");
+            }
+            return {};
         }
         if (column_id == kTags) {
             if (row.tags.empty()) {
@@ -196,7 +269,33 @@ public:
         }
         graphics.setFont(UiFonts::body());
         graphics.setColour(juce::Colour(0xFFE6EDF3));
+        if (libraryManagerRowIsHeader(*row)) {
+            if (column_id == kName) {
+                graphics.setColour(juce::Colour(0xFFF2F4F5));
+                graphics.setFont(UiFonts::body().withHeight(
+                    UiFonts::controlTextHeight(
+                        static_cast<float>(UiLayout::textButtonH))));
+            } else if (column_id != kTags) {
+                return;
+            }
+        }
+        if (column_id == kMini) {
+            if (mini_paint_handler_ && libraryManagerRowIsBody(*row)) {
+                mini_paint_handler_(
+                    graphics,
+                    juce::Rectangle<float>(
+                        1.0F,
+                        1.0F,
+                        static_cast<float>(width - 2),
+                        static_cast<float>(height - 2)),
+                    *row);
+            }
+            return;
+        }
         if (column_id == kPreview) {
+            if (libraryManagerRowIsHeader(*row)) {
+                return;
+            }
             if (auto icon = mgstc::app::makeEditorIcon(
                     mgstc::app::EditorIcon::Audition,
                     juce::Colour(0xFF9AA8B5))) {
@@ -215,6 +314,9 @@ public:
             return;
         }
         if (column_id == kFavorite) {
+            if (libraryManagerRowIsHeader(*row)) {
+                return;
+            }
             graphics.setColour(
                 row->favorite ? juce::Colour(0xFFFFD866)
                               : juce::Colour(0xFF68737E));
@@ -229,11 +331,14 @@ public:
             return;
         }
         const auto text = cellText(*row, column_id);
+        const int indent = row->role == LibraryManagerRowRole::Member
+            ? UiLayout::md
+            : 0;
         graphics.drawText(
             text,
-            UiLayout::xs,
+            UiLayout::xs + indent,
             0,
-            width - UiLayout::xs * 2,
+            width - UiLayout::xs * 2 - indent,
             height,
             juce::Justification::centredLeft,
             true);
@@ -249,7 +354,8 @@ public:
             return;
         }
         if (new_sort_column_id == 0
-            || new_sort_column_id == kPreview) {
+            || new_sort_column_id == kPreview
+            || new_sort_column_id == kMini) {
             return;
         }
         sort_column_id_ = new_sort_column_id;
@@ -265,6 +371,18 @@ public:
         const juce::MouseEvent& event) override {
         const auto* row = rowAt(row_number);
         if (row == nullptr) {
+            return;
+        }
+        if (event.mods.isPopupMenu()) {
+            if (context_menu_handler_) {
+                context_menu_handler_(*row);
+            }
+            return;
+        }
+        if (libraryManagerRowIsHeader(*row)) {
+            if (expand_handler_) {
+                expand_handler_(*row);
+            }
             return;
         }
         if (column_id == kPreview && preview_handler_) {
@@ -352,12 +470,17 @@ private:
     FavoriteHandler favorite_handler_;
     SelectionHandler selection_handler_;
     SortHandler sort_handler_;
+    RowHandler expand_handler_;
+    RowHandler context_menu_handler_;
+    MiniPaintHandler mini_paint_handler_;
     bool recent_used_mode_{};
     int sort_column_id_{kName};
     bool sort_forwards_{true};
 };
 
-class LibraryManagerListTab final : public juce::Component {
+class LibraryManagerListTab final
+    : public juce::Component,
+      public juce::DragAndDropContainer {
 public:
     using PreviewCallback =
         std::function<void(LibraryManagerKind, std::uint64_t)>;
@@ -379,7 +502,13 @@ public:
             composites,
         PerformanceTargetChangedCallback
             performance_target_changed = {},
-        LibrariesChangedCallback libraries_changed = {})
+        LibrariesChangedCallback libraries_changed = {},
+        juce::InterProcessLock* shared_library_lock = nullptr,
+        std::function<std::vector<mgstc::engine::ToneSetRecord>*()>
+            tone_sets = {},
+        std::function<std::vector<mgstc::engine::ToneSetMemberRecord>*()>
+            tone_members = {},
+        std::function<bool()> persist_sets = {})
         : preview_(std::move(preview)),
           open_editor_(std::move(open_editor)),
           reload_(std::move(reload)),
@@ -389,7 +518,13 @@ public:
           performance_target_changed_(
               std::move(performance_target_changed)),
           libraries_changed_(std::move(libraries_changed)),
+          shared_library_lock_(shared_library_lock),
+          tone_sets_(std::move(tone_sets)),
+          tone_members_(std::move(tone_members)),
+          persist_sets_(std::move(persist_sets)),
+          table_(*this),
           tooltip_window_(this, 450) {
+        category_.addItem(juce::String::fromUTF8("すべて"), 4);
         category_.addItem(juce::String::fromUTF8("SCC"), 1);
         category_.addItem(juce::String::fromUTF8("OPLL"), 2);
         category_.addItem(juce::String::fromUTF8("複合"), 3);
@@ -434,19 +569,57 @@ public:
         recent_used_.onClick = [this] { applyRecentUsedMode(); };
         addAndMakeVisible(recent_used_);
 
+        tree_mode_.setButtonText(juce::String::fromUTF8("ツリー"));
+        tree_mode_.setToggleState(true, juce::dontSendNotification);
+        tree_mode_.setTooltip(juce::String::fromUTF8(
+            "セットごとにまとめます。OFF で音色だけの一覧に戻します"));
+        tree_mode_.onClick = [this] { refreshTable(false); };
+        addAndMakeVisible(tree_mode_);
+
+        new_set_.setButtonText(juce::String::fromUTF8("セット"));
+        new_set_.setTooltip(juce::String::fromUTF8(
+            "空のセットを追加します。音色自体は作りません"));
+        new_set_.onClick = [this] { createSet(); };
+        addAndMakeVisible(new_set_);
+
+        detail_toggle_.setButtonText(juce::String::fromUTF8("詳細"));
+        detail_toggle_.setTooltip(juce::String::fromUTF8(
+            "右の詳細ペインを開閉します"));
+        detail_toggle_.onClick = [this] {
+            detail_open_ = !detail_open_;
+            resized();
+        };
+        addAndMakeVisible(detail_toggle_);
+
         table_model_.setTable(&table_);
         table_model_.setPreviewHandler(
             [this](const LibraryManagerRow& row) {
-                if (preview_) {
+                if (preview_ && libraryManagerRowIsBody(row)) {
                     preview_(row.kind, row.id);
                 }
             });
         table_model_.setFavoriteHandler(
             [this](int row_number, const LibraryManagerRow& row) {
+                if (!libraryManagerRowIsBody(row)) {
+                    return;
+                }
                 toggleFavoriteAt(row_number, row);
             });
         table_model_.setSortHandler(
             [this] { refreshTable(false); });
+        table_model_.setExpandHandler(
+            [this](const LibraryManagerRow& row) { toggleExpanded(row); });
+        table_model_.setContextMenuHandler(
+            [this](const LibraryManagerRow& row) {
+                showRowContextMenu(row);
+            });
+        table_model_.setMiniPaintHandler(
+            [this](
+                juce::Graphics& graphics,
+                juce::Rectangle<float> area,
+                const LibraryManagerRow& row) {
+                paintRowMiniPreview(graphics, area, row);
+            });
         table_.setModel(&table_model_);
         table_.setMultipleSelectionEnabled(true);
         auto& header = table_.getHeader();
@@ -456,6 +629,13 @@ public:
             34,
             28,
             -1,
+            juce::TableHeaderComponent::notSortable);
+        header.addColumn(
+            juce::String::fromUTF8("波形"),
+            LibraryManagerTableModel::kMini,
+            72,
+            56,
+            96,
             juce::TableHeaderComponent::notSortable);
         header.addColumn(
             juce::String::fromUTF8("名前"),
@@ -564,6 +744,11 @@ public:
         refreshTable(true);
     }
 
+    void setExportHandler(
+        std::function<void(const std::vector<LibraryManagerRow>&)> handler) {
+        export_add_ = std::move(handler);
+    }
+
     void setReplaceMode(
         std::optional<LibraryManagerKind> kind,
         std::function<void(std::uint64_t)> on_replace) {
@@ -575,6 +760,11 @@ public:
             category_.setSelectedId(1, juce::dontSendNotification);
         }
         category_.setEnabled(!replace_mode_);
+        tree_mode_.setEnabled(!replace_mode_);
+        if (replace_mode_) {
+            tree_mode_.setToggleState(false, juce::dontSendNotification);
+        }
+        new_set_.setVisible(!replace_mode_);
         duplicate_.setVisible(!replace_mode_);
         remove_.setVisible(!replace_mode_);
         assign_tags_.setVisible(!replace_mode_);
@@ -587,12 +777,14 @@ public:
 
     [[nodiscard]] std::optional<LibraryManagerRow>
     performanceTarget() const {
-        if (detail_row_) {
+        if (detail_row_ && libraryManagerRowIsBody(*detail_row_)) {
             return detail_row_;
         }
         const auto selected = selectedRows();
-        if (!selected.empty()) {
-            return selected.front();
+        for (const auto& row : selected) {
+            if (libraryManagerRowIsBody(row)) {
+                return row;
+            }
         }
         return std::nullopt;
     }
@@ -614,6 +806,8 @@ public:
         }
         if (!detail_bounds_.isEmpty()) {
             strokeRoundedPanelFrame(graphics, detail_bounds_);
+            graphics.setColour(juce::Colour(UiLayout::panelStroke));
+            graphics.fillRect(splitterBounds());
         }
     }
 
@@ -621,7 +815,7 @@ public:
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(panelPad);
         auto controls = area.removeFromTop(fieldH);
-        category_.setBounds(controls.removeFromLeft(96));
+        category_.setBounds(controls.removeFromLeft(110));
         controls.removeFromLeft(controlGap);
         recent_used_.setBounds(controls.removeFromRight(150));
         controls.removeFromRight(controlGap);
@@ -637,6 +831,12 @@ public:
         area.removeFromTop(sm);
 
         auto buttons = area.removeFromBottom(textButtonH);
+        tree_mode_.setBounds(buttons.removeFromLeft(libraryButtonMinW));
+        buttons.removeFromLeft(controlGap);
+        new_set_.setBounds(buttons.removeFromLeft(libraryButtonMinW));
+        buttons.removeFromLeft(controlGap);
+        detail_toggle_.setBounds(buttons.removeFromLeft(libraryButtonMinW));
+        buttons.removeFromLeft(controlGap);
         close_.setBounds(buttons.removeFromRight(libraryButtonMinW));
         buttons.removeFromRight(controlGap);
         if (replace_.isVisible()) {
@@ -657,8 +857,12 @@ public:
         }
         area.removeFromBottom(sm);
 
-        detail_bounds_ = area.removeFromRight(280);
-        area.removeFromRight(panelGap);
+        detail_bounds_ = {};
+        if (detail_open_) {
+            detail_width_ = juce::jlimit(200, 480, detail_width_);
+            detail_bounds_ = area.removeFromRight(detail_width_);
+            area.removeFromRight(sm);
+        }
         table_bounds_ = area;
         table_.setBounds(table_bounds_.reduced(1));
 
@@ -666,9 +870,31 @@ public:
         layoutDetailHost();
     }
 
+    void mouseMove(const juce::MouseEvent& event) override {
+        setMouseCursor(
+            splitterHit(event.getPosition())
+                ? juce::MouseCursor::LeftRightResizeCursor
+                : juce::MouseCursor::NormalCursor);
+    }
+
+    void mouseDown(const juce::MouseEvent& event) override {
+        resizing_detail_ = splitterHit(event.getPosition());
+    }
+
+    void mouseDrag(const juce::MouseEvent& event) override {
+        if (!resizing_detail_ || !detail_open_) {
+            return;
+        }
+        const int right = getWidth() - UiLayout::panelPad;
+        detail_width_ = juce::jlimit(200, 480, right - event.x);
+        resized();
+    }
+
     void mouseUp(const juce::MouseEvent& event) override {
+        resizing_detail_ = false;
         if (event.eventComponent == &detail_favorite_
-            && detail_row_.has_value()) {
+            && detail_row_.has_value()
+            && libraryManagerRowIsBody(*detail_row_)) {
             const int index = indexOfDisplayedRow(*detail_row_);
             if (index >= 0) {
                 toggleFavoriteAt(index, *detail_row_);
@@ -777,12 +1003,25 @@ private:
     [[nodiscard]] int indexOfDisplayedRow(
         const LibraryManagerRow& row) const {
         for (std::size_t i = 0; i < displayed_rows_.size(); ++i) {
-            if (displayed_rows_[i].kind == row.kind
+            if (displayed_rows_[i].role == row.role
+                && displayed_rows_[i].set_id == row.set_id
+                && displayed_rows_[i].kind == row.kind
                 && displayed_rows_[i].id == row.id) {
                 return static_cast<int>(i);
             }
         }
         return -1;
+    }
+
+    [[nodiscard]] bool showsAllCategories() const {
+        return category_.getSelectedId() == 4;
+    }
+
+    [[nodiscard]] bool categoryAccepts(LibraryManagerKind kind) const {
+        if (showsAllCategories()) {
+            return true;
+        }
+        return kind == currentKind();
     }
 
     [[nodiscard]] LibraryManagerKind currentKind() const {
@@ -791,9 +1030,30 @@ private:
             return LibraryManagerKind::Opll;
         case 3:
             return LibraryManagerKind::Composite;
+        case 1:
+            return LibraryManagerKind::Scc;
         default:
             return LibraryManagerKind::Scc;
         }
+    }
+
+    [[nodiscard]] bool treeMode() const {
+        return tree_mode_.getToggleState() && !replace_mode_;
+    }
+
+    [[nodiscard]] juce::Rectangle<int> splitterBounds() const {
+        if (!detail_open_ || detail_bounds_.isEmpty()) {
+            return {};
+        }
+        return {
+            detail_bounds_.getX() - UiLayout::sm,
+            detail_bounds_.getY(),
+            UiLayout::sm,
+            detail_bounds_.getHeight()};
+    }
+
+    [[nodiscard]] bool splitterHit(juce::Point<int> position) const {
+        return splitterBounds().expanded(2, 0).contains(position);
     }
 
     [[nodiscard]] static int compareRows(
@@ -857,7 +1117,8 @@ private:
     currentCategoryTagSets() const {
         std::vector<std::vector<std::string>> tag_sets;
         const auto kind = currentKind();
-        if (kind == LibraryManagerKind::Composite) {
+        if (showsAllCategories()
+            || kind == LibraryManagerKind::Composite) {
             const auto* library = composites_();
             if (library == nullptr) {
                 return tag_sets;
@@ -865,6 +1126,12 @@ private:
             for (const auto& entry : library->entries()) {
                 tag_sets.push_back(entry.timbre.tags);
             }
+            if (!showsAllCategories()) {
+                return tag_sets;
+            }
+        }
+        if (!showsAllCategories()
+            && kind == LibraryManagerKind::Composite) {
             return tag_sets;
         }
         const auto* library = timbres_();
@@ -875,7 +1142,7 @@ private:
             ? mgstc::engine::TimbreCategory::Scc
             : mgstc::engine::TimbreCategory::Opll;
         for (const auto& entry : library->entries()) {
-            if (entry.category == category) {
+            if (showsAllCategories() || entry.category == category) {
                 tag_sets.push_back(entry.tags);
             }
         }
@@ -907,7 +1174,295 @@ private:
             });
     }
 
+    [[nodiscard]] bool textMatches(
+        const juce::String& name,
+        const juce::String& tags,
+        const juce::String& memo,
+        const juce::String& filter) const {
+        return filter.isEmpty()
+            || name.containsIgnoreCase(filter)
+            || tags.containsIgnoreCase(filter)
+            || memo.containsIgnoreCase(filter);
+    }
+
+    [[nodiscard]] bool setIsExpanded(std::uint64_t set_id) const {
+        return std::find(
+                   expanded_sets_.begin(),
+                   expanded_sets_.end(),
+                   set_id)
+            != expanded_sets_.end();
+    }
+
+    [[nodiscard]] std::vector<LibraryManagerRow> buildTreeRows() const {
+        std::vector<LibraryManagerRow> rows;
+        if (!tone_sets_ || !tone_members_) {
+            return rows;
+        }
+        const auto* sets = tone_sets_();
+        const auto* members = tone_members_();
+        const auto* timbres = timbres_();
+        const auto* composites = composites_();
+        if (sets == nullptr || members == nullptr) {
+            return rows;
+        }
+        if (!expansion_ready_) {
+            for (const auto& set : *sets) {
+                expanded_sets_.push_back(set.id);
+            }
+            expansion_ready_ = true;
+        }
+        const auto filter = filter_.getText().trim();
+        const bool favorites_only = favorite_only_.getToggleState();
+        const bool recent_used = recent_used_.getToggleState();
+        const int sort_column_id = table_model_.sortColumnId();
+        const bool sort_forwards = table_model_.sortForwards();
+        const bool searching = filter.isNotEmpty()
+            || favorites_only
+            || !selected_filter_tags_.empty();
+
+        auto accept_body = [&](LibraryManagerKind kind,
+                                bool favorite,
+                                const std::vector<std::string>& tags,
+                                const std::string& name,
+                                const std::string& memo) {
+            if (!categoryAccepts(kind)) {
+                return false;
+            }
+            if (favorites_only && !favorite) {
+                return false;
+            }
+            if (!mgstc::engine::containsAllTimbreTags(
+                    tags, selected_filter_tags_)) {
+                return false;
+            }
+            return textMatches(
+                juce::String::fromUTF8(name.c_str()),
+                juce::String::fromUTF8(
+                    mgstc::engine::serializeTimbreTags(tags).c_str()),
+                juce::String::fromUTF8(memo.c_str()),
+                filter);
+        };
+
+        std::vector<mgstc::engine::ToneSetRecord> ordered = *sets;
+        std::stable_sort(
+            ordered.begin(),
+            ordered.end(),
+            [](const auto& left, const auto& right) {
+                const auto left_name =
+                    juce::String::fromUTF8(left.name.c_str());
+                const auto right_name =
+                    juce::String::fromUTF8(right.name.c_str());
+                return left_name.compareIgnoreCase(right_name) < 0;
+            });
+
+        auto append_member = [&](std::uint64_t set_id,
+                                  bool composite,
+                                  std::uint64_t body_id) {
+            if (composite) {
+                const auto* entry =
+                    composites ? composites->find(body_id) : nullptr;
+                if (entry == nullptr
+                    || !accept_body(
+                        LibraryManagerKind::Composite,
+                        entry->timbre.favorite,
+                        entry->timbre.tags,
+                        entry->timbre.name,
+                        entry->timbre.memo)) {
+                    return false;
+                }
+                LibraryManagerRow row{
+                    LibraryManagerKind::Composite,
+                    entry->id,
+                    entry->timbre.name,
+                    entry->timbre.tags,
+                    entry->timbre.memo,
+                    entry->timbre.favorite,
+                    entry->revision,
+                    entry->updated_unix_seconds,
+                    entry->last_used_unix_seconds};
+                row.role = LibraryManagerRowRole::Member;
+                row.set_id = set_id;
+                rows.push_back(std::move(row));
+                return true;
+            }
+            const auto* entry = timbres ? timbres->find(body_id) : nullptr;
+            if (entry == nullptr) {
+                return false;
+            }
+            const auto kind = entry->category
+                    == mgstc::engine::TimbreCategory::Scc
+                ? LibraryManagerKind::Scc
+                : LibraryManagerKind::Opll;
+            if (!accept_body(
+                    kind,
+                    entry->favorite,
+                    entry->tags,
+                    entry->name,
+                    entry->memo)) {
+                return false;
+            }
+            LibraryManagerRow row{
+                kind,
+                entry->id,
+                entry->name,
+                entry->tags,
+                entry->memo,
+                entry->favorite,
+                entry->revision,
+                entry->updated_unix_seconds,
+                entry->last_used_unix_seconds};
+            row.role = LibraryManagerRowRole::Member;
+            row.set_id = set_id;
+            rows.push_back(std::move(row));
+            return true;
+        };
+
+        for (const auto& set : ordered) {
+            std::vector<mgstc::engine::ToneSetMemberRecord> owned;
+            for (const auto& member : *members) {
+                if (member.set_id == set.id) {
+                    owned.push_back(member);
+                }
+            }
+            std::stable_sort(
+                owned.begin(),
+                owned.end(),
+                [](const auto& left, const auto& right) {
+                    return left.position < right.position;
+                });
+            const auto saved_size = rows.size();
+            const bool open = searching || setIsExpanded(set.id);
+            if (open) {
+                for (const auto& member : owned) {
+                    if (member.composite_id != 0) {
+                        append_member(set.id, true, member.composite_id);
+                    } else if (member.timbre_id != 0) {
+                        append_member(set.id, false, member.timbre_id);
+                    }
+                }
+            }
+            const auto visible = static_cast<std::uint32_t>(
+                rows.size() - saved_size);
+            const bool name_matches = textMatches(
+                juce::String::fromUTF8(set.name.c_str()),
+                {},
+                juce::String::fromUTF8(set.memo.c_str()),
+                filter);
+            if (searching && visible == 0 && !name_matches) {
+                continue;
+            }
+            LibraryManagerRow header;
+            header.role = LibraryManagerRowRole::SetHeader;
+            header.id = set.id;
+            header.set_id = set.id;
+            header.name = set.name;
+            header.memo = set.memo;
+            header.revision = open
+                ? visible
+                : static_cast<std::uint32_t>(owned.size());
+            header.updated_unix_seconds = set.updated_unix_seconds;
+            header.expanded = open;
+            if (visible > 0) {
+                rows.insert(rows.begin() + static_cast<std::ptrdiff_t>(saved_size), header);
+            } else {
+                rows.push_back(header);
+            }
+        }
+
+        std::vector<LibraryManagerRow> unassigned;
+        auto consider = [&](LibraryManagerRow row) {
+            const bool owned = std::any_of(
+                members->begin(),
+                members->end(),
+                [&](const mgstc::engine::ToneSetMemberRecord& member) {
+                    return row.kind == LibraryManagerKind::Composite
+                        ? member.composite_id == row.id
+                        : member.timbre_id == row.id;
+                });
+            if (owned) {
+                return;
+            }
+            row.role = LibraryManagerRowRole::Timbre;
+            unassigned.push_back(std::move(row));
+        };
+        if (composites != nullptr && categoryAccepts(LibraryManagerKind::Composite)) {
+            for (const auto& entry : composites->entries()) {
+                if (!accept_body(
+                        LibraryManagerKind::Composite,
+                        entry.timbre.favorite,
+                        entry.timbre.tags,
+                        entry.timbre.name,
+                        entry.timbre.memo)) {
+                    continue;
+                }
+                consider({
+                    LibraryManagerKind::Composite,
+                    entry.id,
+                    entry.timbre.name,
+                    entry.timbre.tags,
+                    entry.timbre.memo,
+                    entry.timbre.favorite,
+                    entry.revision,
+                    entry.updated_unix_seconds,
+                    entry.last_used_unix_seconds});
+            }
+        }
+        if (timbres != nullptr) {
+            for (const auto& entry : timbres->entries()) {
+                const auto kind = entry.category
+                        == mgstc::engine::TimbreCategory::Scc
+                    ? LibraryManagerKind::Scc
+                    : LibraryManagerKind::Opll;
+                if (!accept_body(
+                        kind,
+                        entry.favorite,
+                        entry.tags,
+                        entry.name,
+                        entry.memo)) {
+                    continue;
+                }
+                consider({
+                    kind,
+                    entry.id,
+                    entry.name,
+                    entry.tags,
+                    entry.memo,
+                    entry.favorite,
+                    entry.revision,
+                    entry.updated_unix_seconds,
+                    entry.last_used_unix_seconds});
+            }
+        }
+        std::stable_sort(
+            unassigned.begin(),
+            unassigned.end(),
+            [&](const LibraryManagerRow& left, const LibraryManagerRow& right) {
+                return compareRows(
+                           left,
+                           right,
+                           recent_used,
+                           sort_column_id,
+                           sort_forwards)
+                    < 0;
+            });
+        if (!searching || !unassigned.empty()) {
+            LibraryManagerRow header;
+            header.role = LibraryManagerRowRole::UnassignedHeader;
+            header.name = "未所属";
+            header.revision = static_cast<std::uint32_t>(unassigned.size());
+            header.expanded = searching || unassigned_expanded_;
+            rows.push_back(header);
+            if (header.expanded) {
+                rows.insert(rows.end(), unassigned.begin(), unassigned.end());
+            }
+        }
+        return rows;
+    }
+
     [[nodiscard]] std::vector<LibraryManagerRow> buildRows() const {
+        if (treeMode()) {
+            return buildTreeRows();
+        }
         std::vector<LibraryManagerRow> rows;
         const auto kind = currentKind();
         const auto filter = filter_.getText().trim();
@@ -915,7 +1470,8 @@ private:
         const bool recent_used = recent_used_.getToggleState();
         const int sort_column_id = table_model_.sortColumnId();
         const bool sort_forwards = table_model_.sortForwards();
-        if (kind == LibraryManagerKind::Composite) {
+        if (showsAllCategories()
+            || kind == LibraryManagerKind::Composite) {
             const auto* library = composites_();
             if (library == nullptr) {
                 return rows;
@@ -955,7 +1511,9 @@ private:
                      entry.updated_unix_seconds,
                      entry.last_used_unix_seconds});
             }
-        } else {
+        }
+        if (showsAllCategories()
+            || kind != LibraryManagerKind::Composite) {
             const auto* library = timbres_();
             if (library == nullptr) {
                 return rows;
@@ -964,8 +1522,10 @@ private:
                 ? mgstc::engine::TimbreCategory::Scc
                 : mgstc::engine::TimbreCategory::Opll;
             for (const auto& entry : library->entries()) {
-                if (entry.category != category
-                    || (favorites_only && !entry.favorite)) {
+                if (!showsAllCategories() && entry.category != category) {
+                    continue;
+                }
+                if (favorites_only && !entry.favorite) {
                     continue;
                 }
                 if (!mgstc::engine::containsAllTimbreTags(
@@ -1022,11 +1582,7 @@ private:
                 return;
             }
         }
-        std::vector<std::pair<LibraryManagerKind, std::uint64_t>>
-            previously_selected;
-        for (const auto& row : selectedRows()) {
-            previously_selected.push_back({row.kind, row.id});
-        }
+        const auto previously_selected = selectedRows();
         displayed_rows_ = buildRows();
         table_model_.setRows(displayed_rows_);
         table_.updateContent();
@@ -1038,7 +1594,10 @@ private:
                 const auto& row = displayed_rows_[static_cast<std::size_t>(
                     index)];
                 for (const auto& key : previously_selected) {
-                    if (row.kind == key.first && row.id == key.second) {
+                    if (row.role == key.role
+                        && row.set_id == key.set_id
+                        && row.kind == key.kind
+                        && row.id == key.id) {
                         selection.addRange({index, index + 1});
                         break;
                     }
@@ -1090,6 +1649,45 @@ private:
         }
         detail_row_ = selected.front();
         const auto& row = *detail_row_;
+        if (row.role == LibraryManagerRowRole::UnassignedHeader) {
+            setDetailFieldsEditable(false);
+            detail_name_.setText(
+                juce::String::fromUTF8("未所属"),
+                juce::dontSendNotification);
+            detail_category_.setText(
+                juce::String::fromUTF8(
+                    "どのセットにも入っていない音色です"),
+                juce::dontSendNotification);
+            detail_favorite_.setText({}, juce::dontSendNotification);
+            rebuildDetailTagChips();
+            detail_memo_.setText({}, juce::dontSendNotification);
+            syncing_detail_ = false;
+            layoutDetailHost();
+            detail_viewport_.setViewPosition(0, 0);
+            notifyPerformanceTargetChanged(previous);
+            return;
+        }
+        if (row.role == LibraryManagerRowRole::SetHeader) {
+            setDetailFieldsEditable(!replace_mode_);
+            detail_name_.setText(
+                juce::String::fromUTF8(row.name.c_str()),
+                juce::dontSendNotification);
+            detail_category_.setText(
+                juce::String::fromUTF8("セット  ")
+                    + juce::String(static_cast<int>(row.revision))
+                    + juce::String::fromUTF8(" 件"),
+                juce::dontSendNotification);
+            detail_favorite_.setText({}, juce::dontSendNotification);
+            rebuildDetailTagChips();
+            detail_memo_.setText(
+                juce::String::fromUTF8(row.memo.c_str()),
+                juce::dontSendNotification);
+            syncing_detail_ = false;
+            layoutDetailHost();
+            detail_viewport_.setViewPosition(0, 0);
+            notifyPerformanceTargetChanged(previous);
+            return;
+        }
         setDetailFieldsEditable(!replace_mode_);
         detail_name_.setText(
             juce::String::fromUTF8(row.name.c_str()),
@@ -1183,13 +1781,30 @@ private:
             });
     }
 
+    class ExclusiveLibraryGuard {
+    public:
+        explicit ExclusiveLibraryGuard(juce::InterProcessLock* lock)
+            : lock_(
+                lock != nullptr
+                    ? std::make_unique<mgstc::app::ScopedLibraryIpcLock>(*lock)
+                    : nullptr) {}
+
+        [[nodiscard]] bool locked() const {
+            return lock_ == nullptr || lock_->isLocked();
+        }
+
+    private:
+        std::unique_ptr<mgstc::app::ScopedLibraryIpcLock> lock_;
+    };
+
     void removeDetailTag(const std::string& tag) {
-        if (!detail_row_) {
+        if (!detail_row_ || !libraryManagerRowIsBody(*detail_row_)) {
             return;
         }
         const auto kind = detail_row_->kind;
         const auto id = detail_row_->id;
-        if (!reload_ || !reload_()) {
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !reload_ || !reload_()) {
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::WarningIcon,
                 juce::String::fromUTF8("ライブラリ管理"),
@@ -1276,9 +1891,17 @@ private:
         if (requested == detail_row_->name) {
             return;
         }
+        if (detail_row_->role == LibraryManagerRowRole::SetHeader) {
+            commitSetName(detail_row_->id, requested);
+            return;
+        }
+        if (!libraryManagerRowIsBody(*detail_row_)) {
+            return;
+        }
         const auto kind = detail_row_->kind;
         const auto id = detail_row_->id;
-        if (!reload_ || !reload_()) {
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !reload_ || !reload_()) {
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::WarningIcon,
                 juce::String::fromUTF8("ライブラリ管理"),
@@ -1328,9 +1951,17 @@ private:
         if (requested == detail_row_->memo) {
             return;
         }
+        if (detail_row_->role == LibraryManagerRowRole::SetHeader) {
+            commitSetMemo(detail_row_->id, requested);
+            return;
+        }
+        if (!libraryManagerRowIsBody(*detail_row_)) {
+            return;
+        }
         const auto kind = detail_row_->kind;
         const auto id = detail_row_->id;
-        if (!reload_ || !reload_()) {
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !reload_ || !reload_()) {
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::WarningIcon,
                 juce::String::fromUTF8("ライブラリ管理"),
@@ -1396,8 +2027,15 @@ private:
         const LibraryManagerRow& row) {
         auto* mutable_row = table_model_.rowAtMutable(row_number);
         if (mutable_row == nullptr
+            || mutable_row->role != row.role
+            || mutable_row->set_id != row.set_id
             || mutable_row->id != row.id
             || mutable_row->kind != row.kind) {
+            return;
+        }
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !reload_ || !reload_()) {
+            refreshTable(true);
             return;
         }
         const auto now = mgstc::app::currentUnixTime();
@@ -1470,11 +2108,15 @@ private:
                     "複製する音色を選択してください"));
             return;
         }
-        if (!reload_ || !reload_()) {
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !reload_ || !reload_()) {
             return;
         }
         const auto now = mgstc::app::currentUnixTime();
         for (const auto& row : selected) {
+            if (!libraryManagerRowIsBody(row)) {
+                continue;
+            }
             if (row.kind == LibraryManagerKind::Composite) {
                 auto* library = composites_();
                 const auto* source = library ? library->find(row.id) : nullptr;
@@ -1510,19 +2152,52 @@ private:
     }
 
     void deleteSelected() {
-        const auto selected = selectedRows();
-        if (selected.empty()) {
+        std::vector<LibraryManagerRow> bodies;
+        std::vector<LibraryManagerRow> members;
+        std::vector<LibraryManagerRow> sets;
+        for (const auto& row : selectedRows()) {
+            if (row.role == LibraryManagerRowRole::Member) {
+                members.push_back(row);
+            } else if (row.role == LibraryManagerRowRole::SetHeader) {
+                sets.push_back(row);
+            } else if (row.role == LibraryManagerRowRole::Timbre) {
+                bodies.push_back(row);
+            }
+        }
+        const int groups = (bodies.empty() ? 0 : 1)
+            + (members.empty() ? 0 : 1)
+            + (sets.empty() ? 0 : 1);
+        if (groups == 0) {
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
                 juce::String::fromUTF8("ライブラリ管理"),
                 juce::String::fromUTF8(
-                    "削除する音色を選択してください"));
+                    "削除する音色またはセットを選択してください"));
             return;
         }
+        if (groups > 1) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::InfoIcon,
+                juce::String::fromUTF8("ライブラリ管理"),
+                juce::String::fromUTF8(
+                    "セットの削除、所属の解除、音色の削除は"
+                    "同時には実行できません"));
+            return;
+        }
+        if (!members.empty()) {
+            confirmRemoveMemberships(members);
+            return;
+        }
+        if (!sets.empty()) {
+            confirmDeleteSets(sets);
+            return;
+        }
+        const auto selected = bodies;
         juce::String message =
             juce::String::fromUTF8("選択した ")
             + juce::String(static_cast<int>(selected.size()))
-            + juce::String::fromUTF8(" 件をライブラリから削除しますか？");
+            + juce::String::fromUTF8(
+                " 件の音色をライブラリから削除しますか？");
         juce::Component::SafePointer<LibraryManagerListTab> safe(this);
         juce::AlertWindow::showAsync(
             juce::MessageBoxOptions()
@@ -1537,7 +2212,10 @@ private:
                 if (safe == nullptr || result != 1) {
                     return;
                 }
-                if (!safe->reload_ || !safe->reload_()) {
+                ExclusiveLibraryGuard guard(safe->shared_library_lock_);
+                if (!guard.locked()
+                    || !safe->reload_
+                    || !safe->reload_()) {
                     return;
                 }
                 for (const auto& row : selected) {
@@ -1593,11 +2271,17 @@ private:
                 if (safe == nullptr || additions.empty()) {
                     return;
                 }
-                if (!safe->reload_ || !safe->reload_()) {
+                ExclusiveLibraryGuard guard(safe->shared_library_lock_);
+                if (!guard.locked()
+                    || !safe->reload_
+                    || !safe->reload_()) {
                     return;
                 }
                 const auto now = mgstc::app::currentUnixTime();
                 for (const auto& row : selected) {
+                    if (!libraryManagerRowIsBody(row)) {
+                        continue;
+                    }
                     if (row.kind == LibraryManagerKind::Composite) {
                         auto* library = safe->composites_();
                         auto* entry =
@@ -1648,7 +2332,8 @@ private:
 
     void loadSelectedForEdit() {
         const auto selected = selectedRows();
-        if (selected.size() != 1) {
+        if (selected.size() != 1
+            || !libraryManagerRowIsBody(selected.front())) {
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
                 juce::String::fromUTF8("ライブラリ管理"),
@@ -1663,7 +2348,9 @@ private:
 
     void replaceSelected() {
         const auto selected = selectedRows();
-        if (selected.size() != 1 || !on_replace_) {
+        if (selected.size() != 1
+            || !libraryManagerRowIsBody(selected.front())
+            || !on_replace_) {
             juce::AlertWindow::showMessageBoxAsync(
                 juce::MessageBoxIconType::InfoIcon,
                 juce::String::fromUTF8("ライブラリ管理"),
@@ -1684,6 +2371,711 @@ private:
         }
     }
 
+    [[nodiscard]] bool lockAndReload() {
+        return reload_ && reload_();
+    }
+
+    void toggleExpanded(const LibraryManagerRow& row) {
+        if (row.role == LibraryManagerRowRole::UnassignedHeader) {
+            unassigned_expanded_ = !unassigned_expanded_;
+            refreshTable(false);
+            return;
+        }
+        if (row.role != LibraryManagerRowRole::SetHeader) {
+            return;
+        }
+        const auto found = std::find(
+            expanded_sets_.begin(), expanded_sets_.end(), row.id);
+        if (found == expanded_sets_.end()) {
+            expanded_sets_.push_back(row.id);
+        } else {
+            expanded_sets_.erase(found);
+        }
+        refreshTable(false);
+    }
+
+    void createSet() {
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !lockAndReload() || !tone_sets_
+            || !persist_sets_) {
+            return;
+        }
+        auto* sets = tone_sets_();
+        if (sets == nullptr) {
+            return;
+        }
+        const auto now = mgstc::app::currentUnixTime();
+        mgstc::engine::ToneSetRecord created;
+        created.id = librarySetNextId(*sets);
+        created.name = librarySetUniqueName(*sets, "新しいセット");
+        created.created_unix_seconds = now;
+        created.updated_unix_seconds = now;
+        sets->push_back(created);
+        expanded_sets_.push_back(created.id);
+        if (!persist_sets_()) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("ライブラリ管理"),
+                juce::String::fromUTF8("セットを保存できませんでした"));
+            refreshTable(true);
+            return;
+        }
+        refreshTable(false);
+    }
+
+    void commitSetName(std::uint64_t set_id, const std::string& name) {
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !lockAndReload() || !tone_sets_
+            || !persist_sets_) {
+            restoreDetailNameField();
+            return;
+        }
+        auto* sets = tone_sets_();
+        if (sets == nullptr) {
+            return;
+        }
+        if (librarySetNameTaken(*sets, name, set_id)) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("ライブラリ管理"),
+                juce::String::fromUTF8(
+                    "同じ名前のセットが既にあります"));
+            restoreDetailNameField();
+            return;
+        }
+        const auto found = std::find_if(
+            sets->begin(),
+            sets->end(),
+            [&](const mgstc::engine::ToneSetRecord& set) {
+                return set.id == set_id;
+            });
+        if (found == sets->end()) {
+            restoreDetailNameField();
+            return;
+        }
+        found->name = name;
+        found->updated_unix_seconds = mgstc::app::currentUnixTime();
+        ++found->revision;
+        if (!persist_sets_()) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("ライブラリ管理"),
+                juce::String::fromUTF8(
+                    "セット名を保存できませんでした"));
+            refreshTable(true);
+            return;
+        }
+        refreshTable(false);
+    }
+
+    void commitSetMemo(std::uint64_t set_id, const std::string& memo) {
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !lockAndReload() || !tone_sets_
+            || !persist_sets_) {
+            return;
+        }
+        auto* sets = tone_sets_();
+        if (sets == nullptr) {
+            return;
+        }
+        const auto found = std::find_if(
+            sets->begin(),
+            sets->end(),
+            [&](const mgstc::engine::ToneSetRecord& set) {
+                return set.id == set_id;
+            });
+        if (found == sets->end()) {
+            return;
+        }
+        found->memo = memo;
+        found->updated_unix_seconds = mgstc::app::currentUnixTime();
+        ++found->revision;
+        if (!persist_sets_()) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("ライブラリ管理"),
+                juce::String::fromUTF8(
+                    "セットのメモを保存できませんでした"));
+            refreshTable(true);
+            return;
+        }
+        refreshTable(false);
+    }
+
+    void confirmRemoveMemberships(
+        std::vector<LibraryManagerRow> members) {
+        juce::Component::SafePointer<LibraryManagerListTab> safe(this);
+        juce::AlertWindow::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::WarningIcon)
+                .withTitle(juce::String::fromUTF8("ライブラリ管理"))
+                .withMessage(juce::String::fromUTF8(
+                    "選択した音色を、そのセットから外します。"
+                    "音色自体と、ほかのセットの所属は残します。"))
+                .withButton(juce::String::fromUTF8("セットから外す"))
+                .withButton(juce::String::fromUTF8("キャンセル"))
+                .withAssociatedComponent(this),
+            [safe, members](int result) {
+                if (safe == nullptr || result != 1) {
+                    return;
+                }
+                ExclusiveLibraryGuard guard(safe->shared_library_lock_);
+                if (!guard.locked() || !safe->lockAndReload()
+                    || !safe->tone_members_ || !safe->persist_sets_) {
+                    return;
+                }
+                auto* stored = safe->tone_members_();
+                if (stored == nullptr) {
+                    return;
+                }
+                for (const auto& row : members) {
+                    librarySetRemoveMembership(
+                        *stored,
+                        row.set_id,
+                        row.kind == LibraryManagerKind::Composite,
+                        row.id);
+                }
+                if (!safe->persist_sets_()) {
+                    juce::AlertWindow::showMessageBoxAsync(
+                        juce::MessageBoxIconType::WarningIcon,
+                        juce::String::fromUTF8("ライブラリ管理"),
+                        juce::String::fromUTF8(
+                            "所属の変更を保存できませんでした"));
+                }
+                safe->refreshTable(true);
+            });
+    }
+
+    void confirmDeleteSets(std::vector<LibraryManagerRow> sets) {
+        juce::Component::SafePointer<LibraryManagerListTab> safe(this);
+        juce::AlertWindow::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::WarningIcon)
+                .withTitle(juce::String::fromUTF8("ライブラリ管理"))
+                .withMessage(
+                    juce::String::fromUTF8("選択した ")
+                    + juce::String(static_cast<int>(sets.size()))
+                    + juce::String::fromUTF8(
+                        " 件のセットを削除します。"
+                        "音色自体は残ります。"))
+                .withButton(juce::String::fromUTF8("セットを削除"))
+                .withButton(juce::String::fromUTF8("キャンセル"))
+                .withAssociatedComponent(this),
+            [safe, sets](int result) {
+                if (safe == nullptr || result != 1) {
+                    return;
+                }
+                ExclusiveLibraryGuard guard(safe->shared_library_lock_);
+                if (!guard.locked() || !safe->lockAndReload()
+                    || !safe->tone_sets_ || !safe->tone_members_
+                    || !safe->persist_sets_) {
+                    return;
+                }
+                auto* stored_sets = safe->tone_sets_();
+                auto* stored_members = safe->tone_members_();
+                if (stored_sets == nullptr || stored_members == nullptr) {
+                    return;
+                }
+                for (const auto& row : sets) {
+                    librarySetDelete(*stored_sets, *stored_members, row.id);
+                }
+                if (!safe->persist_sets_()) {
+                    juce::AlertWindow::showMessageBoxAsync(
+                        juce::MessageBoxIconType::WarningIcon,
+                        juce::String::fromUTF8("ライブラリ管理"),
+                        juce::String::fromUTF8(
+                            "セットの削除を保存できませんでした"));
+                }
+                safe->refreshTable(true);
+            });
+    }
+
+    void duplicateSet(std::uint64_t set_id) {
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !lockAndReload() || !tone_sets_
+            || !tone_members_ || !persist_sets_) {
+            return;
+        }
+        auto* sets = tone_sets_();
+        auto* members = tone_members_();
+        if (sets == nullptr || members == nullptr) {
+            return;
+        }
+        const auto found = std::find_if(
+            sets->begin(),
+            sets->end(),
+            [&](const mgstc::engine::ToneSetRecord& set) {
+                return set.id == set_id;
+            });
+        if (found == sets->end()) {
+            return;
+        }
+        const auto now = mgstc::app::currentUnixTime();
+        mgstc::engine::ToneSetRecord copy = *found;
+        copy.id = librarySetNextId(*sets);
+        copy.name = librarySetUniqueName(*sets, found->name);
+        copy.created_unix_seconds = now;
+        copy.updated_unix_seconds = now;
+        copy.revision = 1;
+        const auto source_id = found->id;
+        sets->push_back(copy);
+        const auto snapshot = *members;
+        for (const auto& member : snapshot) {
+            if (member.set_id != source_id) {
+                continue;
+            }
+            auto cloned = member;
+            cloned.set_id = copy.id;
+            members->push_back(cloned);
+        }
+        expanded_sets_.push_back(copy.id);
+        if (!persist_sets_()) {
+            refreshTable(true);
+            return;
+        }
+        refreshTable(false);
+    }
+
+    void paintRowMiniPreview(
+        juce::Graphics& graphics,
+        juce::Rectangle<float> area,
+        const LibraryManagerRow& row) {
+        if (!libraryManagerRowIsBody(row) || area.isEmpty()) {
+            return;
+        }
+        graphics.setColour(juce::Colour(0xFF182028));
+        graphics.fillRoundedRectangle(area, 3.0F);
+        const auto graph = area.reduced(3.0F, 2.0F);
+        graphics.setColour(juce::Colour(0xFF586675));
+        graphics.drawHorizontalLine(
+            juce::roundToInt(graph.getCentreY()),
+            graph.getX(),
+            graph.getRight());
+        if (row.kind == LibraryManagerKind::Composite) {
+            const auto* library = composites_();
+            const auto* entry = library ? library->find(row.id) : nullptr;
+            if (entry != nullptr) {
+                paintToneMiniEnvelope(graphics, graph, entry->timbre);
+            }
+            return;
+        }
+        const auto* library = timbres_();
+        const auto* entry = library ? library->find(row.id) : nullptr;
+        if (entry == nullptr) {
+            return;
+        }
+        if (row.kind == LibraryManagerKind::Scc) {
+            mgstc::engine::SccWaveform wave{};
+            for (std::size_t index = 0; index < wave.size(); ++index) {
+                wave[index] = std::bit_cast<std::int8_t>(
+                    entry->scc_waveform[index]);
+            }
+            paintToneMiniWave(graphics, graph, wave);
+            return;
+        }
+        const auto trace = mgstc::engine::traceOpllEnvelope(
+            mgstc::engine::decodeOpllPatch(entry->opll_registers), 60);
+        if (trace.valid) {
+            paintToneMiniLevels(
+                graphics, graph, trace.carrier, juce::Colour(kUiHoverAccent));
+        }
+    }
+
+    [[nodiscard]] std::vector<LibrarySetDragItem> dragItemsForRow(
+        int row_number) const {
+        std::vector<LibraryManagerRow> chosen;
+        const auto selected = selectedRows();
+        const auto* clicked = table_model_.rowAt(row_number);
+        if (clicked == nullptr || !libraryManagerRowIsBody(*clicked)) {
+            return {};
+        }
+        const bool clicked_selected = std::any_of(
+            selected.begin(),
+            selected.end(),
+            [&](const LibraryManagerRow& row) {
+                return row.role == clicked->role
+                    && row.set_id == clicked->set_id
+                    && row.kind == clicked->kind
+                    && row.id == clicked->id;
+            });
+        if (clicked_selected) {
+            for (const auto& row : selected) {
+                if (libraryManagerRowIsBody(row)) {
+                    chosen.push_back(row);
+                }
+            }
+        } else {
+            chosen.push_back(*clicked);
+        }
+        std::vector<LibrarySetDragItem> items;
+        for (const auto& row : chosen) {
+            LibrarySetDragItem item;
+            item.source_set_id =
+                row.role == LibraryManagerRowRole::Member ? row.set_id : 0;
+            item.composite = row.kind == LibraryManagerKind::Composite;
+            item.body_id = row.id;
+            items.push_back(item);
+        }
+        return items;
+    }
+
+    [[nodiscard]] bool canDragRow(int row_number) const {
+        return !dragItemsForRow(row_number).empty();
+    }
+
+    void startRowDrag(int row_number) {
+        drag_items_ = dragItemsForRow(row_number);
+        if (drag_items_.empty()) {
+            return;
+        }
+        startDragging(
+            juce::var("mgstc-tone-membership"),
+            &table_,
+            juce::ScaledImage{},
+            false);
+    }
+
+    [[nodiscard]] bool dropInterested(const juce::var& description) const {
+        return description == juce::var("mgstc-tone-membership")
+            && !drag_items_.empty();
+    }
+
+    void completeDrop(int row_number) {
+        const auto items = drag_items_;
+        drag_items_.clear();
+        if (items.empty() || !tone_members_) {
+            return;
+        }
+        const auto* row = table_model_.rowAt(row_number);
+        if (row == nullptr) {
+            return;
+        }
+        LibrarySetDropTarget target;
+        if (row->role == LibraryManagerRowRole::UnassignedHeader
+            || row->role == LibraryManagerRowRole::Timbre) {
+            target.place = LibrarySetDropPlace::Unassigned;
+        } else if (row->role == LibraryManagerRowRole::SetHeader) {
+            target.place = LibrarySetDropPlace::SetHeader;
+            target.set_id = row->id;
+        } else if (row->role == LibraryManagerRowRole::Member) {
+            target.place = LibrarySetDropPlace::Member;
+            target.set_id = row->set_id;
+            target.composite = row->kind == LibraryManagerKind::Composite;
+            target.body_id = row->id;
+        } else {
+            return;
+        }
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !lockAndReload()) {
+            return;
+        }
+        auto* members = tone_members_();
+        if (members == nullptr || !persist_sets_) {
+            return;
+        }
+        const bool ctrl =
+            juce::ModifierKeys::getCurrentModifiers().isCtrlDown();
+        if (!applyLibrarySetDrop(*members, items, target, ctrl)) {
+            refreshTable(false);
+            return;
+        }
+        if (!persist_sets_()) {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("ライブラリ管理"),
+                juce::String::fromUTF8("所属の変更を保存できませんでした"));
+            refreshTable(true);
+            return;
+        }
+        refreshTable(false);
+    }
+
+    void addMembersToSet(
+        std::vector<LibraryManagerRow> rows,
+        std::uint64_t set_id,
+        bool move_from_source) {
+        ExclusiveLibraryGuard guard(shared_library_lock_);
+        if (!guard.locked() || !lockAndReload() || !tone_members_
+            || !persist_sets_) {
+            return;
+        }
+        auto* members = tone_members_();
+        if (members == nullptr) {
+            return;
+        }
+        std::vector<LibrarySetDragItem> items;
+        for (const auto& row : rows) {
+            if (!libraryManagerRowIsBody(row)) {
+                continue;
+            }
+            LibrarySetDragItem item;
+            item.source_set_id =
+                row.role == LibraryManagerRowRole::Member ? row.set_id : 0;
+            item.composite = row.kind == LibraryManagerKind::Composite;
+            item.body_id = row.id;
+            items.push_back(item);
+        }
+        LibrarySetDropTarget target;
+        target.place = LibrarySetDropPlace::SetHeader;
+        target.set_id = set_id;
+        if (!applyLibrarySetDrop(
+                *members, items, target, !move_from_source)) {
+            return;
+        }
+        if (!persist_sets_()) {
+            refreshTable(true);
+            return;
+        }
+        refreshTable(false);
+    }
+
+    void showRowContextMenu(const LibraryManagerRow& anchor) {
+        juce::PopupMenu menu;
+        menu.addItem(1, juce::String::fromUTF8("セットを追加"));
+        const bool header =
+            anchor.role == LibraryManagerRowRole::SetHeader;
+        const bool member =
+            anchor.role == LibraryManagerRowRole::Member;
+        const bool body = libraryManagerRowIsBody(anchor);
+        if (header) {
+            menu.addItem(2, juce::String::fromUTF8("セットを複製"));
+            menu.addItem(3, juce::String::fromUTF8("セットを削除"));
+            menu.addItem(
+                4,
+                anchor.expanded
+                    ? juce::String::fromUTF8("折りたたむ")
+                    : juce::String::fromUTF8("展開する"));
+        }
+        if (member) {
+            menu.addItem(5, juce::String::fromUTF8("このセットから外す"));
+        }
+        if (body) {
+            menu.addItem(
+                6, juce::String::fromUTF8("ライブラリから音色を削除"));
+        }
+        if (header || body) {
+            menu.addItem(
+                7, juce::String::fromUTF8("エクスポート対象に追加"));
+        }
+        juce::PopupMenu add_to;
+        juce::PopupMenu move_to;
+        if (body && tone_sets_) {
+            if (const auto* sets = tone_sets_()) {
+                int id = 100;
+                for (const auto& set : *sets) {
+                    add_to.addItem(
+                        id,
+                        juce::String::fromUTF8(set.name.c_str()));
+                    move_to.addItem(
+                        id + 1000,
+                        juce::String::fromUTF8(set.name.c_str()));
+                    ++id;
+                }
+            }
+        }
+        if (add_to.getNumItems() > 0) {
+            menu.addSubMenu(
+                juce::String::fromUTF8("セットへ追加"), add_to);
+            if (member) {
+                menu.addSubMenu(
+                    juce::String::fromUTF8("セットへ移動"), move_to);
+            }
+        }
+        const auto selected = selectedRows();
+        juce::Component::SafePointer<LibraryManagerListTab> safe(this);
+        menu.showMenuAsync(
+            juce::PopupMenu::Options().withTargetComponent(&table_),
+            [safe, anchor, selected](int result) {
+                if (safe == nullptr || result == 0) {
+                    return;
+                }
+                if (result == 1) {
+                    safe->createSet();
+                } else if (result == 2) {
+                    safe->duplicateSet(anchor.id);
+                } else if (result == 3) {
+                    safe->confirmDeleteSets({anchor});
+                } else if (result == 4) {
+                    safe->toggleExpanded(anchor);
+                } else if (result == 5) {
+                    safe->confirmRemoveMemberships({anchor});
+                } else if (result == 6) {
+                    safe->deleteBodies({anchor});
+                } else if (result == 7) {
+                    if (safe->export_add_) {
+                        auto rows = selected;
+                        if (rows.empty()) {
+                            rows.push_back(anchor);
+                        }
+                        safe->export_add_(rows);
+                    }
+                } else if (result >= 100 && result < 1000) {
+                    const auto set_index = result - 100;
+                    if (safe->tone_sets_) {
+                        if (const auto* sets = safe->tone_sets_()) {
+                            if (set_index >= 0
+                                && set_index
+                                    < static_cast<int>(sets->size())) {
+                                const auto rows = selected.empty()
+                                    ? std::vector<LibraryManagerRow>{anchor}
+                                    : selected;
+                                safe->addMembersToSet(
+                                    rows,
+                                    (*sets)[static_cast<std::size_t>(
+                                        set_index)]
+                                        .id,
+                                    false);
+                            }
+                        }
+                    }
+                } else if (result >= 1100) {
+                    const auto set_index = result - 1100;
+                    if (safe->tone_sets_) {
+                        if (const auto* sets = safe->tone_sets_()) {
+                            if (set_index >= 0
+                                && set_index
+                                    < static_cast<int>(sets->size())) {
+                                const auto rows = selected.empty()
+                                    ? std::vector<LibraryManagerRow>{anchor}
+                                    : selected;
+                                safe->addMembersToSet(
+                                    rows,
+                                    (*sets)[static_cast<std::size_t>(
+                                        set_index)]
+                                        .id,
+                                    true);
+                            }
+                        }
+                    }
+                }
+            });
+    }
+
+    void deleteBodies(std::vector<LibraryManagerRow> bodies) {
+        juce::Component::SafePointer<LibraryManagerListTab> safe(this);
+        juce::AlertWindow::showAsync(
+            juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::WarningIcon)
+                .withTitle(juce::String::fromUTF8("ライブラリ管理"))
+                .withMessage(juce::String::fromUTF8(
+                    "選択した音色をライブラリから削除します。"
+                    "セットの所属も一緒に消えます。"))
+                .withButton(juce::String::fromUTF8("音色を削除"))
+                .withButton(juce::String::fromUTF8("キャンセル"))
+                .withAssociatedComponent(this),
+            [safe, bodies](int result) {
+                if (safe == nullptr || result != 1 || !safe->persist_) {
+                    return;
+                }
+                ExclusiveLibraryGuard guard(safe->shared_library_lock_);
+                if (!guard.locked() || !safe->lockAndReload()) {
+                    return;
+                }
+                for (const auto& row : bodies) {
+                    if (row.kind == LibraryManagerKind::Composite) {
+                        if (auto* library = safe->composites_()) {
+                            library->erase(row.id);
+                        }
+                    } else if (auto* library = safe->timbres_()) {
+                        library->erase(row.id);
+                    }
+                }
+                if (!safe->persist_()) {
+                    juce::AlertWindow::showMessageBoxAsync(
+                        juce::MessageBoxIconType::WarningIcon,
+                        juce::String::fromUTF8("ライブラリ管理"),
+                        juce::String::fromUTF8(
+                            "削除結果を保存できませんでした"));
+                }
+                safe->refreshTable(true);
+                safe->notifyLibrariesChanged();
+            });
+    }
+
+    class SetTable final
+        : public juce::TableListBox,
+          public juce::DragAndDropTarget {
+    public:
+        explicit SetTable(LibraryManagerListTab& owner)
+            : owner_(owner) {
+            setWantsKeyboardFocus(true);
+        }
+
+        void mouseDown(const juce::MouseEvent& event) override {
+            drag_row_ = rowUnder(event);
+            drag_started_ = false;
+            juce::TableListBox::mouseDown(event);
+        }
+
+        void mouseDrag(const juce::MouseEvent& event) override {
+            if (!drag_started_
+                && event.getDistanceFromDragStart() >= 8
+                && owner_.canDragRow(drag_row_)) {
+                drag_started_ = true;
+                owner_.startRowDrag(drag_row_);
+                return;
+            }
+            if (!drag_started_) {
+                juce::TableListBox::mouseDrag(event);
+            }
+        }
+
+        bool keyPressed(const juce::KeyPress& key) override {
+            if (key == juce::KeyPress::deleteKey
+                || key == juce::KeyPress::backspaceKey) {
+                owner_.deleteSelected();
+                return true;
+            }
+            if (key.getKeyCode() == juce::KeyPress::F10Key
+                && key.getModifiers().isShiftDown()) {
+                const auto chosen = owner_.selectedRows();
+                if (!chosen.empty()) {
+                    owner_.showRowContextMenu(chosen.front());
+                }
+                return true;
+            }
+            if (key == juce::KeyPress::rightKey
+                || key == juce::KeyPress::leftKey) {
+                const auto chosen = owner_.selectedRows();
+                if (chosen.size() == 1
+                    && libraryManagerRowIsHeader(chosen.front())) {
+                    const bool expand =
+                        key == juce::KeyPress::rightKey;
+                    if (chosen.front().expanded != expand) {
+                        owner_.toggleExpanded(chosen.front());
+                    }
+                    return true;
+                }
+            }
+            return juce::TableListBox::keyPressed(key);
+        }
+
+        bool isInterestedInDragSource(
+            const SourceDetails& details) override {
+            return owner_.dropInterested(details.description);
+        }
+
+        void itemDropped(const SourceDetails& details) override {
+            juce::ignoreUnused(details);
+            owner_.completeDrop(rowUnder(details.localPosition));
+        }
+
+    private:
+        [[nodiscard]] int rowUnder(juce::Point<int> position) const {
+            return getRowContainingPosition(position.x, position.y);
+        }
+
+        [[nodiscard]] int rowUnder(const juce::MouseEvent& event) {
+            const auto position =
+                event.getEventRelativeTo(this).getPosition();
+            return rowUnder(position);
+        }
+
+        LibraryManagerListTab& owner_;
+        int drag_row_{-1};
+        bool drag_started_{false};
+    };
+
     PreviewCallback preview_;
     OpenEditorCallback open_editor_;
     ReloadCallback reload_;
@@ -1693,6 +3085,12 @@ private:
         composites_;
     PerformanceTargetChangedCallback performance_target_changed_;
     LibrariesChangedCallback libraries_changed_;
+    juce::InterProcessLock* shared_library_lock_{};
+    std::function<std::vector<mgstc::engine::ToneSetRecord>*()> tone_sets_;
+    std::function<std::vector<mgstc::engine::ToneSetMemberRecord>*()>
+        tone_members_;
+    std::function<bool()> persist_sets_;
+    std::function<void(const std::vector<LibraryManagerRow>&)> export_add_;
     juce::TooltipWindow tooltip_window_;
     SwitchLookAndFeel switch_look_and_feel_;
     juce::ComboBox category_;
@@ -1700,8 +3098,18 @@ private:
     juce::TextButton tag_filter_;
     juce::ToggleButton favorite_only_;
     juce::ToggleButton recent_used_;
+    juce::ToggleButton tree_mode_;
+    juce::TextButton new_set_;
+    juce::TextButton detail_toggle_;
+    bool detail_open_{true};
+    int detail_width_{280};
+    bool resizing_detail_{false};
+    mutable std::vector<std::uint64_t> expanded_sets_;
+    mutable bool expansion_ready_{false};
+    mutable bool unassigned_expanded_{true};
+    std::vector<LibrarySetDragItem> drag_items_;
     LibraryManagerTableModel table_model_;
-    juce::TableListBox table_;
+    SetTable table_;
     juce::Rectangle<int> table_bounds_;
     juce::Rectangle<int> detail_bounds_;
     std::vector<LibraryManagerRow> displayed_rows_;

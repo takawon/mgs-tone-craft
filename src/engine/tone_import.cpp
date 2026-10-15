@@ -1,5 +1,6 @@
 #include "mgstc/engine/tone_import.hpp"
 
+#include "mgstc/engine/furnace_exchange.hpp"
 #include "mgstc/engine/gzip_inflate.hpp"
 #include "tone_import_internal.hpp"
 
@@ -835,6 +836,10 @@ const char* toneImportFormatName(ToneImportFormat format) noexcept {
         return "VGM";
     case ToneImportFormat::Vgz:
         return "VGZ";
+    case ToneImportFormat::FurnaceInstrument:
+        return "FUI";
+    case ToneImportFormat::FurnaceWavetable:
+        return "FUW";
     case ToneImportFormat::Unknown:
         break;
     }
@@ -891,6 +896,10 @@ void applyDefaultImportNames(ToneImportResult& result) {
 ToneImportFormat detectToneImportFormat(
     std::span<const std::uint8_t> bytes,
     std::string_view extension) {
+    if (const auto furnace = detectFurnaceToneFormat(bytes);
+        furnace != ToneImportFormat::Unknown) {
+        return furnace;
+    }
     if (looksLikeGzip(bytes) && [&] {
             std::string error;
             const auto inflated = inflateGzip(bytes, &error);
@@ -990,6 +999,10 @@ ToneImportResult importTones(
     case ToneImportFormat::SccMusixxSng:
         result = importSccMusixxSng(bytes);
         break;
+    case ToneImportFormat::FurnaceInstrument:
+    case ToneImportFormat::FurnaceWavetable:
+        result = importFurnaceTones(bytes, source_name);
+        break;
     case ToneImportFormat::Unknown:
         break;
     }
@@ -1012,6 +1025,8 @@ TimbreLibraryEntry makeImportedLibraryEntry(
     entry.favorite = candidate.favorite;
     if (register_as == ImportRegisterAs::Opll) {
         entry.category = TimbreCategory::Opll;
+        entry.tags = candidate.tags;
+        entry.memo = candidate.memo;
         if (const auto* patch =
                 std::get_if<OpllPatchParameters>(&candidate.data)) {
             entry.opll_registers = encodeOpllPatch(*patch);
@@ -1022,6 +1037,8 @@ TimbreLibraryEntry makeImportedLibraryEntry(
         }
     } else {
         entry.category = TimbreCategory::Scc;
+        entry.tags = candidate.tags;
+        entry.memo = candidate.memo;
         if (const auto* wave = std::get_if<SccWaveform>(&candidate.data)) {
             entry.scc_waveform = sccWaveformToBytes(*wave);
         } else if (

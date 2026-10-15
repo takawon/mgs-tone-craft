@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 #include "mgstc/engine/composite_timbre_library.hpp"
+#include "mgstc/engine/furnace_exchange.hpp"
 #include "mgstc/engine/composite_program_compiler.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/mgs_composite_io.hpp"
+#include "mgstc/engine/mgs_envelope_io.hpp"
 #include "mgstc/engine/mgs_timbre_io.hpp"
 #include "mgstc/engine/scc_morph.hpp"
 #include "mgstc/engine/tone_library_store.hpp"
@@ -24,6 +26,7 @@
 #include <map>
 #include <numbers>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -2086,6 +2089,50 @@ void testSessionAllocationStarts() {
     }
 }
 
+void testFurnaceMorphExportFollowsCompiledEnvelope() {
+    auto source = morphProgram(sawWave(), sawWave(3, 8), 0, 20, 2);
+    const auto compiled = compileSccMorph(source);
+    require(compiled.valid, "morph compiles before Furnace wave export");
+    const auto numbers = resolveTimbreNumbers(compiled.timbre);
+    const auto formatted = formatMgsCompositeEnvelope(
+        compiled.timbre.layers[0],
+        compiled.timbre.layers[0].envelope_number,
+        kMgscEnvelopeCompiledByteLimit,
+        &numbers);
+    std::vector<int> expected;
+    std::set<int> seen;
+    for (std::size_t position = 0; position < formatted.bytecode.size();) {
+        const auto opcode = formatted.bytecode[position];
+        if (opcode == 0x60) {
+            break;
+        }
+        std::size_t step = 1;
+        if (opcode == 0x11) {
+            step = 3;
+        } else if (opcode == 0x10 || opcode == 0x12
+            || (opcode >= 0x20 && opcode <= 0x2F) || opcode >= 0xE0) {
+            step = 2;
+        }
+        if (position + step > formatted.bytecode.size()) {
+            break;
+        }
+        if (opcode == 0x10 && seen.insert(formatted.bytecode[position + 1]).second) {
+            expected.push_back(formatted.bytecode[position + 1]);
+        }
+        position += step;
+    }
+    require(!expected.empty(), "compiled morph envelope names at least one tone");
+    const auto exported = exportFurnaceWavetables(source);
+    require(exported.files.size() == expected.size(),
+            "Furnace wave count matches first-seen @e tone numbers");
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const auto token = "@" + std::to_string(expected[index]) + "_";
+        require(exported.files[index].filename.find(token) != std::string::npos,
+                "Furnace wave order follows the compiled envelope");
+    }
+    require(exported.partial, "waveform export does not claim the morph timing");
+}
+
 void testMaterializedMgscOutput() {
     for (int fixture = 0; fixture < 3; ++fixture) {
     const auto bank_base = static_cast<std::uint8_t>(fixture == 1 ? 16 : 0);
@@ -2383,6 +2430,7 @@ int main() {
         testDormantRateMorph();
         testCacheInvalidationAndSaveRoundTrips();
         testSessionAllocationStarts();
+        testFurnaceMorphExportFollowsCompiledEnvelope();
         testMaterializedMgscOutput();
         testSccMorphDiagnosticFixture();
         printSccMorphDigest();
