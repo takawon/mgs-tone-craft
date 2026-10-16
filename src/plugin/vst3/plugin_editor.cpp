@@ -14,7 +14,7 @@ public:
         const juce::String& title,
         juce::Component* content)
         : DocumentWindow(
-            title,
+            mgstc::app::editorWindowTitle(title),
             juce::Colour(0xFF1B222C),
             DocumentWindow::allButtons) {
         setUsingNativeTitleBar(true);

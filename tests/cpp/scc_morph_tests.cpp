@@ -2131,6 +2131,50 @@ void testFurnaceMorphExportFollowsCompiledEnvelope() {
                 "Furnace wave order follows the compiled envelope");
     }
     require(exported.partial, "waveform export does not claim the morph timing");
+    for (const auto mode : {SccMorphDistributionMode::AdaptiveDistribution,
+             SccMorphDistributionMode::TimeDistribution, SccMorphDistributionMode::ToneDistribution}) {
+        for (auto& event : source.layers[0].timbre_automation)
+            if (event.scc_morph.enabled) {
+                event.scc_morph.distribution_mode = mode;
+                event.scc_morph.curve = 0.5;
+            }
+        const auto prepared = compileSccMorph(source);
+        require(prepared.valid, "all distribution modes compile for wave comparison");
+        const auto assigned = resolveTimbreNumbers(prepared.timbre);
+        const auto files = exportFurnaceWavetables(source);
+        require(!files.files.empty(), "morph wave sample comparison exports waves");
+        for (const auto& file : files.files) {
+            const auto number_at = file.filename.find("_@") + 2;
+            const auto number = std::stoi(file.filename.substr(number_at));
+            const auto assignment = std::find_if(assigned.assignments.begin(), assigned.assignments.end(),
+                [&](const auto& value) { return value.number == number && value.layer_index == 0; });
+            require(assignment != assigned.assignments.end(), "exported number has a compiled assignment");
+            const auto* snapshot = findEmbeddedTimbreSnapshot(prepared.timbre, assignment->library_id);
+            require(snapshot != nullptr, "exported number has a compiled waveform");
+            require(file.bytes.size() >= 28, "fuw header and WAVE block are present");
+            auto position = static_cast<std::size_t>(std::find(file.bytes.begin() + 28,
+                file.bytes.end(), std::uint8_t{0}) - file.bytes.begin()) + 1;
+            const auto read_u32 = [&]() {
+                require(position + 4 <= file.bytes.size(), "fuw contains the next complete 32-bit value");
+                std::uint32_t value{};
+                for (int byte = 0; byte < 4; ++byte)
+                    value |= static_cast<std::uint32_t>(file.bytes[position++]) << (8 * byte);
+                return value;
+            };
+            require(read_u32() == 32, "fuw stores exactly 32 samples");
+            require(read_u32() == 0, "fuw reserved field is zero");
+            require(read_u32() == 255, "fuw preserves the full 8-bit amplitude range");
+            for (const auto sample : snapshot->scc_waveform)
+                require(read_u32() == static_cast<std::uint32_t>(static_cast<int>(static_cast<std::int8_t>(sample)) + 128),
+                    "raw fuw samples preserve the finalized waveform with only a level offset");
+            const auto restored = importFurnaceTones(file.bytes, file.filename);
+            require(restored.valid() && restored.candidates.size() == 1, "generated fuw imports as one wave");
+            const auto actual = std::get<SccWaveform>(restored.candidates[0].data);
+            for (std::size_t sample = 0; sample < actual.size(); ++sample)
+                require(static_cast<std::uint8_t>(actual[sample]) == snapshot->scc_waveform[sample],
+                    "all 32 exported samples equal the finalized morph waveform");
+        }
+    }
 }
 
 void testMaterializedMgscOutput() {

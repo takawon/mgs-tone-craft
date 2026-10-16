@@ -9969,7 +9969,7 @@ void testFurnaceWavetableAndInstrumentExchange() {
     SavedTimbreReference moving_next{
         .library_id = 12,
         .revision = 1,
-        .name = "Next",
+        .name = "Next@5_",
         .source = TimbreSource::Scc,
         .number_mode = TimbreNumberMode::Manual,
         .manual_number = 8,
@@ -10015,6 +10015,19 @@ void testFurnaceWavetableAndInstrumentExchange() {
     };
     REQUIRE_EQ(has_tone(8), true);
     REQUIRE_EQ(has_tone(5), true);
+    // The patch slide emits a leading @3 restore, then @8; the static
+    // second layer contributes @5. All three are required by spec 6.5.1/10.
+    std::fprintf(stderr, "FUW number regression: %zu files\n", two_waves.files.size());
+    for (const auto& file : two_waves.files)
+        std::fprintf(stderr, "FUW number regression: %s\n", file.filename.c_str());
+    REQUIRE_EQ(two_waves.files.size(), std::size_t{3});
+    // A tone number embedded in a user name is not an exported assignment.
+    two.layers[1].timbre_automation.push_back(EnvelopeEvent{
+        .kind = EnvelopeEventKind::Timbre,
+        .count = 0,
+        .target_library_id = still_base.library_id,
+    });
+    REQUIRE_EQ(exportFurnaceWavetables(two).files.size(), std::size_t{3});
 }
 
 void testMgstcToneSetFileRoundTripAndFailedWrite() {

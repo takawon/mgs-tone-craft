@@ -1598,7 +1598,7 @@ public:
         EditorCloseCallback close_editor,
         EditorActivateCallback activate_editor)
         : DocumentWindow(
-            name,
+            mgstc::app::editorWindowTitle(name, editor == "main"),
             juce::Desktop::getInstance()
                 .getDefaultLookAndFeel()
                 .findColour(
@@ -2264,7 +2264,7 @@ public:
 
     [[nodiscard]] const juce::String
     getApplicationVersion() override {
-        return "0.1.0";
+        return MGSTC_DOC_VERSION;
     }
 
     void initialise(const juce::String& command_line) override {
@@ -2494,6 +2494,8 @@ private:
                 title += juce::String::fromUTF8(" - SCC音色エディタ");
             } else if (editor == "opll") {
                 title += juce::String::fromUTF8(" - OPLL音色エディタ");
+            } else {
+                title += juce::String::fromUTF8(" - 総合音色エディタ");
             }
             window = std::make_unique<MainWindow>(
                 title,
