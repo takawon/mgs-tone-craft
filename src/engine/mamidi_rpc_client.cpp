@@ -1,7 +1,9 @@
 #include "mgstc/engine/mamidi_rpc_client.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <exception>
+#include <vector>
 #include <thread>
 #include <utility>
 
@@ -22,6 +24,8 @@ struct MAmidiRpcClient::Impl {
     std::string last_error{};
     std::string host{};
     std::uint16_t port{};
+    std::vector<std::future<RPCLIB_MSGPACK::object_handle>> pending{};
+    std::atomic<std::uint64_t> acknowledgement_batches{0};
 };
 
 MAmidiRpcClient::MAmidiRpcClient()
@@ -91,6 +95,7 @@ void MAmidiRpcClient::disconnect() noexcept {
     }
     try {
         impl_->client.reset();
+        impl_->pending.clear();
     } catch (...) {
         // Destructor of rpc::client may throw on outstanding calls;
         // never propagate from disconnect/noexcept paths.
@@ -109,7 +114,9 @@ bool MAmidiRpcClient::asyncWrite(const MAmidiChipAccess& access) {
     }
 
     try {
-        static_cast<void>(impl_->client->async_call(
+        // The sender bounds/flushes batches before its final emission check.
+        // Never wait for an earlier batch here, then post a stale next write.
+        impl_->pending.push_back(impl_->client->async_call(
             kMethodName,
             static_cast<unsigned char>(access.device_id),
             static_cast<unsigned char>(access.unit_no),
@@ -126,6 +133,36 @@ bool MAmidiRpcClient::asyncWrite(const MAmidiChipAccess& access) {
         impl_->state = MAmidiConnectionState::Faulted;
         return false;
     }
+}
+
+bool MAmidiRpcClient::flushWrites() {
+    try {
+        if (!impl_->pending.empty())
+            impl_->acknowledgement_batches.fetch_add(1, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(kDefaultTimeoutMs);
+        for (auto& response : impl_->pending) {
+            if (response.wait_until(deadline) != std::future_status::ready) {
+                impl_->last_error = "RPC write acknowledgement timed out";
+                impl_->state = MAmidiConnectionState::Faulted;
+                return false;
+            }
+            static_cast<void>(response.get());
+        }
+        impl_->pending.clear();
+        return true;
+    } catch (const std::exception& error) {
+        impl_->last_error = std::string("RPC write acknowledgement failed: ")
+            + error.what();
+    } catch (...) {
+        impl_->last_error = "RPC write acknowledgement failed";
+    }
+    impl_->state = MAmidiConnectionState::Faulted;
+    return false;
+}
+
+std::uint64_t MAmidiRpcClient::acknowledgementBatchCount() const noexcept {
+    return impl_->acknowledgement_batches.load(std::memory_order_acquire);
 }
 
 MAmidiConnectionState MAmidiRpcClient::state() const noexcept {

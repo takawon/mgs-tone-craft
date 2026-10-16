@@ -48,6 +48,11 @@ public:
     // Does not block on the server response.
     [[nodiscard]] bool asyncWrite(const MAmidiChipAccess& access);
 
+    // Worker/control only. Acknowledge the bounded batch, including server
+    // errors. No future or RPC operation reaches the audio producer.
+    [[nodiscard]] bool flushWrites();
+    [[nodiscard]] std::uint64_t acknowledgementBatchCount() const noexcept;
+
     [[nodiscard]] MAmidiConnectionState state() const noexcept;
     [[nodiscard]] const std::string& lastError() const noexcept;
     [[nodiscard]] const std::string& host() const noexcept;

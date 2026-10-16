@@ -73,6 +73,10 @@
 #include "mgstc/engine/gzip_inflate.hpp"
 #include "mgstc/engine/tone_import.hpp"
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include "mgstc/audio/wasapi_audio_sink.hpp"
 #endif
 
@@ -2074,6 +2078,243 @@ void testEngineCoreWaveformMonitorKeepsScopeWithSilentMix() {
     REQUIRE_EQ(scope_peak > 0.001F, true);
 
     remote.close();
+    server.stop();
+}
+
+void testEngineCoreOfflineMirrorsWithoutRemoteWrites() {
+    using namespace mgstc::engine;
+    struct CountingBackend final : SoundOutputBackend {
+        std::size_t writes{};
+        bool open() override { return true; }
+        void close() override {}
+        bool isOpen() const override { return true; }
+        bool writeRegister(const RegisterWrite&) override { ++writes; return true; }
+        bool writeRegisters(std::span<const RegisterWrite> values) override {
+            writes += values.size(); return true;
+        }
+        void reset() override { ++writes; }
+        void allNotesOff() override { ++writes; }
+        SoundOutputKind kind() const override { return SoundOutputKind::MAmidiMemo; }
+    } backend;
+    EngineCore hardware;
+    EngineCore reference;
+    hardware.setOutputBackend(&backend);
+    REQUIRE_EQ(hardware.waveformMonitor(), false);
+    for (auto* core : {&hardware, &reference}) {
+        REQUIRE_EQ(core->session().setSequenceEnvelope(0, {0x0F}), true);
+        REQUIRE_EQ(core->session().queueNoteOn(0, 60), true);
+    }
+    std::array<float, 1600> remote_pcm{}, reference_pcm{};
+    for (int tick = 0; tick < 3; ++tick) {
+        REQUIRE_EQ(hardware.render(remote_pcm).ok(), true);
+        REQUIRE_EQ(reference.render(reference_pcm).ok(), true);
+        REQUIRE_EQ(std::all_of(remote_pcm.begin(), remote_pcm.end(),
+            [](float sample) { return sample == 0.0F; }), true);
+    }
+    REQUIRE_EQ(backend.writes > 0, true);
+    const auto before_offline = backend.writes;
+    hardware.setOfflineRendering(true);
+    for (int tick = 0; tick < 3; ++tick) {
+        REQUIRE_EQ(hardware.render(remote_pcm).ok(), true);
+        REQUIRE_EQ(reference.render(reference_pcm).ok(), true);
+        REQUIRE_EQ(remote_pcm, reference_pcm);
+    }
+    REQUIRE_EQ(std::any_of(remote_pcm.begin(), remote_pcm.end(),
+        [](float sample) { return std::abs(sample) > 0.001F; }), true);
+    hardware.hardReset();
+    REQUIRE_EQ(backend.writes, before_offline);
+    REQUIRE_EQ(hardware.outputKind(), SoundOutputKind::MAmidiMemo);
+    hardware.setOfflineRendering(false);
+    hardware.hardReset();
+    REQUIRE_EQ(backend.writes > before_offline, true);
+}
+
+void testMAmidiIdleWaitsForServerAcknowledgement() {
+    constexpr std::uint16_t port = 39114;
+    std::atomic<bool> entered{false}, release{false};
+    rpc::server server(port);
+    server.bind(MAmidiRpcClient::kMethodName,
+        [&](unsigned char device, unsigned char, unsigned int, unsigned int) {
+            if (device == 0) return; // connect probe
+            entered.store(true, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        });
+    server.async_run(1);
+    MAmidiMemoSoundOutput output;
+    output.setEndpoint("127.0.0.1", port);
+    REQUIRE_EQ(output.open(), true);
+    REQUIRE_EQ(output.enqueueChipAccess({11, 0, 8, 15}), true);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!entered.load(std::memory_order_acquire)
+        && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool did_enter = entered.load(std::memory_order_acquire);
+    const bool prematurely_idle = output.waitForIdle(20);
+    release.store(true, std::memory_order_release);
+    REQUIRE_EQ(did_enter, true);
+    REQUIRE_EQ(prematurely_idle, false);
+    REQUIRE_EQ(output.waitForIdle(2000), true);
+    output.close();
+    REQUIRE_EQ(output.closeAcknowledged(), true);
+    server.stop();
+}
+
+void testMAmidiStopSurvivesFullQueueAndOfflineCancelsBlockedBatch() {
+    for (const bool offline : {false, true}) {
+        const std::uint16_t port = offline ? 39117 : 39116;
+        std::atomic<bool> entered{false}, release{false};
+        std::mutex mutex;
+        std::vector<MAmidiChipAccess> received;
+        rpc::server server(port);
+        server.bind(MAmidiRpcClient::kMethodName,
+            [&](unsigned char device, unsigned char unit, unsigned int address, unsigned int data) {
+                if (device == 0) return;
+                entered.store(true, std::memory_order_release);
+                while (!release.load(std::memory_order_acquire))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::lock_guard lock(mutex);
+                received.push_back({device, unit, address, data});
+            });
+        server.async_run(1);
+        MAmidiMemoSoundOutput output;
+        struct ReleaseOnExit {
+            std::atomic<bool>& value;
+            ~ReleaseOnExit() { value.store(true, std::memory_order_release); }
+        } release_guard{release};
+        output.setEndpoint("127.0.0.1", port);
+        REQUIRE_EQ(output.open(), true);
+        REQUIRE_EQ(output.enqueueChipAccess({11, 0, 8, 15}), true);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!entered.load(std::memory_order_acquire)
+            && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        REQUIRE_EQ(entered.load(std::memory_order_acquire), true);
+        bool full = false;
+        for (int index = 0; index < 20000; ++index) {
+            if (!output.enqueueChipAccess({11, 0, 8, 15})) { full = true; break; }
+        }
+        REQUIRE_EQ(full, true);
+        // The worker is waiting for server completion, with a full bounded
+        // queue. Neither stop nor offline entry is allowed to wait here.
+        if (offline) output.setEmissionEnabled(false);
+        else output.reset();
+        release.store(true, std::memory_order_release);
+        REQUIRE_EQ(output.waitForIdle(3000), true);
+        {
+            std::lock_guard lock(mutex);
+            if (offline) {
+                // Only the already posted bounded batch may reach the server.
+                REQUIRE_EQ(received.size() <= 128, true);
+            } else {
+                const auto silence_count = kMAmidiPsgSilenceWriteCount
+                    + kMAmidiOpllSilenceWriteCount + kMAmidiSccSilenceWriteCount;
+                REQUIRE_EQ(received.size() >= silence_count, true);
+                const auto offset = received.size() - silence_count;
+                REQUIRE_EQ(received[offset].device_id, static_cast<std::uint8_t>(11));
+                REQUIRE_EQ(received.back().device_id, static_cast<std::uint8_t>(7));
+                REQUIRE_EQ(received.back().address, 0x8FU);
+                REQUIRE_EQ(received.back().data, 0U);
+                // Every surviving old volume write precedes terminal silence.
+                REQUIRE_EQ(received.size() <= 128 + silence_count, true);
+            }
+        }
+        output.close();
+        REQUIRE_EQ(output.closeAcknowledged(), true);
+        server.stop();
+    }
+}
+
+void testMAmidiHostManualHandoffAndOffline() {
+    using namespace mgstc::engine;
+    constexpr std::uint16_t port = 39115;
+    std::mutex mutex;
+    std::vector<MAmidiChipAccess> received;
+    rpc::server server(port);
+    server.bind(MAmidiRpcClient::kMethodName,
+        [&](unsigned char device, unsigned char unit, unsigned int address, unsigned int data) {
+            std::lock_guard lock(mutex);
+            received.push_back({device, unit, address, data});
+        });
+    server.async_run(1);
+    RealtimeEngineHost a, b;
+    auto settings = MAmidiOutputSettings{.host = "127.0.0.1", .port = port, .unit_no = 1};
+    a.setMAmidiSettings(settings);
+    settings.unit_no = 2;
+    b.setMAmidiSettings(settings);
+    REQUIRE_EQ(a.ownsHardwareOutput(), false);
+    REQUIRE_EQ(a.setSoundOutputKind(SoundOutputKind::MAmidiMemo), true);
+    REQUIRE_EQ(a.ownsHardwareOutput(), true);
+#ifdef _WIN32
+    // A second process must refuse acquisition before opening a new RPC client.
+    wchar_t executable[MAX_PATH]{};
+    REQUIRE_EQ(GetModuleFileNameW(nullptr, executable, MAX_PATH) != 0, true);
+    auto command = std::wstring(L"\"") + executable
+        + L"\" --mamidi-lease-probe " + std::to_wstring(port);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child{};
+    REQUIRE_EQ(CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child) != FALSE, true);
+    const auto wait = WaitForSingleObject(child.hProcess, 10000);
+    DWORD exit_code = 1;
+    static_cast<void>(GetExitCodeProcess(child.hProcess, &exit_code));
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+    REQUIRE_EQ(wait, static_cast<DWORD>(WAIT_OBJECT_0));
+    REQUIRE_EQ(exit_code, 0UL);
+#endif
+    // Handoff must put the old owner's complete terminal silence ahead of B.
+    REQUIRE_EQ(b.setSoundOutputKind(SoundOutputKind::MAmidiMemo), true);
+    REQUIRE_EQ(a.ownsHardwareOutput(), false);
+    REQUIRE_EQ(a.soundOutputKind(), SoundOutputKind::Emulator);
+    REQUIRE_EQ(b.ownsHardwareOutput(), true);
+    auto edit = b.beginProgramEdit();
+    REQUIRE_EQ(edit.valid(), true);
+    REQUIRE_EQ(edit.engine->session().setSequenceEnvelope(0, {0x0F}), true);
+    REQUIRE_EQ(b.submitProgram(edit), true);
+    b.setRealtimeOfflineRendering(true);
+    // Let the worker retire any real-time initialization already posted.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::size_t before_offline{};
+    { std::lock_guard lock(mutex); before_offline = received.size(); }
+    b.servicePendingControlCommands();
+    REQUIRE_EQ(b.realtimeNoteOn(0, 60), true);
+    std::array<float, 1600> pcm{};
+    float peak = 0;
+    for (int tick = 0; tick < 10; ++tick) {
+        REQUIRE_EQ(b.renderAudio(pcm).ok(), true);
+        for (float sample : pcm) peak = std::max(peak, std::abs(sample));
+    }
+    b.realtimeStop();
+    REQUIRE_EQ(peak > 0.001F, true);
+    REQUIRE_EQ(b.soundOutputKind(), SoundOutputKind::MAmidiMemo);
+    REQUIRE_EQ(b.ownsHardwareOutput(), true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    { std::lock_guard lock(mutex); REQUIRE_EQ(received.size(), before_offline); }
+    b.setRealtimeOfflineRendering(false);
+    REQUIRE_EQ(b.realtimeNoteOn(0, 60), true);
+    REQUIRE_EQ(b.renderAudio(pcm).ok(), true);
+    REQUIRE_EQ(std::all_of(pcm.begin(), pcm.end(), [](float s) { return s == 0; }), true);
+    REQUIRE_EQ(a.setSoundOutputKind(SoundOutputKind::MAmidiMemo), true);
+    REQUIRE_EQ(b.ownsHardwareOutput(), false);
+    REQUIRE_EQ(a.setSoundOutputKind(SoundOutputKind::Emulator), true);
+    {
+        std::lock_guard lock(mutex);
+        const auto b_start = std::find_if(received.begin(), received.end(),
+            [](const auto& write) { return write.unit_no == 2; });
+        REQUIRE_EQ(b_start != received.end(), true);
+        REQUIRE_EQ(b_start != received.begin(), true);
+        auto previous = b_start;
+        do { --previous; } while (previous != received.begin() && previous->device_id == 0);
+        const auto& last_a = *previous;
+        REQUIRE_EQ(last_a.unit_no, static_cast<std::uint8_t>(1));
+        REQUIRE_EQ(last_a.device_id, static_cast<std::uint8_t>(7));
+        REQUIRE_EQ(last_a.address, 0x8FU);
+        REQUIRE_EQ(last_a.data, 0U);
+        std::cout << "MAmidi mock handoff writes=" << received.size()
+            << ", offline writes=0, A->B->A acknowledged\n";
+    }
     server.stop();
 }
 
@@ -10562,6 +10803,16 @@ CREATE TABLE composite_tags (
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string_view(argv[1]) == "--mamidi-lease-probe") {
+        mgstc::engine::RealtimeEngineHost host;
+        host.setMAmidiSettings({.host = "127.0.0.1",
+            .port = static_cast<std::uint16_t>(std::stoi(argv[2]))});
+        const bool acquired = host.setSoundOutputKind(mgstc::engine::SoundOutputKind::MAmidiMemo);
+        return !acquired && !host.ownsHardwareOutput()
+            && host.soundOutputKind() == mgstc::engine::SoundOutputKind::Emulator
+            && host.soundOutputLastError().find("another MGSTC process") != std::string::npos
+            ? 0 : 1;
+    }
     const std::vector<std::pair<std::string, std::function<void()>>> tests{
         {"TickClockSplitsVariableCallbacks", testTickClockSplitsVariableCallbacks},
         {"AdjacentVolumesAreOneTickApart", testAdjacentVolumesAreOneTickApart},
@@ -10634,6 +10885,10 @@ int main(int argc, char** argv) {
         {"MAmidiMemoSoundOutputOpenFailsWithoutServer", testMAmidiMemoSoundOutputOpenFailsWithoutServer},
         {"MAmidiRpcClientConnectsToMockChipServer", testMAmidiRpcClientConnectsToMockChipServer},
         {"EngineCoreRemoteBackendSilencesLocalMix", testEngineCoreRemoteBackendSilencesLocalMix},
+        {"EngineCoreOfflineMirrorsWithoutRemoteWrites", testEngineCoreOfflineMirrorsWithoutRemoteWrites},
+        {"MAmidiIdleWaitsForServerAcknowledgement", testMAmidiIdleWaitsForServerAcknowledgement},
+        {"MAmidiHostManualHandoffAndOffline", testMAmidiHostManualHandoffAndOffline},
+        {"MAmidiStopSurvivesFullQueueAndOfflineCancelsBlockedBatch", testMAmidiStopSurvivesFullQueueAndOfflineCancelsBlockedBatch},
         {"EngineCoreWaveformMonitorKeepsScopeWithSilentMix", testEngineCoreWaveformMonitorKeepsScopeWithSilentMix},
         {"EngineCoreSplitsAtEightHundredFrameBoundary", testEngineCoreSplitsAtEightHundredFrameBoundary},
         {"EngineCoreValidatesAndClampsOutput", testEngineCoreValidatesAndClampsOutput},

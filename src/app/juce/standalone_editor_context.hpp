@@ -94,6 +94,12 @@ public:
         const auto kind = audio_.engine().soundOutputKind();
         snap.hardware_output =
             kind == mgstc::engine::SoundOutputKind::MAmidiMemo;
+        snap.desired_hardware_output = audio_.engine().desiredSoundOutputKind()
+            == mgstc::engine::SoundOutputKind::MAmidiMemo;
+        snap.hardware_owned = audio_.engine().ownsHardwareOutput();
+        snap.hardware_connected = audio_.engine().hardwareOutputConnected();
+        snap.output_switch_pending = audio_.engine().outputSwitchPending();
+        snap.output_status = audio_.engine().soundOutputStatus();
         const auto& mamidi = audio_.engine().mamidiSettings();
         snap.hardware_settings.host = mamidi.host;
         snap.hardware_settings.port = mamidi.port;
@@ -132,12 +138,12 @@ public:
 
     [[nodiscard]] bool pollOpllScope(
         mgstc::engine::OpllScopeFrame& frame) override {
-        return audio_.engine().pollOpllScope(frame);
+        return audio_.pollDistributedScope(frame, composite_scope_cursor_, false);
     }
 
     [[nodiscard]] bool pollLatestOpllScope(
         mgstc::engine::OpllScopeFrame& frame) override {
-        return audio_.engine().pollLatestOpllScope(frame);
+        return audio_.pollDistributedScope(frame, opll_scope_cursor_, true);
     }
 
 private:
@@ -169,8 +175,7 @@ private:
             return self_.audio_.engine().soundOutputStatus();
         }
 
-        [[nodiscard]] bool applySoundRoute(
-            bool hardware,
+        [[nodiscard]] bool applyHardwareSettings(
             mgstc::app::HardwareOutputSettings settings,
             int opll_keyoff_silence_seconds) override {
             mgstc::engine::MAmidiOutputSettings mamidi{};
@@ -184,6 +189,11 @@ private:
             self_.audio_.engine().setMAmidiSettings(std::move(mamidi));
             self_.audio_.setOpllKeyOffForceSilenceSeconds(
                 opll_keyoff_silence_seconds);
+            self_.audio_.saveSoundOutputSettings();
+            return true;
+        }
+
+        [[nodiscard]] bool requestHardwareMode(bool hardware) override {
             const auto kind = hardware
                 ? mgstc::engine::SoundOutputKind::MAmidiMemo
                 : mgstc::engine::SoundOutputKind::Emulator;
@@ -313,6 +323,7 @@ private:
             &mgstc::app::MidiDrainListener::midiMessagesPending);
     }
 
+    std::uint64_t composite_scope_cursor_{}, opll_scope_cursor_{};
     SharedAudioService& audio_;
     SharedMidiInputService& midi_service_;
     Output output_;

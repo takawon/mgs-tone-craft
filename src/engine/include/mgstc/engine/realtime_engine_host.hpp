@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 
@@ -77,6 +78,24 @@ public:
     [[nodiscard]] bool reconnectMAmidi();
     [[nodiscard]] std::string soundOutputStatus() const;
     [[nodiscard]] std::string soundOutputLastError() const;
+    [[nodiscard]] SoundOutputKind desiredSoundOutputKind() const noexcept {
+        return desired_output_kind_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool ownsHardwareOutput() const noexcept {
+        return hardware_owned_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool hardwareOutputConnected() const noexcept {
+        return mamidi_->connectionState() == MAmidiConnectionState::Connected;
+    }
+    [[nodiscard]] bool outputSwitchPending() const noexcept {
+        return output_switch_pending_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] std::uint64_t outputRoutingRevision() const noexcept {
+        return output_routing_revision_.load(std::memory_order_acquire);
+    }
+    // Audio consumer only, before service/note/render calls for the host block.
+    // Changes emission policy and PCM only, never the selected mode or lease.
+    void setRealtimeOfflineRendering(bool enabled) noexcept;
 
     // UI thread only.
     [[nodiscard]] bool pollNotice(EngineNotice& notice) noexcept;
@@ -166,6 +185,27 @@ public:
             = std::chrono::milliseconds(500)) noexcept;
 
 private:
+    // A control transition closes the gate and waits outside realtime. Audio
+    // makes one bounded CAS attempt and skips work while the gate is closed.
+    class RealtimeAccess {
+    public:
+        explicit RealtimeAccess(const RealtimeEngineHost& host) noexcept;
+        ~RealtimeAccess();
+        explicit operator bool() const noexcept { return entered_; }
+    private:
+        const RealtimeEngineHost& host_;
+        bool entered_{};
+    };
+    class OutputTransition {
+    public:
+        explicit OutputTransition(RealtimeEngineHost& host);
+        ~OutputTransition();
+    private:
+        RealtimeEngineHost& host_;
+        std::unique_lock<std::mutex> lock_;
+    };
+    [[nodiscard]] bool relinquishHardwareOutput();
+    void applyRealtimePolicy(EngineCore& engine) noexcept;
     [[nodiscard]] bool hasPendingProgramLoad() const noexcept;
     enum class ProgramSlotState : std::uint8_t {
         Free,
@@ -186,7 +226,7 @@ private:
     void loadProgram(const EngineCommand& command) noexcept;
     void reject(EngineCommandType command) noexcept;
     void notify(const EngineNotice& notice) noexcept;
-    void applyOutputRouting() noexcept;
+    void applyOutputRouting(bool changed = true) noexcept;
     void applyOutputRouting(EngineCore& engine) noexcept;
     void noteStarted(std::uint8_t track, std::uint8_t note) noexcept;
     void noteStopped(std::uint8_t track) noexcept;
@@ -210,7 +250,16 @@ private:
     std::unique_ptr<ProgramSlot[]> programs_;
     std::unique_ptr<MAmidiMemoSoundOutput> mamidi_;
     MAmidiOutputSettings mamidi_settings_{};
-    SoundOutputKind output_kind_{SoundOutputKind::Emulator};
+    std::atomic<SoundOutputKind> output_kind_{SoundOutputKind::Emulator};
+    std::atomic<SoundOutputKind> desired_output_kind_{SoundOutputKind::Emulator};
+    std::atomic<bool> hardware_owned_{false};
+    std::atomic<bool> output_switch_pending_{false};
+    std::atomic<bool> waveform_monitor_{false};
+    std::atomic<bool> offline_rendering_{false};
+    std::atomic<std::uint64_t> output_routing_revision_{0};
+    mutable std::atomic<std::uint32_t> output_access_{0};
+    std::mutex output_control_mutex_;
+    std::string output_error_;
     std::uint8_t active_program_{};
     MixerGains current_gains_{};
     std::array<ActiveGuideNote, RuntimeSession::kTrackCount>

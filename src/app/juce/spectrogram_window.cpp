@@ -37,9 +37,11 @@
 namespace mgstc::app {
 namespace {
 
-SpectrogramWindow* g_spectrogram_window = nullptr;
-bool g_in_pin_zorder = false;
-HHOOK g_pin_zorder_ret_hook = nullptr;
+// Each editor owns its analysis window. The Windows hook is shared only by
+// windows on this UI thread and survives until its last pinned window closes.
+thread_local std::vector<SpectrogramWindow*> g_spectrogram_windows;
+thread_local bool g_in_pin_zorder = false;
+thread_local HHOOK g_pin_zorder_ret_hook = nullptr;
 
 constexpr double kSampleRate = 48'000.0;
 constexpr int kFftOrder = 11;
@@ -1378,11 +1380,8 @@ void writeIniString(const wchar_t* key, const juce::String& value) {
     return text.isEmpty() ? fallback : text.getIntValue() != 0;
 }
 
-[[nodiscard]] HWND spectrogramNativeHandle() {
-    if (g_spectrogram_window == nullptr) {
-        return nullptr;
-    }
-    auto* peer = g_spectrogram_window->getPeer();
+[[nodiscard]] HWND spectrogramNativeHandle(SpectrogramWindow& window) {
+    auto* peer = window.getPeer();
     if (peer == nullptr) {
         return nullptr;
     }
@@ -1399,10 +1398,9 @@ void writeIniString(const wchar_t* key, const juce::String& value) {
     return process_id != GetCurrentProcessId();
 }
 
-[[nodiscard]] bool shouldKeepPinnedAboveSiblings() {
-    return g_spectrogram_window != nullptr
-        && g_spectrogram_window->isVisible()
-        && !g_spectrogram_window->isMinimised()
+[[nodiscard]] bool shouldKeepPinnedAboveSiblings(const SpectrogramWindow& window) {
+    return window.isVisible()
+        && !window.isMinimised()
         && !anotherProcessIsForeground()
         && juce::ModalComponentManager::getInstance()
                 ->getNumModalComponents()
@@ -2006,7 +2004,7 @@ SpectrogramWindow::SpectrogramWindow(
           DocumentWindow::allButtons),
       performance_input_active_changed_(
           std::move(performance_input_active_changed)) {
-    g_spectrogram_window = this;
+    g_spectrogram_windows.push_back(this);
     setUsingNativeTitleBar(true);
     content_ = new Content(engine, [this](bool pinned) {
         setInternalPin(pinned);
@@ -2015,7 +2013,7 @@ SpectrogramWindow::SpectrogramWindow(
     setResizable(true, false);
     {
         juce::Component::SafePointer<SpectrogramWindow> safe(this);
-        UiScale::addGlobalListener([safe] {
+        ui_scale_listener_ = UiScale::addGlobalListener([safe] {
             if (safe != nullptr) {
                 safe->applyGlobalUiScale();
             }
@@ -2028,10 +2026,9 @@ SpectrogramWindow::SpectrogramWindow(
 
 SpectrogramWindow::~SpectrogramWindow() {
     notifyPerformanceInputActive(false);
-    if (g_spectrogram_window == this) {
-        g_spectrogram_window = nullptr;
-    }
-    removePinZOrderRetHook();
+    UiScale::removeGlobalListener(ui_scale_listener_);
+    std::erase(g_spectrogram_windows, this);
+    updatePinZOrderHook();
     if (content_ != nullptr) {
         content_->setActive(false);
     }
@@ -2072,7 +2069,10 @@ void SpectrogramWindow::setInternalPin(bool pinned) {
 }
 
 void SpectrogramWindow::updatePinZOrderHook() {
-    if (internal_pin_ && isVisible()) {
+    const bool any_pinned = std::any_of(
+        g_spectrogram_windows.begin(), g_spectrogram_windows.end(),
+        [](const auto* window) { return window->internal_pin_ && window->isVisible(); });
+    if (any_pinned) {
         installPinZOrderRetHook();
         return;
     }
@@ -2088,36 +2088,33 @@ void SpectrogramWindow::constrainSiblingZOrder(
         || caller == nullptr
         || g_in_pin_zorder
         || (position->flags & SWP_NOZORDER) != 0
-        || (position->flags & SWP_HIDEWINDOW) != 0
-        || g_spectrogram_window == nullptr
-        || !g_spectrogram_window->internal_pin_
-        || !shouldKeepPinnedAboveSiblings()) {
+        || (position->flags & SWP_HIDEWINDOW) != 0) {
         return;
     }
-    const HWND spectrogram = spectrogramNativeHandle();
-    if (spectrogram == nullptr
-        || spectrogram == caller
-        || !IsWindowVisible(spectrogram)) {
-        return;
+    // Analysis windows never reorder one another through the shared hook.
+    for (auto* window : g_spectrogram_windows)
+        if (spectrogramNativeHandle(*window) == caller) return;
+    for (auto* window : g_spectrogram_windows) {
+        if (!window->internal_pin_ || !shouldKeepPinnedAboveSiblings(*window)) continue;
+        const HWND spectrogram = spectrogramNativeHandle(*window);
+        if (!spectrogram || !IsWindowVisible(spectrogram)) continue;
+        raiseSpectrogramWithoutActivating(spectrogram);
+        position->hwndInsertAfter = spectrogram;
     }
-    raiseSpectrogramWithoutActivating(spectrogram);
-    position->hwndInsertAfter = spectrogram;
 }
 
 void SpectrogramWindow::raisePinnedAfterSibling(void* caller_native_handle) {
     const auto caller = static_cast<HWND>(caller_native_handle);
     if (caller == nullptr
-        || g_in_pin_zorder
-        || g_spectrogram_window == nullptr
-        || !g_spectrogram_window->internal_pin_
-        || !shouldKeepPinnedAboveSiblings()) {
+        || g_in_pin_zorder) {
         return;
     }
-    const HWND spectrogram = spectrogramNativeHandle();
-    if (spectrogram == nullptr || spectrogram == caller) {
-        return;
+    for (auto* window : g_spectrogram_windows)
+        if (spectrogramNativeHandle(*window) == caller) return;
+    for (auto* window : g_spectrogram_windows) {
+        if (!window->internal_pin_ || !shouldKeepPinnedAboveSiblings(*window)) continue;
+        raiseSpectrogramWithoutActivating(spectrogramNativeHandle(*window));
     }
-    raiseSpectrogramWithoutActivating(spectrogram);
 }
 
 void SpectrogramWindow::applyGlobalUiScale() {

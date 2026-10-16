@@ -92,6 +92,7 @@
 
 #include "audio_import_bridge.hpp"
 #include "editor_session.hpp"
+#include "scope_frame_distributor.hpp"
 #include "mgstc_editor_view.hpp"
 
 // Supplied by CMake from the SPECIFICATION.md document version.
@@ -224,6 +225,13 @@ public:
             engine_.submit(mgstc::engine::EngineCommand::stop()));
         asio_audio_.close();
         wasapi_audio_.stop();
+    }
+
+    bool pollDistributedScope(mgstc::engine::OpllScopeFrame& frame,
+        std::uint64_t& cursor, bool latest) {
+        const auto drain = [this](auto& next) { return engine_.pollOpllScope(next); };
+        return latest ? scope_frames_.pollLatest(frame, cursor, drain)
+            : scope_frames_.poll(frame, cursor, drain);
     }
 
     SharedAudioService(const SharedAudioService&) = delete;
@@ -456,6 +464,7 @@ public:
     }
 
     void clearScopeFrames() {
+        scope_frames_.clear();
         mgstc::engine::OpllScopeFrame frame{};
         while (engine_.pollOpllScope(frame)) {
         }
@@ -1072,6 +1081,7 @@ private:
             path_text.toWideCharPointer()));
     }
 
+    mgstc::app::ScopeFrameDistributor scope_frames_;
     mgstc::engine::RealtimeEngineHost engine_;
     mgstc::audio::WasapiAudioSink wasapi_audio_;
     mgstc::audio::AsioAudioSink asio_audio_;
@@ -2827,6 +2837,12 @@ private:
                 if (auto* editor = compositeEditor()) {
                     editor->stopImportedPreview();
                 }
+            },
+            [this](const mgstc::engine::SavedTimbreReference& snapshot,
+                   std::optional<std::uint8_t> note, bool one_second) {
+                if (auto* editor = compositeEditor())
+                    return editor->previewOwnedTimbre(snapshot, note, one_second);
+                return false;
             },
         };
     }

@@ -16,6 +16,7 @@
 #include "plugin_state.hpp"
 #include "plugin_pcm_preview.hpp"
 #include "editor_session.hpp"
+#include "scope_frame_distributor.hpp"
 #include "vst3_diagnostic.hpp"
 #include "mgstc/audio/stereo_sample_rate_converter.hpp"
 #include "mgstc/engine/composite_program_compiler.hpp"
@@ -81,8 +82,8 @@ public:
         return audition_preferences_;
     }
 
-    // Message-thread editor delegation. Does not open OS audio, MIDI,
-    // MAmidi, or the tone library. Shared-wave audition is runtime only
+    // Message-thread editor delegation. Does not open OS audio or MIDI.
+    // Hardware requests reuse the processor-owned engine. Shared-wave audition is runtime only
     // and is not written into Plugin State.
     [[nodiscard]] bool replaceEditorComposite(
         mgstc::engine::CompositeTimbre sound,
@@ -137,10 +138,35 @@ public:
     void editorReleaseCompositeScope() noexcept;
     [[nodiscard]] bool editorPollCompositeScope(
         mgstc::engine::OpllScopeFrame& frame) noexcept;
+    [[nodiscard]] bool editorPollCompositeScope(
+        mgstc::engine::OpllScopeFrame& frame, std::uint64_t& cursor) noexcept;
+    [[nodiscard]] bool editorPollLatestOpllScope(
+        mgstc::engine::OpllScopeFrame& frame, std::uint64_t& cursor) noexcept;
+    [[nodiscard]] mgstc::engine::RealtimeEngineHost& editorEngineForAnalysis() noexcept {
+        return engine_;
+    }
+    void editorPopulateOutputSnapshot(mgstc::app::EditorSnapshot& snapshot) const;
+    [[nodiscard]] bool editorApplyHardwareSettings(
+        mgstc::app::HardwareOutputSettings settings, int keyoff_seconds);
+    [[nodiscard]] bool editorRequestHardwareMode(bool hardware);
+    [[nodiscard]] bool editorReconnectHardware();
+    [[nodiscard]] std::string editorHardwareStatus() const;
+    void editorArmOpllKeyoffSilence(std::uint8_t track,
+        std::optional<std::uint64_t> expected_restore_revision = {}) noexcept;
+    void editorCancelOpllKeyoffSilence(std::uint8_t track,
+        std::optional<std::uint64_t> expected_restore_revision = {}) noexcept;
+    void editorClearOpllKeyoffSilence(
+        std::optional<std::uint64_t> expected_restore_revision = {}) noexcept;
     void editorNoteBlockedBackendCall() noexcept;
     [[nodiscard]] std::uint64_t editorBlockedBackendCalls() const noexcept;
 
 private:
+    void loadHardwarePreferences();
+    void saveHardwarePreferences() const;
+    void updateHostTransport(int num_samples) noexcept;
+    void serviceOpllKeyoffSilence() noexcept;
+    void armOpllKeyoffSilence(std::uint8_t track,
+        std::optional<std::uint64_t> restore_revision = {}) noexcept;
     void notifyEditorStateRestored();
     void handleAsyncUpdate() override;
     std::function<void()> editor_state_restored_;
@@ -336,6 +362,20 @@ private:
     std::uint64_t editor_shared_opll_revision_{1};
     std::uint64_t editor_blocked_backend_calls_{0};
     std::atomic<int> composite_scope_clients_{0};
+    // Message thread only. One SPSC consumer fans out bounded frame history.
+    mgstc::app::ScopeFrameDistributor scope_frames_;
+    std::uint64_t scope_legacy_cursor_{};
+    std::atomic<int> opll_keyoff_silence_seconds_{20};
+    std::array<std::uint64_t, LayerDelayScheduler::kPhysicalTrackCount> opll_silence_due_{};
+    std::array<std::uint64_t, LayerDelayScheduler::kPhysicalTrackCount> opll_silence_revision_{};
+    // Low two bits: arm/cancel. Upper bits: host-restore generation.
+    std::array<std::atomic<std::uint64_t>, LayerDelayScheduler::kPhysicalTrackCount>
+        opll_silence_requests_{};
+    bool transport_known_{};
+    bool previous_block_offline_{};
+    std::uint64_t observed_output_revision_{};
+    bool transport_was_playing_{};
+    std::optional<juce::int64> expected_transport_sample_;
 
     bool in_process_block_{false};
     std::atomic<std::uint64_t> diag_process_block_{};

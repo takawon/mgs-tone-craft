@@ -430,6 +430,7 @@ if(WIN32)
                     src/app/juce/mgstc_editor_view.cpp
                     src/app/juce/composite_timeline.cpp
                     src/app/juce/tone_library_session.cpp
+                    src/app/juce/spectrogram_window.cpp
                     src/app/juce/ui_hang_watchdog.cpp
                     src/app/juce/ui_layout.cpp
                     src/app/juce/ui_paint.cpp
@@ -449,6 +450,7 @@ if(WIN32)
                     mgstc_binary_data
                     juce::juce_audio_processors
                     juce::juce_audio_utils
+                    juce::juce_dsp
                     juce::juce_gui_extra
                     gdiplus
                     windowscodecs
@@ -756,6 +758,7 @@ if(MGSTC_BUILD_TESTS)
             src/app/juce/mgstc_editor_view.cpp
             src/app/juce/composite_timeline.cpp
             src/app/juce/tone_library_session.cpp
+            src/app/juce/spectrogram_window.cpp
             src/app/juce/ui_hang_watchdog.cpp
             src/app/juce/ui_layout.cpp
             src/app/juce/ui_paint.cpp
@@ -770,9 +773,12 @@ if(MGSTC_BUILD_TESTS)
             mgstc_vst3_processor_tests
             PRIVATE
                 mgstc_engine
+                rpc
+                ws2_32
                 mgstc_binary_data
                 juce::juce_audio_processors
                 juce::juce_audio_utils
+                juce::juce_dsp
                 juce::juce_gui_extra
                 gdiplus
                 windowscodecs)
@@ -783,6 +789,7 @@ if(MGSTC_BUILD_TESTS)
             PRIVATE
                 JUCE_WEB_BROWSER=0
                 JUCE_USE_CURL=0
+                MGSTC_TEST_ISOLATED_PREFERENCES=1
                 JUCE_VST3_CAN_REPLACE_VST2=0
                 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
                 JUCE_MODAL_LOOPS_PERMITTED=1
@@ -806,6 +813,7 @@ if(MGSTC_BUILD_TESTS)
             src/app/juce/mgstc_editor_view.cpp
             src/app/juce/composite_timeline.cpp
             src/app/juce/tone_library_session.cpp
+            src/app/juce/spectrogram_window.cpp
             src/app/juce/ui_hang_watchdog.cpp
             src/app/juce/ui_layout.cpp
             src/app/juce/ui_paint.cpp
@@ -823,6 +831,7 @@ if(MGSTC_BUILD_TESTS)
                 mgstc_binary_data
                 juce::juce_audio_processors
                 juce::juce_audio_utils
+                juce::juce_dsp
                 juce::juce_gui_extra
                 gdiplus
                 windowscodecs)
@@ -833,6 +842,7 @@ if(MGSTC_BUILD_TESTS)
             PRIVATE
                 JUCE_WEB_BROWSER=0
                 JUCE_USE_CURL=0
+                MGSTC_TEST_ISOLATED_PREFERENCES=1
                 JUCE_VST3_CAN_REPLACE_VST2=0
                 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
                 JUCE_MODAL_LOOPS_PERMITTED=1
@@ -856,6 +866,7 @@ if(MGSTC_BUILD_TESTS)
             src/app/juce/mgstc_editor_view.cpp
             src/app/juce/composite_timeline.cpp
             src/app/juce/tone_library_session.cpp
+            src/app/juce/spectrogram_window.cpp
             src/app/juce/ui_hang_watchdog.cpp
             src/app/juce/ui_layout.cpp
             src/app/juce/ui_paint.cpp
@@ -873,6 +884,7 @@ if(MGSTC_BUILD_TESTS)
                 mgstc_binary_data
                 juce::juce_audio_processors
                 juce::juce_audio_utils
+                juce::juce_dsp
                 juce::juce_gui_extra
                 gdiplus
                 windowscodecs)
@@ -883,6 +895,7 @@ if(MGSTC_BUILD_TESTS)
             PRIVATE
                 JUCE_WEB_BROWSER=0
                 JUCE_USE_CURL=0
+                MGSTC_TEST_ISOLATED_PREFERENCES=1
                 JUCE_VST3_CAN_REPLACE_VST2=0
                 JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS=0
                 JUCE_MODAL_LOOPS_PERMITTED=1
