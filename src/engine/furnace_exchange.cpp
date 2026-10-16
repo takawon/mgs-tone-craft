@@ -1501,6 +1501,7 @@ FurnaceExportBatch exportFurnaceWavetables(const CompositeTimbre& timbre) {
     TimbreNumberResolution numbers;
     if (compiled && compiled->valid) {
         numbers = resolveTimbreNumbers(compiled->timbre);
+        std::set<int> exported_numbers;
         for (std::size_t layer_index = 0; layer_index < compiled->timbre.layers.size();
              ++layer_index) {
             const auto& layer = compiled->timbre.layers[layer_index];
@@ -1522,15 +1523,7 @@ FurnaceExportBatch exportFurnaceWavetables(const CompositeTimbre& timbre) {
                     const auto number = assignedNumberForLibraryId(
                         numbers, layer.base_timbre->library_id);
                     const auto tone = number.value_or(0);
-                    const bool seen = std::any_of(
-                        batch.files.begin(),
-                        batch.files.end(),
-                        [&](const FurnaceExportFile& file) {
-                            return file.filename.find(
-                                "@" + std::to_string(tone) + "_")
-                                != std::string::npos;
-                        });
-                    if (!seen) {
+                    if (exported_numbers.insert(tone).second) {
                         addWaveFile(
                             batch,
                             static_cast<int>(batch.files.size()) + 1,
@@ -1562,14 +1555,7 @@ FurnaceExportBatch exportFurnaceWavetables(const CompositeTimbre& timbre) {
                     batch.warnings.push_back("音色番号の波形を解決できません");
                     continue;
                 }
-                const bool seen = std::any_of(
-                    batch.files.begin(),
-                    batch.files.end(),
-                    [&](const FurnaceExportFile& file) {
-                        return file.filename.find("@" + std::to_string(tone) + "_")
-                            != std::string::npos;
-                    });
-                if (seen) {
+                if (!exported_numbers.insert(tone).second) {
                     continue;
                 }
                 addWaveFile(

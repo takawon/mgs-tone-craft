@@ -79,6 +79,29 @@ struct SatelliteEditorParityTestAccess {
 };
 
 struct CompositeEditorComponentTestAccess {
+    static const juce::String title(const CompositeEditorComponent& editor) {
+        return editor.title_.getText();
+    }
+    static void pickerPreview(CompositeEditorComponent& editor,
+        const mgstc::engine::CompositeTimbre& sound) {
+        editor.manual_y_preview_timbre_ = sound;
+    }
+    static bool hasPickerPreview(const CompositeEditorComponent& editor) {
+        return editor.manual_y_preview_timbre_.has_value();
+    }
+    static void commitTimelineSound(CompositeEditorComponent& editor,
+        const mgstc::engine::CompositeTimbre& sound) {
+        // Stage edited settings, then use the real timeline commit callback.
+        editor.timeline_.setTimbre(sound);
+        editor.timeline_.clearLoop(0);
+    }
+    static bool previewPending(const CompositeEditorComponent& editor) {
+        return editor.timeline_preview_pending_;
+    }
+    static void fireTimelinePreview(CompositeEditorComponent& editor) {
+        editor.timeline_preview_due_ms_ = 0;
+        editor.timerCallback();
+    }
     static void size(CompositeEditorComponent& editor, int width, int height) {
         editor.setSize(width, height);
     }
@@ -4555,6 +4578,62 @@ void testCompositePlaybackWaveform() {
         "no composite waveform frames after the editor closes");
 }
 
+void testCommittedTimelineEditSupersedesPickerPreview() {
+    using namespace mgstc::engine;
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    auto sound = sccOnlyTimbre();
+    auto endpoint = *sound.layers[0].base_timbre;
+    endpoint.library_id = allocateCompositeOwnedTimbreId(sound);
+    endpoint.number_mode = TimbreNumberMode::Automatic;
+    endpoint.manual_number.reset();
+    endpoint.scc_waveform = sccWaveformToBytes(generateSccPreset(SccWavePreset::Square, SccHarmonic::One));
+    sound.embedded_timbres.push_back(endpoint);
+    EnvelopeEvent arrival;
+    arrival.kind = EnvelopeEventKind::Timbre;
+    arrival.count = 20;
+    arrival.target_library_id = endpoint.library_id;
+    arrival.scc_morph.enabled = true;
+    arrival.scc_morph.intermediate_count = 2;
+    sound.layers[0].envelope_timeline.length_counts = 40;
+    sound.layers[0].timbre_automation = {arrival};
+    require(processor.replacePluginState(documentFrom(sound, 0, {})), "seed morph preview state");
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {},
+        [] {}, [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, sound);
+    const auto title = EditorAccess::title(editor);
+    require(title.contains(MGSTC_DOC_VERSION), "composite header shows the compiled version");
+#if JUCE_DEBUG
+    require(title.endsWith(" (Debug Build)"), "Debug title identifies its build");
+#else
+    require(!title.contains("Debug Build"), "Release title has no Debug suffix");
+#endif
+    const bool old_immediate = EditorAccess::immediate(editor);
+    EditorAccess::immediate(editor, true);
+    processEmpty(processor, 512);
+    EditorAccess::pickerPreview(editor, sound);
+    require(EditorAccess::rebuild(editor), "submit old picker preview");
+    processEmpty(processor, 512);
+    auto changed = sound;
+    changed.layers[0].timbre_automation[0].scc_morph.curve = 0.125;
+    EditorAccess::commitTimelineSound(editor, changed);
+    require(!EditorAccess::hasPickerPreview(editor), "committed morph settings discard stale picker preview");
+    require(EditorAccess::previewPending(editor), "committed edit schedules one-second preview");
+    require(sameAuthoringSound(processor.copyPluginState().sound, EditorAccess::sound(editor)),
+        "new morph authoring reaches plugin state instead of being submitted as stale temporary preview");
+    require(EditorAccess::sound(editor).layers[0].timbre_automation[0].scc_morph.curve == 0.125,
+        "new morph curve survives the timeline commit");
+    processEmpty(processor, 512);
+    EditorAccess::fireTimelinePreview(editor);
+    require(EditorAccess::scheduled(editor) == 1 && EditorAccess::startsAndStopsShiftedEqually(editor, 1000.0),
+        "updated morph triggers the existing one-second note schedule");
+    EditorAccess::stop(editor);
+    EditorAccess::immediate(editor, old_immediate);
+}
+
 void testCompositeEditorDelayedKeyOff() {
     using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
     MgstcAudioProcessor processor;
@@ -6627,6 +6706,7 @@ int main() {
         testOwnedEditorPendingTargetKeepsSnapshot();
         testEditorParityCorrections();
         testCompositePlaybackWaveform();
+        testCommittedTimelineEditSupersedesPickerPreview();
         testCompositeEditorDelayedKeyOff();
         testPluginSoundAuthority();
         testTemporaryCompositePreviewPreservesState();

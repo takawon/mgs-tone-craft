@@ -41,6 +41,7 @@
 
 #include "ui_hang_watchdog.hpp"
 #include "ui_chrome_constants.hpp"
+#include "ui_window_title.hpp"
 #include "ui_paths.hpp"
 #include "ui_scale.hpp"
 #include "ui_fonts.hpp"
@@ -4012,8 +4013,8 @@ public:
         last_audition_note_ = loadLastAuditionNoteSetting();
 
         title_.setText(
-            juce::String::fromUTF8(
-                "MGS Tone Craft - 総合音色エディタ"),
+            editorWindowTitle(juce::String::fromUTF8(
+                "MGS Tone Craft - 総合音色エディタ"), true),
             juce::dontSendNotification);
         title_.setFont(UiFonts::title());
         addAndMakeVisible(title_);
@@ -4487,6 +4488,9 @@ public:
                             "共通時間軸をマウス編集中"));
                     return;
                 }
+                // A committed timeline edit supersedes the picker/y preview
+                // copied before that edit. Submit and audition the new author data.
+                manual_y_preview_timbre_.reset();
                 if (!allocation_only) recordHistory();
                 if (!structure_changed) {
                     refreshValidationSummary();
