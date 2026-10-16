@@ -1728,6 +1728,82 @@ private:
         mgstc::engine::SccApplyRange::All};
 };
 
+// One control shared by composite and owned/independent single-tone editors.
+// Selection displays the actual route; desire, lease and connection remain
+// separate in the session snapshot. All callbacks run on the message thread.
+class SoundOutputSwitch final : public juce::Component, private juce::Timer {
+public:
+    void bind(EditorSession& session) {
+        session_ = &session;
+        emu_.setButtonText(juce::String::fromUTF8("エミュ"));
+        hardware_.setButtonText(juce::String::fromUTF8("実機"));
+        addAndMakeVisible(emu_);
+        addAndMakeVisible(hardware_);
+        addAndMakeVisible(status_);
+        emu_.setExplicitFocusOrder(201);
+        hardware_.setExplicitFocusOrder(202);
+        emu_.onClick = [this] { request(false); };
+        hardware_.onClick = [this] { request(true); };
+        status_.setJustificationType(juce::Justification::centred);
+        status_.setInterceptsMouseClicks(false, false);
+        refresh();
+        startTimerHz(10);
+    }
+
+    void resized() override {
+        auto row = getLocalBounds().removeFromTop(UiLayout::textButtonH);
+        emu_.setBounds(row.removeFromLeft(row.getWidth() / 2));
+        hardware_.setBounds(row);
+        status_.setFont(UiFonts::body());
+        status_.setBounds(0, UiLayout::textButtonH, getWidth(),
+            juce::roundToInt(UiFonts::body().getHeight()));
+    }
+
+private:
+    void timerCallback() override { refresh(); }
+    void refresh() {
+        if (session_ == nullptr) return;
+        const auto snap = session_->snapshot();
+        const bool pending = local_pending_ || snap.output_switch_pending;
+        emu_.setToggleState(!snap.hardware_output, juce::dontSendNotification);
+        hardware_.setToggleState(snap.hardware_output, juce::dontSendNotification);
+        emu_.setEnabled(!pending);
+        hardware_.setEnabled(!pending);
+        const auto detail = juce::String::fromUTF8(snap.output_status.c_str());
+        if (failed_ && detail != failed_status_) failed_ = false;
+        emu_.setTooltip(detail);
+        hardware_.setTooltip(detail + juce::String::fromUTF8(
+            "\n手動で実機使用権を取得します。波形は内蔵エミュによるモニタです。"));
+        juce::String caption;
+        if (pending) caption = juce::String::fromUTF8("切替中…");
+        else if (snap.hardware_output && !snap.hardware_connected)
+            caption = juce::String::fromUTF8("接続断");
+        else if (failed_) caption = juce::String::fromUTF8("切替失敗");
+        status_.setText(caption, juce::dontSendNotification);
+        status_.setTooltip(detail);
+    }
+    void request(bool hardware) {
+        if (session_ == nullptr || local_pending_) return;
+        local_pending_ = true;
+        failed_ = false;
+        refresh();
+        juce::Component::SafePointer<SoundOutputSwitch> safe(this);
+        juce::MessageManager::callAsync([safe, hardware] {
+            if (safe == nullptr) return;
+            safe->failed_ = !safe->session_->output().requestHardwareMode(hardware);
+            safe->failed_status_ = juce::String::fromUTF8(
+                safe->session_->snapshot().output_status.c_str());
+            safe->local_pending_ = false;
+            safe->refresh();
+        });
+    }
+    EditorSession* session_{};
+    juce::TextButton emu_, hardware_;
+    juce::Label status_;
+    bool local_pending_{}, failed_{};
+    juce::String failed_status_;
+};
+
 inline void configureMasterVolumeSlider(
     juce::Slider& slider,
     EditorSession& session,
@@ -2538,7 +2614,7 @@ private:
 
                 mamidi_help_.setText(
                     juce::String::fromUTF8(
-                        "音源の試聴経路を選びます。MAmidiMEmo は "
+                        "実機出力の接続先を設定します。MAmidiMEmo は "
                         "MAmidiMEmo.exe -chip_server 起動後に接続します。\n"
                         "切断時はエミュレータへ自動切替しません。"),
                     juce::dontSendNotification);
@@ -2549,16 +2625,6 @@ private:
                     juce::Label::textColourId,
                     juce::Colour(0xFFE6EDF3));
                 output_page->addAndMakeVisible(mamidi_help_);
-
-                output_kind_.addItem(
-                    juce::String::fromUTF8("内蔵エミュレータ"), 1);
-                output_kind_.addItem("MAmidiMEmo RPC", 2);
-                output_kind_.setSelectedId(
-                    session_.snapshot().hardware_output
-                        ? 2
-                        : 1,
-                    juce::dontSendNotification);
-                output_page->addAndMakeVisible(output_kind_);
 
                 const auto mamidi =
                     session_.snapshot().hardware_settings;
@@ -2702,6 +2768,7 @@ private:
                         tabs_.getTabContentComponent(2)) {
                     auto page =
                         output_page->getLocalBounds().reduced(12);
+                    if (session_.snapshot().capabilities.audio_device_settings) {
                     pc_audio_help_.setBounds(page.removeFromTop(48));
                     page.removeFromTop(8);
                     pc_audio_kind_.setBounds(page.removeFromTop(28));
@@ -2713,9 +2780,8 @@ private:
                     page.removeFromTop(8);
                     pc_audio_status_.setBounds(page.removeFromTop(48));
                     page.removeFromTop(12);
+                    }
                     mamidi_help_.setBounds(page.removeFromTop(72));
-                    page.removeFromTop(10);
-                    output_kind_.setBounds(page.removeFromTop(28));
                     page.removeFromTop(10);
                     auto row = page.removeFromTop(UiLayout::fieldH);
                     host_.setBounds(row.removeFromLeft(180));
@@ -2770,17 +2836,19 @@ private:
             void applyCapabilityGrey() {
                 const auto caps = session_.snapshot().capabilities;
                 if (!caps.midi_device_settings) {
-                    greyOutHostControl(midi_input_);
-                    greyOutHostControl(apply_midi_);
-                    greyOutHostControl(refresh_);
+                    midi_help_.setText("Audio / MIDI: DAW", juce::dontSendNotification);
+                    midi_input_.setVisible(false);
+                    apply_midi_.setVisible(false);
+                    refresh_.setVisible(false);
                 }
                 if (!caps.audio_device_settings) {
-                    greyOutHostControl(pc_audio_kind_);
-                    greyOutHostControl(asio_driver_);
-                    greyOutHostControl(asio_settings_);
+                    pc_audio_help_.setVisible(false);
+                    pc_audio_kind_.setVisible(false);
+                    asio_driver_.setVisible(false);
+                    asio_settings_.setVisible(false);
+                    pc_audio_status_.setVisible(false);
                 }
                 if (!caps.hardware_output && !caps.mamidi && !caps.vsif) {
-                    greyOutHostControl(output_kind_);
                     greyOutHostControl(host_);
                     greyOutHostControl(port_);
                     greyOutHostControl(unit_);
@@ -2806,7 +2874,6 @@ private:
             juce::TextButton asio_settings_;
             juce::Label pc_audio_status_;
             juce::Label mamidi_help_;
-            juce::ComboBox output_kind_;
             juce::TextEditor host_;
             juce::TextEditor port_;
             juce::TextEditor unit_;
@@ -2921,7 +2988,8 @@ private:
                 : PcAudioBackend::Wasapi;
             const auto driver_name = utf8String(
                 safe_content->asio_driver_.getText());
-            if (!safe->session_.output().applyPcAudio(
+            if (caps.audio_device_settings
+                && !safe->session_.output().applyPcAudio(
                     pc_backend,
                     driver_name)) {
                 safe_content->pc_audio_kind_.setSelectedId(
@@ -2952,16 +3020,8 @@ private:
                 9999,
                 safe_content->opll_silence_seconds_.getText()
                     .getIntValue());
-            const bool hardware =
-                safe_content->output_kind_.getSelectedId() == 2;
-            MGSTC_UI_ACTIVITY(
-                "settings: sound output connect (blocking)");
-            if (!safe->session_.output().applySoundRoute(
-                    hardware, std::move(settings), silence_seconds)
-                && hardware) {
-                safe_content->output_kind_.setSelectedId(
-                    1, juce::dontSendNotification);
-            }
+            static_cast<void>(safe->session_.output().applyHardwareSettings(
+                std::move(settings), silence_seconds));
             safe_content->opll_silence_seconds_.setText(
                 juce::String(
                     safe->session_.snapshot()
@@ -3964,6 +4024,7 @@ public:
         if (!isActiveWindow()) {
             return;
         }
+        reloadFromExternalChange();
         UiScale::forceGlobalForNonEditorUi();
         if (auto* content = getContentComponent()) {
             content->sendLookAndFeelChange();
@@ -4023,6 +4084,8 @@ public:
                 performance_keyboard_.showSettingsDialog();
             });
         addAndMakeVisible(settings_);
+        output_switch_.bind(session_);
+        addAndMakeVisible(output_switch_);
         configureMasterVolumeSlider(
             master_volume_, session_, this);
         master_volume_revision_ =
@@ -4717,6 +4780,7 @@ public:
         engine_ready_ = session_.snapshot().audio_running;
         composite_program_stale_ = !hydrate_from_host_;
         applyHostCapabilities();
+        resized();
         startTimer(100);
         ensureCompositeTimerRate();
         updateStatus(
@@ -4747,6 +4811,8 @@ public:
 
     [[nodiscard]] const mgstc::engine::CompositeTimbre& workingTimbre()
         const noexcept {
+        if (import_preview_saved_) return *import_preview_saved_;
+        if (library_manager_saved_timbre_) return *library_manager_saved_timbre_;
         return timbre_;
     }
 
@@ -4861,6 +4927,82 @@ public:
             return;
         }
         performLoadCompositeTimbre(id);
+    }
+
+    void requestSingleTimbreLibraryEntry(
+        mgstc::engine::TimbreSource source, std::uint64_t id) {
+        mgstc::engine::ImportedToneCandidate candidate;
+        {
+            ScopedLibraryIpcLock lock(library_lock_);
+            if (!lock.isLocked()) return;
+            const auto library = loadSharedTimbreLibrary();
+            const auto* entry = library ? library->find(id) : nullptr;
+            if (entry == nullptr) return;
+            const bool scc = source == mgstc::engine::TimbreSource::Scc;
+            if ((!scc && source != mgstc::engine::TimbreSource::Opll)
+                || (entry->category == mgstc::engine::TimbreCategory::Scc) != scc) return;
+            candidate.name = entry->name;
+            candidate.favorite = entry->favorite;
+            candidate.tags = entry->tags;
+            candidate.memo = entry->memo;
+            candidate.type = scc ? mgstc::engine::ImportedToneType::Scc
+                                 : mgstc::engine::ImportedToneType::Opll;
+            candidate.default_register_as = scc ? mgstc::engine::ImportRegisterAs::Scc
+                                                : mgstc::engine::ImportRegisterAs::Opll;
+            if (scc) {
+                mgstc::engine::SccWaveform wave;
+                for (std::size_t i = 0; i < wave.size(); ++i)
+                    wave[i] = static_cast<std::int8_t>(entry->scc_waveform[i]);
+                candidate.data = wave;
+            } else {
+                candidate.data = mgstc::engine::decodeOpllPatch(entry->opll_registers);
+            }
+        }
+        loadSingleImportedCandidate(candidate);
+    }
+
+    void loadSingleImportedCandidate(
+        const mgstc::engine::ImportedToneCandidate& candidate) {
+        libraryManagerAllNotesOff();
+        if (candidate.default_register_as == mgstc::engine::ImportRegisterAs::Composite) {
+            loadImportedCandidate(candidate);
+            return;
+        }
+        stopAudition();
+        const auto source = candidate.default_register_as == mgstc::engine::ImportRegisterAs::Scc
+            ? mgstc::engine::TimbreSource::Scc : mgstc::engine::TimbreSource::Opll;
+        auto layer = std::find_if(timbre_.layers.begin(), timbre_.layers.end(),
+            [source](const auto& value) { return value.source == source; });
+        const auto before = timbre_;
+        if (layer == timbre_.layers.end()) {
+            const auto channel = mgstc::engine::firstAvailableChannel(timbre_, source);
+            if (!channel) return;
+            auto added = mgstc::engine::defaultCompositeTimbre().layers[
+                source == mgstc::engine::TimbreSource::Scc ? 1 : 2];
+            added.channel = *channel;
+            added.envelope_number = mgstc::engine::nextFreeEnvelopeNumber(timbre_);
+            timbre_.layers.push_back(std::move(added));
+            layer = std::prev(timbre_.layers.end());
+        }
+        const auto index = static_cast<std::size_t>(layer - timbre_.layers.begin());
+        const auto entry = mgstc::engine::makeImportedLibraryEntry(
+            candidate, candidate.default_register_as);
+        auto reference = mgstc::engine::adoptLibraryTimbre(timbre_, entry);
+        if (layer->base_timbre) {
+            reference.number_mode = layer->base_timbre->number_mode;
+            reference.manual_number = layer->base_timbre->manual_number;
+        }
+        preserveReferencedBaseSnapshot(index);
+        layer->base_opll_rom.reset();
+        layer->base_timbre = std::move(reference);
+        static_cast<void>(invalidateEditedSccMorphPlans(before, timbre_));
+        composite_program_stale_ = true;
+        refreshTimbreSelectors();
+        syncControlsFromModel();
+        syncTimelineTimbre();
+        recordHistory();
+        static_cast<void>(configureEngine());
+        openOwnedLayerTimbreEditor(index);
     }
 
     void auditionLibraryPreview(std::uint64_t id) {
@@ -5006,6 +5148,28 @@ public:
 
     void ownedEditNoteOff(std::uint8_t note) {
         stopCompositeNote(note);
+        if (import_preview_saved_ && voice_allocator_.activeVoiceCount() == 0)
+            restoreImportPreviewTimbre();
+    }
+
+    bool previewOwnedTimbre(
+        const mgstc::engine::SavedTimbreReference& snapshot,
+        std::optional<std::uint8_t> note, bool one_second) {
+        auto preview = workingTimbre();
+        if (!mgstc::engine::replaceOwnedTimbreSnapshot(preview, snapshot)) return false;
+        if (!import_preview_saved_ || timbre_ != preview) {
+            libraryManagerAllNotesOff();
+            stopAudition();
+            import_preview_saved_ = timbre_;
+            timbre_ = std::move(preview);
+            composite_program_stale_ = true;
+            if (!configureEngine()) {
+                restoreImportPreviewTimbre();
+                return false;
+            }
+        }
+        if (note) startCompositeNote(*note, one_second, true);
+        return true;
     }
 
     void stopImportedPreview() {
@@ -5178,18 +5342,26 @@ public:
             &master_volume_label_,
             &immediate_audition_);
         int chrome_right = immediate_audition_.getX() - controlGap;
-        open_opll_.setBounds(
-            chrome_right - compositeOpenOpllW,
-            pageMargin,
-            compositeOpenOpllW,
-            textButtonH);
-        chrome_right -= compositeOpenOpllW + controlGap;
-        open_scc_.setBounds(
-            chrome_right - compositeOpenSccW,
-            pageMargin,
-            compositeOpenSccW,
-            textButtonH);
-        chrome_right -= compositeOpenSccW + controlGap;
+        const int output_width = UiLayout::outputSwitchW;
+        output_switch_.setBounds(chrome_right - output_width, pageMargin,
+            output_width, textButtonH + juce::roundToInt(UiFonts::body().getHeight()));
+        chrome_right -= output_width + controlGap;
+        if (open_opll_.isVisible()) {
+            open_opll_.setBounds(
+                chrome_right - compositeOpenOpllW,
+                pageMargin,
+                compositeOpenOpllW,
+                textButtonH);
+            chrome_right -= compositeOpenOpllW + controlGap;
+        }
+        if (open_scc_.isVisible()) {
+            open_scc_.setBounds(
+                chrome_right - compositeOpenSccW,
+                pageMargin,
+                compositeOpenSccW,
+                textButtonH);
+            chrome_right -= compositeOpenSccW + controlGap;
+        }
         spectrogram_.setBounds(
             chrome_right - UiScale::sx(88),
             pageMargin,
@@ -7195,8 +7367,8 @@ private:
             greyOutHostControl(spectrogram_);
         }
         if (!caps.independent_scc_opll_workbench) {
-            greyOutHostControl(open_scc_);
-            greyOutHostControl(open_opll_);
+            open_scc_.setVisible(false);
+            open_opll_.setVisible(false);
         }
         if (!caps.tone_library) {
             greyOutHostControl(composite_library_title_);
@@ -7243,9 +7415,12 @@ private:
             : restore_copy ? &*restore_copy
             : manual_y_preview_timbre_ ? &*manual_y_preview_timbre_ : &timbre_;
         request.polyphonic = performance_keyboard_.polyphonic();
-        request.temporary = temporary_restore || wave_conversion_preview_.has_value() || manual_y_preview_timbre_.has_value();
+        const bool library_preview = import_preview_saved_.has_value()
+            || library_manager_saved_timbre_.has_value();
+        request.temporary = temporary_restore || wave_conversion_preview_.has_value()
+            || manual_y_preview_timbre_.has_value() || library_preview;
         request.library = &timbre_library_;
-        request.reserve_restore_slot = wave_conversion_preview_.has_value();
+        request.reserve_restore_slot = wave_conversion_preview_.has_value() || library_preview;
         const auto result = session_.audition().submitComposite(request);
         wave_submission_deferred_ = wave_conversion_preview_.has_value() && result.deferred;
         if (result.deferred) {
@@ -7294,6 +7469,9 @@ private:
         timeline_.applySessionAllocationStarts(timbre_);
         import_preview_saved_.reset();
         composite_program_stale_ = true;
+        // DAW MIDI reaches the Processor without another editor audition.
+        // Restore its runtime program as well as the displayed model.
+        static_cast<void>(configureEngine(true));
     }
 
     void silenceAuditionNotes() {
@@ -7754,6 +7932,7 @@ private:
         juce::DrawableButton::ImageOnButtonBackground};
     juce::DrawableButton settings_{
         "settings", juce::DrawableButton::ImageOnButtonBackground};
+    SoundOutputSwitch output_switch_;
     juce::Slider master_volume_;
     juce::Label master_volume_label_;
     juce::TextButton file_menu_;
@@ -8013,6 +8192,8 @@ public:
                 performance_keyboard_.showSettingsDialog();
             });
         addAndMakeVisible(settings_);
+        output_switch_.bind(session_);
+        addAndMakeVisible(output_switch_);
         configureMasterVolumeSlider(
             master_volume_, session_, this);
         master_volume_revision_ =
@@ -8830,6 +9011,7 @@ public:
         }
         engine_ready_ = session_.snapshot().audio_running;
         applyHostCapabilities();
+        resized();
         startTimerHz(60);
         updateStatus(
             engine_ready_
@@ -8923,6 +9105,7 @@ public:
             || target->source != mgstc::engine::TimbreSource::Scc) {
             return false;
         }
+        owned_preview_snapshot_.reset();
         owned_edit_snapshot_ = *target;
         selected_library_id_.reset();
         SccWaveform waveform{};
@@ -8960,6 +9143,10 @@ public:
         const auto owned_name = utf8Text(name_.getText().trim());
         if (!owned_name.empty()) {
             snapshot.name = owned_name;
+        }
+        if (owned_preview_snapshot_) {
+            owned_preview_snapshot_.reset();
+            link_.owned_audition.stop_preview();
         }
         // A reused editor may publish during activation before the next
         // tone loads. Keep its snapshot separate from the pending target.
@@ -9292,12 +9479,18 @@ public:
             &master_volume_label_,
             &immediate_audition_);
         int chrome_right = immediate_audition_.getX() - controlGap;
-        open_opll_.setBounds(
-            chrome_right - compositeOpenOpllW,
-            pageMargin,
-            compositeOpenOpllW,
-            textButtonH);
-        chrome_right -= compositeOpenOpllW + controlGap;
+        const int output_width = UiLayout::outputSwitchW;
+        output_switch_.setBounds(chrome_right - output_width, pageMargin,
+            output_width, textButtonH + juce::roundToInt(UiFonts::body().getHeight()));
+        chrome_right -= output_width + controlGap;
+        if (open_opll_.isVisible()) {
+            open_opll_.setBounds(
+                chrome_right - compositeOpenOpllW,
+                pageMargin,
+                compositeOpenOpllW,
+                textButtonH);
+            chrome_right -= compositeOpenOpllW + controlGap;
+        }
         spectrogram_.setBounds(
             chrome_right - UiScale::sx(88),
             pageMargin,
@@ -10541,6 +10734,7 @@ private:
             refreshLibraryList();
             return;
         }
+        if (!usesCompositeAudition()) {
         name_.setText(
             juce::String::fromUTF8(entry->name.c_str()), false);
         updateDefinitionPreview();
@@ -10550,6 +10744,7 @@ private:
             juce::String::fromUTF8(entry->memo.c_str()), false);
         favorite_.setToggleState(
             entry->favorite, juce::dontSendNotification);
+        }
         library_preview_ = *entry;
         library_ab_.setEnabled(true);
         library_ab_next_b_ = false;
@@ -11476,7 +11671,7 @@ private:
             greyOutHostControl(spectrogram_);
         }
         if (!caps.independent_scc_opll_workbench) {
-            greyOutHostControl(open_opll_);
+            open_opll_.setVisible(false);
         }
         if (!caps.tone_library) {
             greyOutHostControl(library_filter_);
@@ -11493,11 +11688,22 @@ private:
         }
     }
 
+    bool previewOwnedWave(const SccWaveform& wave,
+        std::optional<std::uint8_t> note = {}, bool one_second = false) {
+        if (!owned_edit_snapshot_ || !link_.owned_audition.preview) return false;
+        auto snapshot = *owned_edit_snapshot_;
+        for (std::size_t index = 0; index < wave.size(); ++index)
+            snapshot.scc_waveform[index] = static_cast<std::uint8_t>(wave[index]);
+        owned_preview_snapshot_ = snapshot;
+        return link_.owned_audition.preview(snapshot, note, one_second);
+    }
+
     bool configureEngine(
         bool retrigger,
         const SccWaveform* preview = nullptr) {
         if (usesCompositeAudition()) {
-            juce::ignoreUnused(retrigger, preview);
+            juce::ignoreUnused(retrigger);
+            if (preview) return previewOwnedWave(*preview);
             publishOwnedSnapshot();
             link_.owned_audition.sync_program();
             return true;
@@ -11529,6 +11735,10 @@ private:
         last_audition_note_ = note;
         saveLastAuditionNoteSetting(last_audition_note_);
         if (usesCompositeAudition()) {
+            if (owned_preview_snapshot_ && link_.owned_audition.preview) {
+                static_cast<void>(link_.owned_audition.preview(*owned_preview_snapshot_, note, false));
+                return;
+            }
             publishOwnedSnapshot();
             link_.owned_audition.note_on(note);
             return;
@@ -11592,6 +11802,11 @@ private:
     [[nodiscard]] bool auditionOneSecond(
         const SccWaveform* preview = nullptr) {
         if (usesCompositeAudition()) {
+            if (preview) {
+                if (!previewOwnedWave(*preview, last_audition_note_, true)) return false;
+                armOneSecondPreview();
+                return true;
+            }
             publishOwnedSnapshot();
             link_.owned_audition.one_second();
             armOneSecondPreview();
@@ -11607,6 +11822,10 @@ private:
     [[nodiscard]] bool auditionAfterEdit(
         const SccWaveform* preview = nullptr) {
         if (usesCompositeAudition()) {
+            if (preview) {
+                if (immediate_audition_.getToggleState()) return auditionOneSecond(preview);
+                return previewOwnedWave(*preview);
+            }
             publishOwnedSnapshot();
             if (immediate_audition_.getToggleState()) {
                 link_.owned_audition.one_second();
@@ -11679,6 +11898,7 @@ private:
     SwitchLookAndFeel switch_look_and_feel_;
     bool envelope_context_{};
     std::optional<mgstc::engine::SavedTimbreReference> owned_edit_snapshot_;
+    std::optional<mgstc::engine::SavedTimbreReference> owned_preview_snapshot_;
     SccWaveform scc_wave_{};
     std::optional<int> ui_scale_session_override_;
     std::vector<SccWaveform> history_;
@@ -11783,6 +12003,7 @@ private:
     juce::Label status_;
     juce::DrawableButton settings_{
         "settings", juce::DrawableButton::ImageOnButtonBackground};
+    SoundOutputSwitch output_switch_;
     juce::Slider master_volume_;
     juce::Label master_volume_label_;
     PerformanceKeyboard performance_keyboard_;
@@ -12173,6 +12394,8 @@ public:
                 performance_keyboard_.showSettingsDialog();
             });
         addAndMakeVisible(settings_);
+        output_switch_.bind(session_);
+        addAndMakeVisible(output_switch_);
         configureMasterVolumeSlider(
             master_volume_, session_, this);
         master_volume_revision_ =
@@ -12612,6 +12835,7 @@ public:
         }
         engine_ready_ = session_.snapshot().audio_running;
         applyHostCapabilities();
+        resized();
         startTimerHz(60);
         updateStatus(
             engine_ready_
@@ -12730,6 +12954,7 @@ public:
             || target->source != mgstc::engine::TimbreSource::Opll) {
             return false;
         }
+        owned_preview_snapshot_.reset();
         owned_edit_snapshot_ = *target;
         selected_library_id_.reset();
         name_.setText(
@@ -12753,6 +12978,10 @@ public:
         const auto owned_name = utf8Text(name_.getText().trim());
         if (!owned_name.empty()) {
             snapshot.name = owned_name;
+        }
+        if (owned_preview_snapshot_) {
+            owned_preview_snapshot_.reset();
+            link_.owned_audition.stop_preview();
         }
         // A reused editor may publish during activation before the next
         // tone loads. Keep its snapshot separate from the pending target.
@@ -13030,12 +13259,18 @@ public:
             &master_volume_label_,
             &immediate_audition_);
         int chrome_right = immediate_audition_.getX() - controlGap;
-        open_scc_.setBounds(
-            chrome_right - compositeOpenSccW,
-            pageMargin,
-            compositeOpenSccW,
-            textButtonH);
-        chrome_right -= compositeOpenSccW + controlGap;
+        const int output_width = UiLayout::outputSwitchW;
+        output_switch_.setBounds(chrome_right - output_width, pageMargin,
+            output_width, textButtonH + juce::roundToInt(UiFonts::body().getHeight()));
+        chrome_right -= output_width + controlGap;
+        if (open_scc_.isVisible()) {
+            open_scc_.setBounds(
+                chrome_right - compositeOpenSccW,
+                pageMargin,
+                compositeOpenSccW,
+                textButtonH);
+            chrome_right -= compositeOpenSccW + controlGap;
+        }
         spectrogram_.setBounds(
             chrome_right - UiScale::sx(88),
             pageMargin,
@@ -13924,6 +14159,7 @@ private:
             refreshLibraryList();
             return;
         }
+        if (!usesCompositeAudition()) {
         name_.setText(
             juce::String::fromUTF8(entry->name.c_str()),
             false);
@@ -13935,6 +14171,7 @@ private:
             false);
         favorite_.setToggleState(
             entry->favorite, juce::dontSendNotification);
+        }
         library_preview_ = *entry;
         library_ab_.setEnabled(true);
         library_ab_next_b_ = false;
@@ -14604,6 +14841,12 @@ private:
         const mgstc::engine::OpllPatchParameters*
             preview = nullptr) {
         if (usesCompositeAudition()) {
+            if (preview) {
+                if (immediate_audition_.getToggleState())
+                    static_cast<void>(auditionOneSecond(preview));
+                else static_cast<void>(previewOwnedPatch(*preview));
+                return;
+            }
             publishOwnedSnapshot();
             if (immediate_audition_.getToggleState()) {
                 link_.owned_audition.one_second();
@@ -14712,7 +14955,7 @@ private:
             greyOutHostControl(spectrogram_);
         }
         if (!caps.independent_scc_opll_workbench) {
-            greyOutHostControl(open_scc_);
+            open_scc_.setVisible(false);
         }
         if (!caps.waveform_scope) {
             greyOutHostControl(scope_);
@@ -14740,12 +14983,22 @@ private:
             && link_.owned_audition.ready();
     }
 
+    bool previewOwnedPatch(const mgstc::engine::OpllPatchParameters& patch,
+        std::optional<std::uint8_t> note = {}, bool one_second = false) {
+        if (!owned_edit_snapshot_ || !link_.owned_audition.preview) return false;
+        auto snapshot = *owned_edit_snapshot_;
+        snapshot.opll_registers = mgstc::engine::encodeOpllPatch(patch);
+        owned_preview_snapshot_ = snapshot;
+        return link_.owned_audition.preview(snapshot, note, one_second);
+    }
+
     bool configureEngine(
         bool retrigger,
         const mgstc::engine::OpllPatchParameters*
             preview = nullptr) {
         if (usesCompositeAudition()) {
-            juce::ignoreUnused(retrigger, preview);
+            juce::ignoreUnused(retrigger);
+            if (preview) return previewOwnedPatch(*preview);
             publishOwnedSnapshot();
             link_.owned_audition.sync_program();
             return true;
@@ -14780,6 +15033,10 @@ private:
         updateAuditionNoteLabels();
         pending_envelope_trace_refresh_ = true;
         if (usesCompositeAudition()) {
+            if (owned_preview_snapshot_ && link_.owned_audition.preview) {
+                static_cast<void>(link_.owned_audition.preview(*owned_preview_snapshot_, note, false));
+                return;
+            }
             publishOwnedSnapshot();
             link_.owned_audition.note_on(note);
             return;
@@ -14825,8 +15082,12 @@ private:
         const mgstc::engine::OpllPatchParameters*
             preview = nullptr) {
         if (usesCompositeAudition()) {
-            publishOwnedSnapshot();
-            link_.owned_audition.one_second();
+            if (preview) {
+                if (!previewOwnedPatch(*preview, last_audition_note_, true)) return false;
+            } else {
+                publishOwnedSnapshot();
+                link_.owned_audition.one_second();
+            }
             performance_keyboard_.showPreviewNote(last_audition_note_);
             audition_stop_time_ms_ =
                 juce::Time::getMillisecondCounterHiRes() + 1000.0;
@@ -14895,6 +15156,7 @@ private:
     SwitchLookAndFeel switch_look_and_feel_;
     bool envelope_context_{};
     std::optional<mgstc::engine::SavedTimbreReference> owned_edit_snapshot_;
+    std::optional<mgstc::engine::SavedTimbreReference> owned_preview_snapshot_;
     mgstc::engine::OpllPatchParameters patch_;
     std::optional<int> ui_scale_session_override_;
     std::vector<mgstc::engine::OpllPatchParameters> history_;
@@ -14966,6 +15228,7 @@ private:
     juce::Label status_;
     juce::DrawableButton settings_{
         "settings", juce::DrawableButton::ImageOnButtonBackground};
+    SoundOutputSwitch output_switch_;
     juce::Slider master_volume_;
     juce::Label master_volume_label_;
     PerformanceKeyboard performance_keyboard_;

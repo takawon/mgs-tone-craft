@@ -72,14 +72,20 @@ public:
         return output_backend_;
     }
 
-    // When remote output is active, also drive the local simulator so
-    // scope/waveform views keep updating. Does not unmute PC speakers.
+    // Show the continuously maintained emulator mirror in the waveform views
+    // during remote output. Does not unmute PC speakers.
     void setWaveformMonitor(bool enabled) noexcept {
         waveform_monitor_ = enabled;
     }
 
     [[nodiscard]] bool waveformMonitor() const noexcept {
         return waveform_monitor_;
+    }
+
+    // Audio consumer only. Offline rendering uses the continuously maintained
+    // emulator mirror without changing the selected output or opening RPC.
+    void setOfflineRendering(bool enabled) noexcept {
+        offline_rendering_ = enabled;
     }
 
     [[nodiscard]] SoundOutputKind outputKind() const noexcept {
@@ -140,6 +146,7 @@ private:
     EmulatorSoundOutput emulator_{};
     SoundOutputBackend* output_backend_{nullptr};
     bool waveform_monitor_{false};
+    bool offline_rendering_{false};
     TickClock clock_{};
     MixerGains gains_{};
     DcBlocker mix_dc_blocker_{48'000.0F, 3.4F};

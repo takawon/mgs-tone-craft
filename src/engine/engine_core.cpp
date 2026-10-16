@@ -11,26 +11,15 @@ bool EngineCore::validGain(float value) noexcept {
 
 bool EngineCore::writeActiveRegisters(
     std::span<const RegisterWrite> writes) noexcept {
-    if (output_backend_ == nullptr) {
-        return emulator_.writeRegisters(writes);
-    }
-    if (!output_backend_->writeRegisters(writes)) {
-        return false;
-    }
-    if (waveform_monitor_) {
-        return emulator_.writeRegisters(writes);
-    }
-    return true;
+    // Keep every ordered write in the mirror even when its waveform is hidden.
+    // Offline bounces can begin between notes, without a route reinitialization.
+    const bool mirrored = emulator_.writeRegisters(writes);
+    return mirrored && (output_backend_ == nullptr || offline_rendering_
+        || output_backend_->writeRegisters(writes));
 }
 
 ChipSamples EngineCore::renderScopeSample(bool capture_channels) noexcept {
-    if (output_backend_ == nullptr) {
-        return emulator_.renderSample(capture_channels);
-    }
-    if (waveform_monitor_) {
-        return emulator_.renderSample(capture_channels);
-    }
-    return silentSample();
+    return emulator_.renderSample(capture_channels);
 }
 
 bool EngineCore::setGains(MixerGains gains) noexcept {
@@ -46,16 +35,10 @@ bool EngineCore::setGains(MixerGains gains) noexcept {
 
 void EngineCore::hardReset() noexcept {
     session_.resetForKeyOn();
-    if (output_backend_ != nullptr) {
+    if (output_backend_ != nullptr && !offline_rendering_) {
         output_backend_->reset();
-        if (waveform_monitor_) {
-            emulator_.reset();
-        } else {
-            emulator_.allNotesOff();
-        }
-    } else {
-        emulator_.reset();
     }
+    emulator_.reset();
     clock_.reset();
     mix_dc_blocker_.reset();
     analysis_mix_dc_blocker_.reset();
@@ -89,7 +72,8 @@ RenderResult EngineCore::render(
         return result;
     }
 
-    const bool remote_output = output_backend_ != nullptr;
+    const bool remote_output = output_backend_ != nullptr && !offline_rendering_;
+    const bool hide_monitor = remote_output && !waveform_monitor_;
     const bool fill_scope = opll_scope_enabled_;
     const auto frame_count = interleaved_stereo.size() / 2;
     for (std::size_t frame = 0; frame < frame_count; ) {
@@ -134,16 +118,18 @@ RenderResult EngineCore::render(
             static_cast<std::size_t>(until_tick));
         for (std::size_t index = 0; index < run; ++index) {
             const auto out_frame = frame + index;
-            const auto scope_chips = renderScopeSample(
+            const auto local_chips = renderScopeSample(
                 capture != nullptr && capture->channelsEnabled());
+            const auto scope_chips = hide_monitor ? silentSample() : local_chips;
             const auto scope_raw = gains_.master * (
-                scope_chips.psg * gains_.psg
-                + scope_chips.scc * gains_.scc
-                + scope_chips.opll * gains_.opll);
+                local_chips.psg * gains_.psg
+                + local_chips.scc * gains_.scc
+                + local_chips.opll * gains_.opll);
             // Mild DC block on the mixed float bus (MSXplay/libkss-like output
             // stage with MML lpf=0: RCF off, DC filter still active).
             const auto scope_filtered = mix_dc_blocker_.process(scope_raw);
-            const auto scope_mixed = std::clamp(scope_filtered, -1.0F, 1.0F);
+            const auto local_mixed = std::clamp(scope_filtered, -1.0F, 1.0F);
+            const auto scope_mixed = hide_monitor ? 0.0F : local_mixed;
             if (capture != nullptr) {
                 if (analysis_context_ != capture->context()) {
                     analysis_mix_dc_blocker_.reset();

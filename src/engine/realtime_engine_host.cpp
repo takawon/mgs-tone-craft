@@ -6,8 +6,118 @@
 #include <cmath>
 #include <thread>
 #include <utility>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace mgstc::engine {
+
+namespace {
+constexpr std::uint32_t kOutputClosed = 0x80000000U;
+
+// This is a control-thread coordinator. The mapping contains only pointers
+// belonging to this process, allowing two loaded copies of the plugin module
+// to transfer the same lease. The file handle is an OS lifetime lock; unlike a
+// mutex owned by a UI thread it also survives that thread's termination.
+struct OutputLease {
+    struct State {
+        void* owner{};
+        bool (*relinquish)(void*){};
+#ifdef _WIN32
+        HANDLE device_lock{};
+#endif
+    };
+#ifdef _WIN32
+    HANDLE mutex{};
+    HANDLE mapping{};
+    State* state{};
+    OutputLease() {
+        const auto suffix = std::to_wstring(GetCurrentProcessId());
+        mutex = CreateMutexW(nullptr, FALSE,
+            (L"Local\\MGSTC.OutputControl.v1." + suffix).c_str());
+        if (mutex == nullptr) return;
+        if (WaitForSingleObject(mutex, INFINITE) > WAIT_ABANDONED) return;
+        mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+            PAGE_READWRITE, 0, sizeof(State),
+            (L"Local\\MGSTC.OutputOwner.v1." + suffix).c_str());
+        if (mapping != nullptr)
+            state = static_cast<State*>(MapViewOfFile(mapping,
+                FILE_MAP_ALL_ACCESS, 0, 0, sizeof(State)));
+        ReleaseMutex(mutex);
+    }
+    bool lock() { return state != nullptr
+        && WaitForSingleObject(mutex, INFINITE) <= WAIT_ABANDONED; }
+    void unlock() { ReleaseMutex(mutex); }
+    bool lockDevice() {
+        if (state->device_lock != nullptr) return true;
+        // Resolve the user's actual folder rather than a process-specific TMP
+        // or environment override (DAWs may customize either).
+        wchar_t path[MAX_PATH + 1]{};
+        const auto shell = LoadLibraryExW(L"shell32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (shell == nullptr) return false;
+        using FolderPath = HRESULT (WINAPI*)(HWND, int, HANDLE, DWORD, LPWSTR);
+        const auto folder = reinterpret_cast<FolderPath>(GetProcAddress(shell, "SHGetFolderPathW"));
+        const bool found = folder != nullptr && SUCCEEDED(folder(nullptr, 0x001c, nullptr, 0, path));
+        FreeLibrary(shell);
+        if (!found) return false;
+        const auto file = std::wstring(path) + L"\\MGSTC.MAmidiMEmo.output.v1.lock";
+        const auto handle = CreateFileW(file.c_str(), GENERIC_READ | GENERIC_WRITE,
+            0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) return false;
+        state->device_lock = handle;
+        return true;
+    }
+    void unlockDevice() {
+        if (state->device_lock != nullptr) CloseHandle(state->device_lock);
+        state->device_lock = nullptr;
+    }
+#else
+    std::mutex mutex;
+    State local{};
+    State* state{&local};
+    bool lock() { mutex.lock(); return true; }
+    void unlock() { mutex.unlock(); }
+    bool lockDevice() { return true; }
+    void unlockDevice() {}
+#endif
+};
+
+OutputLease& outputLease() {
+    // Process lifetime, including late destruction of global EngineHosts and
+    // module unload/reload. The OS releases the mapping/handles on process exit.
+    static auto* lease = new OutputLease;
+    return *lease;
+}
+struct LeaseLock {
+    OutputLease& lease{outputLease()};
+    bool locked{lease.lock()};
+    ~LeaseLock() { if (locked) lease.unlock(); }
+};
+} // namespace
+
+RealtimeEngineHost::RealtimeAccess::RealtimeAccess(
+    const RealtimeEngineHost& host) noexcept : host_(host) {
+    std::uint32_t expected = 0;
+    entered_ = host_.output_access_.compare_exchange_strong(expected, 1,
+        std::memory_order_acquire, std::memory_order_relaxed);
+}
+RealtimeEngineHost::RealtimeAccess::~RealtimeAccess() {
+    if (entered_) host_.output_access_.fetch_sub(1, std::memory_order_release);
+}
+RealtimeEngineHost::OutputTransition::OutputTransition(RealtimeEngineHost& host)
+    : host_(host), lock_(host.output_control_mutex_) {
+    host_.output_switch_pending_.store(true, std::memory_order_release);
+    host_.output_access_.fetch_or(kOutputClosed, std::memory_order_acq_rel);
+    while (host_.output_access_.load(std::memory_order_acquire) != kOutputClosed)
+        std::this_thread::yield();
+}
+RealtimeEngineHost::OutputTransition::~OutputTransition() {
+    host_.output_access_.store(0, std::memory_order_release);
+    host_.output_switch_pending_.store(false, std::memory_order_release);
+}
 
 static_assert(std::is_nothrow_move_assignable_v<EngineCore>);
 
@@ -28,6 +138,7 @@ RealtimeEngineHost::RealtimeEngineHost()
 }
 
 void RealtimeEngineHost::setOpllScopeEnabled(bool enabled) noexcept {
+    OutputTransition transition(*this);
     opll_scope_enabled_ = enabled;
     for (std::size_t index = 0; index < kProgramSlotCount; ++index) {
         programs_[index].engine.setOpllScopeEnabled(enabled);
@@ -35,13 +146,20 @@ void RealtimeEngineHost::setOpllScopeEnabled(bool enabled) noexcept {
 }
 
 bool RealtimeEngineHost::hasRealtimeWork() const noexcept {
+    RealtimeAccess access(*this);
+    if (!access) return false;
     return programs_[active_program_].engine.session().hasRealtimeWork();
 }
 
 RealtimeEngineHost::~RealtimeEngineHost() {
-    output_kind_ = SoundOutputKind::Emulator;
-    applyOutputRouting();
-    if (mamidi_ != nullptr) {
+    LeaseLock lease;
+    if (lease.locked && lease.lease.state->owner == this) {
+        static_cast<void>(relinquishHardwareOutput());
+        lease.lease.state->owner = nullptr;
+        lease.lease.state->relinquish = nullptr;
+        lease.lease.unlockDevice();
+    } else {
+        OutputTransition transition(*this);
         mamidi_->close();
     }
 }
@@ -147,14 +265,18 @@ bool RealtimeEngineHost::submit(
 
 void RealtimeEngineHost::setMAmidiSettings(
     MAmidiOutputSettings settings) {
+    LeaseLock lease;
+    if (!lease.locked) return;
+    OutputTransition transition(*this);
     const bool endpoint_changed =
         settings.host != mamidi_settings_.host
         || settings.port != mamidi_settings_.port
         || settings.unit_no != mamidi_settings_.unit_no
         || settings.scc_plus != mamidi_settings_.scc_plus;
     mamidi_settings_ = std::move(settings);
+    waveform_monitor_.store(mamidi_settings_.waveform_monitor, std::memory_order_release);
     // Waveform monitor is local-only and must update without reconnect.
-    applyOutputRouting();
+    applyOutputRouting(false);
 
     if (mamidi_ == nullptr || !endpoint_changed) {
         return;
@@ -181,39 +303,114 @@ const MAmidiOutputSettings& RealtimeEngineHost::mamidiSettings()
     return mamidi_settings_;
 }
 
-bool RealtimeEngineHost::setSoundOutputKind(SoundOutputKind kind) {
-    if (kind == SoundOutputKind::Emulator) {
-        output_kind_ = SoundOutputKind::Emulator;
-        applyOutputRouting();
-        if (mamidi_ != nullptr) {
-            mamidi_->close();
-        }
-        return true;
-    }
-
-    if (mamidi_ == nullptr) {
+bool RealtimeEngineHost::relinquishHardwareOutput() {
+    OutputTransition transition(*this);
+    mamidi_->close();
+    if (!mamidi_->closeAcknowledged()) {
+        output_error_ = "Previous MAmidiMEmo writes were not acknowledged; release the previous owner explicitly";
         return false;
     }
+    output_kind_.store(SoundOutputKind::Emulator, std::memory_order_release);
+    desired_output_kind_.store(SoundOutputKind::Emulator, std::memory_order_release);
+    hardware_owned_.store(false, std::memory_order_release);
+    applyOutputRouting();
+    // Retire pre-transfer UI notes as well as the active voices. Program/mixer
+    // commands still take effect, then the old runtime is gated until a new note.
+    applyPendingCommands();
+    auto& core = programs_[active_program_].engine;
+    applyRealtimePolicy(core);
+    core.hardReset();
+    core.session().gateUntilNoteOn();
+    allNotesStopped();
+    ++spectrum_pcm_epoch_;
+    return true;
+}
+
+bool RealtimeEngineHost::setSoundOutputKind(SoundOutputKind kind) {
+    LeaseLock lease;
+    if (!lease.locked) {
+        output_error_ = "MAmidiMEmo ownership coordinator is unavailable";
+        return false;
+    }
+    desired_output_kind_.store(kind, std::memory_order_release);
+    if (kind == SoundOutputKind::Emulator) {
+        OutputTransition transition(*this);
+        mamidi_->close();
+        output_kind_.store(kind, std::memory_order_release);
+        hardware_owned_.store(false, std::memory_order_release);
+        applyOutputRouting();
+        applyPendingCommands();
+        auto& core = programs_[active_program_].engine;
+        applyRealtimePolicy(core);
+        core.hardReset();
+        core.session().gateUntilNoteOn();
+        allNotesStopped();
+        ++spectrum_pcm_epoch_;
+        if (lease.lease.state->owner == this) {
+            lease.lease.state->owner = nullptr;
+            lease.lease.state->relinquish = nullptr;
+            lease.lease.unlockDevice();
+        }
+        output_error_.clear();
+        return true;
+    }
+    if (lease.lease.state->owner == this) return true;
+    output_switch_pending_.store(true, std::memory_order_release);
+    if (lease.lease.state->owner != nullptr) {
+        if (!lease.lease.state->relinquish(lease.lease.state->owner)) {
+            output_error_ = "The previous MAmidiMEmo owner could not stop safely";
+            desired_output_kind_.store(SoundOutputKind::Emulator, std::memory_order_release);
+            output_switch_pending_.store(false, std::memory_order_release);
+            return false;
+        }
+        lease.lease.state->owner = nullptr;
+        lease.lease.state->relinquish = nullptr;
+    }
+    if (!lease.lease.lockDevice()) {
+        output_error_ = "MAmidiMEmo is owned by another MGSTC process";
+        desired_output_kind_.store(SoundOutputKind::Emulator, std::memory_order_release);
+        output_switch_pending_.store(false, std::memory_order_release);
+        return false;
+    }
+    OutputTransition transition(*this);
     mamidi_->setEndpoint(mamidi_settings_.host, mamidi_settings_.port);
     mamidi_->setUnitNo(mamidi_settings_.unit_no);
     mamidi_->setSccPlus(mamidi_settings_.scc_plus);
-    if (!mamidi_->isOpen() && !mamidi_->open()) {
-        // Selection stays on emulator until connect succeeds.
+    if (!mamidi_->open()) {
+        output_error_ = mamidi_->lastError();
+        desired_output_kind_.store(SoundOutputKind::Emulator, std::memory_order_release);
+        lease.lease.unlockDevice();
         return false;
     }
-    output_kind_ = SoundOutputKind::MAmidiMemo;
+    output_error_.clear();
+    lease.lease.state->owner = this;
+    lease.lease.state->relinquish = [](void* owner) {
+        return static_cast<RealtimeEngineHost*>(owner)->relinquishHardwareOutput();
+    };
+    hardware_owned_.store(true, std::memory_order_release);
+    output_kind_.store(kind, std::memory_order_release);
     applyOutputRouting();
+    // Old terminal silence is acknowledged before new initialization begins.
+    auto& core = programs_[active_program_].engine;
+    applyRealtimePolicy(core);
+    core.hardReset();
+    core.session().gateUntilNoteOn();
+    allNotesStopped();
+    ++spectrum_pcm_epoch_;
     return true;
 }
 
 SoundOutputKind RealtimeEngineHost::soundOutputKind() const noexcept {
-    return output_kind_;
+    return output_kind_.load(std::memory_order_acquire);
 }
 
 bool RealtimeEngineHost::reconnectMAmidi() {
-    if (mamidi_ == nullptr) {
+    LeaseLock lease;
+    if (!lease.locked || lease.lease.state->owner != this) {
+        output_error_ = "Select hardware output before reconnecting";
         return false;
     }
+    OutputTransition transition(*this);
     mamidi_->close();
     mamidi_->setEndpoint(mamidi_settings_.host, mamidi_settings_.port);
     mamidi_->setUnitNo(mamidi_settings_.unit_no);
@@ -226,10 +423,13 @@ bool RealtimeEngineHost::reconnectMAmidi() {
     if (output_kind_ == SoundOutputKind::MAmidiMemo) {
         applyOutputRouting();
     }
+    output_error_.clear();
     return true;
 }
 
 std::string RealtimeEngineHost::soundOutputStatus() const {
+    LeaseLock lease;
+    if (!output_error_.empty()) return output_error_;
     if (output_kind_ == SoundOutputKind::Emulator) {
         return "Output: Emulator";
     }
@@ -240,10 +440,21 @@ std::string RealtimeEngineHost::soundOutputStatus() const {
 }
 
 std::string RealtimeEngineHost::soundOutputLastError() const {
+    LeaseLock lease;
+    if (!output_error_.empty()) return output_error_;
     if (mamidi_ == nullptr) {
         return {};
     }
     return mamidi_->lastError();
+}
+
+void RealtimeEngineHost::setRealtimeOfflineRendering(bool enabled) noexcept {
+    offline_rendering_.store(enabled, std::memory_order_release);
+    mamidi_->setEmissionEnabled(!enabled);
+}
+
+void RealtimeEngineHost::applyRealtimePolicy(EngineCore& core) noexcept {
+    core.setOfflineRendering(offline_rendering_.load(std::memory_order_acquire));
 }
 
 bool RealtimeEngineHost::pollNotice(EngineNotice& notice) noexcept {
@@ -359,10 +570,10 @@ void RealtimeEngineHost::reject(
     });
 }
 
-void RealtimeEngineHost::applyOutputRouting() noexcept {
-    for (std::uint8_t index = 0; index < kProgramSlotCount; ++index) {
-        applyOutputRouting(programs_[index].engine);
-    }
+void RealtimeEngineHost::applyOutputRouting(bool changed) noexcept {
+    // Inactive Editing slots belong to the producer; refresh at activation.
+    applyOutputRouting(programs_[active_program_].engine);
+    if (changed) output_routing_revision_.fetch_add(1, std::memory_order_release);
 }
 
 void RealtimeEngineHost::applyOutputRouting(EngineCore& engine) noexcept {
@@ -373,7 +584,7 @@ void RealtimeEngineHost::applyOutputRouting(EngineCore& engine) noexcept {
     } else {
         engine.setOutputBackend(nullptr);
     }
-    engine.setWaveformMonitor(mamidi_settings_.waveform_monitor);
+    engine.setWaveformMonitor(waveform_monitor_.load(std::memory_order_acquire));
 }
 
 void RealtimeEngineHost::loadProgram(
@@ -400,6 +611,7 @@ void RealtimeEngineHost::loadProgram(
     static_cast<void>(incoming.engine.setGains(current_gains_));
     incoming.engine.setOpllScopeEnabled(opll_scope_enabled_);
     applyOutputRouting(incoming.engine);
+    applyRealtimePolicy(incoming.engine);
     incoming.engine.hardReset();
     ++spectrum_pcm_epoch_;
     incoming.engine.session().gateUntilNoteOn();
@@ -442,7 +654,7 @@ void RealtimeEngineHost::drainPendingCommands(
     bool process_on_caller_thread) noexcept {
     if (process_on_caller_thread) {
         while (pendingCommandCount() > 0 || hasPendingProgramLoad()) {
-            applyPendingCommands();
+            servicePendingControlCommands();
         }
         return;
     }
@@ -543,12 +755,17 @@ void RealtimeEngineHost::applyPendingCommands() noexcept {
 }
 
 void RealtimeEngineHost::servicePendingControlCommands() noexcept {
+    RealtimeAccess access(*this);
+    if (!access) return;
+    applyRealtimePolicy(programs_[active_program_].engine);
     applyPendingCommands();
 }
 
 bool RealtimeEngineHost::realtimeNoteOn(
     std::uint8_t track,
     std::uint8_t midi_note) noexcept {
+    RealtimeAccess access(*this);
+    if (!access) return false;
     if (!programs_[active_program_].engine.session().queueNoteOn(
             track, midi_note)) {
         return false;
@@ -558,6 +775,8 @@ bool RealtimeEngineHost::realtimeNoteOn(
 }
 
 bool RealtimeEngineHost::realtimeNoteOff(std::uint8_t track) noexcept {
+    RealtimeAccess access(*this);
+    if (!access) return false;
     if (!programs_[active_program_].engine.session().queueKeyOff(track)) {
         return false;
     }
@@ -566,6 +785,8 @@ bool RealtimeEngineHost::realtimeNoteOff(std::uint8_t track) noexcept {
 }
 
 bool RealtimeEngineHost::realtimeSilenceTrack(std::uint8_t track) noexcept {
+    RealtimeAccess access(*this);
+    if (!access) return false;
     if (!programs_[active_program_].engine.session().forceMuteTrack(track)) {
         return false;
     }
@@ -574,6 +795,9 @@ bool RealtimeEngineHost::realtimeSilenceTrack(std::uint8_t track) noexcept {
 }
 
 void RealtimeEngineHost::realtimeStop() noexcept {
+    RealtimeAccess access(*this);
+    if (!access) return;
+    applyRealtimePolicy(programs_[active_program_].engine);
     programs_[active_program_].engine.hardReset();
     ++spectrum_pcm_epoch_;
     allNotesStopped();
@@ -587,7 +811,13 @@ RenderResult RealtimeEngineHost::render(
 
 RenderResult RealtimeEngineHost::renderAudio(
     std::span<float> interleaved_stereo) noexcept {
+    RealtimeAccess access(*this);
+    if (!access) {
+        std::fill(interleaved_stereo.begin(), interleaved_stereo.end(), 0.0F);
+        return {.frames = interleaved_stereo.size() / 2};
+    }
     auto& core = programs_[active_program_].engine;
+    applyRealtimePolicy(core);
     SpectrumCapture* capture = nullptr;
     if (spectrum_enabled_.load(std::memory_order_acquire)) {
         spectrum_capture_->begin(spectrum_sample_clock_,

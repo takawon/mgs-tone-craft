@@ -62,6 +62,7 @@ private:
     Content* content_{};
     std::function<void(bool)> performance_input_active_changed_;
     bool internal_pin_{};
+    std::uint64_t ui_scale_listener_{};
 };
 
 }  // namespace mgstc::app

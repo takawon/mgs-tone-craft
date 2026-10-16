@@ -9,6 +9,14 @@
 #include <limits>
 #include <span>
 
+#if JUCE_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#include "ui_paths.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
 #include "mgstc/engine/engine_command.hpp"
 #include "mgstc/engine/opll_patch.hpp"
@@ -73,9 +81,11 @@ MgstcAudioProcessor::MgstcAudioProcessor()
     engine_.setOpllScopeEnabled(false);
     engine_.setSpectrumCaptureEnabled(false);
     engine_.setSpectrogramCaptureEnabled(false);
+    loadHardwarePreferences();
     PluginStateDocument document;
     document.sound = mgstc::engine::makePluginDefaultComposite();
     static_cast<void>(commitPluginState(std::move(document), CommitMode::Initial));
+    observed_output_revision_ = engine_.outputRoutingRevision();
 }
 
 MgstcAudioProcessor::~MgstcAudioProcessor() {
@@ -258,6 +268,7 @@ int MgstcAudioProcessor::srcLatencyHostSamples(
 
 void MgstcAudioProcessor::resetPlaybackState(bool hard_stop) noexcept {
     scheduler_.reset();
+    opll_silence_due_.fill(0);
     std::array<std::uint8_t, kMaxVoices> ignored{};
     static_cast<void>(voices_.allNotesOff(ignored));
     if (hard_stop) {
@@ -281,6 +292,10 @@ void MgstcAudioProcessor::prepareToPlay(
     double sampleRate,
     int samplesPerBlock) {
     pcm_preview_.stop();
+    engine_.setRealtimeOfflineRendering(isNonRealtime());
+    previous_block_offline_ = isNonRealtime();
+    transport_known_ = false;
+    expected_transport_sample_.reset();
     diag_prepare_to_play_.fetch_add(1, std::memory_order_relaxed);
     diag_last_samples_per_block_.store(
         samplesPerBlock, std::memory_order_relaxed);
@@ -340,10 +355,12 @@ void MgstcAudioProcessor::prepareToPlay(
             0,
             100))
         / 100.0F;
+    observed_output_revision_ = engine_.outputRoutingRevision();
 }
 
 void MgstcAudioProcessor::releaseResources() {
     pcm_preview_.stop();
+    engine_.setRealtimeOfflineRendering(isNonRealtime());
     diag_release_resources_.fetch_add(1, std::memory_order_relaxed);
     resetPlaybackState(true);
     engine_frame_position_ = 0;
@@ -359,6 +376,11 @@ void MgstcAudioProcessor::releaseResources() {
 
 void MgstcAudioProcessor::reset() {
     pcm_preview_.stop();
+    engine_.setRealtimeOfflineRendering(isNonRealtime());
+    previous_block_offline_ = isNonRealtime();
+    resetProgramState();
+    transport_known_ = false;
+    expected_transport_sample_.reset();
     diag_reset_.fetch_add(1, std::memory_order_relaxed);
     juce::AudioProcessor::reset();
 }
@@ -398,6 +420,36 @@ void MgstcAudioProcessor::processBlock(
         bool& flag;
         ~ProcessFlag() { flag = false; }
     } clear_flag{in_process_block_};
+
+    const bool offline = isNonRealtime();
+    // This audio-only flag suppresses RPC and enables the mirrored emulator;
+    // it never changes ownership, the user's selection, or RPC connections.
+    engine_.setRealtimeOfflineRendering(offline);
+    struct FinalHardwareSilence {
+        mgstc::engine::RealtimeEngineHost& engine;
+        juce::AudioBuffer<float>& buffer;
+        bool offline;
+        ~FinalHardwareSilence() {
+            if (!offline && engine.soundOutputKind()
+                == mgstc::engine::SoundOutputKind::MAmidiMemo)
+                buffer.clear();
+        }
+    } hardware_silence{engine_, buffer, offline};
+    const auto output_revision = engine_.outputRoutingRevision();
+    const bool offline_mode_changed = previous_block_offline_ != offline;
+    previous_block_offline_ = offline;
+    if (output_revision != observed_output_revision_ || offline_mode_changed) {
+        // Offline rendering advances runtime register shadows. On returning to
+        // realtime, hardReset clears them and queues the physical reset before
+        // any new live note, preserving the manually selected route/lease.
+        resetPlaybackState(true);
+        editorClearOpllKeyoffSilence();
+        pcm_preview_.stop();
+        src_.reset();
+        if (use_src_ && sample_rate_ok_) src_.primeWithSilence();
+        observed_output_revision_ = output_revision;
+    }
+    updateHostTransport(buffer.getNumSamples());
 
     if constexpr (vst3DiagSilencesNon48Process()) {
         if (!hostIsEngineRate()) {
@@ -458,6 +510,38 @@ void MgstcAudioProcessor::processBlock(
     mapped_count_ = 0;
     mapped_index_ = 0;
     midi.clear();
+}
+
+void MgstcAudioProcessor::updateHostTransport(int num_samples) noexcept {
+    auto* play_head = getPlayHead();
+    const auto position = play_head != nullptr ? play_head->getPosition()
+                                               : juce::Optional<juce::AudioPlayHead::PositionInfo>{};
+    if (!position) {
+        transport_known_ = false;
+        expected_transport_sample_.reset();
+        return;
+    }
+    const bool playing = position->getIsPlaying();
+    bool discontinuity = transport_known_ && transport_was_playing_ && !playing;
+    const auto sample = position->getTimeInSamples();
+    if (playing && transport_known_ && transport_was_playing_
+        && sample && expected_transport_sample_
+        && *sample != *expected_transport_sample_)
+        discontinuity = true;
+    if (discontinuity) {
+        // Bounded engine stop queues chip key-offs; no RPC, mutex, or join.
+        resetPlaybackState(true);
+        pcm_preview_.stop();
+        src_.reset();
+        if (use_src_ && sample_rate_ok_) src_.primeWithSilence();
+    }
+    transport_known_ = true;
+    transport_was_playing_ = playing;
+    if (playing && sample && num_samples >= 0
+        && *sample <= std::numeric_limits<juce::int64>::max() - num_samples)
+        expected_transport_sample_ = *sample + num_samples;
+    else
+        expected_transport_sample_.reset();
 }
 
 void MgstcAudioProcessor::resetBlockDiagnostics() noexcept {
@@ -933,9 +1017,11 @@ void MgstcAudioProcessor::stopTrack(std::uint8_t track, bool hard) noexcept {
         break;
     case TrackLayerState::Active:
         if (hard) {
+            opll_silence_due_[track] = 0;
             static_cast<void>(engine_.realtimeSilenceTrack(track));
         } else {
             static_cast<void>(engine_.realtimeNoteOff(track));
+            armOpllKeyoffSilence(track);
         }
         track_state_[track] = TrackLayerState::Inactive;
         break;
@@ -965,6 +1051,7 @@ void MgstcAudioProcessor::startVoice(
         const auto delay_frames =
             delayMillisecondsToEngineFrames(binding.start_delay_ms);
         if (delay_frames == 0) {
+            opll_silence_due_[track] = 0;
             static_cast<void>(engine_.realtimeNoteOn(track, *note));
             track_state_[track] = TrackLayerState::Active;
             recordNoteOn(track, *note);
@@ -997,6 +1084,7 @@ void MgstcAudioProcessor::fireDueLayers(std::uint64_t frame) noexcept {
         }
         static_cast<void>(
             engine_.realtimeNoteOn(event.physical_track, event.midi_note));
+        opll_silence_due_[event.physical_track] = 0;
         track_state_[event.physical_track] = TrackLayerState::Active;
         recordNoteOn(event.physical_track, event.midi_note);
     }
@@ -1294,12 +1382,14 @@ void MgstcAudioProcessor::applyCommittedPlaybackPlan() noexcept {
     acknowledged_plan_.store(index, std::memory_order_release);
     engine_.servicePendingControlCommands();
     if (index == applied_plan_) {
+        serviceOpllKeyoffSilence();
         return;
     }
     resetPlaybackState(true);
     applied_plan_ = index;
     const auto capacity = plan_slots_[index].voice_capacity;
     voices_.setActiveChannelCount(capacity == 0 ? 1 : capacity);
+    serviceOpllKeyoffSilence();
 }
 
 bool MgstcAudioProcessor::commitPluginState(
@@ -1502,18 +1592,23 @@ bool MgstcAudioProcessor::editorNoteOn(
     std::uint8_t track,
     std::uint8_t note,
     std::optional<std::uint64_t> expected_restore_revision) {
-    return editorSubmitEngine(
+    const bool ok = editorSubmitEngine(
         mgstc::engine::EngineCommand::noteOn(track, note), expected_restore_revision);
+    if (ok) editorCancelOpllKeyoffSilence(track, expected_restore_revision);
+    return ok;
 }
 
 bool MgstcAudioProcessor::editorNoteOff(std::uint8_t track,
     std::optional<std::uint64_t> expected_restore_revision) {
-    return editorSubmitEngine(
+    const bool ok = editorSubmitEngine(
         mgstc::engine::EngineCommand::noteOff(track), expected_restore_revision);
+    if (ok) editorArmOpllKeyoffSilence(track, expected_restore_revision);
+    return ok;
 }
 
 void MgstcAudioProcessor::editorSilenceTrack(std::uint8_t track,
     std::optional<std::uint64_t> expected_restore_revision) {
+    editorCancelOpllKeyoffSilence(track, expected_restore_revision);
     static_cast<void>(editorSubmitEngine(
         mgstc::engine::EngineCommand::silenceTrack(track), expected_restore_revision));
 }
@@ -1667,12 +1762,196 @@ void MgstcAudioProcessor::editorReleaseCompositeScope() noexcept {
         mgstc::engine::OpllScopeFrame dump{};
         while (engine_.pollOpllScope(dump)) {
         }
+        scope_frames_.clear();
     }
 }
 
 bool MgstcAudioProcessor::editorPollCompositeScope(
     mgstc::engine::OpllScopeFrame& frame) noexcept {
-    return engine_.pollOpllScope(frame);
+    return editorPollCompositeScope(frame, scope_legacy_cursor_);
+}
+
+bool MgstcAudioProcessor::editorPollCompositeScope(
+    mgstc::engine::OpllScopeFrame& frame, std::uint64_t& cursor) noexcept {
+    return scope_frames_.poll(frame, cursor,
+        [this](auto& captured) { return engine_.pollOpllScope(captured); });
+}
+
+bool MgstcAudioProcessor::editorPollLatestOpllScope(
+    mgstc::engine::OpllScopeFrame& frame, std::uint64_t& cursor) noexcept {
+    return scope_frames_.pollLatest(frame, cursor,
+        [this](auto& captured) { return engine_.pollOpllScope(captured); });
+}
+
+void MgstcAudioProcessor::editorPopulateOutputSnapshot(
+    mgstc::app::EditorSnapshot& snapshot) const {
+    snapshot.hardware_output = engine_.soundOutputKind()
+        == mgstc::engine::SoundOutputKind::MAmidiMemo;
+    snapshot.desired_hardware_output = engine_.desiredSoundOutputKind()
+        == mgstc::engine::SoundOutputKind::MAmidiMemo;
+    snapshot.hardware_owned = engine_.ownsHardwareOutput();
+    snapshot.hardware_connected = engine_.hardwareOutputConnected();
+    snapshot.output_switch_pending = engine_.outputSwitchPending();
+    snapshot.output_status = editorHardwareStatus();
+    const auto& settings = engine_.mamidiSettings();
+    snapshot.hardware_settings = {settings.host, settings.port, settings.unit_no,
+        settings.scc_plus, settings.waveform_monitor};
+    snapshot.opll_keyoff_silence_seconds = opll_keyoff_silence_seconds_.load(std::memory_order_relaxed);
+}
+
+void MgstcAudioProcessor::editorArmOpllKeyoffSilence(std::uint8_t track,
+    std::optional<std::uint64_t> expected_restore_revision) noexcept {
+    if (onAudioThread()) return;
+    std::lock_guard<std::mutex> lock(state_commit_mu_);
+    const auto revision = editorStateRestoreRevision();
+    if (expected_restore_revision && *expected_restore_revision != revision) return;
+    if (track >= 8 && track < opll_silence_requests_.size())
+        opll_silence_requests_[track].store((revision << 2) | 1, std::memory_order_release);
+}
+
+void MgstcAudioProcessor::editorCancelOpllKeyoffSilence(std::uint8_t track,
+    std::optional<std::uint64_t> expected_restore_revision) noexcept {
+    if (onAudioThread()) return;
+    std::lock_guard<std::mutex> lock(state_commit_mu_);
+    const auto revision = editorStateRestoreRevision();
+    if (expected_restore_revision && *expected_restore_revision != revision) return;
+    if (track < opll_silence_requests_.size())
+        opll_silence_requests_[track].store((revision << 2) | 2, std::memory_order_release);
+}
+
+void MgstcAudioProcessor::editorClearOpllKeyoffSilence(
+    std::optional<std::uint64_t> expected_restore_revision) noexcept {
+    if (onAudioThread()) {
+        if (expected_restore_revision) return;
+        // Block-boundary resets clear directly: no queued cancel may erase a
+        // deadline armed by subsequent host MIDI in this same block.
+        opll_silence_due_.fill(0);
+        for (auto& request : opll_silence_requests_)
+            request.store(0, std::memory_order_release);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(state_commit_mu_);
+    const auto revision = editorStateRestoreRevision();
+    if (expected_restore_revision && *expected_restore_revision != revision) return;
+    for (auto& pending : opll_silence_requests_)
+        pending.store((revision << 2) | 2, std::memory_order_release);
+}
+
+void MgstcAudioProcessor::armOpllKeyoffSilence(std::uint8_t track,
+    std::optional<std::uint64_t> restore_revision) noexcept {
+    if (track < 8 || track >= opll_silence_due_.size()) return;
+    const auto seconds = opll_keyoff_silence_seconds_.load(std::memory_order_relaxed);
+    opll_silence_revision_[track] = restore_revision.value_or(editorStateRestoreRevision());
+    opll_silence_due_[track] = seconds <= 0 ? 0
+        : engine_frame_position_ + static_cast<std::uint64_t>(seconds) * 48'000;
+}
+
+void MgstcAudioProcessor::serviceOpllKeyoffSilence() noexcept {
+    // Reuse the existing force-silence operation, after the same configurable
+    // delay as Standalone. This is a UI/runtime safety timer, not an MGSDRV
+    // envelope or key-off semantic. Work is bounded to the nine OPLL tracks.
+    for (std::uint8_t track = 8; track < opll_silence_due_.size(); ++track) {
+        const auto request = opll_silence_requests_[track].exchange(0,
+            std::memory_order_acq_rel);
+        const auto revision = editorStateRestoreRevision();
+        if (request != 0 && (request >> 2) == (revision & (UINT64_MAX >> 2))) {
+            if ((request & 3) == 1) armOpllKeyoffSilence(track, revision);
+            else if ((request & 3) == 2) opll_silence_due_[track] = 0;
+        }
+        // Also discard an already armed deadline if restoration raced with
+        // its registration. A restored held voice cannot inherit old timers.
+        if (opll_silence_revision_[track] != editorStateRestoreRevision())
+            opll_silence_due_[track] = 0;
+        if (opll_keyoff_silence_seconds_.load(std::memory_order_relaxed) <= 0)
+            opll_silence_due_[track] = 0;
+        if (opll_silence_due_[track] != 0
+            && engine_frame_position_ >= opll_silence_due_[track]) {
+            opll_silence_due_[track] = 0;
+            static_cast<void>(engine_.realtimeSilenceTrack(track));
+        }
+    }
+}
+
+bool MgstcAudioProcessor::editorApplyHardwareSettings(
+    mgstc::app::HardwareOutputSettings settings, int keyoff_seconds) {
+    if (onAudioThread()) return false;
+    engine_.setMAmidiSettings({
+        settings.host.empty() ? "localhost" : std::move(settings.host),
+        settings.port == 0 ? std::uint16_t{30000} : settings.port,
+        settings.unit_no, settings.scc_plus, settings.waveform_monitor});
+    opll_keyoff_silence_seconds_ = std::clamp(keyoff_seconds, 0, 9999);
+    saveHardwarePreferences();
+    return !engine_.ownsHardwareOutput() || engine_.hardwareOutputConnected();
+}
+
+bool MgstcAudioProcessor::editorRequestHardwareMode(bool hardware) {
+    if (onAudioThread()) return false;
+    return engine_.setSoundOutputKind(hardware
+        ? mgstc::engine::SoundOutputKind::MAmidiMemo
+        : mgstc::engine::SoundOutputKind::Emulator);
+}
+
+bool MgstcAudioProcessor::editorReconnectHardware() {
+    return !onAudioThread() && engine_.reconnectMAmidi();
+}
+
+std::string MgstcAudioProcessor::editorHardwareStatus() const {
+    auto status = engine_.soundOutputStatus();
+    const auto error = engine_.soundOutputLastError();
+    if (!error.empty()) {
+        if (!status.empty()) status += ": ";
+        status += error;
+    }
+    return status;
+}
+
+void MgstcAudioProcessor::loadHardwarePreferences() {
+#if JUCE_WINDOWS
+    const auto file = mgstcApplicationDataDirectory().getChildFile("settings-v1.ini");
+    if (!file.existsAsFile()) return;
+    const auto path = file.getFullPathName();
+    wchar_t host[256]{};
+    GetPrivateProfileStringW(L"SoundOutput", L"Host", L"localhost", host,
+        static_cast<DWORD>(std::size(host)), path.toWideCharPointer());
+    const auto value = [&](const wchar_t* key, int fallback) {
+        return static_cast<int>(GetPrivateProfileIntW(L"SoundOutput", key,
+            fallback, path.toWideCharPointer()));
+    };
+    mgstc::engine::MAmidiOutputSettings settings;
+    settings.host = juce::String(host).toStdString();
+    settings.port = static_cast<std::uint16_t>(std::clamp(value(L"Port", 30000), 1, 65535));
+    settings.unit_no = static_cast<std::uint8_t>(std::clamp(value(L"UnitNo", 0), 0, 255));
+    settings.scc_plus = value(L"SccPlus", 0) != 0;
+    settings.waveform_monitor = value(L"WaveformMonitor", 0) != 0;
+    opll_keyoff_silence_seconds_ = std::clamp(
+        value(L"OpllKeyOffForceSilenceSeconds", 20), 0, 9999);
+    // Deliberately do not read Kind: construction and state restore cannot
+    // acquire hardware. Connection preferences are machine settings only.
+    engine_.setMAmidiSettings(std::move(settings));
+#endif
+}
+
+void MgstcAudioProcessor::saveHardwarePreferences() const {
+#if JUCE_WINDOWS
+    const auto file = mgstcApplicationDataDirectory().getChildFile("settings-v1.ini");
+    if (file.getParentDirectory().createDirectory().failed()) return;
+    const auto path = file.getFullPathName();
+    const auto& settings = engine_.mamidiSettings();
+    const auto write = [&](const wchar_t* key, const juce::String& value) {
+        WritePrivateProfileStringW(L"SoundOutput", key,
+            value.toWideCharPointer(), path.toWideCharPointer());
+    };
+    write(L"Host", juce::String(settings.host));
+    write(L"Port", juce::String(static_cast<int>(settings.port)));
+    write(L"UnitNo", juce::String(static_cast<int>(settings.unit_no)));
+    write(L"SccPlus", settings.scc_plus ? "1" : "0");
+    write(L"WaveformMonitor", settings.waveform_monitor ? "1" : "0");
+    write(L"OpllKeyOffForceSilenceSeconds", juce::String(
+        opll_keyoff_silence_seconds_.load(std::memory_order_relaxed)));
+    // Do not write Kind or replace the INI: preserve Standalone startup route
+    // and all unrelated device preferences.
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.toWideCharPointer());
+#endif
 }
 
 void MgstcAudioProcessor::editorNoteBlockedBackendCall() noexcept {

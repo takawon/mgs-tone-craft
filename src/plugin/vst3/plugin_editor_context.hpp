@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Thin per-editor adapter. Plugin State stays on MgstcAudioProcessor.
 // This object dies with the AudioProcessorEditor and does not open
-// OS audio, standalone MIDI, MAmidi, VSIF, or the tone library.
+// OS audio or standalone MIDI. Hardware ownership stays on the processor.
 
 #pragma once
 
@@ -51,6 +51,7 @@ public:
         mgstc::app::EditorSnapshot snap;
         snap.capabilities = mgstc::app::pluginEditorCapabilities();
         snap.audio_running = processor_.editorProgramReady();
+        processor_.editorPopulateOutputSnapshot(snap);
         snap.master_volume_percent =
             processor_.editorMasterVolumePercent();
         snap.master_volume_revision =
@@ -86,12 +87,12 @@ public:
 
     [[nodiscard]] bool pollOpllScope(
         mgstc::engine::OpllScopeFrame& frame) override {
-        return processor_.editorPollCompositeScope(frame);
+        return processor_.editorPollCompositeScope(frame, scope_cursor_);
     }
 
     [[nodiscard]] bool pollLatestOpllScope(
-        mgstc::engine::OpllScopeFrame&) override {
-        return false;
+        mgstc::engine::OpllScopeFrame& frame) override {
+        return processor_.editorPollLatestOpllScope(frame, latest_scope_cursor_);
     }
 
 private:
@@ -141,21 +142,22 @@ private:
         }
 
         [[nodiscard]] std::string hardwareStatus() override {
-            self_.processor_.editorNoteBlockedBackendCall();
-            return {};
+            return self_.processor_.editorHardwareStatus();
         }
 
-        [[nodiscard]] bool applySoundRoute(
-            bool,
-            mgstc::app::HardwareOutputSettings,
-            int) override {
-            self_.processor_.editorNoteBlockedBackendCall();
-            return false;
+        [[nodiscard]] bool applyHardwareSettings(
+            mgstc::app::HardwareOutputSettings settings,
+            int keyoff_seconds) override {
+            return self_.processor_.editorApplyHardwareSettings(
+                std::move(settings), keyoff_seconds);
+        }
+
+        [[nodiscard]] bool requestHardwareMode(bool hardware) override {
+            return self_.processor_.editorRequestHardwareMode(hardware);
         }
 
         [[nodiscard]] bool reconnectHardware() override {
-            self_.processor_.editorNoteBlockedBackendCall();
-            return false;
+            return self_.processor_.editorReconnectHardware();
         }
 
     private:
@@ -256,11 +258,17 @@ private:
             return self_.processor_.editorNoteOff(track, restoreRevision());
         }
 
-        void armOpllKeyOffSilence(std::uint8_t) override {}
+        void armOpllKeyOffSilence(std::uint8_t track) override {
+            self_.processor_.editorArmOpllKeyoffSilence(track, restoreRevision());
+        }
 
-        void cancelOpllKeyOffSilence(std::uint8_t) override {}
+        void cancelOpllKeyOffSilence(std::uint8_t track) override {
+            self_.processor_.editorCancelOpllKeyoffSilence(track, restoreRevision());
+        }
 
-        void clearOpllKeyOffSilence() override {}
+        void clearOpllKeyOffSilence() override {
+            self_.processor_.editorClearOpllKeyoffSilence(restoreRevision());
+        }
 
         void flushPending() override {
             self_.processor_.editorFlushPending();
@@ -278,6 +286,8 @@ private:
     MgstcAudioProcessor& processor_;
     std::uint64_t acknowledged_restore_revision_{};
     bool restore_tracking_{};
+    std::uint64_t scope_cursor_{};
+    std::uint64_t latest_scope_cursor_{};
     Output output_;
     Midi midi_;
     Audition audition_;

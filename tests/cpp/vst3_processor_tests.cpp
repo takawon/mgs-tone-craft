@@ -6,6 +6,7 @@
 #include "mgstc_editor_view.hpp"
 #include "ui_layout.hpp"
 #include "tone_library_session.hpp"
+#include <rpc/server.h>
 
 #include <algorithm>
 #include <array>
@@ -210,6 +211,13 @@ struct CompositeEditorComponentTestAccess {
         editor.silenceAuditionNotes();
     }
     static bool rebuild(CompositeEditorComponent& editor) {
+        return editor.configureEngine();
+    }
+    static bool managerPreview(CompositeEditorComponent& editor,
+        const mgstc::engine::CompositeTimbre& preview) {
+        editor.library_manager_saved_timbre_ = editor.timbre_;
+        editor.timbre_ = preview;
+        editor.composite_program_stale_ = true;
         return editor.configureEngine();
     }
     static void setPolyphonic(CompositeEditorComponent& editor, bool enabled) {
@@ -709,6 +717,13 @@ struct MgstcAudioProcessorTestAccess {
 
     static bool scopeEnabled(const MgstcAudioProcessor& processor) {
         return processor.engine_.opllScopeEnabled();
+    }
+    static void keyoffSeconds(MgstcAudioProcessor& processor, int seconds) {
+        processor.opll_keyoff_silence_seconds_.store(seconds);
+    }
+    static std::uint64_t keyoffDue(const MgstcAudioProcessor& processor,
+        std::uint8_t track) {
+        return processor.opll_silence_due_[track];
     }
 
     static std::uint64_t stateCompileCount(
@@ -4358,11 +4373,17 @@ void testPluginEditor() {
     juce::Button* focus_button = nullptr;
     juce::Button* compact_button = nullptr;
     juce::Button* file_menu = nullptr;
-    bool spectrum_disabled = false;
-    bool library_disabled = false;
-    bool scc_disabled = false;
-    bool opll_disabled = false;
+    bool spectrum_enabled = false;
+    juce::Button* spectrum_button = nullptr;
+    mgstc::app::SoundOutputSwitch* output_switch = nullptr;
+    bool library_enabled = false;
+    juce::Button* library_manage = nullptr;
+    bool scc_hidden = false;
+    bool opll_hidden = false;
+    int emu_buttons{}, hardware_buttons{};
     const auto walk = [&](auto&& self, juce::Component* component) -> void {
+        if (auto* control = dynamic_cast<mgstc::app::SoundOutputSwitch*>(component))
+            output_switch = control;
         if (auto* button = dynamic_cast<juce::Button*>(component)) {
             const auto text = button->getButtonText();
             if (text == juce::String::fromUTF8("ライブラリ")) library_toggle = button;
@@ -4370,21 +4391,25 @@ void testPluginEditor() {
             if (text == juce::String::fromUTF8("編集に集中")) focus_button = button;
             if (text == juce::String::fromUTF8("概要を縮小")) compact_button = button;
             if (text == juce::String::fromUTF8("ファイル")) file_menu = button;
+            if (text == juce::String::fromUTF8("エミュ") && button->isVisible()) ++emu_buttons;
+            if (text == juce::String::fromUTF8("実機") && button->isVisible()) ++hardware_buttons;
             if (text == juce::String::fromUTF8("スペアナ")) {
-                require(!button->isEnabled(), "spectrum control stays in place and is grey");
-                spectrum_disabled = true;
+                require(button->isEnabled() && button->isVisible(), "shared spectrum control is available");
+                spectrum_enabled = true;
+                spectrum_button = button;
             }
             if (text == juce::String::fromUTF8("ライブラリ管理")) {
-                require(!button->isEnabled(), "tone library control stays in place and is grey");
-                library_disabled = true;
+                require(button->isEnabled(), "shared tone library manager is available");
+                library_manage = button;
+                library_enabled = true;
             }
             if (text == juce::String::fromUTF8("SCC音色")) {
-                require(!button->isEnabled(), "independent SCC editor is grey");
-                scc_disabled = true;
+                require(!button->isVisible(), "independent SCC workbench button is hidden");
+                scc_hidden = true;
             }
             if (text == juce::String::fromUTF8("OPLL音色")) {
-                require(!button->isEnabled(), "independent OPLL editor is grey");
-                opll_disabled = true;
+                require(!button->isVisible(), "independent OPLL workbench button is hidden");
+                opll_hidden = true;
             }
         }
         for (int index = 0; index < component->getNumChildComponents(); ++index) {
@@ -4392,10 +4417,15 @@ void testPluginEditor() {
         }
     };
     walk(walk, editor);
-    require(spectrum_disabled, "spectrum button is present");
-    require(library_disabled, "library button is present");
-    require(scc_disabled, "SCC workbench button is present");
-    require(opll_disabled, "OPLL workbench button is present");
+    require(spectrum_enabled, "spectrum button is present");
+    require(spectrum_button && output_switch
+            && spectrum_button->getRight() + UiLayout::controlGap == output_switch->getX(),
+        "hidden independent workbench controls leave no gap in plugin chrome");
+    require(library_enabled, "library button is present");
+    require(scc_hidden, "SCC workbench button is retained but hidden");
+    require(opll_hidden, "OPLL workbench button is retained but hidden");
+    require(emu_buttons == 1 && hardware_buttons == 1,
+        "composite view has one visible shared emulator/hardware switch");
     require(library_toggle && count_tab && focus_button, "main workspace navigation is present");
     const auto captures = juce::File::getCurrentWorkingDirectory().getChildFile("composite-ui-captures");
     require(captures.createDirectory().wasOk(), "create workspace snapshot directory");
@@ -4419,6 +4449,8 @@ void testPluginEditor() {
     compact_button->onClick();
     library_toggle->setToggleState(true, juce::dontSendNotification);
     library_toggle->onClick();
+    require(library_manage && library_manage->isVisible(),
+        "library manager becomes visible when the library panel opens");
     capture("main-library.png");
     library_toggle->setToggleState(false, juce::dontSendNotification);
     library_toggle->onClick();
@@ -4460,14 +4492,14 @@ void testPluginEditor() {
             sameBlock(other_before, stateBytes(other)),
             "another instance is unchanged");
         require(
-            context.snapshot().capabilities.spectrum_analyzer == false
-                && context.snapshot().capabilities.tone_library == false
-                && context.snapshot().capabilities.waveform_scope == false
+            context.snapshot().capabilities.spectrum_analyzer
+                && context.snapshot().capabilities.tone_library
+                && context.snapshot().capabilities.waveform_scope
                 && context.snapshot().capabilities.composite_playback_waveform
                 && context.snapshot().capabilities.independent_scc_opll_workbench
                     == false
                 && context.snapshot().capabilities.on_screen_keyboard,
-            "plugin capabilities stay off except keyboard and composite waveform");
+            "shared plugin features are enabled while independent workbenches stay hidden");
         require(
             context.output().availableAsioDrivers().empty(),
             "plugin does not list ASIO drivers");
@@ -4576,6 +4608,297 @@ void testCompositePlaybackWaveform() {
     require(
         !processor.editorPollCompositeScope(frame),
         "no composite waveform frames after the editor closes");
+}
+
+void testScopeFrameDistributorReaders() {
+    mgstc::app::ScopeFrameDistributor distributor;
+    std::uint64_t first_cursor{}, second_cursor{}, latest_cursor{};
+    int pending = 3;
+    std::uint64_t sequence{};
+    auto drain = [&](mgstc::engine::OpllScopeFrame& frame) {
+        if (pending == 0) return false;
+        --pending;
+        frame.sequence = ++sequence;
+        frame.mixed_samples[0] = static_cast<float>(sequence);
+        return true;
+    };
+    mgstc::engine::OpllScopeFrame first{}, second{}, latest{};
+    require(distributor.poll(first, first_cursor, drain) && first.sequence == 1,
+        "first waveform view gets full frame history");
+    require(distributor.pollLatest(latest, latest_cursor, drain) && latest.sequence == 3,
+        "OPLL scope gets the latest frame independently");
+    require(distributor.poll(second, second_cursor, drain) && second.sequence == 1,
+        "second history view does not steal first view frames");
+    require(!distributor.pollLatest(latest, latest_cursor, drain),
+        "latest scope does not append the same captured frame twice");
+    require(distributor.poll(first, first_cursor, drain) && first.sequence == 2,
+        "latest scope does not consume composite waveform history");
+    distributor.clear();
+    require(!distributor.poll(first, first_cursor, drain),
+        "released capture cannot replay stale history");
+    pending = 1;
+    require(distributor.poll(first, first_cursor, drain) && first.sequence == 4,
+        "reopened capture starts at fresh history");
+    // A producer that remains busy cannot trap the message thread in receive.
+    int calls{};
+    auto busy = [&](mgstc::engine::OpllScopeFrame& frame) {
+        frame.sequence = static_cast<std::uint64_t>(++calls);
+        return true;
+    };
+    require(distributor.pollLatest(latest, latest_cursor, busy)
+            && calls == static_cast<int>(mgstc::app::ScopeFrameDistributor::kMaxDrainFrames),
+        "scope distribution drains at most one bounded queue per poll");
+}
+
+void testProcessorOfflineAndTransport() {
+    struct PlayHead final : juce::AudioPlayHead {
+        PositionInfo position;
+        juce::Optional<PositionInfo> getPosition() const override { return position; }
+    } play_head;
+    MgstcAudioProcessor processor;
+    processor.setPlayHead(&play_head);
+    processor.prepareToPlay(48'000.0, 512);
+    processor.setNonRealtime(true);
+    play_head.position.setIsPlaying(true);
+    play_head.position.setTimeInSamples(0);
+    juce::AudioBuffer<float> buffer(2, 512);
+    juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)), 128);
+    processor.processBlock(buffer, midi);
+    double peak = channelPeak(buffer, 0, 512);
+    for (int block = 1; block < 5; ++block) {
+        play_head.position.setTimeInSamples(block * 512);
+        processor.processBlock(buffer, midi);
+        peak = std::max(peak, channelPeak(buffer, 0, 512));
+    }
+    require(peak > 0.001, "non realtime host processing produces emulator PCM");
+    mgstc::app::EditorSnapshot snap;
+    processor.editorPopulateOutputSnapshot(snap);
+    require(!snap.hardware_output && !snap.desired_hardware_output && !snap.hardware_owned,
+        "offline processing cannot acquire hardware");
+    play_head.position.setTimeInSamples(0); // loop/rewind
+    processor.processBlock(buffer, midi);
+    for (std::uint8_t track = 0; track < mgstc::plugin::LayerDelayScheduler::kPhysicalTrackCount; ++track)
+        require(Access::isInactive(processor, track),
+            "transport discontinuity stops old voices and delayed starts");
+    midi.addEvent(juce::MidiMessage::noteOn(1, 64, static_cast<juce::uint8>(100)), 0);
+    play_head.position.setTimeInSamples(512);
+    processor.processBlock(buffer, midi);
+    bool active = false;
+    for (std::uint8_t track = 0; track < mgstc::plugin::LayerDelayScheduler::kPhysicalTrackCount; ++track)
+        active = active || Access::isActive(processor, track);
+    require(active, "new notes work after transport loop");
+    play_head.position.setIsPlaying(false);
+    play_head.position.setTimeInSamples(1024);
+    processor.processBlock(buffer, midi);
+    for (std::uint8_t track = 0; track < mgstc::plugin::LayerDelayScheduler::kPhysicalTrackCount; ++track)
+        require(Access::isInactive(processor, track), "DAW stop ends every active voice");
+    processor.setNonRealtime(false);
+    processor.processBlock(buffer, midi);
+    processor.editorPopulateOutputSnapshot(snap);
+    require(!snap.hardware_output && !snap.hardware_owned,
+        "leaving offline processing preserves manual output selection");
+    processor.setPlayHead(nullptr);
+    processor.setNonRealtime(true);
+    midi.addEvent(juce::MidiMessage::noteOn(1, 67, static_cast<juce::uint8>(100)), 0);
+    processor.processBlock(buffer, midi);
+    bool offline_note_active = false;
+    for (std::uint8_t track = 0; track < mgstc::plugin::LayerDelayScheduler::kPhysicalTrackCount; ++track)
+        offline_note_active = offline_note_active || Access::isActive(processor, track);
+    require(offline_note_active, "offline render plays MIDI without a host playhead");
+    processor.setNonRealtime(false);
+    processor.processBlock(buffer, midi);
+    for (std::uint8_t track = 0; track < mgstc::plugin::LayerDelayScheduler::kPhysicalTrackCount; ++track)
+        require(Access::isInactive(processor, track),
+            "offline to realtime edge clears old voices even without transport metadata");
+}
+
+void testLibraryPreviewsPreserveCommittedPluginState() {
+    using namespace mgstc::engine;
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    processEmpty(processor, 512); // activate the initial live program before previewing
+    std::unique_ptr<juce::AudioProcessorEditor> view(processor.createEditor());
+    auto* plugin_editor = dynamic_cast<mgstc::plugin::MgstcAudioProcessorEditor*>(view.get());
+    require(plugin_editor != nullptr, "library preview test opens shared plugin editor");
+    const auto find = [](const auto& self, juce::Component& parent)
+        -> mgstc::app::CompositeEditorComponent* {
+        if (auto* editor = dynamic_cast<mgstc::app::CompositeEditorComponent*>(&parent))
+            return editor;
+        for (int index = 0; index < parent.getNumChildComponents(); ++index)
+            if (auto* found = self(self, *parent.getChildComponent(index))) return found;
+        return nullptr;
+    };
+    auto* editor = find(find, *view);
+    require(editor != nullptr, "library preview test finds shared composite component");
+    const auto committed = processor.copyPluginState().sound;
+    const auto saved = stateBytes(processor);
+    auto preview = sccOnlyTimbre();
+    preview.name = "temporary manager preview";
+    require(EditorAccess::managerPreview(*editor, preview), "manager preview compiles as temporary sound");
+    processEmpty(processor, 512);
+    require(Access::plan(processor).audible_layers.front().source == TimbreSource::Scc,
+        "manager preview reaches the audio runtime");
+    require(sameBlock(saved, stateBytes(processor)), "manager preview does not enter Plugin State");
+    require(sameAuthoringSound(plugin_editor->copyWorkingComposite(), committed),
+        "working snapshot returns committed sound during manager preview");
+    editor->libraryManagerAllNotesOff();
+    processEmpty(processor, 512);
+    require(Access::plan(processor).audible_layers.front().source == TimbreSource::Psg,
+        "manager stop restores committed runtime without another editor action");
+    ImportedToneCandidate candidate;
+    candidate.type = ImportedToneType::Composite;
+    candidate.default_register_as = ImportRegisterAs::Composite;
+    candidate.data = preview;
+    editor->auditionImportedCandidate(candidate);
+    processEmpty(processor, 512);
+    require(Access::plan(processor).audible_layers.front().source == TimbreSource::Scc,
+        "import preview reaches the audio runtime");
+    require(sameBlock(saved, stateBytes(processor)), "import candidate preview does not enter Plugin State");
+    require(sameAuthoringSound(plugin_editor->copyWorkingComposite(), committed),
+        "working snapshot returns committed sound during import preview");
+    editor->stopImportedPreview();
+    processEmpty(processor, 512);
+    require(Access::plan(processor).audible_layers.front().source == TimbreSource::Psg,
+        "import stop restores committed runtime without another editor action");
+    juce::AudioBuffer<float> buffer(2, 512);
+    juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)), 0);
+    processor.processBlock(buffer, midi);
+    require(Access::logTrack(processor, 0) == 0 && channelPeak(buffer, 0, 512) > 0.001,
+        "DAW MIDI after preview stop audibly plays the committed PSG sound");
+    require(sameAuthoringSound(processor.copyPluginState().sound, committed),
+        "ending library previews restores committed sound");
+}
+
+void testProcessorHardwareRoutingWithMockRpc() {
+    using namespace mgstc::engine;
+    constexpr std::uint16_t port = 39118;
+    std::atomic<std::uint64_t> writes{0};
+    rpc::server server(port);
+    server.bind(MAmidiRpcClient::kMethodName,
+        [&](unsigned char device, unsigned char, unsigned int, unsigned int) {
+            if (device != 0) writes.fetch_add(1, std::memory_order_release);
+        });
+    server.async_run(1);
+    {
+        MgstcAudioProcessor a, b;
+        a.prepareToPlay(48'000.0, 512);
+        b.prepareToPlay(48'000.0, 512);
+        const auto original = stateBytes(a);
+        mgstc::app::HardwareOutputSettings settings;
+        settings.host = "127.0.0.1"; settings.port = port; settings.unit_no = 1;
+        require(a.editorApplyHardwareSettings(settings, 20), "processor accepts hardware settings without mode change");
+        settings.unit_no = 2;
+        require(b.editorApplyHardwareSettings(settings, 20), "second processor configures shared RPC endpoint");
+        require(a.editorRequestHardwareMode(true), "processor explicitly acquires hardware");
+        processEmpty(a, 512); // finish route-edge cleanup before starting PCM preview
+        auto pcm = std::make_shared<SourcePcm>();
+        pcm->sample_rate = 48000; pcm->channels = 2;
+        pcm->mono_samples.assign(4096, 0.25f);
+        pcm->interleaved_samples.assign(8192, 0.25f);
+        require(a.editorPlayPcmPreview(pcm, 0, 4096, 1.0f), "hardware owner starts comparison PCM preview");
+        juce::AudioBuffer<float> buffer(2, 512);
+        juce::MidiBuffer midi;
+        midi.addEvent(juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)), 0);
+        a.processBlock(buffer, midi);
+        require(channelPeak(buffer, 0, 512) == 0 && channelPeak(buffer, 1, 512) == 0,
+            "realtime hardware owner clears final DAW PCM including comparison preview");
+        a.setNonRealtime(true);
+        processEmpty(a, 512); // suppress queued generations and retire the mode edge
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto before_offline = writes.load(std::memory_order_acquire);
+        midi.addEvent(juce::MidiMessage::noteOn(1, 62, static_cast<juce::uint8>(100)), 0);
+        a.processBlock(buffer, midi);
+        require(channelPeak(buffer, 0, 512) > 0.001, "offline hardware selection generates emulator PCM");
+        for (int block = 0; block < 10; ++block) processEmpty(a, 512);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        require(writes.load(std::memory_order_acquire) == before_offline,
+            "offline Processor emits no newly generated RPC commands");
+        mgstc::app::EditorSnapshot snap;
+        a.editorPopulateOutputSnapshot(snap);
+        require(snap.hardware_output && snap.hardware_owned, "offline rendering preserves selected hardware and lease");
+        require(sameBlock(original, stateBytes(a)), "hardware and offline state never enter Plugin State");
+        a.setNonRealtime(false);
+        processEmpty(a, 512); // physical reset independent of host transport
+        require(b.editorRequestHardwareMode(true), "second Processor manually takes hardware");
+        a.editorPopulateOutputSnapshot(snap);
+        require(!snap.hardware_output && !snap.hardware_owned, "previous Processor returns to emulator");
+        midi.addEvent(juce::MidiMessage::noteOn(1, 64, static_cast<juce::uint8>(100)), 0);
+        a.processBlock(buffer, midi);
+        require(channelPeak(buffer, 0, 512) > 0.001, "nonowner Processor continues normal emulator MIDI");
+        {
+            std::unique_ptr<juce::AudioProcessorEditor> view(b.createEditor());
+        }
+        b.editorPopulateOutputSnapshot(snap);
+        require(snap.hardware_owned, "closing Editor retains Processor hardware ownership");
+        MgstcAudioProcessor restored;
+        restored.setStateInformation(original.getData(), static_cast<int>(original.getSize()));
+        restored.editorPopulateOutputSnapshot(snap);
+        require(!snap.hardware_output && !snap.hardware_owned, "restored project does not acquire hardware");
+        require(b.editorRequestHardwareMode(false), "explicit release closes hardware safely");
+        require(writes.load(std::memory_order_acquire) > 0, "realtime processor reaches mock RPC server");
+    }
+    server.stop();
+}
+
+void testOpllKeyoffSilenceDeadline() {
+    MgstcAudioProcessor processor;
+    auto sound = opllOnlyTimbre();
+    sound.layers[0].start_delay_value = 0;
+    require(processor.replacePluginState(documentFrom(sound, 0, {})),
+        "keyoff test loads an OPLL program");
+    processor.prepareToPlay(48'000.0, 512);
+    Access::keyoffSeconds(processor, 1);
+    juce::AudioBuffer<float> buffer(2, 512);
+    juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)), 0);
+    midi.addEvent(juce::MidiMessage::noteOff(1, 60), 128);
+    processor.processBlock(buffer, midi);
+    constexpr std::uint8_t opll_track = 8;
+    require(Access::keyoffDue(processor, opll_track) == 48'128,
+        "DAW OPLL noteoff arms the configured engine-frame deadline");
+    midi.addEvent(juce::MidiMessage::noteOn(1, 62, static_cast<juce::uint8>(100)), 0);
+    processor.processBlock(buffer, midi);
+    require(Access::keyoffDue(processor, opll_track) == 0,
+        "a reused OPLL voice cancels the old force-silence deadline");
+    processor.editorArmOpllKeyoffSilence(opll_track);
+    processor.processBlock(buffer, midi);
+    require(Access::keyoffDue(processor, opll_track) != 0,
+        "editor boundary arms the same processor-owned deadline");
+    for (int block = 0; block < 96; ++block) processor.processBlock(buffer, midi);
+    require(Access::keyoffDue(processor, opll_track) == 0,
+        "OPLL force silence expires without UI timers or editor lifetime");
+    processor.editorArmOpllKeyoffSilence(opll_track);
+    Access::keyoffSeconds(processor, 0);
+    processor.processBlock(buffer, midi);
+    require(Access::keyoffDue(processor, opll_track) == 0,
+        "disabled force-silence setting does not arm a deadline");
+    Access::keyoffSeconds(processor, 1);
+    PluginEditorContext stale_context(processor);
+    stale_context.acknowledgeStateRestore(processor.editorStateRestoreRevision());
+    require(processor.replacePluginState(documentFrom(sound, 0, {})),
+        "restore another OPLL snapshot while the old editor still exists");
+    processEmpty(processor, 512);
+    stale_context.audition().armOpllKeyOffSilence(opll_track);
+    processEmpty(processor, 512);
+    require(Access::keyoffDue(processor, opll_track) == 0,
+        "old editor destruction cannot arm a force-silence timer on restored sound");
+    processor.editorArmOpllKeyoffSilence(opll_track);
+    stale_context.audition().clearOpllKeyOffSilence();
+    processEmpty(processor, 512);
+    const auto restored_due = Access::keyoffDue(processor, opll_track);
+    require(restored_due != 0, "current-generation keyoff request still works after restore");
+    stale_context.audition().cancelOpllKeyOffSilence(opll_track);
+    processEmpty(processor, 512);
+    require(Access::keyoffDue(processor, opll_track) == restored_due,
+        "old editor cannot cancel a restored sound's timer");
+    stale_context.audition().clearOpllKeyOffSilence();
+    processEmpty(processor, 512);
+    require(Access::keyoffDue(processor, opll_track) == restored_due,
+        "old editor cannot clear restored sound timers");
+
 }
 
 void testCommittedTimelineEditSupersedesPickerPreview() {
@@ -6637,6 +6960,23 @@ void testToneLibrarySessionFallback() {
 int main() {
     juce::ScopedJuceInitialiser_GUI juce_init;
     try {
+        if (std::getenv("MGSTC_COMMON_HOST_UI_ONLY")) {
+            testPluginStateFoundation();
+            testPluginProjectRestore();
+            testPluginEditor();
+            testCompositePlaybackWaveform();
+            testScopeFrameDistributorReaders();
+            testProcessorOfflineAndTransport();
+            testLibraryPreviewsPreserveCommittedPluginState();
+            testProcessorHardwareRoutingWithMockRpc();
+            testOpllKeyoffSilenceDeadline();
+            testVstPcmPreviewStereoRangeGainAndHostRate();
+            testVstPcmPreviewMuteClampAndInvalidRequests();
+            testVstPcmPreviewReplaceStopAndLifecycle();
+            testPluginSoundAuthority();
+            testTemporaryCompositePreviewPreservesState();
+            return 0;
+        }
         if (std::getenv("MGSTC_WAV_CANDIDATE_UI_ONLY")) {
             testConversionOwnerClose();
             testConversionCompletionCancellation();
@@ -6706,6 +7046,11 @@ int main() {
         testOwnedEditorPendingTargetKeepsSnapshot();
         testEditorParityCorrections();
         testCompositePlaybackWaveform();
+        testScopeFrameDistributorReaders();
+        testProcessorOfflineAndTransport();
+        testLibraryPreviewsPreserveCommittedPluginState();
+        testProcessorHardwareRoutingWithMockRpc();
+        testOpllKeyoffSilenceDeadline();
         testCommittedTimelineEditSupersedesPickerPreview();
         testCompositeEditorDelayedKeyOff();
         testPluginSoundAuthority();
