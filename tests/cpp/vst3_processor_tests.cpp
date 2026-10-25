@@ -35,6 +35,7 @@
 #include "mgstc/engine/dc_blocker.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/opll_patch.hpp"
+#include "mgstc/engine/patchslide_timbre.hpp"
 #include "mgstc/engine/register_write.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/scc_morph.hpp"
@@ -6790,6 +6791,184 @@ void testTemporaryCompositePreviewPreservesState() {
         "restoring temporary preview preserves plugin state");
 }
 
+void testPatchSlideSharedEditorTransactions() {
+    using namespace mgstc::engine;
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    const auto makeSound = [](bool second) {
+        PatchSlideCandidate candidate;
+        candidate.candidate_id = second ? "slide_14_0_h2" : "slide_0_5_14_h12";
+        candidate.patch_a = second ? 14 : 0;
+        candidate.patch_b = second ? 0 : 5;
+        candidate.hold_a_steps = second ? 2 : 1;
+        candidate.hold_pattern = second ? "h2" : "h12";
+        if (!second) {
+            candidate.change_count = 2;
+            candidate.patch_c = 14;
+            candidate.hold_b_steps = 2;
+        }
+        candidate.tags = {"Bright", "Metallic"};
+        auto sound = makePatchSlideTimbre(candidate);
+        require(sound.has_value(), "PatchSlide test sound expands without opening a database");
+        return *sound;
+    };
+    const auto slide = makeSound(false);
+    const auto other_slide = makeSound(true);
+    const auto find = [](const auto& self, juce::Component& parent)
+        -> mgstc::app::CompositeEditorComponent* {
+        if (auto* editor = dynamic_cast<mgstc::app::CompositeEditorComponent*>(&parent))
+            return editor;
+        for (int index = 0; index < parent.getNumChildComponents(); ++index)
+            if (auto* found = self(self, *parent.getChildComponent(index))) return found;
+        return nullptr;
+    };
+    MgstcAudioProcessor processor;
+    auto original = defaultCompositeTimbre();
+    original.name = "PatchSlide destination";
+    original.tags = {"Keep original metadata"};
+    original.memo = "Keep SCC, PSG and unrelated channel settings";
+    original.favorite = true;
+    original.layers[2].channel = 3;
+    original.layers[2].envelope_number = 9;
+    require(processor.replacePluginState(documentFrom(original, 0, {})), "Seed PatchSlide destination");
+    processor.prepareToPlay(48'000.0, 512);
+    processEmpty(processor, 512);
+    MgstcAudioProcessor independent;
+    independent.prepareToPlay(48'000.0, 512);
+    const auto independent_state = stateBytes(independent);
+    std::unique_ptr<juce::AudioProcessorEditor> view(processor.createEditor());
+    auto* plugin_editor = dynamic_cast<mgstc::plugin::MgstcAudioProcessorEditor*>(view.get());
+    require(plugin_editor != nullptr, "PatchSlide uses the real shared VST3 editor");
+    auto* editor = find(find, *view);
+    require(editor != nullptr, "PatchSlide shared composite editor is connected");
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    const auto before = editor->workingTimbre();
+    const auto before_state = stateBytes(processor);
+    const auto history_before = EditorAccess::historySize(*editor);
+    const auto cursor_before = EditorAccess::historyCursor(*editor);
+    require(before.layers.size() == 3, "PatchSlide fixture retains all three chip sources");
+
+    const auto preview = [&](const CompositeTimbre& sound) {
+        ImportedToneCandidate imported;
+        imported.source_format = "OPLL PatchSlide";
+        imported.type = ImportedToneType::Composite;
+        imported.default_register_as = ImportRegisterAs::Composite;
+        imported.data = sound;
+        editor->auditionImportedCandidate(imported);
+        processEmpty(processor, 512);
+        require(Access::plan(processor).audible_layers.size() == 1
+                && Access::plan(processor).audible_layers.front().source == TimbreSource::Opll,
+                "PatchSlide preview reaches the existing OPLL runtime");
+        require(sameBlock(before_state, stateBytes(processor))
+                && sameAuthoringSound(editor->workingTimbre(), before)
+                && sameAuthoringSound(plugin_editor->copyWorkingComposite(), before),
+                "PatchSlide preview preserves working sound and Plugin State");
+        require(EditorAccess::historySize(*editor) == history_before
+                && EditorAccess::historyCursor(*editor) == cursor_before,
+                "Changing PatchSlide preview creates no Undo transaction");
+    };
+    preview(slide);
+    preview(other_slide);
+    editor->stopImportedPreview();
+    processEmpty(processor, 512);
+    require(sameBlock(before_state, stateBytes(processor))
+            && Access::plan(processor).audible_layers.size() == 3,
+            "Stopping PatchSlide preview restores the full committed program");
+    require(!editor->applyPatchSlideAt(slide, 0)
+            && !editor->applyPatchSlideAt(slide, before.layers.size() + 1),
+            "PatchSlide application cannot overwrite PSG or use an invalid layer index");
+    require(sameBlock(before_state, stateBytes(processor))
+            && EditorAccess::historySize(*editor) == history_before,
+            "Rejected PatchSlide targets leave state and history intact");
+    preview(other_slide);
+    require(editor->applyPatchSlideAt(slide, 2), "Confirmed PatchSlide replaces the selected OPLL channel");
+    processEmpty(processor, 512);
+    const auto applied = editor->workingTimbre();
+    require(applied.layers.size() == before.layers.size()
+            && applied.layers[0] == before.layers[0] && applied.layers[1] == before.layers[1],
+            "PatchSlide replacement preserves SCC and PSG layers");
+    auto expected_layer = slide.layers.front();
+    expected_layer.channel = before.layers[2].channel;
+    expected_layer.envelope_number = before.layers[2].envelope_number;
+    require(applied.layers[2] == expected_layer,
+            "PatchSlide replacement retains selected channel and envelope allocation");
+    require(applied.name == before.name && applied.tags == before.tags
+            && applied.memo == before.memo && applied.favorite == before.favorite,
+            "PatchSlide replacement preserves the edited composite metadata");
+    require(EditorAccess::historySize(*editor) == history_before + 1
+            && EditorAccess::historyCursor(*editor) == cursor_before + 1
+            && sameAuthoringSound(processor.copyPluginState().sound, applied),
+            "One PatchSlide apply is one Undo transaction and one committed native sound");
+    const auto saved = stateBytes(processor);
+    EditorAccess::undo(*editor);
+    processEmpty(processor, 512);
+    require(sameAuthoringSound(editor->workingTimbre(), before)
+            && sameAuthoringSound(processor.copyPluginState().sound, before),
+            "Undo restores pre-application composite in editor and Processor");
+    EditorAccess::redo(*editor);
+    processEmpty(processor, 512);
+    require(sameAuthoringSound(editor->workingTimbre(), applied)
+            && sameAuthoringSound(processor.copyPluginState().sound, applied),
+            "Redo restores every PatchSlide event in editor and Processor");
+
+    const auto append_history = EditorAccess::historyCursor(*editor);
+    require(editor->applyPatchSlideAt(other_slide, applied.layers.size()), "PatchSlide can append an OPLL layer");
+    processEmpty(processor, 512);
+    const auto appended = editor->workingTimbre();
+    require(appended.layers.size() == applied.layers.size() + 1
+            && std::equal(applied.layers.begin(), applied.layers.end(), appended.layers.begin())
+            && appended.layers.back().source == TimbreSource::Opll
+            && appended.layers.back().channel != applied.layers[2].channel
+            && appended.layers.back().envelope_number != applied.layers[2].envelope_number,
+            "Append preserves existing layers and allocates a free OPLL channel and ENV");
+    require(EditorAccess::historyCursor(*editor) == append_history + 1,
+            "Appending a PatchSlide is one Undo transaction");
+    EditorAccess::undo(*editor);
+    processEmpty(processor, 512);
+    require(sameAuthoringSound(editor->workingTimbre(), applied), "Undo removes only the appended PatchSlide layer");
+    require(sameBlock(independent_state, stateBytes(independent)), "PatchSlide editor operations are instance-local");
+
+    view.reset();
+    processEmpty(processor, 512);
+    view.reset(processor.createEditor());
+    requireWorkingCompositeMatchesProcessor(view.get(), processor,
+        "Recreated VST3 editor hydrates the committed PatchSlide sound");
+    require(sameAuthoringSound(processor.copyPluginState().sound, applied),
+            "Closing and reopening the editor retains native PatchSlide data");
+    view.reset();
+
+    MgstcAudioProcessor restored;
+    restored.setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
+    require(sameAuthoringSound(restored.copyPluginState().sound, applied),
+            "Plugin State restores PatchSlide events without a DB lookup");
+    restored.prepareToPlay(48'000.0, 512);
+    const auto pcm = captureHostNotePcm(restored);
+    require(peakOf(pcm) > 0.001, "Restored native PatchSlide composite plays through DAW MIDI without an editor");
+    std::unique_ptr<juce::AudioProcessorEditor> restored_view(restored.createEditor());
+    requireWorkingCompositeMatchesProcessor(restored_view.get(), restored,
+        "Editor created after DB-independent state restore has the full PatchSlide timeline");
+    require(sameBlock(independent_state, stateBytes(independent)),
+            "Restoring another PatchSlide instance leaves the original independent instance unchanged");
+    std::unique_ptr<juce::AudioProcessorEditor> independent_view(independent.createEditor());
+    auto* independent_editor = find(find, *independent_view);
+    require(independent_editor != nullptr, "Independent instance uses the same shared editor");
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    const auto without_opll = independent_editor->workingTimbre();
+    require(std::none_of(without_opll.layers.begin(), without_opll.layers.end(),
+                [](const CompositeLayer& layer) { return layer.source == TimbreSource::Opll; }),
+            "Fresh instance has no OPLL destination layer");
+    require(independent_editor->applyPatchSlideAt(slide, without_opll.layers.size()),
+            "PatchSlide appends when the composite has no OPLL layer");
+    processEmpty(independent, 512);
+    const auto first_opll = independent_editor->workingTimbre();
+    require(first_opll.layers.size() == without_opll.layers.size() + 1
+            && std::equal(without_opll.layers.begin(), without_opll.layers.end(), first_opll.layers.begin())
+            && first_opll.layers.back().source == TimbreSource::Opll
+            && first_opll.layers.back().channel == 0,
+            "First OPLL application retains every existing layer and uses channel zero");
+    require(sameAuthoringSound(processor.copyPluginState().sound, applied),
+            "Applying PatchSlide in the second instance leaves the first instance unchanged");
+}
+
 void testPluginSoundAuthority() {
     MgstcAudioProcessor reference;
     MgstcAudioProcessor shared;
@@ -6960,6 +7139,10 @@ void testToneLibrarySessionFallback() {
 int main() {
     juce::ScopedJuceInitialiser_GUI juce_init;
     try {
+        if (std::getenv("MGSTC_PATCHSLIDE_UI_ONLY")) {
+            testPatchSlideSharedEditorTransactions();
+            return 0;
+        }
         if (std::getenv("MGSTC_COMMON_HOST_UI_ONLY")) {
             testPluginStateFoundation();
             testPluginProjectRestore();
@@ -6975,6 +7158,7 @@ int main() {
             testVstPcmPreviewReplaceStopAndLifecycle();
             testPluginSoundAuthority();
             testTemporaryCompositePreviewPreservesState();
+            testPatchSlideSharedEditorTransactions();
             return 0;
         }
         if (std::getenv("MGSTC_WAV_CANDIDATE_UI_ONLY")) {
@@ -7055,6 +7239,7 @@ int main() {
         testCompositeEditorDelayedKeyOff();
         testPluginSoundAuthority();
         testTemporaryCompositePreviewPreservesState();
+        testPatchSlideSharedEditorTransactions();
         testVstPcmPreviewStereoRangeGainAndHostRate();
         testVstPcmPreviewMuteClampAndInvalidRequests();
         testVstPcmPreviewReplaceStopAndLifecycle();

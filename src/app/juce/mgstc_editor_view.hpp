@@ -64,6 +64,7 @@
 #include "tone_set_filter.hpp"
 #include "tone_import_tab.hpp"
 #include "tone_export_tab.hpp"
+#include "patchslide_browser.hpp"
 #include "mgstc/engine/mgstc_tone_set.hpp"
 #include "switch_look_and_feel.hpp"
 #include "mgstc_look_and_feel.hpp"
@@ -1769,7 +1770,7 @@ private:
         hardware_.setToggleState(snap.hardware_output, juce::dontSendNotification);
         emu_.setEnabled(!pending);
         hardware_.setEnabled(!pending);
-        const auto detail = juce::String::fromUTF8(snap.output_status.c_str());
+        const auto detail = statusTextFromUtf8(snap.output_status);
         if (failed_ && detail != failed_status_) failed_ = false;
         emu_.setTooltip(detail);
         hardware_.setTooltip(detail + juce::String::fromUTF8(
@@ -1791,8 +1792,8 @@ private:
         juce::MessageManager::callAsync([safe, hardware] {
             if (safe == nullptr) return;
             safe->failed_ = !safe->session_->output().requestHardwareMode(hardware);
-            safe->failed_status_ = juce::String::fromUTF8(
-                safe->session_->snapshot().output_status.c_str());
+            safe->failed_status_ = statusTextFromUtf8(
+                safe->session_->snapshot().output_status);
             safe->local_pending_ = false;
             safe->refresh();
         });
@@ -2691,8 +2692,8 @@ private:
                 const auto output_caps = session_.snapshot().capabilities;
                 output_status_.setText(
                     (output_caps.hardware_output || output_caps.mamidi)
-                        ? juce::String::fromUTF8(
-                              session_.output().hardwareStatus().c_str())
+                        ? statusTextFromUtf8(
+                              session_.output().hardwareStatus())
                         : juce::String{},
                     juce::dontSendNotification);
                 output_page->addAndMakeVisible(output_status_);
@@ -2814,16 +2815,16 @@ private:
                 const auto caps = session_.snapshot().capabilities;
                 output_status_.setText(
                     (caps.hardware_output || caps.mamidi)
-                        ? juce::String::fromUTF8(
-                              session_.output().hardwareStatus().c_str())
+                        ? statusTextFromUtf8(
+                              session_.output().hardwareStatus())
                         : juce::String{},
                     juce::dontSendNotification);
             }
 
             void refreshPcAudioStatus() {
                 pc_audio_status_.setText(
-                    juce::String::fromUTF8(
-                        session_.snapshot().pc_audio_status.c_str()),
+                    statusTextFromUtf8(
+                        session_.snapshot().pc_audio_status),
                     juce::dontSendNotification);
                 if (!session_.snapshot().capabilities.audio_device_settings) {
                     asio_settings_.setEnabled(false);
@@ -3136,8 +3137,8 @@ private:
         auto status = snap.midi_status;
         if (snap.capabilities.hardware_output || snap.capabilities.mamidi) {
             status += " | ";
-            status += juce::String::fromUTF8(
-                session_.output().hardwareStatus().c_str());
+            status += statusTextFromUtf8(
+                session_.output().hardwareStatus());
         }
         midi_status_.setText(status, juce::dontSendNotification);
     }
@@ -3486,7 +3487,8 @@ public:
         ImportPreviewCallback import_preview = {},
         ImportEditCallback import_edit = {},
         ImportNoteOnCallback import_note_on = {},
-        PolyphonicQuery editor_polyphonic = {})
+        PolyphonicQuery editor_polyphonic = {},
+        std::function<void(const engine::CompositeTimbre&)> patchslide_apply = {})
         : timbres_(std::move(timbres)),
           composites_(std::move(composites)),
           apply_tag_(std::move(apply_tag)),
@@ -3532,6 +3534,20 @@ public:
             juce::Colour(UiLayout::panelFill),
             list_tab_.get(),
             false);
+
+        patchslide_tab_ = std::make_unique<PatchSlideBrowserComponent>(
+            PatchSlideBrowserComponent::Callbacks{
+                [this](const engine::CompositeTimbre& sound) {
+                    if (import_preview_) import_preview_(patchSlideImported(sound));
+                },
+                std::move(patchslide_apply),
+                [this](const engine::CompositeTimbre& sound) { registerPatchSlide(sound); },
+                [this] {
+                    performance_keyboard_.allNotesOff();
+                    if (all_notes_off_) all_notes_off_();
+                }}, session.backgroundTasks());
+        tabs_.addTab(juce::String::fromUTF8("パッチスライド"),
+            juce::Colour(UiLayout::panelFill), patchslide_tab_.get(), false);
 
         tag_tab_ = std::make_unique<TagManagementContent>(
             collectCustomTags(),
@@ -3678,15 +3694,9 @@ public:
         }
         tabs_.setCurrentTabIndex(0, juce::dontSendNotification);
         tabs_.setTabBarDepth(replacing ? 0 : UiLayout::fieldH);
-        if (auto* bar = tabs_.getTabbedButtonBar().getTabButton(1)) {
-            bar->setEnabled(!replacing);
-        }
-        if (auto* bar = tabs_.getTabbedButtonBar().getTabButton(2)) {
-            bar->setEnabled(!replacing);
-        }
-        if (auto* bar = tabs_.getTabbedButtonBar().getTabButton(3)) {
-            bar->setEnabled(!replacing);
-        }
+        for (int index = 1; index < tabs_.getNumTabs(); ++index)
+            if (auto* bar = tabs_.getTabbedButtonBar().getTabButton(index))
+                bar->setEnabled(!replacing);
         resized();
     }
 
@@ -3705,6 +3715,7 @@ public:
     }
 
     void prepareToHide() {
+        if (patchslide_tab_) patchslide_tab_->stopPreview();
         performance_keyboard_.allNotesOff();
         if (all_notes_off_) {
             all_notes_off_();
@@ -3723,7 +3734,14 @@ public:
 
 private:
     void handlePerformanceNoteOn(std::uint8_t note) {
-        if (tabs_.getCurrentTabIndex() == 2
+        if (tabs_.getCurrentContentComponent() == patchslide_tab_.get()) {
+            if (import_note_on_ && patchslide_tab_->selectedTimbre()) {
+                active_performance_kind_ = LibraryManagerKind::Composite;
+                import_note_on_(patchSlideImported(*patchslide_tab_->selectedTimbre()), note);
+            }
+            return;
+        }
+        if (tabs_.getCurrentContentComponent() == import_tab_.get()
             && import_tab_ != nullptr
             && import_note_on_) {
             const auto* candidate = import_tab_->selectedCandidate();
@@ -3925,7 +3943,9 @@ private:
         if (!editor_polyphonic_) {
             return true;
         }
-        if (tabs_.getCurrentTabIndex() == 2
+        if (tabs_.getCurrentContentComponent() == patchslide_tab_.get())
+            return editor_polyphonic_(LibraryManagerKind::Composite);
+        if (tabs_.getCurrentContentComponent() == import_tab_.get()
             && import_tab_ != nullptr) {
             const auto* candidate = import_tab_->selectedCandidate();
             if (candidate != nullptr) {
@@ -3953,6 +3973,34 @@ private:
         return LibraryManagerKind::Opll;
     }
 
+    static engine::ImportedToneCandidate patchSlideImported(const engine::CompositeTimbre& sound) {
+        engine::ImportedToneCandidate result;
+        result.name = sound.name;
+        result.data = sound;
+        result.default_register_as = engine::ImportRegisterAs::Composite;
+        result.source_format = "OPLL PatchSlide";
+        result.tags = sound.tags;
+        return result;
+    }
+
+    void registerPatchSlide(const engine::CompositeTimbre& sound) {
+        ScopedLibraryIpcLock lock(*shared_library_lock_);
+        if (!lock.isLocked() || !reloadLibraries()) return;
+        auto copy = sound;
+        copy.name = composites_.uniqueName(copy.name);
+        composites_.add(std::move(copy), currentUnixTime());
+        if (!persistCompositeTimbreLibrary(composites_)) {
+            reloadLibraries();
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8("音色ライブラリ"),
+                juce::String::fromUTF8("総合音色を保存できませんでした。"));
+            return;
+        }
+        list_tab_->reloadFromParent();
+        refreshTagManagementFromLibraries();
+        if (refresh_editors_) refresh_editors_();
+    }
+
     mgstc::engine::TimbreLibrary timbres_;
     mgstc::engine::CompositeTimbreLibrary composites_;
     std::vector<mgstc::engine::ToneSetRecord> tone_sets_;
@@ -3974,6 +4022,7 @@ private:
     juce::TabbedComponent tabs_{
         juce::TabbedButtonBar::TabsAtTop};
     std::unique_ptr<LibraryManagerListTab> list_tab_;
+    std::unique_ptr<PatchSlideBrowserComponent> patchslide_tab_;
     std::unique_ptr<TagManagementContent> tag_tab_;
     std::unique_ptr<ToneImportTab> import_tab_;
     std::unique_ptr<ToneExportTab> export_tab_;
@@ -5096,9 +5145,88 @@ public:
             return;
         }
         prepareEngineForProgramEdit();
-        if (immediate_audition_.getToggleState()) {
+        if (candidate.source_format == "OPLL PatchSlide"
+            || immediate_audition_.getToggleState()) {
             startCompositeNote(last_audition_note_, true, true, false);
         }
+    }
+
+    void requestApplyPatchSlide(const engine::CompositeTimbre& sound) {
+        if (sound.layers.size() != 1
+            || sound.layers.front().source != engine::TimbreSource::Opll) return;
+        libraryManagerAllNotesOff();
+        stopImportedPreview();
+        const auto original = workingTimbre();
+        juce::PopupMenu targets;
+        for (std::size_t i = 0; i < original.layers.size(); ++i) {
+            const auto& layer = original.layers[i];
+            if (layer.source != engine::TimbreSource::Opll) continue;
+            targets.addItem(static_cast<int>(i) + 1,
+                juce::String::fromUTF8("置換: OPLL Ch.")
+                    + juce::String(static_cast<int>(layer.channel) + 1)
+                    + " " + juce::String::fromUTF8(layer.name.c_str()));
+        }
+        if (engine::firstAvailableChannel(original, engine::TimbreSource::Opll))
+            targets.addItem(static_cast<int>(original.layers.size()) + 1,
+                juce::String::fromUTF8("新しいOPLLレイヤーを追加"));
+        juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+        const auto restore_generation = host_restore_generation_;
+        targets.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
+            [safe, original, sound, restore_generation](int selected) {
+                if (!safe || selected <= 0) return;
+                const auto index = static_cast<std::size_t>(selected - 1);
+                juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+                    .withTitle(juce::String::fromUTF8("パッチスライドを適用"))
+                    .withMessage(index < original.layers.size()
+                        ? juce::String::fromUTF8("選択したOPLLレイヤーの音色・ENV・変調設定を置き換えます。他のレイヤーは保持します。")
+                        : juce::String::fromUTF8("OPLLレイヤーを追加します。既存のレイヤーは保持します。"))
+                    .withButton(juce::String::fromUTF8("適用"))
+                    .withButton(juce::String::fromUTF8("キャンセル"))
+                    .withAssociatedComponent(safe.getComponent()),
+                    [safe, original, sound, index, restore_generation](int result) {
+                        if (!safe || result != 1) return;
+                        safe->libraryManagerAllNotesOff();
+                        safe->stopImportedPreview();
+                        if (safe->host_restore_generation_ != restore_generation
+                            || safe->workingTimbre() != original) {
+                            safe->updateStatus(juce::String::fromUTF8("編集中の音色が変更されました。適用先を選び直してください。"));
+                            return;
+                        }
+                        static_cast<void>(safe->applyPatchSlideAt(sound, index));
+                    });
+            });
+    }
+
+    // Confirmed author edit. Preview never calls this boundary.
+    bool applyPatchSlideAt(const engine::CompositeTimbre& sound, std::size_t index) {
+        libraryManagerAllNotesOff();
+        stopImportedPreview();
+        if (sound.layers.size() != 1
+            || sound.layers.front().source != engine::TimbreSource::Opll
+            || index > timbre_.layers.size()
+            || (index < timbre_.layers.size()
+                && timbre_.layers[index].source != engine::TimbreSource::Opll)) return false;
+        auto replacement = sound.layers.front();
+        replacement.envelope_number = engine::nextFreeEnvelopeNumber(timbre_);
+        if (index < timbre_.layers.size()) {
+            replacement.channel = timbre_.layers[index].channel;
+            replacement.envelope_number = timbre_.layers[index].envelope_number;
+        } else {
+            const auto channel = engine::firstAvailableChannel(timbre_, engine::TimbreSource::Opll);
+            if (!channel) return false;
+            replacement.channel = *channel;
+        }
+        recordHistory();
+        if (index < timbre_.layers.size()) timbre_.layers[index] = std::move(replacement);
+        else timbre_.layers.push_back(std::move(replacement));
+        composite_program_stale_ = true;
+        recordHistory();
+        refreshTimbreSelectors();
+        syncControlsFromModel();
+        syncTimelineTimbre(true);
+        resized();
+        static_cast<void>(configureEngine());
+        return true;
     }
 
     bool applyPublishedOwnedSnapshot() {
@@ -7708,9 +7836,7 @@ private:
     }
 
     [[nodiscard]] juce::File settingsFile() const {
-        return juce::File::getSpecialLocation(
-                   juce::File::userApplicationDataDirectory)
-            .getChildFile("MgsToneCraft")
+        return mgstcApplicationDataDirectory()
             .getChildFile("settings-v1.ini");
     }
 
@@ -10452,9 +10578,7 @@ private:
     }
 
     [[nodiscard]] juce::File settingsFile() const {
-        return juce::File::getSpecialLocation(
-                   juce::File::userApplicationDataDirectory)
-            .getChildFile("MgsToneCraft")
+        return mgstcApplicationDataDirectory()
             .getChildFile("settings-v1.ini");
     }
 
@@ -13463,9 +13587,7 @@ private:
     }
 
     [[nodiscard]] juce::File settingsFile() const {
-        return juce::File::getSpecialLocation(
-                   juce::File::userApplicationDataDirectory)
-            .getChildFile("MgsToneCraft")
+        return mgstcApplicationDataDirectory()
             .getChildFile("settings-v1.ini");
     }
 

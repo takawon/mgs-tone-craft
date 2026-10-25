@@ -91,21 +91,7 @@ public:
         snap.asio_control_panel_available =
             audio_.asioControlPanelAvailable();
         snap.pc_audio_status = audio_.pcAudioStatus();
-        const auto kind = audio_.engine().soundOutputKind();
-        snap.hardware_output =
-            kind == mgstc::engine::SoundOutputKind::MAmidiMemo;
-        snap.desired_hardware_output = audio_.engine().desiredSoundOutputKind()
-            == mgstc::engine::SoundOutputKind::MAmidiMemo;
-        snap.hardware_owned = audio_.engine().ownsHardwareOutput();
-        snap.hardware_connected = audio_.engine().hardwareOutputConnected();
-        snap.output_switch_pending = audio_.engine().outputSwitchPending();
-        snap.output_status = audio_.engine().soundOutputStatus();
-        const auto& mamidi = audio_.engine().mamidiSettings();
-        snap.hardware_settings.host = mamidi.host;
-        snap.hardware_settings.port = mamidi.port;
-        snap.hardware_settings.unit_no = mamidi.unit_no;
-        snap.hardware_settings.scc_plus = mamidi.scc_plus;
-        snap.hardware_settings.waveform_monitor = mamidi.waveform_monitor;
+        audio_.fillHardwareSnapshot(snap);
         const auto& devices = midi_service_.devices();
         snap.midi_devices.reserve(
             static_cast<std::size_t>(devices.size()));
@@ -172,7 +158,7 @@ private:
         }
 
         [[nodiscard]] std::string hardwareStatus() override {
-            return self_.audio_.engine().soundOutputStatus();
+            return self_.audio_.hardwareStatus();
         }
 
         [[nodiscard]] bool applyHardwareSettings(
@@ -186,24 +172,16 @@ private:
             mamidi.unit_no = settings.unit_no;
             mamidi.scc_plus = settings.scc_plus;
             mamidi.waveform_monitor = settings.waveform_monitor;
-            self_.audio_.engine().setMAmidiSettings(std::move(mamidi));
-            self_.audio_.setOpllKeyOffForceSilenceSeconds(
-                opll_keyoff_silence_seconds);
-            self_.audio_.saveSoundOutputSettings();
-            return true;
+            return self_.audio_.applyHardwareSettings(
+                std::move(mamidi), opll_keyoff_silence_seconds);
         }
 
         [[nodiscard]] bool requestHardwareMode(bool hardware) override {
-            const auto kind = hardware
-                ? mgstc::engine::SoundOutputKind::MAmidiMemo
-                : mgstc::engine::SoundOutputKind::Emulator;
-            const bool ok = self_.audio_.engine().setSoundOutputKind(kind);
-            self_.audio_.saveSoundOutputSettings();
-            return ok;
+            return self_.audio_.requestHardwareMode(hardware);
         }
 
         [[nodiscard]] bool reconnectHardware() override {
-            return self_.audio_.engine().reconnectMAmidi();
+            return self_.audio_.reconnectHardware();
         }
 
     private:

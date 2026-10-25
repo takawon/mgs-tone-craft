@@ -373,7 +373,10 @@ void MgstcAudioProcessorEditor::showLibraryManager(
             [this](const mgstc::engine::ImportedToneCandidate& candidate, std::uint8_t note) {
                 previewImportedCandidate(candidate, note);
             },
-            [this](LibraryManagerKind) { return composite_->polyphonic(); });
+            [this](LibraryManagerKind) { return composite_->polyphonic(); },
+            [this](const mgstc::engine::CompositeTimbre& sound) {
+                composite_->requestApplyPatchSlide(sound);
+            });
         library_manager_window_ = std::make_unique<mgstc::app::LibraryManagerWindow>(std::move(content));
         library_manager_window_->centreAroundComponent(anchor ? anchor : this,
             library_manager_window_->getWidth(), library_manager_window_->getHeight());

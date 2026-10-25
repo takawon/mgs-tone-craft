@@ -7,7 +7,7 @@
 namespace mgstc::engine {
 namespace {
 
-constexpr std::array<std::string_view, 78> kPresetTags{
+constexpr std::array<std::string_view, 94> kPresetTags{
     "ピアノ",
     "E.ピアノ",
     "オルガン",
@@ -86,6 +86,22 @@ constexpr std::array<std::string_view, 78> kPresetTags{
     "チップチューン",
     "ノイズ",
     "ドローン",
+    "明るい",
+    "暗い",
+    "柔らかい",
+    "硬い",
+    "金属的",
+    "澄んだ",
+    "ざらついた",
+    "太い",
+    "細い",
+    "減衰音",
+    "持続音",
+    "揺らぐ",
+    "ギター",
+    "ベース",
+    "シンセ",
+    "エレキベース",
 };
 
 [[nodiscard]] bool isAsciiSpace(unsigned char value) {

@@ -160,6 +160,8 @@ else()
 endif()
 
 add_library(mgstc_engine STATIC
+    src/engine/patchslide_database.cpp
+    src/engine/patchslide_timbre.cpp
     src/engine/chip_rack.cpp
     src/engine/composite_envelope_compile.cpp
     src/engine/composite_program_compiler.cpp
@@ -178,6 +180,7 @@ add_library(mgstc_engine STATIC
     src/engine/mamidi_memo_sound_output.cpp
     src/engine/mamidi_register_map.cpp
     src/engine/mamidi_rpc_client.cpp
+    src/engine/exception_text.cpp
     src/engine/mgs_composite_io.cpp
     src/engine/mgs_envelope_io.cpp
     src/engine/mgs_timbre_io.cpp
@@ -220,7 +223,7 @@ target_link_libraries(
         Threads::Threads
 )
 if(WIN32)
-    target_link_libraries(mgstc_engine PRIVATE ws2_32)
+    target_link_libraries(mgstc_engine PRIVATE ws2_32 bcrypt shell32 ole32 uuid)
 endif()
 # rpclib headers are only needed by mamidi_rpc_client.cpp; keep them
 # out of the public interface of mgstc_engine.
@@ -526,11 +529,38 @@ endif()
 
 if(MGSTC_BUILD_TESTS)
     enable_testing()
+    add_executable(mgstc_exception_text_tests tests/cpp/exception_text_tests.cpp)
+    target_link_libraries(mgstc_exception_text_tests PRIVATE mgstc_engine)
+    if(TARGET juce::juce_core)
+        target_link_libraries(mgstc_exception_text_tests PRIVATE juce::juce_core)
+        target_compile_definitions(mgstc_exception_text_tests PRIVATE MGSTC_HAVE_JUCE_UTF8_TESTS=1 JUCE_USE_CURL=0)
+    endif()
+    add_test(NAME mgstc_exception_text_tests COMMAND mgstc_exception_text_tests)
+    add_executable(mgstc_startup_output_connection_tests tests/cpp/startup_output_connection_tests.cpp)
+    target_include_directories(mgstc_startup_output_connection_tests PRIVATE src/app/juce)
+    target_compile_features(mgstc_startup_output_connection_tests PRIVATE cxx_std_20)
+    target_link_libraries(mgstc_startup_output_connection_tests PRIVATE Threads::Threads)
+    add_test(NAME mgstc_startup_output_connection_tests COMMAND mgstc_startup_output_connection_tests)
+    set_tests_properties(mgstc_startup_output_connection_tests PROPERTIES TIMEOUT 15)
 
     if(TARGET mgstc)
+        add_test(NAME mgstc_startup_smoke_tests COMMAND mgstc --verify-startup)
+        set_tests_properties(mgstc_startup_smoke_tests PROPERTIES TIMEOUT 30)
+        foreach(_settings_tab view midi output about)
+            add_test(NAME mgstc_settings_${_settings_tab}_smoke_tests COMMAND mgstc
+                "--capture-ui=${CMAKE_CURRENT_BINARY_DIR}/settings-${_settings_tab}-smoke.png"
+                "--capture-target=settings-${_settings_tab}")
+            set_tests_properties(mgstc_settings_${_settings_tab}_smoke_tests PROPERTIES TIMEOUT 30)
+        endforeach()
         add_test(NAME mgstc_composite_workspace_tests
             COMMAND mgstc --verify-composite-workspace)
-        set_tests_properties(mgstc_composite_workspace_tests PROPERTIES TIMEOUT 60)
+        # This command renders many fixtures and runs an offscreen repaint
+        # benchmark. Its whole-run budget is separate from UI response timing.
+        if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+            set_tests_properties(mgstc_composite_workspace_tests PROPERTIES TIMEOUT 600)
+        else()
+            set_tests_properties(mgstc_composite_workspace_tests PROPERTIES TIMEOUT 60)
+        endif()
     endif()
 
     add_executable(mgstc_engine_tests
@@ -582,6 +612,35 @@ if(MGSTC_BUILD_TESTS)
     endif()
 
     add_test(NAME mgstc_engine_tests COMMAND mgstc_engine_tests)
+
+    foreach(_patchslide_component database timbre)
+        add_executable(mgstc_patchslide_${_patchslide_component}_tests
+            tests/cpp/patchslide_${_patchslide_component}_tests.cpp)
+        target_link_libraries(mgstc_patchslide_${_patchslide_component}_tests
+            PRIVATE mgstc_engine sqlite3)
+        target_compile_features(mgstc_patchslide_${_patchslide_component}_tests PRIVATE cxx_std_20)
+        target_compile_definitions(mgstc_patchslide_${_patchslide_component}_tests
+            PRIVATE MGSTC_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        if(MSVC)
+            target_compile_options(mgstc_patchslide_${_patchslide_component}_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+        endif()
+        add_test(NAME mgstc_patchslide_${_patchslide_component}_tests
+            COMMAND mgstc_patchslide_${_patchslide_component}_tests)
+    endforeach()
+
+    if(TARGET juce::juce_gui_extra)
+        add_executable(mgstc_patchslide_browser_tests
+            tests/cpp/patchslide_browser_tests.cpp
+            src/app/juce/ui_layout.cpp src/app/juce/ui_paint.cpp)
+        target_include_directories(mgstc_patchslide_browser_tests PRIVATE src/app/juce)
+        target_link_libraries(mgstc_patchslide_browser_tests PRIVATE mgstc_engine juce::juce_gui_extra)
+        target_compile_features(mgstc_patchslide_browser_tests PRIVATE cxx_std_20)
+        target_compile_definitions(mgstc_patchslide_browser_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_MODAL_LOOPS_PERMITTED=1)
+        if(MSVC)
+            target_compile_options(mgstc_patchslide_browser_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+        endif()
+        add_test(NAME mgstc_patchslide_browser_tests COMMAND mgstc_patchslide_browser_tests)
+    endif()
 
     add_executable(mgstc_opll_envelope_edit_tests tests/cpp/opll_envelope_edit_tests.cpp)
     target_link_libraries(mgstc_opll_envelope_edit_tests PRIVATE mgstc_engine)

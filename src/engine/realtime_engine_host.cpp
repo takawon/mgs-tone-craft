@@ -654,6 +654,10 @@ void RealtimeEngineHost::drainPendingCommands(
     bool process_on_caller_thread) noexcept {
     if (process_on_caller_thread) {
         while (pendingCommandCount() > 0 || hasPendingProgramLoad()) {
+            // A non-realtime output connection can hold the audio gate for a
+            // complete RPC timeout. Leave commands queued instead of spinning
+            // the caller/UI until that external operation finishes.
+            if (outputSwitchPending()) return;
             servicePendingControlCommands();
         }
         return;

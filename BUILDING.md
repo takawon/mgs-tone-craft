@@ -1,5 +1,23 @@
 # MGS Tone Craft ビルド手順
 
+## OPLL PatchSlide DBの手動配置
+
+共通の`ProgramData\OPLL_PatchSlide_DB`フォルダ（通常は`C:\ProgramData\OPLL_PatchSlide_DB`）に次の3ファイルを手動配置してください。Standalone／VST3は同じファイルを読み取り専用で使います。ビルド・起動での自動コピーは行いません。
+
+| ファイル | 初期版（13,950候補）のSHA-256 | 重複パッチ除外更新版（12,180候補）のSHA-256 |
+|---|---|---|
+| `patchslide.sqlite` | `27f6d7821d0ddd16caafd8397a603670977821823a21fee7146df410665d2793` | `5122f57eedd251f7dac2e1184ded353b1c86090343567020421bf27d7ea641b6` |
+| `patchslide_search.sqlite` | `0f086f089c4373490988302031a6dd4545f441cd50ec3e3a24a6e43d41b8b3e1` | `14b17f3b5458d3887a1aa73f53eeb71b6a9cff1f01280eb7c965dc1d10f0075f` |
+| `manifest.json` | `4b2c918887dec0c257811c34b8e886c323fc1697bdbf205af1e4e5b021ec2880` | `839ecd1659616dc7e8731ee9e046db10da0cdbedf8f03ef401286f0c70330a10` |
+
+同じ12,180候補のcompact版も受け入れます。SHA-256は本体DB `67e3de24979e2c3fe0817653fa8fce6386ee91099b9a615d4231a7a32512d0a0`、検索DB `a7b43f1121e2355f2023488f078cdbe7c8f952d028b6602291cc4a6616e47fa1`、manifest `d912cf65a8f61fe4a1a3d5c07746525401038521cf48b3bf3cce51b7d6c7eb93` です。
+
+3ファイルは同じセットで揃え、版を混在させないでください。
+
+ライブラリ管理の「パッチスライド」を開いて認識を確認します。配置後は再起動またはタブ内の再読込を行ってください。欠損・破損・対応不一致はタブに表示され、既存のライブラリ・編集・演奏は引き続き利用できます。SQLiteの更新中ファイルやjournal／WALは配置せず、完成した3ファイルを使います。Pythonや生成ツールは実行時に不要です。
+
+DBを含むインストーラー・配布ZIP・GitHub Releaseは今回作成しません。登録・保存済みの総合音色はDBなしでも利用できます。
+
 ## 必要環境
 
 - Windows 10または11
@@ -337,3 +355,9 @@ wrapper の明示引数を初期 cache より後に指定し、今回の構成�
 新規ツリーを通信なしで検証する場合は `-DependencySourceRoot build/_deps` を指定できる。
 既存の juce-src / rpclib-src のソースだけを参照し、OBJ・生成物・バイナリは新しいツリーに作る。
 通常ビルドでは常時 fresh / clean を実行せず、Ninja の増分コンパイルを維持する。
+
+### 起動診断と画面キャプチャ
+
+`mgstc --verify-startup` は、私有の一時設定・ライブラリで通常の初期化とnativeウィンドウ生成を行い、初回描画とデバイス隔離を確認して終了する。CTestの `mgstc_startup_smoke_tests` からも実行する。作業ディレクトリの `startup-verification.txt` に結果を残す。PC Audio、実MIDI、MAmidiMEmo接続は開始しない。
+
+`--capture-ui` も設定・ライブラリを私有一時フォルダへ隔離し、外部デバイスを開始しない。利用者の音色・設定を撮影する操作ではなく、既定状態の診断用画像を生成する。workspace回帰の成功、native起動診断、実デバイス／DAW／聴感の確認はそれぞれ別に扱う。

@@ -3740,7 +3740,34 @@ void testTimbreLibraryCrudAndVersionedRoundTrip() {
 
 void testTimbreTagsNormalizeMatchAndCollectUsage() {
     using namespace mgstc::engine;
-    REQUIRE_EQ(presetTimbreTags().size(), static_cast<std::size_t>(78));
+    const auto presets = presetTimbreTags();
+    REQUIRE_EQ(presets.size(), static_cast<std::size_t>(94));
+    const std::array<std::string_view, 16> added_tags{
+        "\xE6\x98\x8E\xE3\x82\x8B\xE3\x81\x84",
+        "\xE6\x9A\x97\xE3\x81\x84",
+        "\xE6\x9F\x94\xE3\x82\x89\xE3\x81\x8B\xE3\x81\x84",
+        "\xE7\xA1\xAC\xE3\x81\x84",
+        "\xE9\x87\x91\xE5\xB1\x9E\xE7\x9A\x84",
+        "\xE6\xBE\x84\xE3\x82\x93\xE3\x81\xA0",
+        "\xE3\x81\x96\xE3\x82\x89\xE3\x81\xA4\xE3\x81\x84\xE3\x81\x9F",
+        "\xE5\xA4\xAA\xE3\x81\x84",
+        "\xE7\xB4\xB0\xE3\x81\x84",
+        "\xE6\xB8\x9B\xE8\xA1\xB0\xE9\x9F\xB3",
+        "\xE6\x8C\x81\xE7\xB6\x9A\xE9\x9F\xB3",
+        "\xE6\x8F\xBA\xE3\x82\x89\xE3\x81\x90",
+        "\xE3\x82\xAE\xE3\x82\xBF\xE3\x83\xBC",
+        "\xE3\x83\x99\xE3\x83\xBC\xE3\x82\xB9",
+        "\xE3\x82\xB7\xE3\x83\xB3\xE3\x82\xBB",
+        "\xE3\x82\xA8\xE3\x83\xAC\xE3\x82\xAD\xE3\x83\x99\xE3\x83\xBC\xE3\x82\xB9",
+    };
+    for (std::size_t index = 0; index < added_tags.size(); ++index) {
+        const auto tag = added_tags[index];
+        REQUIRE_EQ(presets[78 + index], tag);
+        REQUIRE_EQ(isPresetTimbreTag(tag), true);
+        std::vector<std::string> tags{std::string(tag)};
+        REQUIRE_EQ(rewriteTimbreTag(tags, tag, "Custom"), false);
+        REQUIRE_EQ(tags, std::vector<std::string>({std::string(tag)}));
+    }
 
     const auto parsed = parseTimbreTags(
         " bright, Bright\xEF\xBC\x8C\xE5\x92\x8C\xE6\xA5\xBD\xE5\x99\xA8\npad ");

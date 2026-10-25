@@ -41,6 +41,8 @@
 #include "ui_hang_watchdog.hpp"
 #include "ui_chrome_constants.hpp"
 #include "ui_paths.hpp"
+#include "startup_output_connection.hpp"
+#include "startup_policy.hpp"
 #include "ui_scale.hpp"
 #include "ui_fonts.hpp"
 #include "ui_layout.hpp"
@@ -204,9 +206,19 @@ public:
             static_cast<std::uint32_t>(master_volume_percent_));
         asio_audio_.setMasterVolumePercent(
             static_cast<std::uint32_t>(master_volume_percent_));
-        loadAndApplySoundOutputSettings();
+        loadSoundOutputSettings();
         if (!offline_snapshot_capture_) {
             loadAndStartPcAudioSettings();
+            if (startup_hardware_requested_) {
+                startup_output_connection_.start([this] {
+                    const bool connected = engine_.setSoundOutputKind(
+                        mgstc::engine::SoundOutputKind::MAmidiMemo);
+                    return mgstc::app::StartupOutputConnection::Result{
+                        connected, connected ? std::string{} : engine_.soundOutputLastError()};
+                });
+            }
+        } else {
+            engine_.setRealtimeOfflineRendering(true);
         }
         publishHangHints();
         opll_keyoff_force_silence_seconds_ =
@@ -216,6 +228,7 @@ public:
 
     ~SharedAudioService() {
         stopTimer();
+        startup_output_connection_.join();
         // Let an in-flight recovery skip its device open and finish fast; the
         // worker touches members, so it must be joined before teardown.
         device_recovery_cancel_.store(true, std::memory_order_release);
@@ -640,7 +653,72 @@ public:
         return submitted;
     }
 
+    [[nodiscard]] bool startupOutputPending() const noexcept {
+        return startup_output_connection_.pending();
+    }
+
+    [[nodiscard]] bool physicalAudioRunning() const noexcept {
+        return active_audio_ != nullptr && active_audio_->running();
+    }
+
+    [[nodiscard]] bool startupOutputAttempted() const noexcept {
+        return startup_output_connection_.started();
+    }
+
+    [[nodiscard]] bool startupPcAudioAttempted() const noexcept { return startup_pc_audio_attempted_; }
+
+    [[nodiscard]] std::string hardwareStatus() const {
+        if (startupOutputPending()) return "Output: MAmidiMEmo (connecting)";
+        if (!startup_output_error_.empty()) return startup_output_error_;
+        return engine_.soundOutputStatus();
+    }
+
+    void fillHardwareSnapshot(mgstc::app::EditorSnapshot& snap) const {
+        const bool pending = startupOutputPending();
+        snap.hardware_output = engine_.soundOutputKind()
+            == mgstc::engine::SoundOutputKind::MAmidiMemo;
+        snap.desired_hardware_output = pending || engine_.desiredSoundOutputKind()
+            == mgstc::engine::SoundOutputKind::MAmidiMemo;
+        snap.hardware_owned = engine_.ownsHardwareOutput();
+        snap.hardware_connected = !pending && engine_.hardwareOutputConnected();
+        snap.output_switch_pending = pending || engine_.outputSwitchPending();
+        snap.output_status = hardwareStatus();
+        const auto& settings = pending ? startup_hardware_settings_ : engine_.mamidiSettings();
+        snap.hardware_settings.host = settings.host;
+        snap.hardware_settings.port = settings.port;
+        snap.hardware_settings.unit_no = settings.unit_no;
+        snap.hardware_settings.scc_plus = settings.scc_plus;
+        snap.hardware_settings.waveform_monitor = settings.waveform_monitor;
+    }
+
+    [[nodiscard]] bool applyHardwareSettings(
+        mgstc::engine::MAmidiOutputSettings settings, int silence_seconds) {
+        if (startupOutputPending() || offline_snapshot_capture_) return false;
+        startup_output_error_.clear();
+        engine_.setMAmidiSettings(std::move(settings));
+        setOpllKeyOffForceSilenceSeconds(silence_seconds);
+        saveSoundOutputSettings();
+        return true;
+    }
+
+    [[nodiscard]] bool requestHardwareMode(bool hardware) {
+        if (startupOutputPending() || offline_snapshot_capture_) return false;
+        startup_output_error_.clear();
+        const bool result = engine_.setSoundOutputKind(hardware
+            ? mgstc::engine::SoundOutputKind::MAmidiMemo
+            : mgstc::engine::SoundOutputKind::Emulator);
+        saveSoundOutputSettings();
+        return result;
+    }
+
+    [[nodiscard]] bool reconnectHardware() {
+        if (startupOutputPending() || offline_snapshot_capture_) return false;
+        startup_output_error_.clear();
+        return engine_.reconnectMAmidi();
+    }
+
     void saveSoundOutputSettings() const {
+        if (startupOutputPending() || offline_snapshot_capture_) return;
         const auto file = settingsFile();
         if (file.getParentDirectory().createDirectory().failed()) {
             return;
@@ -710,7 +788,7 @@ private:
             "settings-v1.ini");
     }
 
-    void loadAndApplySoundOutputSettings() {
+    void loadSoundOutputSettings() {
         const auto file = settingsFile();
         mgstc::engine::MAmidiOutputSettings settings{};
         wchar_t host_buffer[256]{};
@@ -755,7 +833,8 @@ private:
                     file.getFullPathName().toWideCharPointer())
                 != 0;
         }
-        engine_.setMAmidiSettings(std::move(settings));
+        startup_hardware_settings_ = settings;
+        if (!offline_snapshot_capture_) engine_.setMAmidiSettings(std::move(settings));
 
         wchar_t kind_buffer[64]{};
         if (file.existsAsFile()) {
@@ -767,16 +846,7 @@ private:
                 static_cast<DWORD>(std::size(kind_buffer)),
                 file.getFullPathName().toWideCharPointer()));
         }
-        if (juce::String(kind_buffer) == "MAmidiMemo") {
-            // Connect if possible; keep Emulator if chip_server is down.
-            // Blocking connect (poll + RPC timeout): breadcrumbed because a
-            // failed attempt still reports sound_output=emulator.
-            MGSTC_UI_ACTIVITY(
-                "startup: MAmidiMEmo connect (blocking)");
-            static_cast<void>(engine_.setSoundOutputKind(
-                mgstc::engine::SoundOutputKind::MAmidiMemo));
-        }
-        publishHangHints();
+        startup_hardware_requested_ = juce::String(kind_buffer) == "MAmidiMemo";
     }
 
     void pollOpllKeyOffForceSilence() {
@@ -924,6 +994,10 @@ private:
     }
 
     void timerCallback() override {
+        if (auto result = startup_output_connection_.collect()) {
+            startup_output_error_ = std::move(result->error);
+            publishHangHints();
+        }
         pollOpllKeyOffForceSilence();
         if (device_recovery_busy_) {
             if (device_recovery_done_.load(std::memory_order_acquire)) {
@@ -967,6 +1041,7 @@ private:
     }
 
     void loadAndStartPcAudioSettings() {
+        startup_pc_audio_attempted_ = true;
         MGSTC_UI_ACTIVITY("startup: PC audio device open");
         const auto file = settingsFile();
         wchar_t backend_buffer[32]{};
@@ -1106,6 +1181,11 @@ private:
     std::string pc_audio_note_;
     bool suppress_pc_audio_fallback_{};
     bool offline_snapshot_capture_{};
+    mgstc::app::StartupOutputConnection startup_output_connection_;
+    bool startup_pc_audio_attempted_{};
+    mgstc::engine::MAmidiOutputSettings startup_hardware_settings_;
+    bool startup_hardware_requested_{};
+    std::string startup_output_error_;
     // Message thread owns these; only the two atomics cross to the worker.
     std::thread device_worker_;
     bool device_recovery_busy_{};
@@ -1366,8 +1446,10 @@ public:
         virtual void midiMessagesPending() = 0;
     };
 
-    SharedMidiInputService() {
+    explicit SharedMidiInputService(bool devices_enabled = true)
+        : devices_enabled_(devices_enabled) {
         pending_messages_.reserve(2048);
+        if (!devices_enabled_) return;
         const auto saved = loadSelectedIdentifier();
         if (saved) {
             selected_identifier_ = *saved;
@@ -1402,6 +1484,8 @@ public:
         return devices_;
     }
 
+    [[nodiscard]] bool deviceAccessAttempted() const noexcept { return device_access_attempts_ != 0; }
+
     [[nodiscard]] int selectedComboId() const noexcept {
         for (int index = 0; index < devices_.size(); ++index) {
             if (devices_.getReference(index).identifier
@@ -1421,6 +1505,8 @@ public:
     }
 
     void refreshDevices(bool select_first = false) {
+        if (!devices_enabled_) return;
+        ++device_access_attempts_;
         const auto current = juce::MidiInput::getAvailableDevices();
         devices_ = current;
         if (selected_identifier_.isEmpty()
@@ -1517,6 +1603,8 @@ private:
     }
 
     void reopenSelectedDevice() {
+        if (!devices_enabled_) return;
+        ++device_access_attempts_;
         closeDevice();
         if (selected_identifier_.isEmpty()) {
             status_text_ = juce::String::fromUTF8(
@@ -1571,6 +1659,8 @@ private:
     }
 
     void timerCallback() override {
+        if (!devices_enabled_) return;
+        ++device_access_attempts_;
         const auto current = juce::MidiInput::getAvailableDevices();
         if (current != devices_) {
             refreshDevices(false);
@@ -1588,6 +1678,8 @@ private:
     std::vector<juce::MidiMessage> pending_messages_;
     juce::ListenerList<DrainListener> drain_listeners_;
     std::uint64_t revision_{1};
+    std::size_t device_access_attempts_{};
+    bool devices_enabled_{true};
 };
 
 #include "standalone_editor_context.hpp"
@@ -1657,6 +1749,13 @@ public:
     ~MainWindow() override {
         removeCaptionZOrderHook();
     }
+
+    void paint(juce::Graphics& graphics) override {
+        juce::DocumentWindow::paint(graphics);
+        initial_paint_seen_ = true;
+    }
+
+    [[nodiscard]] bool initialPaintSeen() const noexcept { return initial_paint_seen_; }
 
     void setLibraryReplaceOpener(
         std::function<void(
@@ -2260,6 +2359,7 @@ private:
     juce::String editor_;
     EditorCloseCallback close_editor_;
     EditorActivateCallback activate_editor_;
+    bool initial_paint_seen_{};
     HWND caption_hook_hwnd_{nullptr};
 };
 
@@ -2278,11 +2378,28 @@ public:
     }
 
     void initialise(const juce::String& command_line) override {
-        UiScale::loadGlobalFromIni();
-        juce::LookAndFeel::setDefaultLookAndFeel(&look_and_feel_);
         const juce::ArgumentList arguments(
             getApplicationName(),
             command_line);
+        startup_policy_ = mgstc::app::StartupPolicy::fromArguments(arguments);
+        if (startup_policy_.isolated) {
+            if (!mgstcUseIsolatedApplicationDataDirectory()) {
+                setApplicationReturnValue(1);
+                quit();
+                return;
+            }
+            if (startup_policy_.verify_native_window) {
+                // Deliberately unsafe saved endpoints must have no effect in
+                // isolated startup, including MIDI enumeration and RPC probes.
+                const bool seeded = mgstcApplicationDataDirectory()
+                    .getChildFile("settings-v1.ini").replaceWithText(
+                        "[SoundOutput]\nKind=MAmidiMemo\nHost=127.0.0.1\nPort=1\n"
+                        "[Application]\nMidiInputConfigured=1\nMidiInputIdentifier=diagnostic-unavailable\n");
+                if (!seeded) { setApplicationReturnValue(1); quit(); return; }
+            }
+        }
+        UiScale::loadGlobalFromIni();
+        juce::LookAndFeel::setDefaultLookAndFeel(&look_and_feel_);
         if (arguments.containsOption("--verify-composite-workspace")) {
             const auto directory = juce::File::getCurrentWorkingDirectory()
                 .getChildFile("composite-ui-captures");
@@ -2350,8 +2467,10 @@ private:
             arguments.getValueForOption("--capture-ui").isNotEmpty()
             && (snapshot_target == "spectrogram" || snapshot_target == "spectrum");
         audio_service_ = std::make_unique<SharedAudioService>(
-            offline_spectrogram_capture_);
-        midi_service_ = std::make_unique<SharedMidiInputService>();
+            startup_policy_.isolated);
+        if (startup_policy_.isolated)
+            audio_service_->engine().setRealtimeOfflineRendering(true);
+        midi_service_ = std::make_unique<SharedMidiInputService>(!startup_policy_.isolated);
         editor_session_ = std::make_unique<StandaloneEditorContext>(
             *audio_service_, *midi_service_);
         wireCompositeOwnedAuditionCallbacks();
@@ -2362,6 +2481,11 @@ private:
         }
         primary_editor_ = canonicalEditor(requested_editor);
         snapshot_window_ = showEditor(primary_editor_);
+        if (startup_policy_.verify_native_window) {
+            startup_verify_started_ms_ = juce::Time::getMillisecondCounterHiRes();
+            startTimer(50);
+            return;
+        }
         if (arguments.containsOption("--verify-window-routing")) {
             routing_test_mode_ = true;
             auto* const main = showEditor("main");
@@ -2758,6 +2882,10 @@ private:
                     return window->polyphonic();
                 }
                 return true;
+            },
+            [this](const mgstc::engine::CompositeTimbre& sound) {
+                static_cast<void>(showEditor("main"));
+                if (auto* editor = compositeEditor()) editor->requestApplyPatchSlide(sound);
             });
         library_manager_window_ =
             std::make_unique<LibraryManagerWindow>(std::move(content));
@@ -3216,6 +3344,28 @@ private:
     }
 
     void timerCallback() override {
+        if (startup_policy_.verify_native_window) {
+            const auto elapsed = juce::Time::getMillisecondCounterHiRes() - startup_verify_started_ms_;
+            const bool window_painted = snapshot_window_ && snapshot_window_->getPeer()
+                && snapshot_window_->initialPaintSeen();
+            if ((!window_painted || elapsed < 2500.0) && elapsed < 15000.0) return;
+            stopTimer();
+            const bool isolated = !audio_service_->physicalAudioRunning()
+                && !audio_service_->startupPcAudioAttempted()
+                && !audio_service_->startupOutputAttempted()
+                && !midi_service_->deviceAccessAttempted()
+                && midi_service_->devices().isEmpty()
+                && !audio_service_->engine().ownsHardwareOutput()
+                && audio_service_->engine().desiredSoundOutputKind()
+                    == mgstc::engine::SoundOutputKind::Emulator;
+            const bool passed = window_painted && isolated;
+            juce::File::getCurrentWorkingDirectory().getChildFile("startup-verification.txt")
+                .replaceWithText(passed ? "PASS: native peer painted; audio/MIDI/RPC isolated\n"
+                    : "FAIL: native startup or device isolation\n");
+            setApplicationReturnValue(passed ? 0 : 1);
+            quit();
+            return;
+        }
         if (offline_spectrogram_capture_) {
             // `--capture-ui --capture-target spectrogram` is a headless
             // documentation path: no device callback runs, so it advances
@@ -3253,12 +3403,16 @@ private:
                 ? snapshot_window_->captureSettingsTab(
                     2, snapshot_file_)
                 : SnapshotResult::MissingContent;
+        } else if (snapshot_target_ == "settings-about") {
+            result = snapshot_window_ != nullptr
+                ? snapshot_window_->captureSettingsTab(3, snapshot_file_)
+                : SnapshotResult::MissingContent;
         } else if (snapshot_target_ == "library") {
             result = captureLibraryManagerSnapshot(snapshot_file_, 0);
         } else if (snapshot_target_ == "library-tags") {
-            result = captureLibraryManagerSnapshot(snapshot_file_, 1);
-        } else if (snapshot_target_ == "library-import") {
             result = captureLibraryManagerSnapshot(snapshot_file_, 2);
+        } else if (snapshot_target_ == "library-import") {
+            result = captureLibraryManagerSnapshot(snapshot_file_, 3);
         } else if (snapshot_target_ == "spectrogram" || snapshot_target_ == "spectrum") {
             auto* const content = spectrogram_window_ != nullptr
                 ? spectrogram_window_->snapshotContent()
@@ -3324,6 +3478,8 @@ private:
     std::uint8_t composite_spectrogram_source_mask_{};
     juce::String snapshot_target_{"editor"};
     bool offline_spectrogram_capture_{};
+    mgstc::app::StartupPolicy startup_policy_;
+    double startup_verify_started_ms_{};
     double snapshot_due_ms_{};
     bool routing_test_mode_{};
     bool routing_test_passed_{};

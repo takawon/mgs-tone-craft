@@ -11,6 +11,22 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
+
+namespace mgstc::engine {
+class RealtimeEngineHostTestAccess {
+public:
+    static void duringOutputTransition(RealtimeEngineHost& host,
+        const std::function<void()>& work) {
+        RealtimeEngineHost::OutputTransition transition(host);
+        work();
+    }
+};
+}
 
 namespace {
 
@@ -116,6 +132,54 @@ void testTwoHostsDoNotShareNoteState() {
     require(peak_b < 0.001, "host B should stay silent");
 }
 
+void testCallerDrainDefersDuringOutputTransition() {
+    using namespace mgstc::engine;
+    RealtimeEngineHost host;
+    CompositePlaybackPlan plan;
+    loadDefaultProgram(host, plan);
+    const auto track = plan.physicalTrack(plan.audible_layers.front(), 0);
+    require(host.submit(EngineCommand::noteOn(track, 60)), "note command was not queued");
+    std::mutex mutex;
+    std::condition_variable wake;
+    bool entered = false, release = false;
+    std::thread control([&] {
+        RealtimeEngineHostTestAccess::duringOutputTransition(host, [&] {
+            std::unique_lock lock(mutex);
+            entered = true;
+            wake.notify_one();
+            wake.wait_for(lock, std::chrono::seconds(5), [&] { return release; });
+        });
+    });
+    bool started;
+    {
+        std::unique_lock lock(mutex);
+        started = wake.wait_for(lock, std::chrono::seconds(5), [&] { return entered; });
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    std::array<float, 2> drain{};
+    if (started) host.drainPendingCommands(drain, 250, true);
+    const auto duration = std::chrono::steady_clock::now() - begin;
+    const auto retained = host.pendingCommandCount();
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    wake.notify_one();
+    control.join();
+    require(started, "Output transition did not start");
+    require(duration < std::chrono::seconds(1), "Caller drain waited for output connection");
+    require(retained == 1, "Closed gate consumed or discarded the queued note");
+    host.drainPendingCommands(drain, 250, true);
+    require(host.pendingCommandCount() == 0, "Reopened gate did not drain the note");
+    std::array<float, 1600> pcm{};
+    double peak = 0.0;
+    for (int frame = 0; frame < 60; ++frame) {
+        require(host.renderAudio(pcm).ok(), "render after deferred drain failed");
+        peak = std::max(peak, peakOf(pcm));
+    }
+    require(peak > 0.001, "Deferred note did not sound after connection completed");
+}
+
 }  // namespace
 
 int main() {
@@ -123,6 +187,7 @@ int main() {
         testRealtimeNoteOnRendersWithoutSpscNoteCommands();
         testRealtimeNoteOnDoesNotAffectPriorSamples();
         testTwoHostsDoNotShareNoteState();
+        testCallerDrainDefersDuringOutputTransition();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

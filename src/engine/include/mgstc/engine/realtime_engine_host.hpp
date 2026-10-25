@@ -70,7 +70,10 @@ public:
     // UI thread only.
     [[nodiscard]] bool submit(const EngineCommand& command) noexcept;
 
-    // UI thread only. Does not auto-fall back to emulator on failure.
+    // Serialized non-realtime control only. The standalone startup worker may
+    // select a mode while UI status/control is proxied until completion; it
+    // must not race settings changes. Never call these operations from audio.
+    // Does not auto-fall back to emulator on failure.
     void setMAmidiSettings(MAmidiOutputSettings settings);
     [[nodiscard]] const MAmidiOutputSettings& mamidiSettings() const noexcept;
     [[nodiscard]] bool setSoundOutputKind(SoundOutputKind kind);
@@ -185,6 +188,7 @@ public:
             = std::chrono::milliseconds(500)) noexcept;
 
 private:
+    friend class RealtimeEngineHostTestAccess;
     // A control transition closes the gate and waits outside realtime. Audio
     // makes one bounded CAS attempt and skips work while the gate is closed.
     class RealtimeAccess {

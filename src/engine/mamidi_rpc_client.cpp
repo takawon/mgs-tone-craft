@@ -1,4 +1,5 @@
 #include "mgstc/engine/mamidi_rpc_client.hpp"
+#include "exception_text.hpp"
 
 #include <chrono>
 #include <atomic>
@@ -74,12 +75,12 @@ bool MAmidiRpcClient::connect(
         impl_->state = MAmidiConnectionState::Connected;
         return true;
     } catch (const rpc::timeout& error) {
-        impl_->last_error = std::string("RPC timeout: ") + error.what();
+        impl_->last_error = std::string("RPC timeout: ") + detail::normaliseExceptionTextUtf8(error.what());
     } catch (const rpc::rpc_error& error) {
-        impl_->last_error = std::string("RPC error: ") + error.what();
+        impl_->last_error = std::string("RPC error: ") + detail::normaliseExceptionTextUtf8(error.what());
     } catch (const std::exception& error) {
         impl_->last_error = std::string("RPC connect failed: ")
-            + error.what();
+            + detail::normaliseExceptionTextUtf8(error.what());
     } catch (...) {
         impl_->last_error = "RPC connect failed: unknown error";
     }
@@ -125,7 +126,7 @@ bool MAmidiRpcClient::asyncWrite(const MAmidiChipAccess& access) {
         return true;
     } catch (const std::exception& error) {
         impl_->last_error = std::string("RPC async write failed: ")
-            + error.what();
+            + detail::normaliseExceptionTextUtf8(error.what());
         impl_->state = MAmidiConnectionState::Faulted;
         return false;
     } catch (...) {
@@ -153,7 +154,7 @@ bool MAmidiRpcClient::flushWrites() {
         return true;
     } catch (const std::exception& error) {
         impl_->last_error = std::string("RPC write acknowledgement failed: ")
-            + error.what();
+            + detail::normaliseExceptionTextUtf8(error.what());
     } catch (...) {
         impl_->last_error = "RPC write acknowledgement failed";
     }
