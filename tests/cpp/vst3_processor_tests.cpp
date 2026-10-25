@@ -45,6 +45,123 @@
 namespace mgstc::app {
 
 struct SatelliteEditorParityTestAccess {
+    static void checkNumeric(SccEditorComponent& editor) {
+        const auto check = [](bool value, const char* message) {
+            if (!value) throw std::runtime_error(message);
+        };
+        editor.immediate_audition_.setToggleState(false, juce::dontSendNotification);
+        editor.pasteNumericText("SCCNUM/1 L=16 0 15");
+        check(editor.numeric_state_.resolution == 16 && editor.scc_wave_[0] == -128
+            && editor.scc_wave_[16] == 127, "shared numeric paste applies waveform and resolution");
+        const auto first = editor.history_cursor_;
+        editor.numeric_input_.moveCaretToEnd();
+        editor.numeric_input_.keyPressed(juce::KeyPress(' ', {}, ' '));
+        editor.numeric_input_.keyPressed(juce::KeyPress('1', {}, '1'));
+        editor.numeric_input_.keyPressed(juce::KeyPress('5', {}, '5'));
+        check(editor.history_cursor_ == first + 1 && editor.numeric_state_.values.size() == 3
+            && editor.numeric_state_.values.back() == 15, "multi-digit token is one live undo operation");
+        editor.undo();
+        check(editor.numeric_state_.values == std::vector<int>({0,15})
+            && editor.numeric_state_.resolution == 16, "undo restores numeric sequence and resolution");
+        editor.redo();
+        check(editor.numeric_state_.values.size() == 3, "redo restores numeric token");
+        editor.numeric_resolution_.setSelectedId(256, juce::sendNotificationSync);
+        check(editor.numeric_state_.values == std::vector<int>({0,255,255}), "resolution change requantizes");
+        editor.undo();
+        check(editor.numeric_state_.resolution == 16, "resolution change is one undo operation");
+        auto valid = editor.scc_wave_;
+        auto cursor = editor.history_cursor_;
+        editor.numeric_input_.setText("16 invalid", false);
+        editor.numericTextChanged();
+        check(editor.scc_wave_ == valid && editor.history_cursor_ == cursor
+            && !editor.numeric_copy_.isEnabled(), "invalid text preserves wave and history");
+        editor.pasteNumericText("SCCNUM/2 L=16 0 15");
+        check(editor.scc_wave_ == valid && editor.numeric_input_.getText() == "16 invalid",
+            "failed dedicated paste preserves text and waveform");
+        editor.pasteNumericText("SCCNUM/1 L=16 0 15");
+        editor.commitWave(editor.scc_wave_);
+        check(editor.numeric_state_.resolution == 16 && editor.numeric_state_.values.size() == 2,
+            "identical external wave does not reset numeric state");
+        editor.performLoadImportedScc(editor.scc_wave_, "Numeric reload", false);
+        check(editor.numeric_state_.resolution == 16 && editor.numeric_state_.values.size() == 2,
+            "identical imported wave preserves numeric resolution and source sequence");
+        auto other = editor.scc_wave_;
+        other[0] = 1;
+        editor.commitWave(other);
+        check(editor.numeric_state_.resolution == 256 && editor.numeric_state_.values.size() == 32
+            && editor.numeric_state_.values.front() == 129, "external edit synchronizes signed samples exactly");
+        editor.undo();
+        check(editor.numeric_state_.resolution == 16 && editor.numeric_state_.values.size() == 2,
+            "mixed external and numeric history restores compact sequence");
+        editor.numeric_copy_.onClick();
+        check(juce::SystemClipboard::getTextFromClipboard() == "SCCNUM/1 L=16 0 15",
+            "copy preserves compact numeric source");
+        editor.numeric_input_.setHighlightedRegion({0,1});
+        juce::SystemClipboard::copyTextToClipboard("15");
+        editor.numeric_input_.keyPressed(juce::KeyPress('V', juce::ModifierKeys::ctrlModifier, 0));
+        check(editor.numeric_state_.values == std::vector<int>({15,15}), "ordinary paste replaces selection");
+        editor.undo();
+        check(editor.numeric_state_.values == std::vector<int>({0,15}), "batch paste undo is atomic");
+        for (const int percent : {75,100,125}) {
+            editor.applyEditorUiScale(percent);
+            check(!editor.random_reroll_.isVisible(), "canvas preserves hidden non-Random control");
+            const auto graph = editor.graph_.graphBounds();
+            check(graph.getHeight() >= 256, "scaled graph retains 256 mouse positions");
+            const auto row = editor.numeric_input_.getBounds();
+            check(row.getWidth() > 100 && editor.numeric_resolution_.getX() == editor.graph_.getX() + graph.getX()
+                && editor.numeric_paste_.getRight() == editor.graph_.getX() + graph.getRight(),
+                "numeric controls fit graph width at every scale");
+            for (const int height : {256,384,graph.getHeight()}) {
+                const juce::Rectangle<int> bounds(30,26,640,height);
+                std::array<bool,256> reachable{};
+                for (int y=bounds.getY(); y<bounds.getBottom(); ++y)
+                    reachable[static_cast<int>(SccWaveGraph::sampleValueAtY(static_cast<float>(y),bounds)) + 128] = true;
+                check(std::all_of(reachable.begin(),reachable.end(),[](bool v) { return v; }),
+                    "all 256 signed values reachable inside graph");
+                for (int value=-128; value<=127; ++value) {
+                    const auto y = SccWaveGraph::sampleY(static_cast<std::int8_t>(value), bounds);
+                    check(SccWaveGraph::sampleValueAtY(y,bounds) == value, "draw and edit amplitude scales agree");
+                }
+            }
+            const auto image = editor.createComponentSnapshot(editor.getLocalBounds());
+            auto output = juce::File::getCurrentWorkingDirectory().getChildFile(
+                "scc-numeric-" + juce::String(percent) + ".png").createOutputStream();
+            check(output != nullptr && juce::PNGImageFormat().writeImageToStream(image, *output),
+                "numeric editor snapshot saved");
+            {
+                juce::DocumentWindow host("SCC numeric layout", juce::Colours::black,
+                    juce::DocumentWindow::allButtons);
+                host.setContentNonOwned(&editor, false);
+                host.setSize(UiScale::sx(1280), 800);
+                editor.resized();
+                check(editor.graph_.graphBounds().getHeight() >= 256,
+                    "host-clamped editor preserves full mouse resolution via viewport");
+                check(editor.ab_audition_.getWidth() == UiScale::sx(52),
+                    "small host preserves existing preset controls through horizontal scrolling");
+                editor.waveform_viewport_.setViewPosition(0,
+                    editor.waveform_content_.getHeight());
+                check(editor.waveform_viewport_.getViewArea().contains(editor.numeric_input_.getBounds()),
+                    "numeric input row remains reachable when host is small");
+                check(editor.waveform_content_.getWidth() == editor.waveform_viewport_.getMaximumVisibleWidth(),
+                    "scrollbar transition keeps Paste inside content width");
+                host.setTopLeftPosition(-10000, -10000);
+                host.setVisible(true);
+                editor.editor_viewport_.setViewPosition(0,0);
+                editor.numeric_input_.grabKeyboardFocus();
+                editor.editor_viewport_.focusOfChildComponentChanged(juce::Component::focusChangedDirectly);
+                const auto focused_bounds = editor.editor_canvas_.getLocalArea(
+                    &editor.numeric_input_, editor.numeric_input_.getLocalBounds());
+                check(editor.editor_viewport_.getViewArea().contains(focused_bounds),
+                    "keyboard focus reveals numeric input in clamped editor");
+                host.setSize(UiLayout::editorWindowW, UiLayout::editorWindowH + UiScale::sx(180));
+                check(editor.waveform_content_.getWidth() == editor.waveform_viewport_.getMaximumVisibleWidth(),
+                    "expansion reconciles waveform content width");
+                host.setVisible(false);
+                host.clearContentComponent();
+            }
+        }
+        editor.applyEditorUiScale(100);
+    }
     template<class Editor>
     static const std::optional<mgstc::engine::SavedTimbreReference>&
     ownedSnapshot(const Editor& editor) {
@@ -4276,6 +4393,7 @@ void testEditorParityCorrections() {
         const auto open = [](const juce::String&, std::optional<std::uint64_t>) {};
         mgstc::app::SccEditorComponent scc_editor(context, link, open, [] {},
             [](std::vector<mgstc::engine::OpllPatchParameters>) {}, [](juce::Component*) {}, true, [] {});
+        mgstc::app::SatelliteEditorParityTestAccess::checkNumeric(scc_editor);
         mgstc::app::OpllEditorComponent opll_editor(context, link, open, [] {},
             [](juce::Component*) {}, true, [] {});
         require(mgstc::app::SatelliteEditorParityTestAccess::check(scc_editor, opll_editor),

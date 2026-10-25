@@ -70,6 +70,7 @@
 #include "mgstc_look_and_feel.hpp"
 #include "about_panel.hpp"
 #include "audio_import_bridge.hpp"
+#include "../scc_numeric_wave.hpp"
 
 #include "mgstc/engine/chip_volume_curve.hpp"
 #include "mgstc/engine/composite_timbre.hpp"
@@ -1032,6 +1033,7 @@ class SccWaveGraph final
     : public juce::Component,
       public juce::SettableTooltipClient {
 public:
+    friend struct SatelliteEditorParityTestAccess;
     using CommitCallback =
         std::function<void(const SccWaveform&, const SccWaveform&)>;
     using LiveEditCallback =
@@ -1178,7 +1180,7 @@ public:
         graphics.setColour(juce::Colour(0xFF34404C));
         graphics.drawRoundedRectangle(graph.toFloat(), 6.0F, 1.0F);
         graphics.drawHorizontalLine(
-            graph.getCentreY(),
+            juce::roundToInt(sampleY(0, graph)),
             static_cast<float>(graph.getX()),
             static_cast<float>(graph.getRight()));
 
@@ -1192,6 +1194,23 @@ public:
                 juce::roundToInt(x),
                 static_cast<float>(graph.getY()),
                 static_cast<float>(graph.getBottom()));
+        }
+
+        const auto& confirmed = reference_waveform_ ? *reference_waveform_ : waveform_;
+        const auto zero_y = sampleY(0, graph);
+        graphics.setColour(juce::Colour(0x4853E3A6));
+        for (std::size_t index = 0; index < confirmed.size(); ++index) {
+            const auto tip = sampleY(confirmed[index], graph);
+            graphics.fillRect(juce::Rectangle<float>(
+                static_cast<float>(graph.getX()) + static_cast<float>(index) * pitch,
+                std::min(zero_y, tip), pitch, std::abs(tip - zero_y)));
+            if (tip != zero_y) {
+                graphics.setColour(juce::Colour(0x5053E3A6));
+                graphics.drawRect(juce::Rectangle<float>(
+                    static_cast<float>(graph.getX()) + static_cast<float>(index) * pitch,
+                    std::min(zero_y, tip), pitch, std::abs(tip - zero_y)), 0.7F);
+                graphics.setColour(juce::Colour(0x4853E3A6));
+            }
         }
 
         const auto make_path =
@@ -1427,7 +1446,7 @@ private:
     [[nodiscard]] juce::Rectangle<int> graphBounds() const {
         return getLocalBounds()
             .withTrimmedTop(26)
-            .withTrimmedBottom(52)
+            .withTrimmedBottom(52 + UiLayout::fieldH + UiLayout::xs)
             .withTrimmedLeft(28)
             .reduced(2, 0);
     }
@@ -1469,7 +1488,7 @@ private:
             0.0F,
             1.0F,
             (y - static_cast<float>(graph.getY()))
-                / static_cast<float>(graph.getHeight()));
+                / static_cast<float>(juce::jmax(1, graph.getHeight() - 1)));
         return static_cast<std::int8_t>(juce::jlimit(
             -128,
             127,
@@ -1669,7 +1688,7 @@ private:
         const auto normalized =
             (127.0F - static_cast<float>(sample)) / 255.0F;
         return static_cast<float>(graph.getY())
-            + normalized * static_cast<float>(graph.getHeight());
+            + normalized * static_cast<float>(juce::jmax(1, graph.getHeight() - 1));
     }
 
     void updateFromMouse(juce::Point<float> position) {
@@ -8274,6 +8293,109 @@ private:
     std::optional<SccWaveform> waveform_;
 };
 
+// Keep native selection/cut/copy behaviour, but route waveform undo and shared
+// numeric paste through the owning editor. Text changes are delivered synchronously
+// so key boundaries cannot overtake TextEditor's queued change notifications.
+class SccNumericTextEditor final : public juce::TextEditor {
+public:
+    std::function<void()> changed;
+    std::function<void()> boundary;
+    std::function<void(bool)> history;
+    std::function<void(const juce::String&)> shared_paste;
+
+    void insertTextAtCaret(const juce::String& text) override {
+        if (text.trimStart().startsWith("SCCNUM")) {
+            if (boundary) boundary();
+            if (shared_paste) shared_paste(text);
+            return;
+        }
+        const bool batch = text.length() > 1;
+        if (batch && boundary) boundary();
+        juce::TextEditor::insertTextAtCaret(text);
+        if (changed) changed();
+        if (batch && boundary) boundary();
+    }
+
+    bool keyPressed(const juce::KeyPress& key) override {
+        const auto mods = key.getModifiers();
+        if (key.getKeyCode() == juce::KeyPress::tabKey) {
+            if (boundary) boundary();
+            return juce::TextEditor::keyPressed(key);
+        }
+        if (mods.isCommandDown() && (key.getKeyCode() == 'Z' || key.getKeyCode() == 'Y')) {
+            if (boundary) boundary();
+            if (history) history(key.getKeyCode() == 'Y' || mods.isShiftDown());
+            return true;
+        }
+        const bool paste = (mods.isCommandDown() && key.getKeyCode() == 'V')
+            || (mods.isShiftDown() && key.getKeyCode() == juce::KeyPress::insertKey);
+        const auto c = key.getTextCharacter();
+        if (paste || !getHighlightedRegion().isEmpty()
+            || !((c >= '0' && c <= '9') || key == juce::KeyPress::backspaceKey
+                || key == juce::KeyPress::deleteKey)) {
+            if (boundary) boundary();
+        }
+        const auto handled = juce::TextEditor::keyPressed(key);
+        if (changed) changed();
+        if ((paste || c == ' ') && boundary) boundary();
+        // Never let a text-entry key bubble into PC-keyboard performance.
+        return handled || !mods.isCommandDown();
+    }
+
+    void mouseDown(const juce::MouseEvent& event) override {
+        if (boundary) boundary();
+        juce::TextEditor::mouseDown(event);
+    }
+
+    void focusLost(FocusChangeType cause) override {
+        if (boundary) boundary();
+        juce::TextEditor::focusLost(cause);
+    }
+
+    void addPopupMenuItems(juce::PopupMenu& menu, const juce::MouseEvent*) override {
+        menu.addItem(1, "Cut", !getHighlightedRegion().isEmpty());
+        menu.addItem(2, "Copy", !getHighlightedRegion().isEmpty());
+        menu.addItem(3, "Paste");
+        menu.addSeparator();
+        menu.addItem(4, "Undo");
+        menu.addItem(5, "Redo");
+        menu.addItem(6, "Select All");
+    }
+
+    void performPopupMenuAction(int id) override {
+        if (boundary) boundary();
+        if (id == 1) { copyToClipboard(); cut(); }
+        else if (id == 2) copyToClipboard();
+        else if (id == 3) insertTextAtCaret(juce::SystemClipboard::getTextFromClipboard());
+        else if (id == 4 || id == 5) { if (history) history(id == 5); }
+        else if (id == 6) selectAll();
+        if (changed) changed();
+        if (boundary) boundary();
+    }
+};
+
+class SccEditorViewport final : public juce::Viewport {
+public:
+    void focusOfChildComponentChanged(FocusChangeType) override {
+        auto* content = getViewedComponent();
+        auto* focused = juce::Component::getCurrentlyFocusedComponent();
+        if (content == nullptr || focused == nullptr || !content->isParentOf(focused)) return;
+        const auto bounds = content->getLocalArea(focused, focused->getLocalBounds());
+        const auto view = getViewArea();
+        const auto x = bounds.getX() < view.getX() ? bounds.getX()
+            : juce::jmax(view.getX(), bounds.getRight() - view.getWidth());
+        const auto y = bounds.getY() < view.getY() ? bounds.getY()
+            : juce::jmax(view.getY(), bounds.getBottom() - view.getHeight());
+        setViewPosition(x, y);
+    }
+};
+
+class SccEditorCanvas final : public juce::Component {
+public:
+    std::function<void(juce::Graphics&)> draw;
+    void paint(juce::Graphics& graphics) override { if (draw) draw(graphics); }
+};
+
 class SccEditorComponent final
     : public juce::Component,
       private juce::Timer {
@@ -8302,7 +8424,8 @@ public:
         scc_wave_ = mgstc::engine::generateSccPreset(
             mgstc::engine::SccWavePreset::Sine,
             mgstc::engine::SccHarmonic::One);
-        history_.push_back(scc_wave_);
+        numeric_state_ = SccNumericWave::fromWaveform(scc_wave_);
+        history_.push_back({scc_wave_, numeric_state_, juce::String(numeric_state_.text())});
         last_audition_note_ = loadLastAuditionNoteSetting();
 
         title_.setText(
@@ -8741,6 +8864,45 @@ public:
         });
         addAndMakeVisible(graph_);
 
+        for (const auto resolution : kSccNumericResolutions)
+            numeric_resolution_.addItem(juce::String(resolution), resolution);
+        numeric_resolution_.setSelectedId(256, juce::dontSendNotification);
+        numeric_resolution_.setTooltip(juce::String::fromUTF8("数値波形の縦分解能（変更時は数値を変換します）"));
+        numeric_resolution_.onChange = [this] { changeNumericResolution(); };
+        addAndMakeVisible(numeric_resolution_);
+        numeric_input_.setMultiLine(false);
+        numeric_input_.setScrollbarsShown(false);
+        UiFonts::styleBodyField(numeric_input_);
+        numeric_input_.setTooltip(juce::String::fromUTF8("半角スペース区切りの整数1～32個。入力すると即時反映します"));
+        numeric_input_.boundary = [this] { finishNumericEdit(); };
+        numeric_input_.changed = [this] { numericTextChanged(); };
+        numeric_input_.onTextChange = [this] { numericTextChanged(); };
+        numeric_input_.history = [this](bool forward) { if (forward) redo(); else undo(); };
+        numeric_input_.shared_paste = [this](const juce::String& text) { pasteNumericText(text); };
+        numeric_input_.onReturnKey = [this] { finishNumericEdit(); };
+        addAndMakeVisible(numeric_input_);
+        configureButton(numeric_copy_, "Copy", juce::String::fromUTF8("分解能付き数値波形をコピー"),
+            [this] {
+                const auto parsed = parseSccNumericWave(numeric_input_.getText().toStdString(), numeric_state_.resolution);
+                if (parsed.value) juce::SystemClipboard::copyTextToClipboard(juce::String(parsed.value->sharedText()));
+            });
+        configureButton(numeric_paste_, "Paste", juce::String::fromUTF8("数値列またはSCCNUM/1を貼り付け"),
+            [this] { pasteNumericText(juce::SystemClipboard::getTextFromClipboard()); });
+        numeric_resolution_.setExplicitFocusOrder(350);
+        numeric_input_.setExplicitFocusOrder(351);
+        numeric_copy_.setExplicitFocusOrder(352);
+        numeric_paste_.setExplicitFocusOrder(353);
+        syncNumericControls();
+        waveform_content_.addAndMakeVisible(graph_);
+        waveform_content_.addAndMakeVisible(numeric_resolution_);
+        waveform_content_.addAndMakeVisible(numeric_input_);
+        waveform_content_.addAndMakeVisible(numeric_copy_);
+        waveform_content_.addAndMakeVisible(numeric_paste_);
+        waveform_viewport_.setViewedComponent(&waveform_content_, false);
+        waveform_viewport_.setScrollBarsShown(true, false);
+        waveform_viewport_.setExplicitFocusOrder(300);
+        addAndMakeVisible(waveform_viewport_);
+
         background_load_.setButtonText(
             juce::String::fromUTF8("背景読込"));
         background_load_.setTooltip(
@@ -8868,6 +9030,7 @@ public:
         library_filter_.onTextChange = [this] {
             refreshLibraryList();
         };
+        UiFonts::styleBodyField(numeric_input_);
         UiFonts::styleBodyField(library_filter_);
         addAndMakeVisible(library_filter_);
         library_tag_filter_.setButtonText(
@@ -9126,7 +9289,17 @@ public:
                 &performance_keyboard_,
             },
             400);
-        setSize(UiLayout::editorWindowW, UiLayout::editorWindowH);
+        editor_canvas_.draw = [this](juce::Graphics& graphics) {
+            paintPageBackground(graphics, editor_canvas_.getLocalBounds());
+            paintRoundedPanelFrame(graphics, editor_panel_bounds_);
+            paintRoundedPanelFrame(graphics, library_panel_bounds_);
+        };
+        while (getNumChildComponents() > 0)
+            editor_canvas_.addChildComponent(getChildComponent(0));
+        editor_viewport_.setViewedComponent(&editor_canvas_, false);
+        editor_viewport_.setScrollBarsShown(true, true);
+        addAndMakeVisible(editor_viewport_);
+        setSize(UiLayout::editorWindowW, UiLayout::editorWindowH + UiScale::sx(180));
         {
             juce::Component::SafePointer<SccEditorComponent> safe(this);
             ui_scale_listener_ = UiScale::addGlobalListener([safe] {
@@ -9546,6 +9719,7 @@ public:
         master_volume_label_.setFont(UiFonts::body());
         library_title_.setFont(UiFonts::heading());
         mgsc_title_.setFont(UiFonts::heading());
+        UiFonts::styleBodyField(numeric_input_);
         UiFonts::styleBodyField(library_filter_);
         UiFonts::styleBodyField(name_);
         UiFonts::styleBodyField(memo_);
@@ -9574,7 +9748,7 @@ public:
         applyScaledContentSize(
             *this,
             UiLayout::editorWindowW,
-            UiLayout::editorWindowH,
+            UiLayout::editorWindowH + UiScale::sx(180),
             true);
     }
 
@@ -9595,11 +9769,20 @@ public:
         UiScale::syncEditorDrivenActivePercent(
             *this, effectiveUiScalePercent());
         using namespace UiLayout;
-        auto area = getLocalBounds().reduced(pageMargin);
+        editor_viewport_.setBounds(getLocalBounds());
+        const int chrome_height = pageMargin * 2 + titleH + descriptionH + md
+            + keyboardH + keyboardGap + statusH + sm + fieldH * 3 + xs * 2 + sm
+            + toolbarH + sm + textButtonH + sm + textButtonH + md + panelPad * 2;
+        const int minimum_height = chrome_height + 256 + 26 + 52 + fieldH + xs;
+        editor_canvas_.setSize(juce::jmax(getWidth(), UiLayout::editorWindowW),
+            juce::jmax(getHeight(), minimum_height));
+        editor_canvas_.setSize(juce::jmax(editor_viewport_.getMaximumVisibleWidth(), UiLayout::editorWindowW),
+            juce::jmax(editor_viewport_.getMaximumVisibleHeight(), minimum_height));
+        auto area = editor_canvas_.getLocalBounds().reduced(pageMargin);
         title_.setBounds(area.removeFromTop(titleH));
         description_.setBounds(area.removeFromTop(descriptionH));
         layoutEditorTopRightChrome(
-            getWidth(),
+            editor_canvas_.getWidth(),
             settings_,
             master_volume_,
             &master_volume_label_,
@@ -9716,8 +9899,23 @@ public:
         const int tool_column_w =
             cursor_pad_w + controlGap + scale_bar_w;
         auto editor_row = area.reduced(panelPad);
-        graph_.setBounds(
-            editor_row.withTrimmedRight(tool_column_w + panelGap));
+        waveform_viewport_.setBounds(editor_row.withTrimmedRight(tool_column_w + panelGap));
+        // Keep every signed sample reachable even when the host clamps its
+        // window to a small display. Only this waveform area scrolls vertically.
+        const auto waveform_height = juce::jmax(waveform_viewport_.getHeight(),
+            256 + 26 + 52 + fieldH + xs);
+        waveform_content_.setSize(waveform_viewport_.getMaximumVisibleWidth(), waveform_height);
+        waveform_content_.setSize(waveform_viewport_.getMaximumVisibleWidth(), waveform_height);
+        graph_.setBounds(waveform_content_.getLocalBounds());
+        auto numeric_row = graph_.getBounds().withTrimmedLeft(30).withTrimmedRight(2);
+        numeric_row = numeric_row.removeFromBottom(fieldH);
+        numeric_resolution_.setBounds(numeric_row.removeFromLeft(UiScale::sx(78)));
+        numeric_row.removeFromLeft(controlGap);
+        numeric_paste_.setBounds(numeric_row.removeFromRight(UiScale::sx(68)));
+        numeric_row.removeFromRight(controlGap);
+        numeric_copy_.setBounds(numeric_row.removeFromRight(UiScale::sx(68)));
+        numeric_row.removeFromRight(controlGap);
+        numeric_input_.setBounds(numeric_row);
         auto tool_area = editor_row.removeFromRight(tool_column_w);
         auto wave_tools = tool_area.removeFromBottom(button_size)
             .withSizeKeepingCentre(
@@ -10957,10 +11155,15 @@ private:
         selected_tags_.clear();
         updateTagButtons();
         memo_.clear();
+        finishNumericEdit();
+        if (scc_wave_ != wave) {
+            numeric_state_ = SccNumericWave::fromWaveform(wave);
+            syncNumericControls();
+        }
         scc_wave_ = wave;
         graph_.setWaveform(scc_wave_);
         history_.clear();
-        history_.push_back(scc_wave_);
+        history_.push_back({scc_wave_, numeric_state_, numeric_input_.getText()});
         history_cursor_ = 0;
         updateHistoryButtons();
         if (engine_ready_) {
@@ -11691,7 +11894,97 @@ private:
         preserve_volume_.setEnabled(enabled);
     }
 
+    void finishNumericEdit() { numeric_edit_active_ = false; }
+
+    void syncNumericControls(const juce::String& text = {}) {
+        numeric_resolution_.setSelectedId(numeric_state_.resolution, juce::dontSendNotification);
+        numeric_input_.setText(text.isEmpty() ? juce::String(numeric_state_.text()) : text, false);
+        numeric_last_text_ = numeric_input_.getText();
+        numeric_copy_.setEnabled(true);
+    }
+
+    void numericError(SccNumericError error) {
+        const char* message = "数値波形を解析できません";
+        switch (error) {
+        case SccNumericError::Empty: message = "数値波形が空です（1～32個の整数を入力してください）"; break;
+        case SccNumericError::InvalidResolution: message = "数値波形の分解能が不正です"; break;
+        case SccNumericError::InvalidCharacter: message = "数値波形は半角数字とスペースで入力してください"; break;
+        case SccNumericError::OutOfRange: message = "数値が選択した分解能の範囲外です"; break;
+        case SccNumericError::TooManyValues: message = "数値波形は32個までです"; break;
+        case SccNumericError::UnsupportedFormat: message = "未対応の数値波形共有形式です"; break;
+        default: break;
+        }
+        updateStatus(juce::String::fromUTF8(message));
+    }
+
+    void applyNumericState(const SccNumericWave& state, const juce::String& text,
+                           bool merge, bool sync_controls) {
+        dismissPreviewState(false);
+        scale_previewing_ = false;
+        numeric_state_ = state;
+        scc_wave_ = state.waveform();
+        if (sync_controls) syncNumericControls(text);
+        graph_.setWaveform(scc_wave_);
+        updateDefinitionPreview();
+        history_.erase(history_.begin() + static_cast<std::ptrdiff_t>(history_cursor_ + 1), history_.end());
+        const WaveHistory entry{scc_wave_, numeric_state_, text};
+        if (merge && history_cursor_ > 0) history_[history_cursor_] = entry;
+        else {
+            history_.push_back(entry);
+            if (history_.size() > 257) history_.erase(history_.begin());
+            else ++history_cursor_;
+        }
+        updateHistoryButtons();
+        numeric_copy_.setEnabled(true);
+        const bool audition = immediate_audition_.getToggleState();
+        if (configureEngine(audition) && audition) armOneSecondPreview();
+        publishOwnedSnapshot();
+        updateStatus(juce::String::fromUTF8("数値波形を更新しました"));
+    }
+
+    void numericTextChanged() {
+        const auto text = numeric_input_.getText();
+        if (text == numeric_last_text_) return;
+        numeric_last_text_ = text;
+        const auto parsed = parseSccNumericWave(text.toStdString(), numeric_state_.resolution);
+        numeric_copy_.setEnabled(parsed.value.has_value());
+        if (!parsed.value) { finishNumericEdit(); numericError(parsed.error); return; }
+        if (*parsed.value == numeric_state_) {
+            // Whitespace does not create a waveform operation.
+            history_[history_cursor_].text = text;
+            updateStatus(juce::String::fromUTF8("数値波形は有効です"));
+            return;
+        }
+        const bool merge = numeric_edit_active_
+            && parsed.value->values.size() == numeric_state_.values.size();
+        applyNumericState(*parsed.value, text, merge, false);
+        numeric_edit_active_ = true;
+    }
+
+    void changeNumericResolution() {
+        finishNumericEdit();
+        const auto parsed = parseSccNumericWave(numeric_input_.getText().toStdString(), numeric_state_.resolution);
+        if (!parsed.value) {
+            numeric_resolution_.setSelectedId(numeric_state_.resolution, juce::dontSendNotification);
+            numericError(parsed.error);
+            return;
+        }
+        const auto resolution = numeric_resolution_.getSelectedId();
+        if (resolution == numeric_state_.resolution) return;
+        const auto next = parsed.value->requantized(resolution);
+        applyNumericState(next, juce::String(next.text()), false, true);
+    }
+
+    void pasteNumericText(const juce::String& text) {
+        finishNumericEdit();
+        const auto parsed = parseSccNumericWave(text.toStdString(), numeric_state_.resolution, true);
+        if (!parsed.value) { numericError(parsed.error); return; }
+        if (*parsed.value == numeric_state_ && text == numeric_input_.getText()) return;
+        applyNumericState(*parsed.value, juce::String(parsed.value->text()), false, true);
+    }
+
     void commitWave(const SccWaveform& waveform) {
+        finishNumericEdit();
         dismissPreviewState(false);
         scale_previewing_ = false;
         if (waveform == scc_wave_) {
@@ -11705,13 +11998,15 @@ private:
             return;
         }
         scc_wave_ = waveform;
+        numeric_state_ = SccNumericWave::fromWaveform(scc_wave_);
+        syncNumericControls();
         graph_.setWaveform(scc_wave_);
         updateDefinitionPreview();
         history_.erase(
             history_.begin()
                 + static_cast<std::ptrdiff_t>(history_cursor_ + 1),
             history_.end());
-        history_.push_back(scc_wave_);
+        history_.push_back({scc_wave_, numeric_state_, numeric_input_.getText()});
         if (history_.size() > 257) {
             history_.erase(history_.begin());
         } else {
@@ -11732,9 +12027,12 @@ private:
     }
 
     void restoreHistory() {
+        finishNumericEdit();
         dismissPreviewState(false);
         scale_previewing_ = false;
-        scc_wave_ = history_[history_cursor_];
+        scc_wave_ = history_[history_cursor_].waveform;
+        numeric_state_ = history_[history_cursor_].numeric;
+        syncNumericControls(history_[history_cursor_].text);
         graph_.setWaveform(scc_wave_);
         updateDefinitionPreview();
         updateHistoryButtons();
@@ -11744,6 +12042,7 @@ private:
         }
         updateStatus(
             juce::String::fromUTF8("履歴から波形を復元しました"));
+        publishOwnedSnapshot();
     }
 
     void undo() {
@@ -12025,7 +12324,23 @@ private:
     std::optional<mgstc::engine::SavedTimbreReference> owned_preview_snapshot_;
     SccWaveform scc_wave_{};
     std::optional<int> ui_scale_session_override_;
-    std::vector<SccWaveform> history_;
+    struct WaveHistory {
+        SccWaveform waveform;
+        SccNumericWave numeric;
+        juce::String text;
+    };
+    SccNumericWave numeric_state_;
+    bool numeric_edit_active_{};
+    juce::String numeric_last_text_;
+    juce::ComboBox numeric_resolution_;
+    SccNumericTextEditor numeric_input_;
+    juce::TextButton numeric_copy_;
+    juce::TextButton numeric_paste_;
+    juce::Component waveform_content_;
+    SccEditorViewport waveform_viewport_;
+    SccEditorCanvas editor_canvas_;
+    SccEditorViewport editor_viewport_;
+    std::vector<WaveHistory> history_;
     std::size_t history_cursor_{};
     juce::Label title_;
     juce::Label description_;

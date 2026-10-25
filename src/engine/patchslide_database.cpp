@@ -621,7 +621,11 @@ std::optional<std::size_t> PatchSlideDatabase::find(std::string_view id) const {
 }
 
 bool PatchSlideDatabase::isRejected(const PatchSlideCandidate& candidate) noexcept {
-    return candidate.visibility == "hidden" || (!candidate.manual_use_allowed && !candidate.auto_safe);
+    const auto& pattern = candidate.human_pattern.empty()
+        ? candidate.predicted_partition : candidate.human_pattern;
+    return candidate.visibility == "hidden"
+        || (!candidate.manual_use_allowed && !candidate.auto_safe)
+        || (pattern != "AAAA" && pattern != "ABBB");
 }
 
 bool PatchSlideDatabase::isVisible(const PatchSlideCandidate& candidate, bool show_rejected) noexcept {

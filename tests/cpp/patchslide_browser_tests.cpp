@@ -24,6 +24,41 @@ class PatchSlideBrowserTestAccess {
         button.triggerClick();
         juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
     }
+    static void checkBrowseRejectToggle(PatchSlideBrowserComponent& browser, engine::PatchSlideFilter filter) {
+        require(!browser.rejected_.getToggleState(), "Reject toggle setup must be OFF");
+        press(browser.rejected_);
+        settle(browser);
+        filter.show_rejected = true;
+        require(browser.rejected_.getToggleState() && browser.rows_ == browser.db_->filter(filter),
+            "Reject ON did not update the current browse filter");
+        press(browser.rejected_);
+        settle(browser);
+        filter.show_rejected = false;
+        require(!browser.rejected_.getToggleState() && browser.rows_ == browser.db_->filter(filter),
+            "Reject OFF did not restore the current browse filter");
+    }
+    static void checkSearchRejectToggle(PatchSlideBrowserComponent& browser) {
+        const auto ranks = browser.ranks_;
+        const auto visible = browser.rows_;
+        press(browser.rejected_);
+        settle(browser);
+        require(browser.rejected_.getToggleState() && browser.ranks_.size() == ranks.size(),
+            "Reject ON changed global search size");
+        for (std::size_t i = 0; i < ranks.size(); ++i)
+            require(browser.ranks_[i].candidate_index == ranks[i].candidate_index
+                && browser.ranks_[i].rank == ranks[i].rank
+                && browser.ranks_[i].squared_distance == ranks[i].squared_distance,
+                "Reject visibility changed the global search ranking");
+        std::vector<std::size_t> expected;
+        for (const auto& row : ranks)
+            if (engine::PatchSlideDatabase::isVisible(browser.db_->candidates()[row.candidate_index], true))
+                expected.push_back(row.candidate_index);
+        require(browser.rows_ == expected, "Reject ON did not expose the original search candidates");
+        press(browser.rejected_);
+        settle(browser);
+        require(!browser.rejected_.getToggleState() && browser.rows_ == visible,
+            "Reject OFF did not restore the filtered global search results");
+    }
     struct TaskRegistry final : BackgroundTaskBoundary {
         std::vector<std::shared_ptr<EditorBackgroundTask>> tasks;
         bool registerTask(std::shared_ptr<EditorBackgroundTask> task) override {
@@ -98,6 +133,28 @@ public:
         require(browser.random_.isVisible(), "Discovery action is missing from all-candidate mode");
         for (const auto index : browser.rows_)
             require(!engine::PatchSlideDatabase::isRejected(browser.db_->candidates()[index]), "Reject exposed by default");
+        const auto default_count = browser.rows_.size();
+        checkBrowseRejectToggle(browser, all);
+        if (browser.db_->candidates().size() == engine::PatchSlideDatabase::pruned_candidate_count) {
+            require(default_count == 11974, "Reject OFF must show 11974 candidates");
+            press(browser.rejected_);
+            settle(browser);
+            require(browser.rows_.size() == 12180, "Reject ON must show 12180 candidates");
+            const auto rejected = std::find_if(browser.rows_.begin(), browser.rows_.end(), [&](auto index) {
+                return engine::PatchSlideDatabase::isRejected(browser.db_->candidates()[index]);
+            });
+            require(rejected != browser.rows_.end(), "Reject ON exposed no unstable candidates");
+            const auto& candidate = browser.db_->candidates()[*rejected];
+            const auto label = PatchSlideBrowserComponent::candidateStateText(candidate);
+            require(label.startsWith("Reject") && !label.contains(juce::String::fromUTF8("\xe6\x89\x8b\xe5\x8b\x95\xe5\x88\xa9\xe7\x94\xa8\xe5\x80\x99\xe8\xa3\x9c")),
+                "Rejected candidate was labelled as an ordinary manual-use candidate");
+            browser.list_.selectRow(static_cast<int>(std::distance(browser.rows_.begin(), rejected)));
+            require(browser.details_.getText().contains("Reject"), "Rejected selection has no detail warning");
+            press(browser.rejected_);
+            settle(browser);
+            require(browser.rows_.size() == 11974, "Reject OFF failed to hide the 206 candidates again");
+            std::cout << "Browser Reject OFF=11974, ON=12180, OFF=11974 passed\n";
+        }
         browser.random_.onClick();
         require(previews == 1, "Discovery did not audition its selection");
         require(browser.selected_index_.has_value(), "Discovery did not select a candidate");
@@ -128,6 +185,7 @@ public:
         settle(browser);
         tags.tags_match_all = false;
         require(browser.rows_ == browser.db_->filter(tags), "OR tag filter mismatch");
+        checkBrowseRejectToggle(browser, tags);
 
         browser.mode_.setSelectedId(2, juce::sendNotificationSync);
         for (const int count : {16, 64}) {
@@ -139,6 +197,7 @@ public:
             group.cluster_id = 0;
             require(browser.rows_ == browser.db_->filter(group), "Independent classification filter mismatch");
             require(browser.selectedGroup() && browser.selectedGroup()->cluster_count == count, "Representative belongs to wrong classification");
+            checkBrowseRejectToggle(browser, group);
         }
 
         // A representative is absent from its own Standard B results. Pressing
@@ -192,6 +251,7 @@ public:
         require(browser.query_kind_ == PatchSlideBrowserComponent::QueryKind::StandardB, "Standard B mode was not retained");
         require(std::find(browser.rows_.begin(), browser.rows_.end(), source) == browser.rows_.end(), "Standard B included its source");
         require(browser.ranks_.size() == browser.db_->candidates().size() - 1, "Standard B did not search all candidates");
+        checkSearchRejectToggle(browser);
         browser.variation_.onClick();
         settle(browser);
         require(browser.ranks_.size() == 3 && browser.rows_.size() <= 3, "Variation filled filtered positions or changed count");
@@ -199,6 +259,7 @@ public:
         for (const auto& row : browser.ranks_)
             if (engine::PatchSlideDatabase::isVisible(browser.db_->candidates()[row.candidate_index])) expected_visible.push_back(row.candidate_index);
         require(browser.rows_ == expected_visible, "Variation display reordered or replaced selected candidates");
+        checkSearchRejectToggle(browser);
 
         // Inject only an obsolete delivery, representing a finished earlier job.
         const auto retained_rows = browser.rows_;
@@ -220,10 +281,20 @@ public:
 
         if (!screenshots.empty()) {
             std::filesystem::create_directories(screenshots);
+            const auto rejected = std::find_if(browser.rows_.begin(), browser.rows_.end(), [&](auto index) {
+                return engine::PatchSlideDatabase::isRejected(browser.db_->candidates()[index]);
+            });
+            if (rejected != browser.rows_.end()) {
+                const auto row = static_cast<int>(std::distance(browser.rows_.begin(), rejected));
+                browser.list_.selectRow(row);
+                browser.list_.scrollToEnsureRowIsOnscreen(row);
+            }
             for (const int scale : {75, 100, 125}) {
                 UiScale::setActivePercent(scale);
                 browser.setSize(UiLayout::libraryManagerW, UiLayout::libraryManagerH);
                 browser.resized();
+                if (browser.list_.getSelectedRow() >= 0)
+                    browser.list_.scrollToEnsureRowIsOnscreen(browser.list_.getSelectedRow());
                 require(browser.list_.getHeight() > UiLayout::fieldH, "Scaled candidate list has no usable height");
                 require(browser.register_.getRight() <= browser.getWidth(), "Scaled actions overflow browser");
                 const auto image = browser.createComponentSnapshot(browser.getLocalBounds());

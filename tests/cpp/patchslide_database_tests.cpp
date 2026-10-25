@@ -116,11 +116,34 @@ void standaloneValueBoundaries() {
     c.auto_safe = false;
     c.manual_use_allowed = false;
     c.visibility = "visible";
+    c.predicted_partition = "AAAA";
     require(PatchSlideDatabase::isRejected(c), "unsafe candidate requires explicit review permission");
     require(!PatchSlideDatabase::isVisible(c, false), "rejected candidate is hidden by default");
     require(PatchSlideDatabase::isVisible(c, true), "show-rejected exposes an enabled rejected candidate");
     c.manual_use_allowed = true;
     require(!PatchSlideDatabase::isRejected(c), "manual permission permits a non-automatic candidate");
+    for (const auto* pattern : {"AAAA", "ABBB"}) {
+        c.predicted_partition = pattern;
+        require(!PatchSlideDatabase::isRejected(c), "AAAA/ABBB remain visible without AUTO_SAFE");
+    }
+    for (const auto* pattern : {"ABAB", "AABA", "ABBA", "AAAB", "ABAA", "AABB", "ABCB", "", "unknown"}) {
+        c.predicted_partition = pattern;
+        require(PatchSlideDatabase::isRejected(c), "unstable/unknown pattern requires explicit Reject visibility");
+        require(!PatchSlideDatabase::isVisible(c) && PatchSlideDatabase::isVisible(c, true),
+            "Reject switch controls pattern-based rejection");
+    }
+    c.predicted_partition = "ABAB";
+    c.auto_safe = true;
+    require(PatchSlideDatabase::isRejected(c), "AUTO_SAFE cannot override a rejected pattern");
+    c.human_pattern = "AAAA";
+    require(!PatchSlideDatabase::isRejected(c), "human stable pattern overrides prediction");
+    c.human_pattern = "ABBB";
+    require(!PatchSlideDatabase::isRejected(c), "human initial-difference pattern remains visible");
+    c.predicted_partition = "AAAA";
+    c.human_pattern = "ABAB";
+    require(PatchSlideDatabase::isRejected(c), "human rejected pattern overrides prediction and AUTO_SAFE");
+    c.human_pattern.clear();
+    require(!PatchSlideDatabase::isRejected(c), "empty human pattern falls back to prediction");
     c.visibility = "hidden";
     require(PatchSlideDatabase::isRejected(c), "explicitly hidden candidate remains rejected");
     c.enabled = false;
@@ -282,6 +305,11 @@ void validateCatalog(const PatchSlideDatabase& db) {
     }
     require(default_visible == expectedDefault, "default search excludes rejected and disabled entries");
     require(show_rejected == expectedAllEnabled, "empty tag selection retains all enabled entries when requested");
+    if (pruned) {
+        require(default_visible.size() == 11974 && show_rejected.size() == 12180,
+            "pruned catalog must hide exactly 206 unstable candidates by default");
+        std::cout << "Reject OFF=11974, ON=12180 (206 rejected).\n";
+    }
     filter.auto_safe_only = true;
     const auto safe_only = db.filter(filter);
     const auto expectedSafe = static_cast<std::size_t>(std::count_if(candidates.begin(), candidates.end(),

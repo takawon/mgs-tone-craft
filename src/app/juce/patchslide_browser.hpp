@@ -493,8 +493,10 @@ private:
         text += utf8("　手動利用: ") + juce::String(candidate.manual_use_allowed ? "Yes" : "No");
         text += "\nvisibility: " + utf8(candidate.visibility.c_str()) + " / partition: " + utf8(candidate.predicted_partition.c_str());
         text += " / human: " + (candidate.human_pattern.empty() ? utf8("未判定") : utf8(candidate.human_pattern.c_str()));
-        if (candidate.human_pattern == "ABBB" || candidate.predicted_partition == "ABBB")
+        if ((candidate.human_pattern.empty() ? candidate.predicted_partition : candidate.human_pattern) == "ABBB")
             text += utf8("\n注意: ABBBは初回発声と以降の発声で音が異なる場合があります。");
+        if (engine::PatchSlideDatabase::isRejected(candidate))
+            text += utf8("\n判定: Reject（通常非表示）");
         text += utf8("\nタグ: ");
         for (std::size_t i = 0; i < candidate.tags.size(); ++i) {
             if (i != 0) text += " / ";
@@ -512,6 +514,15 @@ private:
     }
     void returnKeyPressed(int) override { previewSelection(); }
     void listBoxItemDoubleClicked(int, const juce::MouseEvent&) override { previewSelection(); }
+    [[nodiscard]] static juce::String candidateStateText(const engine::PatchSlideCandidate& candidate) {
+        auto state = engine::PatchSlideDatabase::isRejected(candidate) ? juce::String("Reject")
+            : candidate.auto_safe ? juce::String("AUTO_SAFE")
+            : candidate.manual_use_allowed ? utf8("手動利用候補") : utf8("利用判定を確認");
+        state += " / " + utf8(candidate.visibility.c_str());
+        if ((candidate.human_pattern.empty() ? candidate.predicted_partition : candidate.human_pattern) == "ABBB")
+            state += utf8(" / ABBB: 初回発声差に注意");
+        return state;
+    }
     void paintListBoxItem(int row, juce::Graphics& g, int width, int height, bool selected) override {
         if (!db_ || !names_ || row < 0 || row >= getNumRows()) return;
         if (selected) g.fillAll(uiToggleOnFill());
@@ -521,11 +532,7 @@ private:
         const auto& candidate = db_->candidates()[index];
         auto area = juce::Rectangle<int>(0, 0, width, height).reduced(UiLayout::xs);
         g.drawFittedText((*names_)[index], area.removeFromTop(area.getHeight() / 2), juce::Justification::centredLeft, 1);
-        auto state = candidate.auto_safe ? juce::String("AUTO_SAFE")
-            : candidate.manual_use_allowed ? utf8("手動利用候補") : utf8("利用判定を確認");
-        state += " / " + utf8(candidate.visibility.c_str());
-        if (candidate.human_pattern == "ABBB" || candidate.predicted_partition == "ABBB") state += utf8(" / ABBB: 初回発声差に注意");
-        g.drawFittedText(state, area, juce::Justification::centredLeft, 1);
+        g.drawFittedText(candidateStateText(candidate), area, juce::Justification::centredLeft, 1);
     }
 
     Callbacks callbacks_;

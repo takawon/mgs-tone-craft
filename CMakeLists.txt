@@ -714,6 +714,16 @@ if(MGSTC_BUILD_TESTS)
         NAME mgstc_composite_envelope_compile_tests
         COMMAND mgstc_composite_envelope_compile_tests)
 
+    add_executable(mgstc_scc_numeric_wave_tests tests/cpp/scc_numeric_wave_tests.cpp)
+    target_link_libraries(mgstc_scc_numeric_wave_tests PRIVATE mgstc_engine)
+    target_compile_features(mgstc_scc_numeric_wave_tests PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(mgstc_scc_numeric_wave_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    else()
+        target_compile_options(mgstc_scc_numeric_wave_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME mgstc_scc_numeric_wave_tests COMMAND mgstc_scc_numeric_wave_tests)
+
     add_executable(mgstc_scc_morph_tests tests/cpp/scc_morph_tests.cpp)
     add_executable(mgstc_composite_step_edit_tests tests/cpp/composite_step_edit_tests.cpp)
     target_link_libraries(mgstc_composite_step_edit_tests PRIVATE mgstc_engine)
