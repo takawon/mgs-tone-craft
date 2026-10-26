@@ -45,12 +45,135 @@
 namespace mgstc::app {
 
 struct SatelliteEditorParityTestAccess {
+    static void checkSccWav(SccEditorComponent& editor) {
+        const auto check = [](bool value, const char* message) {
+            if (!value) throw std::runtime_error(message);
+        };
+        const auto type = [&](const juce::String& text) {
+            editor.finishNumericEdit();
+            editor.numeric_input_.setText(text, false);
+            editor.numeric_input_.setCaretPosition(4);
+            editor.numericTextChanged();
+            check(editor.numeric_input_.getText() == text && editor.numeric_input_.getCaretPosition() == 4,
+                "live expression evaluation preserves input text and caret");
+        };
+        const auto previous_wave = editor.scc_wave_;
+        const juce::String periodic_text("SCCWAV L=256 127<255>127<0>127");
+        editor.pasteNumericText(periodic_text);
+        const mgstc::engine::SccWaveform periodic_expected{
+            -1,24,48,70,90,105,117,125,127,125,117,105,90,70,48,24,
+            -1,-26,-50,-72,-91,-107,-118,-126,-128,-126,-118,-107,-91,-72,-50,-26};
+        check(editor.scc_wave_ == periodic_expected && editor.graph_.waveform() == periodic_expected,
+            "shared editor applies all 32 nonduplicated periodic samples");
+        editor.numeric_copy_.onClick();
+        check(juce::SystemClipboard::getTextFromClipboard() == periodic_text,
+            "endpoint sampling preserves original shared expression");
+        editor.undo();
+        check(editor.scc_wave_ == previous_wave, "periodic paste undo preserves prior wave");
+        editor.redo();
+        check(editor.scc_wave_ == periodic_expected, "periodic paste redo preserves new endpoint policy");
+        const auto wave = editor.scc_wave_;
+        const auto cursor = editor.history_cursor_;
+        type("SCCWAV L=16");
+        check(editor.scc_wave_ == wave && editor.history_cursor_ == cursor
+            && editor.numeric_resolution_.getSelectedId() == 16 && !editor.numeric_copy_.isEnabled(),
+            "header-only input updates selector without waveform or history");
+        editor.numeric_resolution_.setSelectedId(32, juce::sendNotificationSync);
+        check(editor.numeric_input_.getText() == "SCCWAV L=32" && editor.scc_wave_ == wave,
+            "incomplete header tracks resolution changes");
+        editor.pasteNumericText("0 31");
+        check(editor.numeric_state_.resolution == 32 && editor.scc_wave_.back() == 127,
+            "bare dedicated paste uses header-only selector resolution");
+        type("SCCWAV L=16 0>(15 0)");
+        const auto cross = editor.scc_wave_;
+        const auto cross_cursor = editor.history_cursor_;
+        type("SCCWAV L=16 0(>15 0)");
+        check(editor.scc_wave_ == cross && editor.history_cursor_ == cross_cursor + 1,
+            "equivalent cross-boundary syntax records distinct expression history");
+        editor.undo();
+        check(editor.numeric_input_.getText() == "SCCWAV L=16 0>(15 0)",
+            "undo restores original equivalent expression");
+        editor.redo();
+        check(editor.numeric_input_.getText() == "SCCWAV L=16 0(>15 0)",
+            "redo restores parentheses and operator placement");
+        editor.numeric_copy_.onClick();
+        check(juce::SystemClipboard::getTextFromClipboard() == "SCCWAV L=16 0(>15 0)",
+            "copy emits a single header and preserves expression");
+        editor.numeric_resolution_.setSelectedId(256, juce::sendNotificationSync);
+        check(editor.numeric_input_.getText() == "SCCWAV L=256 0(>255 0)",
+            "requantization rewrites literals and header only");
+        editor.undo();
+        check(editor.numeric_resolution_.getSelectedId() == 16, "expression resolution undo restores selector");
+        const auto valid = editor.scc_wave_;
+        const auto valid_cursor = editor.history_cursor_;
+        type("SCCWAV L=16 0>(>15 0)");
+        check(editor.scc_wave_ == valid && editor.history_cursor_ == valid_cursor,
+            "duplicate interpolation preserves committed wave and history");
+        type("SCCWAV L=16 0 (15 0");
+        check(editor.scc_wave_ == valid && editor.history_cursor_ == valid_cursor,
+            "unfinished parentheses do not commit waveform");
+        type("SCCWAV L=32 (");
+        editor.numeric_resolution_.setSelectedId(64, juce::sendNotificationSync);
+        check(editor.numeric_resolution_.getSelectedId() == 32
+            && editor.numeric_input_.getText() == "SCCWAV L=32 (",
+            "invalid expression retains header resolution and text when selector change is rejected");
+        editor.pasteNumericText("SCCWAV L=16 0>(15-0)");
+        check(editor.numeric_input_.getText() == "SCCWAV L=16 0>(15-0)",
+            "dedicated paste preserves full expression");
+        const auto pasted = editor.scc_wave_;
+        editor.pasteNumericText("SCCNUM/1 L=16 0 15");
+        check(editor.scc_wave_ == pasted, "obsolete sharing format is rejected");
+        editor.numeric_input_.insertTextAtCaret("SCCWAV L=16 (0 8)(>15 0)");
+        check(editor.numeric_input_.getText() == "SCCWAV L=16 (0 8)(>15 0)",
+            "shared text insertion atomically replaces full input");
+        for (const int percent : {75,100,125}) {
+            editor.applyEditorUiScale(percent);
+            const auto bounds = editor.numeric_input_.getBounds();
+            editor.showNumericHelp();
+            check(editor.numeric_help_->isVisible() && !editor.numeric_help_->isCurrentlyModal()
+                && editor.numeric_input_.getBounds() == bounds, "help is a non-modal overlay without relayout");
+            check(editor.numeric_help_button_.getRight() < editor.numeric_copy_.getX()
+                && editor.numeric_help_button_.getX() > bounds.getRight(), "help fits between input and Copy");
+            const auto image = editor.createComponentSnapshot(editor.getLocalBounds());
+            auto output = juce::File::getCurrentWorkingDirectory().getChildFile(
+                "sccwav-help-" + juce::String(percent) + ".png").createOutputStream();
+            check(output != nullptr && juce::PNGImageFormat().writeImageToStream(image, *output),
+                "SCCWAV help snapshot saved");
+            check(editor.numeric_input_.keyPressed(juce::KeyPress(juce::KeyPress::escapeKey))
+                && !editor.numeric_help_->isVisible(), "Escape dismisses help from numeric editor");
+            editor.showNumericHelp();
+            const auto now = juce::Time::getCurrentTime();
+            const juce::MouseEvent outside(juce::Desktop::getInstance().getMainMouseSource(), {0.0F,0.0F},
+                juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),
+                1.0F,0.0F,0.0F,0.0F,0.0F, &editor.numeric_copy_, &editor.numeric_copy_, now,
+                {0.0F,0.0F}, now,1,false);
+            editor.numeric_help_->mouseDown(outside);
+            check(!editor.numeric_help_->isVisible(), "outside click dismisses non-modal help");
+        }
+        editor.applyEditorUiScale(100);
+        {
+            juce::DocumentWindow host("SCCWAV focus", juce::Colours::black, juce::DocumentWindow::allButtons);
+            host.setContentNonOwned(&editor, true);
+            host.setTopLeftPosition(-10000,-10000);
+            host.setVisible(true);
+            editor.numeric_input_.grabKeyboardFocus();
+            const auto* focus = juce::Component::getCurrentlyFocusedComponent();
+            const auto modal_count = juce::Component::getNumCurrentlyModalComponents();
+            editor.showNumericHelp();
+            check(focus == &editor.numeric_input_ && juce::Component::getCurrentlyFocusedComponent() == focus
+                && juce::Component::getNumCurrentlyModalComponents() == modal_count,
+                "help does not steal numeric focus or enter modal state");
+            editor.closeNumericHelp();
+            host.setVisible(false);
+            host.clearContentComponent();
+        }
+    }
     static void checkNumeric(SccEditorComponent& editor) {
         const auto check = [](bool value, const char* message) {
             if (!value) throw std::runtime_error(message);
         };
         editor.immediate_audition_.setToggleState(false, juce::dontSendNotification);
-        editor.pasteNumericText("SCCNUM/1 L=16 0 15");
+        editor.pasteNumericText("SCCWAV L=16 0 15");
         check(editor.numeric_state_.resolution == 16 && editor.scc_wave_[0] == -128
             && editor.scc_wave_[16] == 127, "shared numeric paste applies waveform and resolution");
         const auto first = editor.history_cursor_;
@@ -78,7 +201,7 @@ struct SatelliteEditorParityTestAccess {
         editor.pasteNumericText("SCCNUM/2 L=16 0 15");
         check(editor.scc_wave_ == valid && editor.numeric_input_.getText() == "16 invalid",
             "failed dedicated paste preserves text and waveform");
-        editor.pasteNumericText("SCCNUM/1 L=16 0 15");
+        editor.pasteNumericText("SCCWAV L=16 0 15");
         editor.commitWave(editor.scc_wave_);
         check(editor.numeric_state_.resolution == 16 && editor.numeric_state_.values.size() == 2,
             "identical external wave does not reset numeric state");
@@ -94,9 +217,10 @@ struct SatelliteEditorParityTestAccess {
         check(editor.numeric_state_.resolution == 16 && editor.numeric_state_.values.size() == 2,
             "mixed external and numeric history restores compact sequence");
         editor.numeric_copy_.onClick();
-        check(juce::SystemClipboard::getTextFromClipboard() == "SCCNUM/1 L=16 0 15",
+        check(juce::SystemClipboard::getTextFromClipboard() == "SCCWAV L=16 0 15",
             "copy preserves compact numeric source");
-        editor.numeric_input_.setHighlightedRegion({0,1});
+        const auto first_value = editor.numeric_input_.getText().lastIndexOf("0 15");
+        editor.numeric_input_.setHighlightedRegion({first_value,first_value+1});
         juce::SystemClipboard::copyTextToClipboard("15");
         editor.numeric_input_.keyPressed(juce::KeyPress('V', juce::ModifierKeys::ctrlModifier, 0));
         check(editor.numeric_state_.values == std::vector<int>({15,15}), "ordinary paste replaces selection");
@@ -4394,6 +4518,7 @@ void testEditorParityCorrections() {
         mgstc::app::SccEditorComponent scc_editor(context, link, open, [] {},
             [](std::vector<mgstc::engine::OpllPatchParameters>) {}, [](juce::Component*) {}, true, [] {});
         mgstc::app::SatelliteEditorParityTestAccess::checkNumeric(scc_editor);
+        mgstc::app::SatelliteEditorParityTestAccess::checkSccWav(scc_editor);
         mgstc::app::OpllEditorComponent opll_editor(context, link, open, [] {},
             [](juce::Component*) {}, true, [] {});
         require(mgstc::app::SatelliteEditorParityTestAccess::check(scc_editor, opll_editor),

@@ -35,6 +35,8 @@ MGSCで使える定義テキストの作成を支援します。
 
 ![SCC 音色エディタ](docs/screenshots/scc-editor.png)
 
+数値波形入力の分解能、補間演算子、括弧による時間配分、`SCCWAV`共有形式は[SCC数値波形入力ガイド](docs/SCC_NUMERIC_WAVE.md)を参照してください。
+
 ※画面は開発中のものです
 
 ### アプリ設定（View / MIDI / Output）
