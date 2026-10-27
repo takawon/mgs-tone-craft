@@ -635,6 +635,8 @@ bool PatchSlideDatabase::isVisible(const PatchSlideCandidate& candidate, bool sh
 std::vector<std::size_t> PatchSlideDatabase::filter(const PatchSlideFilter& conditions) const {
     require(conditions.cluster_count == 0 || conditions.cluster_count == 16 || conditions.cluster_count == 64,
             "Invalid PatchSlide classification size");
+    require(conditions.max_change_count == 1 || conditions.max_change_count == 2,
+            "Invalid PatchSlide maximum change count");
     std::set<std::string> selected(conditions.tags.begin(), conditions.tags.end());
     for (const auto& tag : selected) {
         if (std::none_of(tags_.begin(), tags_.end(), [&](const auto& item) { return item.tag == tag; })) return {};
@@ -643,6 +645,7 @@ std::vector<std::size_t> PatchSlideDatabase::filter(const PatchSlideFilter& cond
     result.reserve(candidates_.size());
     for (std::size_t index = 0; index < candidates_.size(); ++index) {
         const auto& candidate = candidates_[index];
+        if (candidate.change_count > conditions.max_change_count) continue;
         if (!isVisible(candidate, conditions.show_rejected) || (conditions.auto_safe_only && !candidate.auto_safe)) continue;
         if (conditions.cluster_count != 0 && conditions.cluster_id != (conditions.cluster_count == 16 ? candidate.cluster16 : candidate.cluster64)) continue;
         if (!selected.empty()) {
@@ -685,6 +688,32 @@ std::vector<PatchSlideSearchResult> PatchSlideDatabase::standardB(std::size_t so
 
 PatchSlideVariationResult PatchSlideDatabase::variation(std::size_t source_index) const {
     const auto pool = standardB(source_index, 256);
+    return variationFromPool(pool);
+}
+
+PatchSlideVariationResult PatchSlideDatabase::variation(
+    std::size_t source_index, int max_change_count) const {
+    require(max_change_count == 1 || max_change_count == 2,
+            "Invalid PatchSlide maximum change count");
+    if (max_change_count == 2) return variation(source_index);
+    const auto ranked = standardB(source_index, candidates_.size() - 1);
+    std::vector<PatchSlideSearchResult> pool;
+    pool.reserve(256);
+    for (auto row : ranked) {
+        if (candidates_[row.candidate_index].change_count > max_change_count) continue;
+        // Keep the frozen Standard B order; consecutive eligible ranks retain
+        // the same tie order while satisfying the pool selector's contract.
+        row.rank = pool.size() + 1;
+        pool.push_back(row);
+        if (pool.size() == 256) break;
+    }
+    require(pool.size() == 256, "Variation requires at least 256 eligible PatchSlide candidates");
+    return variationFromPool(pool);
+}
+
+PatchSlideVariationResult PatchSlideDatabase::variationFromPool(
+    std::span<const PatchSlideSearchResult> pool) const {
+    require(pool.size() == 256, "Variation requires a complete eligible pool256");
     std::vector<double> pairs(256 * 256);
     for (std::size_t i = 0; i < 256; ++i) {
         const auto left = std::span<const double>(vectors_.data() + pool[i].candidate_index * vector_dimension, vector_dimension);

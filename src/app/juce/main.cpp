@@ -2885,7 +2885,7 @@ private:
             },
             [this](const mgstc::engine::CompositeTimbre& sound) {
                 static_cast<void>(showEditor("main"));
-                if (auto* editor = compositeEditor()) editor->requestApplyPatchSlide(sound);
+                if (auto* editor = compositeEditor()) editor->requestApplyPatchSlide(sound, library_manager_window_.get());
             });
         library_manager_window_ =
             std::make_unique<LibraryManagerWindow>(std::move(content));

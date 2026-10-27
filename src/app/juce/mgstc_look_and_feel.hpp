@@ -7,6 +7,7 @@
 #include "ui_chrome_constants.hpp"
 #include "ui_fonts.hpp"
 #include "ui_layout.hpp"
+#include "segmented_control.hpp"
 
 class MgstcLookAndFeel final : public juce::LookAndFeel_V4 {
 public:
@@ -58,6 +59,10 @@ public:
         const juce::Colour& backgroundColour,
         bool should_draw_highlighted,
         bool should_draw_down) override {
+        if (isSegmentButton(button)) {
+            paintSegmentBackground(graphics, button);
+            return;
+        }
         constexpr float corner = 6.0F;
         const auto bounds =
             button.getLocalBounds().toFloat().reduced(0.5F, 0.5F);

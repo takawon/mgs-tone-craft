@@ -490,9 +490,36 @@ static void displayAndCache(const juce::File& imageDirectory) {
     std::cout<<"Frame bytes: "<<sizeof(s::Frame)<<"; history spectra bytes (live+stopped): "
              <<2*s::historyCapacity*sizeof(s::HistoryFrame)<<"\n";
 }
+static void segmentBackgroundCompositesWithParent() {
+    juce::TextButton button;
+    button.setBounds(0, 0, 64, 32);
+    configureSegmentButton(button, 0, 2);
+    require(!button.isOpaque(), "segment must expose the parent background");
+    for (const auto background : {juce::Colour(0xff406080), juce::Colour(0xffc08040)}) {
+        juce::Image image(juce::Image::RGB, 64, 32, true);
+        // Finish the native image drawing context before reading its pixels.
+        {
+            juce::Graphics graphics(image);
+            graphics.fillAll(background);
+            paintSegmentBackground(graphics, button);
+        }
+        const auto pixel = image.getPixelAt(32, 16);
+        std::cout << "segment background=" << background.toString()
+                  << " actual=" << pixel.toString() << " expected half RGB="
+                  << static_cast<int>(background.getRed()) / 2 << ","
+                  << static_cast<int>(background.getGreen()) / 2 << ","
+                  << static_cast<int>(background.getBlue()) / 2 << "\n";
+        require(std::abs(static_cast<int>(pixel.getRed()) * 2 - background.getRed()) <= 2
+            && std::abs(static_cast<int>(pixel.getGreen()) * 2 - background.getGreen()) <= 2
+            && std::abs(static_cast<int>(pixel.getBlue()) * 2 - background.getBlue()) <= 2,
+            "inactive segment must blend 50 percent black over each parent colour");
+    }
+}
+
 int main(int argc,char** argv) {
     juce::ScopedJuceInitialiser_GUI gui;
     try {
+        segmentBackgroundCompositesWithParent();
         capturePreservesAudio(); captureBlocksAndGain(); signalsAndTiming(); averagedHistoryFrames();
         historyAndSnapshots(); colourMappings(); maximumChannelsAndGaps(); spectrogramGaps();
         displayAndCache(argc>1 ? juce::File(juce::String::fromUTF8(argv[1])) : juce::File{});

@@ -9,12 +9,14 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "editor_session.hpp"
+#include "patchslide_stock.hpp"
 #include "mgstc/engine/patchslide_database.hpp"
 #include "mgstc/engine/patchslide_timbre.hpp"
 #include "switch_look_and_feel.hpp"
@@ -39,14 +41,18 @@ public:
     };
 
     explicit PatchSlideBrowserComponent(
-        Callbacks callbacks, BackgroundTaskBoundary* background_tasks = nullptr)
-        : PatchSlideBrowserComponent(std::move(callbacks), background_tasks, {}) {}
+        Callbacks callbacks, BackgroundTaskBoundary* background_tasks = nullptr,
+        std::shared_ptr<PatchSlideStock> stock = {})
+        : PatchSlideBrowserComponent(std::move(callbacks), background_tasks, {}, std::move(stock)) {}
+
+    [[nodiscard]] static int minimumContentWidth() { return UiScale::sx(1100); }
 
 private:
     friend class PatchSlideBrowserTestAccess;
     PatchSlideBrowserComponent(Callbacks callbacks, BackgroundTaskBoundary* background_tasks,
-                              std::filesystem::path directory)
-        : callbacks_(std::move(callbacks)), tags_model_(*this),
+                              std::filesystem::path directory, std::shared_ptr<PatchSlideStock> stock = {})
+        : callbacks_(std::move(callbacks)), tags_model_(*this), stock_model_(*this),
+          stock_(stock ? std::move(stock) : std::make_shared<PatchSlideStock>()),
           worker_(std::make_shared<Worker>()) {
         worker_->directory = std::move(directory);
         mode_.addItem(utf8("タグから探す"), 1);
@@ -70,6 +76,10 @@ private:
             if (query_kind_ == QueryKind::Browse) requestBrowse();
             else request(query_kind_, query_source_);
         };
+        two_changes_.setButtonText(utf8("2回変更"));
+        two_changes_.setLookAndFeel(&switch_style_);
+        two_changes_.setTooltip(utf8("OFF: 1回変更のみ / ON: 1回変更と2回変更"));
+        two_changes_.onClick = rejected_.onClick;
         configure(preview_, "試聴", [this] { previewSelection(); });
         configure(stop_, "停止", [this] { stopPreview(); });
         configure(apply_, "編集へ適用", [this] {
@@ -93,7 +103,7 @@ private:
             }
         });
         configure(back_, "探索へ戻る", [this] { requestBrowse(); });
-        configure(reload_, "再読込", [this] { requestBrowse(); });
+        configure(reload_, "再読込", [this] { requestBrowse(true); });
         configure(representative_, "代表候補を試聴", [this] {
             if (busy_ || query_kind_ != QueryKind::Browse) return;
             if (const auto* group = selectedGroup()) {
@@ -102,22 +112,36 @@ private:
                     const auto index = static_cast<int>(std::distance(rows_.begin(), row));
                     list_.selectRow(index);
                     list_.scrollToEnsureRowIsOnscreen(index);
+                    previewSelection();
                 }
-                selectCandidate(group->representative_index);
-                previewSelection();
             }
         });
         list_.setModel(this);
         list_.setMultipleSelectionEnabled(false);
         list_.setColour(juce::ListBox::backgroundColourId, juce::Colour(UiLayout::panelFill));
         list_.setOutlineThickness(1);
+        list_.setName(utf8("パッチスライド候補（Spaceでストック切替）"));
+        list_.onSpace = [this] {
+            const auto row = list_.getSelectedRow();
+            if (db_ && row >= 0 && row < getNumRows()) toggleStock(db_->candidates()[rows_[static_cast<std::size_t>(row)]].candidate_id);
+        };
+        stock_list_.setModel(&stock_model_);
+        stock_list_.setMultipleSelectionEnabled(false);
+        stock_list_.setColour(juce::ListBox::backgroundColourId, juce::Colour(UiLayout::panelFill));
+        stock_list_.setColour(juce::ListBox::outlineColourId, juce::Colour(UiLayout::panelStroke));
+        stock_list_.setOutlineThickness(1);
+        stock_list_.setName(utf8("ストック（Deleteで解除）"));
+        stock_list_.onDelete = [this] {
+            const auto row = stock_list_.getSelectedRow();
+            if (row >= 0 && static_cast<std::size_t>(row) < stock_ids_.size()) removeStock(stock_ids_[static_cast<std::size_t>(row)]);
+        };
         list_.setColour(juce::ListBox::outlineColourId, juce::Colour(UiLayout::panelStroke));
         tag_list_.setModel(&tags_model_);
         tag_list_.setMultipleSelectionEnabled(true);
         tag_list_.setColour(juce::ListBox::backgroundColourId, juce::Colour(UiLayout::panelFill));
         tag_hint_.setText(utf8("タグを複数選択: Ctrl / Shift"), juce::dontSendNotification);
         group_info_.setJustificationType(juce::Justification::topLeft);
-        details_.setMultiLine(true);
+        details_.setMultiLine(true, false);
         details_.setReadOnly(true);
         details_.setScrollbarsShown(true);
         details_.setCaretVisible(false);
@@ -125,12 +149,12 @@ private:
         for (auto* component : std::initializer_list<juce::Component*>{
                  &mode_, &match_, &cluster_size_, &group_, &rejected_, &preview_, &stop_,
                  &apply_, &register_, &similar_, &variation_, &random_, &back_, &reload_,
-                 &representative_, &list_, &tag_list_, &tag_hint_, &group_info_, &details_, &status_})
+                 &representative_, &list_, &stock_list_, &stock_header_, &two_changes_, &tag_list_, &tag_hint_, &group_info_, &details_, &status_})
             addAndMakeVisible(component);
         int focus = 100;
         for (auto* component : std::initializer_list<juce::Component*>{
                  &mode_, &match_, &tag_list_, &cluster_size_, &group_, &representative_,
-                 &rejected_, &list_, &random_, &similar_, &variation_, &back_, &preview_,
+                 &rejected_, &list_, &stock_list_, &random_, &similar_, &variation_, &two_changes_, &back_, &preview_,
                  &stop_, &apply_, &register_, &details_, &reload_})
             component->setExplicitFocusOrder(focus++);
         const bool registered = !background_tasks || background_tasks->registerTask(worker_);
@@ -143,6 +167,7 @@ private:
             status_.setText(utf8("検索ワーカーを開始できません。画面を開き直してください。"), juce::dontSendNotification);
         }
         updateMode();
+        refreshStock();
         updateActions();
     }
 
@@ -152,17 +177,20 @@ public:
         stopPreview();
         worker_->cancel();
         list_.setModel(nullptr);
+        stock_list_.setModel(nullptr);
         tag_list_.setModel(nullptr);
         rejected_.setLookAndFeel(nullptr);
+        two_changes_.setLookAndFeel(nullptr);
         // Plugin ownership is retained by BackgroundTaskBoundary until its
         // non-audio shutdown joins the worker, including after editor closure.
     }
 
     [[nodiscard]] const std::optional<engine::CompositeTimbre>& selectedTimbre() const noexcept {
-        return selection_;
+        return busy_ && selection_origin_ != SelectionOrigin::Stock ? no_selection_ : selection_;
     }
     [[nodiscard]] const engine::PatchSlideCandidate* selectedCandidate() const noexcept {
-        return db_ && selected_index_ ? &db_->candidates()[*selected_index_] : nullptr;
+        return db_ && selected_index_ && (!busy_ || selection_origin_ == SelectionOrigin::Stock)
+            ? &db_->candidates()[*selected_index_] : nullptr;
     }
     void stopPreview() { if (callbacks_.stop) callbacks_.stop(); }
 
@@ -171,8 +199,9 @@ public:
     void resized() override {
         using namespace UiLayout;
         UiFonts::styleBodyField(details_);
-        for (auto* label : {&status_, &tag_hint_, &group_info_}) label->setFont(UiFonts::body());
-        list_.setRowHeight(fieldH * 2);
+        for (auto* label : {&status_, &tag_hint_, &group_info_, &stock_header_}) label->setFont(UiFonts::body());
+        list_.setRowHeight(fieldH * 3);
+        stock_list_.setRowHeight(fieldH * 3);
         tag_list_.setRowHeight(fieldH);
         auto area = getLocalBounds().reduced(panelPad);
         auto top = area.removeFromTop(fieldH);
@@ -193,44 +222,58 @@ public:
         bottom.removeFromLeft(controlGap);
         register_.setBounds(bottom.removeFromLeft(outputSwitchW + panelPad * 2));
         area.removeFromBottom(sm);
-        details_.setBounds(area.removeFromBottom(libraryMemoH + fieldH));
-        area.removeFromBottom(sm);
-        auto filters = area.removeFromLeft(libraryWidth);
-        area.removeFromLeft(panelGap);
-        match_.setBounds(filters.removeFromTop(fieldH));
-        filters.removeFromTop(sm);
-        tag_hint_.setBounds(filters.removeFromTop(fieldH));
-        filters.removeFromTop(xs);
-        tag_list_.setBounds(filters);
-        auto groups = getLocalBounds().reduced(panelPad);
-        groups.removeFromTop(fieldH * 2 + sm * 2);
-        groups.setWidth(libraryWidth);
+        auto left = area.removeFromLeft(libraryWidth);
+        details_.setBounds(left.removeFromBottom(libraryMemoH + fieldH));
+        left.removeFromBottom(sm);
+        auto tags = left;
+        match_.setBounds(tags.removeFromTop(fieldH));
+        tags.removeFromTop(sm);
+        tag_hint_.setBounds(tags.removeFromTop(fieldH));
+        tags.removeFromTop(xs);
+        tag_list_.setBounds(tags);
+        auto groups = left;
         cluster_size_.setBounds(groups.removeFromTop(fieldH));
         groups.removeFromTop(sm);
         group_.setBounds(groups.removeFromTop(fieldH));
         groups.removeFromTop(sm);
         representative_.setBounds(groups.removeFromTop(textButtonH));
         groups.removeFromTop(sm);
-        group_info_.setBounds(groups.removeFromTop(fieldH * 3));
-        auto actions = area.removeFromTop(textButtonH);
-        similar_.setBounds(actions.removeFromLeft(compositeSelectorW));
-        actions.removeFromLeft(controlGap);
-        variation_.setBounds(actions.removeFromLeft(outputSwitchW));
-        actions.removeFromLeft(controlGap);
-        back_.setBounds(actions.removeFromLeft(compositeSelectorW));
+        group_info_.setBounds(groups);
+        random_.setBounds(left.removeFromTop(textButtonH));
+        area.removeFromLeft(panelGap);
+        auto stockArea = area.removeFromRight(juce::jmax(UiScale::sx(220), getWidth() / 3));
+        area.removeFromRight(panelGap);
+        stock_header_.setBounds(stockArea.removeFromTop(textButtonH));
+        stockArea.removeFromTop(sm);
+        stock_list_.setBounds(stockArea);
+        auto first = area.removeFromTop(textButtonH);
+        similar_.setBounds(first.removeFromLeft(compositeSelectorW));
+        first.removeFromLeft(controlGap);
+        variation_.setBounds(first.removeFromLeft(outputSwitchW));
+        first.removeFromLeft(controlGap);
+        const bool fits = first.getWidth() >= UiScale::sx(112);
+        if (fits) two_changes_.setBounds(first.removeFromLeft(UiScale::sx(112)));
         area.removeFromTop(sm);
-        random_.setBounds(juce::Rectangle<int>(panelPad, status_.getBottom() + sm,
-            libraryWidth, textButtonH));
+        auto second = area.removeFromTop(textButtonH);
+        if (!fits) {
+            two_changes_.setBounds(second.removeFromLeft(UiScale::sx(112)));
+            second.removeFromLeft(controlGap);
+        }
+        back_.setBounds(second.removeFromLeft(juce::jmin(second.getWidth(), compositeSelectorW)));
+        area.removeFromTop(sm);
         list_.setBounds(area);
     }
 
 private:
     enum class QueryKind { Browse, StandardB, Variation };
+    enum class SelectionOrigin { None, Candidate, Stock };
     struct Query {
         std::uint64_t generation{};
         QueryKind kind{QueryKind::Browse};
         engine::PatchSlideFilter filter;
         std::size_t source{};
+        std::string source_id;
+        bool reload{};
     };
     struct Result {
         std::uint64_t generation{};
@@ -265,6 +308,7 @@ private:
         }
         void submit(Query query) {
             std::lock_guard lock(mutex);
+            if (pending && pending->reload) query.reload = true;
             newest.store(query.generation, std::memory_order_release);
             pending = std::move(query);
             wake.notify_one();
@@ -284,6 +328,7 @@ private:
                 Result result;
                 result.generation = query.generation;
                 try {
+                    if (query.reload) { db.reset(); names.reset(); }
                     if (!db) db = directory.empty() ? engine::PatchSlideDatabase::load(&result.error)
                         : engine::PatchSlideDatabase::load(directory, &result.error);
                     if (db && !names) {
@@ -305,14 +350,19 @@ private:
                             result.total = candidates.size();
                             for (const auto index : candidates) appendVisible(result, index, query.filter.show_rejected);
                         } else {
+                            const auto source = db->find(query.source_id);
+                            if (!source) throw std::runtime_error("The selected PatchSlide candidate is no longer available");
                             if (query.kind == QueryKind::StandardB)
-                                result.ranks = db->standardB(query.source, db->candidates().size() - 1);
+                                result.ranks = db->standardB(*source, db->candidates().size() - 1);
                             else {
-                                const auto variation = db->variation(query.source);
+                                const auto variation = db->variation(*source, query.filter.max_change_count);
                                 for (const auto& row : variation.candidates) result.ranks.push_back(row);
                             }
-                            result.total = result.ranks.size();
-                            for (const auto& row : result.ranks) appendVisible(result, row.candidate_index, query.filter.show_rejected);
+                            for (const auto& row : result.ranks) {
+                                if (db->candidates()[row.candidate_index].change_count > query.filter.max_change_count) continue;
+                                ++result.total;
+                                appendVisible(result, row.candidate_index, query.filter.show_rejected);
+                            }
                         }
                     }
                 } catch (const std::exception& error) { result.error = error.what(); }
@@ -342,6 +392,93 @@ private:
         std::filesystem::path directory;
     };
 
+    class KeyboardList final : public juce::ListBox {
+    public:
+        std::function<void()> onSpace, onDelete;
+        bool keyPressed(const juce::KeyPress& key) override {
+            if (key == juce::KeyPress::spaceKey && onSpace) { onSpace(); return true; }
+            if ((key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey) && onDelete) { onDelete(); return true; }
+            return juce::ListBox::keyPressed(key);
+        }
+    };
+    class TrashButton final : public juce::Button {
+    public:
+        TrashButton() : juce::Button(utf8("ストックから削除")) {}
+        void paintButton(juce::Graphics& g, bool over, bool down) override {
+            g.setColour(over || down || hasKeyboardFocus(true) ? juce::Colour(kUiHoverAccent) : juce::Colours::lightgrey);
+            auto box = getLocalBounds().toFloat().reduced(static_cast<float>(UiLayout::sm));
+            g.drawLine(box.getX(), box.getY() + box.getHeight() * 0.2f, box.getRight(), box.getY() + box.getHeight() * 0.2f, 1.5f);
+            g.drawRect(box.reduced(box.getWidth() * 0.15f, 0).withTrimmedTop(box.getHeight() * 0.3f), 1.5f);
+            g.drawLine(box.getCentreX() - box.getWidth() * 0.15f, box.getY(), box.getCentreX() + box.getWidth() * 0.15f, box.getY(), 1.5f);
+        }
+    };
+    class RowControls final : public juce::Component {
+    public:
+        RowControls() { setInterceptsMouseClicks(false, true); addAndMakeVisible(check); addAndMakeVisible(trash); }
+        void bind(PatchSlideBrowserComponent& owner, const std::string& id, bool stockRow) {
+            check.setVisible(!stockRow);
+            trash.setVisible(stockRow);
+            check.setToggleState(owner.stock_->contains(id), juce::dontSendNotification);
+            check.setTitle(utf8("ストック: ") + utf8(id.c_str()));
+            check.setTooltip(utf8("ストックに追加／解除。行選択とは独立した操作です。"));
+            trash.setTooltip(utf8("一時ストックから解除します。DBやライブラリは変更しません。"));
+            juce::Component::SafePointer<PatchSlideBrowserComponent> safe(&owner);
+            check.onClick = [safe, id] { if (safe) safe->toggleStock(id); };
+            trash.onClick = [safe, id] { if (safe) safe->removeStock(id); };
+        }
+        void resized() override {
+            check.setBounds(0, 0, UiLayout::fieldH, getHeight());
+            trash.setBounds(getWidth() - UiLayout::fieldH, (getHeight() - UiLayout::fieldH) / 2, UiLayout::fieldH, UiLayout::fieldH);
+        }
+        juce::ToggleButton check;
+        TrashButton trash;
+    };
+    class StockModel final : public juce::ListBoxModel {
+    public:
+        explicit StockModel(PatchSlideBrowserComponent& owner) : owner_(owner) {}
+        int getNumRows() override { return static_cast<int>(owner_.stock_ids_.size()); }
+        void paintListBoxItem(int row, juce::Graphics& g, int width, int height, bool selected) override {
+            if (row < 0 || row >= getNumRows()) return;
+            const auto& id = owner_.stock_ids_[static_cast<std::size_t>(row)];
+            if (selected && owner_.selection_origin_ == SelectionOrigin::Stock) g.fillAll(uiToggleOnFill());
+            g.setColour(juce::Colours::white);
+            g.setFont(UiFonts::body());
+            auto area = juce::Rectangle<int>(0, 0, width - UiLayout::fieldH, height).reduced(UiLayout::xs);
+            const auto index = owner_.db_ ? owner_.db_->find(id) : std::optional<std::size_t>{};
+            const auto name = index && owner_.names_ ? (*owner_.names_)[*index] : utf8(id.c_str());
+            g.drawFittedText(name, area.removeFromTop(area.getHeight() / 2), juce::Justification::centredLeft, 2, 1.0f);
+            g.drawFittedText(index ? candidateStateText(owner_.db_->candidates()[*index]) : utf8("参照不可・再読込で確認"),
+                area, juce::Justification::centredLeft, 2, 1.0f);
+        }
+        juce::Component* refreshComponentForRow(int row, bool, juce::Component* component) override {
+            if (row < 0 || row >= getNumRows()) { delete component; return nullptr; }
+            auto* controls = dynamic_cast<RowControls*>(component);
+            if (!controls) { delete component; controls = new RowControls; }
+            controls->bind(owner_, owner_.stock_ids_[static_cast<std::size_t>(row)], true);
+            return controls;
+        }
+        void selectedRowsChanged(int row) override {
+            if (owner_.updating_) return;
+            if (row < 0) {
+                if (owner_.selection_origin_ == SelectionOrigin::Stock) owner_.clearSelection();
+                return;
+            }
+            if (row >= getNumRows()) return;
+            const auto id = owner_.stock_ids_[static_cast<std::size_t>(row)];
+            if (const auto index = owner_.db_ ? owner_.db_->find(id) : std::optional<std::size_t>{}) owner_.selectCandidate(*index, true);
+            else {
+                owner_.clearSelection();
+                const juce::ScopedValueSetter<bool> updating(owner_.updating_, true);
+                owner_.stock_list_.selectRow(row);
+                owner_.details_.setText(utf8(id.c_str()) + utf8("\n参照不可。再読込で確認するか、ストックから解除してください。"), false);
+            }
+        }
+        void returnKeyPressed(int) override { owner_.previewSelection(); }
+        void listBoxItemDoubleClicked(int, const juce::MouseEvent&) override { owner_.previewSelection(); }
+    private:
+        PatchSlideBrowserComponent& owner_;
+    };
+
     class TagsModel final : public juce::ListBoxModel {
     public:
         explicit TagsModel(PatchSlideBrowserComponent& owner) : owner_(owner) {}
@@ -365,12 +502,69 @@ private:
         button.setButtonText(utf8(text));
         button.onClick = std::move(action);
     }
-    void requestBrowse() { request(QueryKind::Browse, 0); }
-    void request(QueryKind kind, std::size_t source) {
-        if (worker_->cancelled.load(std::memory_order_acquire)) return;
-        stopPreview();
+    void clearSelection() {
+        if (selection_ && !adopting_result_) stopPreview();
         selection_.reset();
         selected_index_.reset();
+        active_id_.clear();
+        selection_origin_ = SelectionOrigin::None;
+        details_.clear();
+        const juce::ScopedValueSetter<bool> updating(updating_, true);
+        list_.deselectAllRows();
+        stock_list_.deselectAllRows();
+        updateActions();
+    }
+    void reconcileSelection() {
+        if (selection_origin_ == SelectionOrigin::None) return;
+        const auto index = db_ ? db_->find(active_id_) : std::optional<std::size_t>{};
+        if (!index) { clearSelection(); return; }
+        if (selection_origin_ == SelectionOrigin::Candidate) {
+            const auto row = std::find(rows_.begin(), rows_.end(), *index);
+            if (row == rows_.end()) { clearSelection(); return; }
+            {
+                const juce::ScopedValueSetter<bool> updating(updating_, true);
+                list_.selectRow(static_cast<int>(std::distance(rows_.begin(), row)));
+            }
+            selectCandidate(*index);
+        } else {
+            if (!stock_->contains(active_id_)) { clearSelection(); return; }
+            selectCandidate(*index, true);
+        }
+    }
+    void refreshStock() {
+        const auto selected_row = stock_list_.getSelectedRow();
+        const auto previous_id = selected_row >= 0 && static_cast<std::size_t>(selected_row) < stock_ids_.size()
+            ? stock_ids_[static_cast<std::size_t>(selected_row)] : std::string{};
+        stock_revision_ = stock_->revision();
+        stock_ids_ = stock_->ids();
+        {
+            const juce::ScopedValueSetter<bool> updating(updating_, true);
+            stock_list_.deselectAllRows();
+            stock_list_.updateContent();
+            list_.updateContent();
+            if (selection_origin_ == SelectionOrigin::Stock) {
+                const auto row = std::find(stock_ids_.begin(), stock_ids_.end(), active_id_);
+                if (row != stock_ids_.end()) stock_list_.selectRow(static_cast<int>(std::distance(stock_ids_.begin(), row)));
+            }
+        }
+        stock_header_.setText(utf8("ストック: ") + juce::String(static_cast<int>(stock_ids_.size())), juce::dontSendNotification);
+        if (selection_origin_ == SelectionOrigin::Stock && !stock_->contains(active_id_)) clearSelection();
+        if (selection_origin_ == SelectionOrigin::None && !previous_id.empty() && !stock_->contains(previous_id)) details_.clear();
+        stock_list_.repaint();
+        list_.repaint();
+    }
+    void toggleStock(std::string id) {
+        if (stock_->contains(id)) removeStock(std::move(id));
+        else if (db_ && db_->find(id)) { stock_->add(id); refreshStock(); }
+    }
+    void removeStock(std::string id) {
+        stock_->remove(id);
+        refreshStock();
+    }
+    void requestBrowse(bool reload = false) { request(QueryKind::Browse, 0, reload); }
+    void request(QueryKind kind, std::size_t source, bool reload = false) {
+        if (worker_->cancelled.load(std::memory_order_acquire)) return;
+        stopPreview();
         busy_ = true;
         query_kind_ = kind;
         query_source_ = source;
@@ -378,7 +572,10 @@ private:
         query.generation = ++generation_;
         query.kind = kind;
         query.source = source;
+        if (db_ && source < db_->candidates().size()) query.source_id = db_->candidates()[source].candidate_id;
+        query.reload = reload;
         query.filter.show_rejected = rejected_.getToggleState();
+        query.filter.max_change_count = two_changes_.getToggleState() ? 2 : 1;
         if (kind == QueryKind::Browse) {
             if (mode_.getSelectedId() == 1) {
                 query.filter.tags_match_all = match_.getSelectedId() == 1;
@@ -394,11 +591,12 @@ private:
             }
         }
         status_.setText(utf8("読込・検索中…"), juce::dontSendNotification);
-        details_.clear();
+        if (selection_origin_ != SelectionOrigin::Stock) details_.clear();
         updateActions();
         worker_->submit(std::move(query));
     }
     void timerCallback() override {
+        if (stock_revision_ != stock_->revision()) refreshStock();
         std::optional<Result> result;
         {
             std::lock_guard lock(worker_->mutex);
@@ -407,7 +605,12 @@ private:
         if (!result || result->generation != generation_) return;
         const juce::ScopedValueSetter<bool> adopting(adopting_result_, true);
         busy_ = false;
-        const bool first_load = !db_ && result->db;
+        const bool catalog_changed = db_ != result->db;
+        std::vector<std::string> selected_tags;
+        const auto tag_rows = tag_list_.getSelectedRows();
+        for (int i = 0; i < tag_rows.size(); ++i)
+            if (tag_rows[i] >= 0 && static_cast<std::size_t>(tag_rows[i]) < used_tags_.size())
+                selected_tags.push_back(used_tags_[static_cast<std::size_t>(tag_rows[i])].tag);
         db_ = std::move(result->db);
         names_ = std::move(result->names);
         rows_ = std::move(result->rows);
@@ -415,13 +618,19 @@ private:
         updating_ = true;
         list_.deselectAllRows();
         list_.updateContent();
-        if (first_load) {
-            for (const auto& tag : db_->tags()) if (tag.candidate_count > 0) used_tags_.push_back(tag);
+        if (catalog_changed) {
+            used_tags_.clear();
+            if (db_) for (const auto& tag : db_->tags()) if (tag.candidate_count > 0) used_tags_.push_back(tag);
+            tag_list_.deselectAllRows();
             tag_list_.updateContent();
+            for (std::size_t i = 0; i < used_tags_.size(); ++i)
+                if (std::find(selected_tags.begin(), selected_tags.end(), used_tags_[i].tag) != selected_tags.end())
+                    tag_list_.selectRow(static_cast<int>(i), true, false);
             rebuildGroups();
         }
         updating_ = false;
         if (!result->error.empty()) {
+            clearSelection();
             status_.setText(utf8("パッチスライドを利用できません"), juce::dontSendNotification);
             details_.setText(utf8(result->error.c_str()) + utf8("\n正しい3ファイルを配置後、再読込またはMGSTCを再起動してください。"), false);
         } else {
@@ -431,8 +640,9 @@ private:
             text += utf8("　除外 Reject ") + juce::String(static_cast<int>(result->rejected));
             text += utf8(" / 表示不可 ") + juce::String(static_cast<int>(result->other_hidden));
             status_.setText(text, juce::dontSendNotification);
-            if (!rows_.empty()) list_.selectRow(0);
         }
+        if (result->error.empty()) reconcileSelection();
+        refreshStock();
         updateMode();
         updateActions();
     }
@@ -465,11 +675,11 @@ private:
     void updateRepresentative() {
         const auto* group = selectedGroup();
         representative_.setEnabled(group && !busy_ && query_kind_ == QueryKind::Browse
-            && engine::PatchSlideDatabase::isVisible(db_->candidates()[group->representative_index], rejected_.getToggleState()));
+            && std::find(rows_.begin(), rows_.end(), group->representative_index) != rows_.end());
         group_info_.setText(group && names_ ? utf8("DB指定の代表候補:\n") + (*names_)[group->representative_index] : utf8("16群と64群は独立した分類です。\n群を選ぶと代表候補を確認できます。"), juce::dontSendNotification);
     }
     void updateActions() {
-        const bool selected = selection_.has_value() && !busy_;
+        const bool selected = selection_.has_value() && (!busy_ || selection_origin_ == SelectionOrigin::Stock);
         preview_.setEnabled(selected && static_cast<bool>(callbacks_.preview));
         apply_.setEnabled(selected && static_cast<bool>(callbacks_.apply));
         register_.setEnabled(selected && static_cast<bool>(callbacks_.registerTimbre));
@@ -479,13 +689,23 @@ private:
         list_.setEnabled(!busy_);
         updateRepresentative();
     }
-    void selectCandidate(std::size_t index) {
+    void selectCandidate(std::size_t index, bool from_stock = false) {
+        if (!db_ || index >= db_->candidates().size() || !db_->candidates()[index].enabled) {
+            clearSelection();
+            return;
+        }
         // The request already stopped its audition. Its asynchronous initial
         // selection must not stop notes begun elsewhere while it was pending.
         if (!adopting_result_) stopPreview();
         selected_index_ = index;
         std::string error;
         const auto& candidate = db_->candidates()[index];
+        active_id_ = candidate.candidate_id;
+        selection_origin_ = from_stock ? SelectionOrigin::Stock : SelectionOrigin::Candidate;
+        {
+            const juce::ScopedValueSetter<bool> updating(updating_, true);
+            if (from_stock) list_.deselectAllRows(); else stock_list_.deselectAllRows();
+        }
         selection_ = engine::makePatchSlideTimbre(candidate, &error);
         juce::String text = (*names_)[index];
         text += "\n" + utf8(candidate.candidate_id.c_str());
@@ -507,10 +727,18 @@ private:
         details_.setText(text, false);
         updateActions();
     }
-    void previewSelection() { if (selection_ && !busy_ && callbacks_.preview) callbacks_.preview(*selection_); }
+    void previewSelection() { if (selection_ && (!busy_ || selection_origin_ == SelectionOrigin::Stock) && callbacks_.preview) callbacks_.preview(*selection_); }
     int getNumRows() override { return static_cast<int>(rows_.size()); }
     void selectedRowsChanged(int row) override {
+        if (!updating_ && row < 0 && selection_origin_ == SelectionOrigin::Candidate) { clearSelection(); return; }
         if (!updating_ && !busy_ && db_ && row >= 0 && row < getNumRows()) selectCandidate(rows_[static_cast<std::size_t>(row)]);
+    }
+    juce::Component* refreshComponentForRow(int row, bool, juce::Component* component) override {
+        if (!db_ || row < 0 || row >= getNumRows()) { delete component; return nullptr; }
+        auto* controls = dynamic_cast<RowControls*>(component);
+        if (!controls) { delete component; controls = new RowControls; }
+        controls->bind(*this, db_->candidates()[rows_[static_cast<std::size_t>(row)]].candidate_id, false);
+        return controls;
     }
     void returnKeyPressed(int) override { previewSelection(); }
     void listBoxItemDoubleClicked(int, const juce::MouseEvent&) override { previewSelection(); }
@@ -531,19 +759,25 @@ private:
         const auto index = rows_[static_cast<std::size_t>(row)];
         const auto& candidate = db_->candidates()[index];
         auto area = juce::Rectangle<int>(0, 0, width, height).reduced(UiLayout::xs);
-        g.drawFittedText((*names_)[index], area.removeFromTop(area.getHeight() / 2), juce::Justification::centredLeft, 1);
-        g.drawFittedText(candidateStateText(candidate), area, juce::Justification::centredLeft, 1);
+        area.removeFromLeft(UiLayout::fieldH);
+        g.drawFittedText((*names_)[index], area.removeFromTop(area.getHeight() / 2), juce::Justification::centredLeft, 2, 1.0f);
+        g.drawFittedText(candidateStateText(candidate), area, juce::Justification::centredLeft, 2, 1.0f);
     }
 
     Callbacks callbacks_;
     SwitchLookAndFeel switch_style_;
     juce::ComboBox mode_, match_, cluster_size_, group_;
-    juce::ToggleButton rejected_;
+    juce::ToggleButton rejected_, two_changes_;
     juce::TextButton preview_, stop_, apply_, register_, similar_, variation_, random_, back_, reload_, representative_;
-    juce::Label status_, tag_hint_, group_info_;
+    juce::Label status_, tag_hint_, group_info_, stock_header_;
     juce::TextEditor details_;
-    juce::ListBox list_, tag_list_;
+    KeyboardList list_, stock_list_;
+    juce::ListBox tag_list_;
     TagsModel tags_model_;
+    StockModel stock_model_;
+    std::shared_ptr<PatchSlideStock> stock_;
+    std::vector<std::string> stock_ids_;
+    std::uint64_t stock_revision_{};
     std::shared_ptr<Worker> worker_;
     std::shared_ptr<const engine::PatchSlideDatabase> db_;
     std::shared_ptr<const std::vector<juce::String>> names_;
@@ -552,6 +786,9 @@ private:
     std::vector<engine::PatchSlideSearchResult> ranks_;
     std::optional<std::size_t> selected_index_;
     std::optional<engine::CompositeTimbre> selection_;
+    const std::optional<engine::CompositeTimbre> no_selection_;
+    SelectionOrigin selection_origin_{SelectionOrigin::None};
+    std::string active_id_;
     std::uint64_t generation_{};
     QueryKind query_kind_{QueryKind::Browse};
     std::size_t query_source_{};

@@ -539,6 +539,39 @@ void verifyVariations(const PatchSlideDatabase* db, const fs::path& fixture_dir)
             "trailing bytes in Variation numeric fixtures");
 }
 
+void verifyChangeCountEligibility(const PatchSlideDatabase& db) {
+    PatchSlideFilter filter;filter.show_rejected=true;filter.max_change_count=1;
+    const auto one=db.filter(filter);
+    require(!one.empty(),"One-change candidate set is empty");
+    for(auto i:one)require(db.candidates()[i].change_count==1,"Change-count filter used another field");
+    filter.max_change_count=2;require(db.filter(filter).size()==db.candidates().size(),"Max-two removed valid candidates");
+    filter.max_change_count=0;
+    bool rejected=false;try{(void)db.filter(filter);}catch(const std::exception&){rejected=true;}
+    require(rejected,"Invalid change-count filter accepted");
+    std::vector<std::size_t> sources{one.front()};
+    const auto two=std::find_if(db.candidates().begin(),db.candidates().end(),[](const auto& c){return c.change_count==2;});
+    if(two!=db.candidates().end())sources.push_back(static_cast<std::size_t>(std::distance(db.candidates().begin(),two)));
+    for(auto source:sources) {
+        const auto full=db.standardB(source,db.candidates().size()-1);
+        std::vector<std::size_t> expected;
+        for(const auto& row:full)if(db.candidates()[row.candidate_index].change_count==1)expected.push_back(row.candidate_index);
+        require(expected.size()>=256,"Test dataset lacks eligible pool256");
+        const auto filtered=db.variation(source,1);
+        require(filtered.candidates.size()==3,"Filtered Variation lost eligible results");
+        for(const auto& row:filtered.candidates) {
+            require(row.rank>=1 && row.rank<=256 && row.candidate_index==expected[row.rank-1],"Variation did not filter the full ranking before limiting pool256");
+            require(db.candidates()[row.candidate_index].change_count==1 && row.candidate_index!=source,"Variation selected an ineligible/source candidate");
+        }
+        const auto original=db.variation(source);const auto explicitTwo=db.variation(source,2);
+        for(std::size_t i=0;i<original.candidates.size();++i) {
+            require(original.candidates[i].candidate_index==explicitTwo.candidates[i].candidate_index
+                && original.candidates[i].squared_distance==explicitTwo.candidates[i].squared_distance
+                && original.candidates[i].score==explicitTwo.candidates[i].score,"Unfiltered Variation changed");
+        }
+    }
+    std::cout<<"Change-count eligible pool and unchanged unfiltered Variation passed\n";
+}
+
 void verifyManifestBinding(const fs::path& source_dir) {
     TempTree temp{temporaryDirectory("manifest")};
     for (const auto* name : {"patchslide.sqlite", "patchslide_search.sqlite"}) {
@@ -634,6 +667,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         validateCatalog(*db);
+        verifyChangeCountEligibility(*db);
         std::size_t compared_queries = 0;
         if (have_full_fixture) compared_queries = verifyFullRankings(*db, fixture_dir);
         else std::cout << "PatchSlide full 572-query ranking regression skipped (local fixture absent).\n";

@@ -322,6 +322,7 @@ struct SatelliteEditorParityTestAccess {
 };
 
 struct CompositeEditorComponentTestAccess {
+    static juce::String patchSlideStatus(const CompositeEditorComponent& editor) { return editor.status_.getText(); }
     static const juce::String title(const CompositeEditorComponent& editor) {
         return editor.title_.getText();
     }
@@ -7034,6 +7035,92 @@ void testTemporaryCompositePreviewPreservesState() {
         "restoring temporary preview preserves plugin state");
 }
 
+void testPatchSlideUiOwnershipAndModal() {
+    using namespace mgstc::engine;
+    using mgstc::app::PatchSlideApplyContent;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48000.0,512);
+    const auto before=stateBytes(processor);
+    auto stock=processor.editorPatchSlideStock();
+    stock->add("transient_candidate");
+    require(sameBlock(before,stateBytes(processor)),"Stock entered serialized Plugin State");
+    {mgstc::plugin::PluginEditorContext context(processor);
+     require(context.patchSlideStock()==stock,"Editor context has a different stock owner");}
+    {mgstc::plugin::PluginEditorContext context(processor);
+     require(context.patchSlideStock()->contains("transient_candidate"),"Context recreation lost stock");}
+    MgstcAudioProcessor independent;
+    independent.setStateInformation(before.getData(),static_cast<int>(before.getSize()));
+    require(independent.editorPatchSlideStock()->ids().empty(),"Restored or independent instance inherited stock");
+    auto document=processor.copyPluginState();
+    require(processor.replacePluginState(document) && stock->contains("transient_candidate"),"DAW state restore cleared runtime stock");
+    std::weak_ptr<mgstc::app::PatchSlideStock> lifetime;
+    {auto owner=std::make_unique<MgstcAudioProcessor>();lifetime=owner->editorPatchSlideStock();}
+    require(lifetime.expired(),"Stock survived instance destruction");
+    const auto find=[](const auto& self,juce::Component& parent)->mgstc::app::CompositeEditorComponent* {
+        if(auto* editor=dynamic_cast<mgstc::app::CompositeEditorComponent*>(&parent))return editor;
+        for(auto* child:parent.getChildren())if(auto* found=self(self,*child))return found;
+        return nullptr;
+    };
+    processEmpty(processor,512);
+    std::unique_ptr<juce::AudioProcessorEditor> view(processor.createEditor());
+    auto* editor=find(find,*view);require(editor!=nullptr,"Composite editor absent");
+    PatchSlideCandidate candidate;candidate.patch_a=0;candidate.patch_b=5;candidate.change_count=1;
+    candidate.hold_a_steps=1;candidate.hold_pattern="h1";candidate.candidate_id="modal_candidate";
+    auto sound=makePatchSlideTimbre(candidate);require(sound.has_value(),"Modal candidate invalid");
+    const auto initial=processor.copyPluginState().sound;
+    const auto modalCount=juce::Component::getNumCurrentlyModalComponents();
+    processEmpty(processor,512);
+    editor->requestApplyPatchSlide(*sound);
+    auto* dialog=dynamic_cast<ModalDialogWindow*>(juce::Component::getCurrentlyModalComponent());
+    require(dialog && juce::Component::getNumCurrentlyModalComponents()==modalCount+1,"Apply selection is not modal");
+    auto* content=dynamic_cast<PatchSlideApplyContent*>(dialog->getContentComponent());
+    require(content && content->sourceName()==juce::String::fromUTF8(sound->name.c_str()),"Dialog lost the immutable source name");
+    require(content->targetControl().getNumItems()>0,"Dialog has no original target choices");
+    processEmpty(processor,512);
+    editor->requestApplyPatchSlide(*sound);
+    require(juce::Component::getNumCurrentlyModalComponents()==modalCount+1,"Duplicate apply dialog appeared");
+    content->keyPressed(juce::KeyPress(juce::KeyPress::escapeKey));
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+    require(juce::Component::getNumCurrentlyModalComponents()==modalCount && sameAuthoringSound(initial,processor.copyPluginState().sound),"Escape changed the document or leaked modal state");
+    processEmpty(processor,512);
+    editor->requestApplyPatchSlide(*sound);
+    dialog=dynamic_cast<ModalDialogWindow*>(juce::Component::getCurrentlyModalComponent());
+    content=dynamic_cast<PatchSlideApplyContent*>(dialog->getContentComponent());
+    content->targetControl().setSelectedId(content->targetControl().getNumItems(),juce::sendNotificationSync);
+    content->targetControl().keyPressed(juce::KeyPress(juce::KeyPress::returnKey));
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+    processEmpty(processor,512);
+    editor=find(find,*view);require(editor!=nullptr,"Editor vanished after modal confirmation");
+    const auto modal_failure = std::string("Enter did not apply the original add-layer choice; expected=")
+        + std::to_string(initial.layers.size()+1) + "; processor=" + std::to_string(processor.copyPluginState().sound.layers.size())
+        + "; editor=" + std::to_string(editor->workingTimbre().layers.size())
+        + "; modal_count=" + std::to_string(juce::Component::getNumCurrentlyModalComponents())
+        + "; status=" + mgstc::app::CompositeEditorComponentTestAccess::patchSlideStatus(*editor).toStdString();
+    require(processor.copyPluginState().sound.layers.size()==initial.layers.size()+1,modal_failure.c_str());
+    juce::Component parent;parent.setVisible(true);
+    const auto after=processor.copyPluginState().sound;
+    editor->requestApplyPatchSlide(*sound,&parent);parent.setVisible(false);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+    require(juce::Component::getNumCurrentlyModalComponents()==modalCount && sameAuthoringSound(after,processor.copyPluginState().sound),"Hiding the library owner did not cancel cleanly");
+    processEmpty(processor,512);
+    editor->requestApplyPatchSlide(*sound);
+    auto changed=processor.copyPluginState();changed.sound.name="Restored while modal";
+    require(processor.replacePluginState(changed),"Restore while modal failed");
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+    if(auto* pending=dynamic_cast<ModalDialogWindow*>(juce::Component::getCurrentlyModalComponent())) {
+        if(auto* c=dynamic_cast<PatchSlideApplyContent*>(pending->getContentComponent()))c->keyPressed(juce::KeyPress(juce::KeyPress::returnKey));
+    }
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+    require(processor.copyPluginState().sound.name==changed.sound.name,"Stale modal overwrote a restored host document");
+    editor=find(find,*view);require(editor!=nullptr,"Restored editor absent");
+    processEmpty(processor,512);
+    editor->requestApplyPatchSlide(*sound);view.reset();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+    require(juce::Component::getNumCurrentlyModalComponents()==modalCount,"Editor destruction leaked its modal dialog");
+    view.reset(processor.createEditor());require(stock==processor.editorPatchSlideStock() && stock->contains("transient_candidate"),"Actual editor recreation lost stock");
+    view.reset();
+}
+
 void testPatchSlideSharedEditorTransactions() {
     using namespace mgstc::engine;
     using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
@@ -7383,6 +7470,7 @@ int main() {
     juce::ScopedJuceInitialiser_GUI juce_init;
     try {
         if (std::getenv("MGSTC_PATCHSLIDE_UI_ONLY")) {
+            testPatchSlideUiOwnershipAndModal();
             testPatchSlideSharedEditorTransactions();
             return 0;
         }
@@ -7401,6 +7489,7 @@ int main() {
             testVstPcmPreviewReplaceStopAndLifecycle();
             testPluginSoundAuthority();
             testTemporaryCompositePreviewPreservesState();
+            testPatchSlideUiOwnershipAndModal();
             testPatchSlideSharedEditorTransactions();
             return 0;
         }
@@ -7482,6 +7571,7 @@ int main() {
         testCompositeEditorDelayedKeyOff();
         testPluginSoundAuthority();
         testTemporaryCompositePreviewPreservesState();
+        testPatchSlideUiOwnershipAndModal();
         testPatchSlideSharedEditorTransactions();
         testVstPcmPreviewStereoRangeGainAndHostRate();
         testVstPcmPreviewMuteClampAndInvalidRequests();

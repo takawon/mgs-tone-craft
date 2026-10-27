@@ -53,6 +53,8 @@ struct PatchSlideFilter {
     int cluster_id = -1;
     bool show_rejected = false;
     bool auto_safe_only = false;
+    // One-change only (1), or both supported sequence lengths (2).
+    int max_change_count = 2;
 };
 
 struct PatchSlideSearchResult {
@@ -106,6 +108,10 @@ public:
     [[nodiscard]] std::vector<PatchSlideSearchResult> standardB(
         std::size_t source_index, std::size_t top_n) const;
     [[nodiscard]] PatchSlideVariationResult variation(std::size_t source_index) const;
+    // Restrict sequence lengths before choosing the eligible Standard B pool256.
+    // The score expression and tie ordering are identical to the unfiltered mode.
+    [[nodiscard]] PatchSlideVariationResult variation(
+        std::size_t source_index, int max_change_count) const;
     // Portable fixture seam: exactly the same binary64 expression used in search.
     [[nodiscard]] static double squaredDistance(std::span<const double> query,
                                                  std::span<const double> target);
@@ -121,6 +127,8 @@ private:
     std::vector<PatchSlideCluster> clusters_;
     std::vector<double> vectors_;
     std::vector<double> norms_;
+    [[nodiscard]] PatchSlideVariationResult variationFromPool(
+        std::span<const PatchSlideSearchResult> pool) const;
     void read(const std::filesystem::path& directory);
 };
 

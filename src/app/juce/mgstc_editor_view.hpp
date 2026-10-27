@@ -65,6 +65,7 @@
 #include "tone_import_tab.hpp"
 #include "tone_export_tab.hpp"
 #include "patchslide_browser.hpp"
+#include "patchslide_apply_dialog.hpp"
 #include "mgstc/engine/mgstc_tone_set.hpp"
 #include "switch_look_and_feel.hpp"
 #include "mgstc_look_and_feel.hpp"
@@ -1757,6 +1758,8 @@ public:
         session_ = &session;
         emu_.setButtonText(juce::String::fromUTF8("エミュ"));
         hardware_.setButtonText(juce::String::fromUTF8("実機"));
+        configureSegmentButton(emu_, 0, 2);
+        configureSegmentButton(hardware_, 1, 2);
         addAndMakeVisible(emu_);
         addAndMakeVisible(hardware_);
         addAndMakeVisible(status_);
@@ -3564,7 +3567,7 @@ public:
                 [this] {
                     performance_keyboard_.allNotesOff();
                     if (all_notes_off_) all_notes_off_();
-                }}, session.backgroundTasks());
+                }}, session.backgroundTasks(), session.patchSlideStock());
         tabs_.addTab(juce::String::fromUTF8("パッチスライド"),
             juce::Colour(UiLayout::panelFill), patchslide_tab_.get(), false);
 
@@ -3668,6 +3671,9 @@ public:
                 if (auto* top = safe->getTopLevelComponent()) {
                     if (auto* window =
                             dynamic_cast<juce::ResizableWindow*>(top)) {
+                        window->setResizeLimits(
+                            PatchSlideBrowserComponent::minimumContentWidth() + UiLayout::panelPad * 2,
+                            UiScale::sx(560), UiScale::sx(1600), UiScale::sx(960));
                         window->setSize(
                             safe->getWidth(),
                             safe->getHeight() + 32);
@@ -4058,7 +4064,7 @@ public:
         setUsingNativeTitleBar(true);
         setResizable(true, true);
         setResizeLimits(
-            UiScale::sx(900),
+            PatchSlideBrowserComponent::minimumContentWidth() + UiLayout::panelPad * 2,
             UiScale::sx(560),
             UiScale::sx(1600),
             UiScale::sx(960));
@@ -4864,6 +4870,7 @@ public:
         timeline_.cancelPendingDialogs();
         // The comparison adapter belongs to the EditorSession. Destroy this
         // owned modal window before the plugin editor destroys its context.
+        delete patchslide_apply_dialog_.getComponent();
         delete wave_converter_window_.getComponent();
         UiScale::removeGlobalListener(ui_scale_listener_);
         stopTimer();
@@ -5170,50 +5177,44 @@ public:
         }
     }
 
-    void requestApplyPatchSlide(const engine::CompositeTimbre& sound) {
-        if (sound.layers.size() != 1
-            || sound.layers.front().source != engine::TimbreSource::Opll) return;
+    void requestApplyPatchSlide(const engine::CompositeTimbre& sound, juce::Component* parent = nullptr) {
+        if (patchslide_apply_dialog_) { patchslide_apply_dialog_->toFront(true); return; }
+        if (sound.layers.size() != 1 || sound.layers.front().source != engine::TimbreSource::Opll) return;
         libraryManagerAllNotesOff();
         stopImportedPreview();
         const auto original = workingTimbre();
-        juce::PopupMenu targets;
+        std::vector<PatchSlideApplyTarget> targets;
         for (std::size_t i = 0; i < original.layers.size(); ++i) {
             const auto& layer = original.layers[i];
-            if (layer.source != engine::TimbreSource::Opll) continue;
-            targets.addItem(static_cast<int>(i) + 1,
-                juce::String::fromUTF8("置換: OPLL Ch.")
+            if (layer.source == engine::TimbreSource::Opll)
+                targets.push_back({i, juce::String::fromUTF8("置換: OPLL Ch.")
                     + juce::String(static_cast<int>(layer.channel) + 1)
-                    + " " + juce::String::fromUTF8(layer.name.c_str()));
+                    + " " + juce::String::fromUTF8(layer.name.c_str()), true});
         }
         if (engine::firstAvailableChannel(original, engine::TimbreSource::Opll))
-            targets.addItem(static_cast<int>(original.layers.size()) + 1,
-                juce::String::fromUTF8("新しいOPLLレイヤーを追加"));
-        juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+            targets.push_back({original.layers.size(), juce::String::fromUTF8("新しいOPLLレイヤーを追加"), false});
+        if (targets.empty()) return;
+        UiScale::forceGlobalForNonEditorUi();
+        auto content = std::make_unique<PatchSlideApplyContent>(juce::String::fromUTF8(sound.name.c_str()), targets, parent);
+        auto* dialog = new ModalDialogWindow(juce::String::fromUTF8("パッチスライドを適用"), juce::Colour(UiLayout::panelFill));
+        patchslide_apply_dialog_ = dialog;
+        dialog->setUsingNativeTitleBar(true);
+        dialog->setResizable(false, false);
+        dialog->setContentOwned(content.release(), true);
+        dialog->centreAroundComponent(parent ? parent : this, dialog->getWidth(), dialog->getHeight());
         const auto restore_generation = host_restore_generation_;
-        targets.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
-            [safe, original, sound, restore_generation](int selected) {
-                if (!safe || selected <= 0) return;
-                const auto index = static_cast<std::size_t>(selected - 1);
-                juce::AlertWindow::showAsync(juce::MessageBoxOptions()
-                    .withTitle(juce::String::fromUTF8("パッチスライドを適用"))
-                    .withMessage(index < original.layers.size()
-                        ? juce::String::fromUTF8("選択したOPLLレイヤーの音色・ENV・変調設定を置き換えます。他のレイヤーは保持します。")
-                        : juce::String::fromUTF8("OPLLレイヤーを追加します。既存のレイヤーは保持します。"))
-                    .withButton(juce::String::fromUTF8("適用"))
-                    .withButton(juce::String::fromUTF8("キャンセル"))
-                    .withAssociatedComponent(safe.getComponent()),
-                    [safe, original, sound, index, restore_generation](int result) {
-                        if (!safe || result != 1) return;
-                        safe->libraryManagerAllNotesOff();
-                        safe->stopImportedPreview();
-                        if (safe->host_restore_generation_ != restore_generation
-                            || safe->workingTimbre() != original) {
-                            safe->updateStatus(juce::String::fromUTF8("編集中の音色が変更されました。適用先を選び直してください。"));
-                            return;
-                        }
-                        static_cast<void>(safe->applyPatchSlideAt(sound, index));
-                    });
-            });
+        juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+        dialog->enterModalState(true, juce::ModalCallbackFunction::create(
+            [safe, original, sound, targets, restore_generation](int result) {
+                if (!safe) return;
+                safe->patchslide_apply_dialog_ = nullptr;
+                if (result <= 0 || result > static_cast<int>(targets.size())) return;
+                if (safe->host_restore_generation_ != restore_generation || safe->workingTimbre() != original) {
+                    safe->updateStatus(juce::String::fromUTF8("編集中の音色が変更されました。適用先を選び直してください。"));
+                    return;
+                }
+                static_cast<void>(safe->applyPatchSlideAt(sound, targets[static_cast<std::size_t>(result - 1)].layer_index));
+            }), true);
     }
 
     // Confirmed author edit. Preview never calls this boundary.
@@ -8087,6 +8088,7 @@ private:
         "redo", juce::DrawableButton::ImageOnButtonBackground};
     juce::TextButton import_wave_;
     juce::Component::SafePointer<ModalDialogWindow> wave_converter_window_;
+    juce::Component::SafePointer<ModalDialogWindow> patchslide_apply_dialog_;
     std::vector<mgstc::engine::CompositeTimbre> history_;
     std::size_t history_cursor_{};
     PerformanceKeyboard performance_keyboard_;

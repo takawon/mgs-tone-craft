@@ -84,6 +84,11 @@ void verifyCandidate(const PatchSlideCandidate& item) {
     std::string error = "stale";
     auto sound = makePatchSlideTimbre(item, &error);
     require(sound.has_value() && error.empty(), "Valid definition converts");
+    const auto display=patchSlideDisplayName(item);
+    require(display.find("OPLL @") == 0 && display.find("\xe5\x9b\x9e\xe5\xa4\x89\xe6\x9b\xb4") == std::string::npos,
+        "Redundant change-count text remains in the display name");
+    require(display.find(std::to_string(item.hold_a_steps)) != std::string::npos,
+        "Count information disappeared from the display name");
     require(sound->layers.size() == 1, "One OPLL layer");
     const auto& layer = sound->layers.front();
     require(layer.source == TimbreSource::Opll && layer.channel == 0, "Native OPLL channel");

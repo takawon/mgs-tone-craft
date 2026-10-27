@@ -39,6 +39,9 @@ public:
     mgstc::app::EditorAuditionPreferences& auditionPreferences() noexcept override {
         return processor_.editorAuditionPreferences();
     }
+    std::shared_ptr<mgstc::app::PatchSlideStock> patchSlideStock() override {
+        return processor_.editorPatchSlideStock();
+    }
     std::uint64_t stateRestoreRevision() const noexcept override {
         return processor_.editorStateRestoreRevision();
     }

@@ -28,6 +28,8 @@
 #include "ui_scale.hpp"
 #include "ui_chrome_constants.hpp"
 #include "ui_fonts.hpp"
+#include "segmented_control.hpp"
+#include "mgstc_look_and_feel.hpp"
 #include "mgstc/engine/dc_blocker.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/note_pitch.hpp"
@@ -1548,6 +1550,8 @@ public:
             addAndMakeVisible(*b);
         }
         mode_gram_.setToggleState(true, juce::dontSendNotification);
+        configureSegmentButton(mode_gram_, 0, 2);
+        configureSegmentButton(mode_spectrum_, 1, 2);
         mode_gram_.onClick = [this] { setSpectrumMode(false); };
         mode_spectrum_.onClick = [this] { setSpectrumMode(true); };
         colour_source_.setButtonText(juce::String::fromUTF8("音源色"));
@@ -1558,6 +1562,11 @@ public:
             addAndMakeVisible(*b);
         }
         colour_source_.setToggleState(true, juce::dontSendNotification);
+        configureSegmentButton(colour_source_, 0, 2);
+        configureSegmentButton(colour_pseudo_, 1, 2);
+        // This independent window also exists in plugin hosts with their own default LAF.
+        for (auto* button : {&mode_gram_, &mode_spectrum_, &colour_source_, &colour_pseudo_})
+            button->setLookAndFeel(&segment_look_and_feel_);
         colour_source_.onClick = [this] {
             display_.setColourMode(SpectrogramColourMode::Source);
         };
@@ -1617,6 +1626,8 @@ public:
     ~Content() override {
         setActive(false);
         frequency_scroll_.removeListener(this);
+        for (auto* button : {&mode_gram_, &mode_spectrum_, &colour_source_, &colour_pseudo_})
+            button->setLookAndFeel(nullptr);
         for (auto* button : std::array<juce::ToggleButton*, 3>{
                  &psg_, &scc_, &opll_}) {
             button->setLookAndFeel(nullptr);
@@ -1741,12 +1752,10 @@ public:
         auto modes = area.removeFromTop(UiLayout::fieldH);
         pin_.setBounds(modes.removeFromRight(UiLayout::fieldH));
         mode_gram_.setBounds(modes.removeFromLeft(UiLayout::spectrumModeW));
-        modes.removeFromLeft(UiLayout::controlGap);
         mode_spectrum_.setBounds(modes.removeFromLeft(UiLayout::spectrumActionW));
         if (!spectrum_mode_) {
             modes.removeFromLeft(UiLayout::controlGap);
             colour_source_.setBounds(modes.removeFromLeft(UiLayout::spectrumActionW));
-            modes.removeFromLeft(UiLayout::controlGap);
             colour_pseudo_.setBounds(modes.removeFromLeft(UiLayout::spectrumActionW));
         }
         area.removeFromTop(UiLayout::controlGap);
@@ -1978,6 +1987,7 @@ private:
     juce::Slider history_seconds_, history_position_;
     bool spectrum_mode_{}, active_{};
     std::function<void(bool)> internal_pin_changed_;
+    MgstcLookAndFeel segment_look_and_feel_;
     SpectrogramToggleLookAndFeel source_toggle_look_and_feel_;
     juce::ToggleButton psg_;
     juce::ToggleButton scc_;

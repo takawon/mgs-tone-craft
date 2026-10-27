@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 #include "composite_timeline.hpp"
+#include "segmented_control.hpp"
 
 #include <algorithm>
 #include <array>
@@ -429,27 +430,16 @@ private:
     juce::Viewport viewport_;
 };
 
-// Radio semantics retain JUCE's keyboard/accessibility handling. The circle
-// uses the same font, scaled geometry, hover and enabled-state tokens as chrome.
+// Keep radio keyboard/accessibility semantics while sharing segment chrome.
 class MorphDistributionButton final : public juce::ToggleButton {
     void paintButton(juce::Graphics& graphics, bool highlighted, bool) override {
-        auto area = getLocalBounds().reduced(UiLayout::controlGap, 0);
-        const int diameter = UiLayout::switchTrackH;
-        const auto circle = juce::Rectangle<float>(static_cast<float>(area.getX()),
-            static_cast<float>(area.getCentreY()) - static_cast<float>(diameter) * 0.5F,
-            static_cast<float>(diameter), static_cast<float>(diameter));
-        const auto text = findColour(juce::ToggleButton::textColourId);
-        graphics.setColour((highlighted || hasKeyboardFocus(true) ? uiHoverAccent() : text)
+        paintSegmentBackground(graphics, *this);
+        graphics.setColour((highlighted && !getToggleState() ? uiHoverAccent()
+            : findColour(juce::ToggleButton::textColourId))
             .withMultipliedAlpha(isEnabled() ? 1.0F : 0.5F));
-        graphics.drawEllipse(circle, 1.5F);
-        if (getToggleState()) graphics.fillEllipse(circle.reduced(static_cast<float>(UiLayout::xs)));
-        area.removeFromLeft(diameter + UiLayout::controlGap);
-        graphics.setFont(UiFonts::body());
-        graphics.drawFittedText(getButtonText(), area, juce::Justification::centredLeft, 1);
-        if (hasKeyboardFocus(true)) {
-            graphics.setColour(uiHoverAccent());
-            graphics.drawRect(getLocalBounds().toFloat().reduced(1.0F), 1.5F);
-        }
+        graphics.setFont(UiFonts::controlTextHeight(static_cast<float>(getHeight())));
+        graphics.drawFittedText(getButtonText(), getLocalBounds().reduced(UiLayout::controlGap, 0),
+            juce::Justification::centred, 1);
     }
 };
 
@@ -498,6 +488,7 @@ public:
         for (std::size_t index = 0; index < morph_distribution_.size(); ++index) {
             auto& button = morph_distribution_[index];
             button.setButtonText(distribution_names[index]);
+            configureSegmentButton(button, static_cast<int>(index), 3);
             button.setRadioGroupId(1);
             button.setClickingTogglesState(true);
             button.setWantsKeyboardFocus(true);
@@ -570,10 +561,23 @@ public:
             const auto& button = morph_distribution_[index];
             if (button.getExplicitFocusOrder() != 221 + static_cast<int>(index))
                 return "unexpected distribution mode Tab order";
+            const int group_width = UiLayout::compositeTimbrePickW - UiLayout::panelPad * 2;
+            if (button.getWidth() < group_width / 3 || button.getWidth() > (group_width + 2) / 3
+                || button.getHeight() != UiLayout::fieldH)
+                return "distribution mode button size changed";
+            if (index > 0 && (button.getX() != morph_distribution_[index - 1].getRight()
+                || button.getY() != morph_distribution_[0].getY()))
+                return "distribution segments are not contiguous in one row";
             if (button.isEnabled()) return "Morph OFF leaves distribution mode enabled";
             if (button.getBounds().isEmpty() || !getLocalBounds().contains(button.getBounds()))
                 return "distribution mode lies outside picker bounds";
         }
+        if (getWidth() != UiLayout::compositeTimbrePickW * 2 - UiLayout::panelPad * 2 + UiLayout::panelGap
+            || morph_distribution_.front().getX() != morph_enabled_.getX()
+            || morph_distribution_.back().getRight() != morph_enabled_.getRight())
+            return "morph segments do not fit the original dialog width";
+        if (morph_enabled_.getWidth() != UiLayout::compositeTimbrePickW - UiLayout::panelPad * 2)
+            return "independent morph enable button size changed";
         if (morph_count_.isEnabled()) return "Morph OFF leaves intermediate count enabled";
         if (morph_curve_.isEnabled()) return "Morph OFF leaves curve enabled";
         if (morph_curve_.getWidth() < UiLayout::libraryButtonMinW * 2) return "curve track is too narrow";
@@ -958,10 +962,11 @@ public:
             morph_area.removeFromTop(sm);
             morph_distribution_label_.setBounds(morph_area.removeFromTop(fieldH));
             morph_area.removeFromTop(sm);
-            for (auto& button : morph_distribution_) {
-                button.setBounds(morph_area.removeFromTop(fieldH));
-                morph_area.removeFromTop(sm);
-            }
+            auto distribution_row = morph_area.removeFromTop(fieldH);
+            for (std::size_t index = 0; index < morph_distribution_.size(); ++index)
+                morph_distribution_[index].setBounds(distribution_row.removeFromLeft(
+                    distribution_row.getWidth() / static_cast<int>(morph_distribution_.size() - index)));
+            morph_area.removeFromTop(sm);
             auto count_row = morph_area.removeFromTop(fieldH);
             morph_count_label_.setBounds(count_row.removeFromLeft(compositeInspectorLabelW));
             morph_count_.setBounds(count_row);
@@ -4885,6 +4890,8 @@ public:
             button->setClickingTogglesState(true);
             addAndMakeVisible(button);
         }
+        configureSegmentButton(setup_tab_, 0, 2);
+        configureSegmentButton(count_tab_, 1, 2);
         setup_tab_.onClick = [this] { setCountInspector(false); };
         count_tab_.onClick = [this] { setCountInspector(true); };
         focus_.onClick = [this] { resized(); repaint(); };

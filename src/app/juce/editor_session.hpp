@@ -15,6 +15,7 @@
 #include "mgstc/engine/opll_patch.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/timbre_library.hpp"
+#include "patchslide_stock.hpp"
 
 namespace mgstc::engine {
 struct OpllScopeFrame;
@@ -238,6 +239,12 @@ struct EditorAuditionPreferences {
 class EditorSession {
 public:
     virtual ~EditorSession() = default;
+    // UI only. The standalone session lives for the application; plugin
+    // adapters delegate to processor-owned memory across editor recreation.
+    virtual std::shared_ptr<PatchSlideStock> patchSlideStock() {
+        if (!patchslide_stock_) patchslide_stock_ = std::make_shared<PatchSlideStock>();
+        return patchslide_stock_;
+    }
     // Message-thread UI preferences, separate from the sound document.
     virtual EditorAuditionPreferences& auditionPreferences() noexcept {
         return audition_preferences_;
@@ -258,6 +265,7 @@ public:
         mgstc::engine::OpllScopeFrame& frame) = 0;
 private:
     EditorAuditionPreferences audition_preferences_;
+    std::shared_ptr<PatchSlideStock> patchslide_stock_;
 };
 
 // Per-instance editor collaboration. Not engine or plugin state authority.

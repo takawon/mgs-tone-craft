@@ -81,6 +81,11 @@ public:
     mgstc::app::EditorAuditionPreferences& editorAuditionPreferences() noexcept {
         return audition_preferences_;
     }
+    // Message-thread-only transient stock; never part of Plugin State or audio.
+    std::shared_ptr<mgstc::app::PatchSlideStock> editorPatchSlideStock() {
+        if (!patchslide_stock_) patchslide_stock_ = std::make_shared<mgstc::app::PatchSlideStock>();
+        return patchslide_stock_;
+    }
 
     // Message-thread editor delegation. Does not open OS audio or MIDI.
     // Hardware requests reuse the processor-owned engine. Shared-wave audition is runtime only
@@ -172,6 +177,7 @@ private:
     std::function<void()> editor_state_restored_;
     std::atomic<std::uint64_t> state_restore_revision_{0};
     mgstc::app::EditorAuditionPreferences audition_preferences_;
+    std::shared_ptr<mgstc::app::PatchSlideStock> patchslide_stock_;
     friend struct MgstcAudioProcessorTestAccess;
 
     enum class TrackLayerState : std::uint8_t {

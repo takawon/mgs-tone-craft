@@ -10,8 +10,7 @@ std::string patchSlideDisplayName(const PatchSlideCandidate& candidate) {
         + " → @" + std::to_string(candidate.patch_b);
     if (candidate.change_count == 2 && candidate.patch_c)
         name += " → @" + std::to_string(*candidate.patch_c);
-    name += "（" + std::to_string(candidate.change_count) + "回変更、"
-        + std::to_string(candidate.hold_a_steps);
+    name += "（" + std::to_string(candidate.hold_a_steps);
     if (candidate.change_count == 2 && candidate.hold_b_steps)
         name += " / " + std::to_string(candidate.hold_a_steps + *candidate.hold_b_steps);
     return name + "カウント）";
