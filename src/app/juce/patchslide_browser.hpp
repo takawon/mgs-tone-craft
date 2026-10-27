@@ -200,8 +200,9 @@ public:
         using namespace UiLayout;
         UiFonts::styleBodyField(details_);
         for (auto* label : {&status_, &tag_hint_, &group_info_, &stock_header_}) label->setFont(UiFonts::body());
-        list_.setRowHeight(fieldH * 3);
-        stock_list_.setRowHeight(fieldH * 3);
+        const auto resultRowHeight = fieldH * 3 / 2;
+        list_.setRowHeight(resultRowHeight);
+        stock_list_.setRowHeight(resultRowHeight);
         tag_list_.setRowHeight(fieldH);
         auto area = getLocalBounds().reduced(panelPad);
         auto top = area.removeFromTop(fieldH);

@@ -229,6 +229,18 @@ public:
             UiScale::setActivePercent(scale);
             for(int baseWidth:{1100,1250,1500}) for(int baseHeight:{560,700}) {
                 browser.setSize(UiScale::sx(baseWidth),UiScale::sx(baseHeight));browser.resized();
+                const auto resultRowHeight = UiLayout::fieldH * 3 / 2;
+                require(browser.list_.getRowHeight()==resultRowHeight
+                    && browser.stock_list_.getRowHeight()==resultRowHeight,
+                    "Candidate and stock rows did not use the compact shared height");
+                Browser::RowControls rowControls;
+                rowControls.setBounds(0,0,100,resultRowHeight);
+                require(rowControls.check.getWidth()==UiLayout::fieldH
+                    && rowControls.check.getHeight()==resultRowHeight,
+                    "Candidate stock checkbox lost its full-height hit area");
+                require(rowControls.trash.getWidth()==UiLayout::fieldH
+                    && rowControls.trash.getHeight()==UiLayout::fieldH,
+                    "Stock removal button no longer fits its compact row");
                 require(browser.details_.getWidth()==UiLayout::libraryWidth && browser.details_.getHeight()==UiLayout::libraryMemoH+UiLayout::fieldH,"Fixed detail dimensions changed");
                 require(browser.details_.getX()==browser.tag_list_.getX(),"Detail is not beneath the left column");
                 require(browser.list_.getBottom()==browser.stock_list_.getBottom() && browser.list_.getBottom()<browser.preview_.getY(),"Lists did not stretch to the bottom controls");

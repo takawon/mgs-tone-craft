@@ -42,6 +42,175 @@
 #include "mgstc/engine/mgs_composite_io.hpp"
 #include "mgstc/engine/sinc_rate_conv.hpp"
 
+struct LibraryManagerListTabTestAccess {
+    static void run() {
+        const auto check = [](bool ok, const char* message) {
+            if (!ok) throw std::runtime_error(message);
+        };
+        mgstc::engine::TimbreLibrary timbres;
+        mgstc::engine::TimbreLibraryEntry single;
+        single.name = "Unrelated OPLL";
+        single.category = mgstc::engine::TimbreCategory::Opll;
+        single.favorite = true;
+        single.tags = {"kept"};
+        const auto opll = timbres.add(single, 1);
+        single.name = "Unrelated SCC";
+        single.category = mgstc::engine::TimbreCategory::Scc;
+        single.favorite = false;
+        single.tags = {"other"};
+        const auto scc = timbres.add(single, 1);
+        mgstc::engine::CompositeTimbreLibrary composites;
+        auto sound = mgstc::engine::defaultCompositeTimbre();
+        sound.name = "Unrelated Composite";
+        sound.tags = {"kept"};
+        const auto composite = composites.add(sound, 1);
+        std::vector<mgstc::engine::ToneSetRecord> sets{
+            {1, "Set name match"}, {2, "Destination"}, {3, "Other set"}};
+        std::vector<mgstc::engine::ToneSetMemberRecord> members{
+            {1, opll, 0, 0}, {1, scc, 0, 1}, {1, 0, composite, 2}};
+        int saved{};
+        LibraryManagerListTab tab(LibraryManagerKind::Scc,
+            {}, {}, [] { return true; }, [] { return true; },
+            [&] { return &timbres; }, [&] { return &composites; }, {}, {}, nullptr,
+            [&] { return &sets; }, [&] { return &members; }, [&] { ++saved; return true; });
+        check(!tab.replace_mode_ && !tab.replace_.isVisible(),
+            "normal constructor keeps the replacement-only button hidden");
+        const auto refresh = [&] { tab.refreshTable(false); };
+        const auto header = [&](std::uint64_t id) -> LibraryManagerRow {
+            for (const auto& row : tab.displayed_rows_)
+                if (row.role == LibraryManagerRowRole::SetHeader && row.id == id) return row;
+            throw std::runtime_error("expected set header");
+        };
+        const auto index = [&](LibraryManagerRowRole role, std::uint64_t set_id,
+                               LibraryManagerKind kind, std::uint64_t id) {
+            for (std::size_t i = 0; i < tab.displayed_rows_.size(); ++i) {
+                const auto& row = tab.displayed_rows_[i];
+                if (row.role == role && row.set_id == set_id
+                    && (role == LibraryManagerRowRole::SetHeader || (row.kind == kind && row.id == id)))
+                    return static_cast<int>(i);
+            }
+            throw std::runtime_error("expected library row");
+        };
+        for (const auto category : {1, 2, 3}) {
+            tab.category_.setSelectedId(category, juce::dontSendNotification);
+            refresh();
+            const auto row = header(1);
+            check(row.revision == 1 && row.total_members == 3 && row.show_total_members,
+                "filtered set header shows current-kind count and total registration count");
+            check(LibraryManagerTableModel::cellText(row, LibraryManagerTableModel::kTags)
+                == juce::String::fromUTF8("1 件 / 全 3 件"), "filtered count text includes total");
+            tab.expanded_sets_.clear();
+            refresh();
+            check(!header(1).expanded && header(1).revision == 1,
+                "collapsed set count is filtered even though its members are not drawn");
+        }
+        tab.category_.setSelectedId(4, juce::dontSendNotification);
+        refresh();
+        check(header(1).revision == 3 && !header(1).show_total_members,
+            "all categories retain the single registration count");
+        tab.tree_mode_.setToggleState(false, juce::dontSendNotification);
+        refresh();
+        check(std::any_of(tab.displayed_rows_.begin(), tab.displayed_rows_.end(), [&](const auto& row) {
+            return row.id == opll && row.kind == LibraryManagerKind::Opll;
+        }), "flat All view retains the actual OPLL kind for editing and export");
+        tab.tree_mode_.setToggleState(true, juce::dontSendNotification);
+        refresh();
+        tab.filter_.setText("name match", false);
+        refresh();
+        check(header(1).expanded && header(1).revision == 3,
+            "set-name search reveals member sounds with unrelated names");
+        check(std::count_if(tab.displayed_rows_.begin(), tab.displayed_rows_.end(), [](const auto& row) {
+            return row.role == LibraryManagerRowRole::Member && row.set_id == 1;
+        }) == 3, "matching set displays all its member kinds in All mode");
+        for (const auto category : {1, 2, 3}) {
+            tab.category_.setSelectedId(category, juce::dontSendNotification);
+            refresh();
+            check(header(1).revision == 1 && header(1).total_members == 3,
+                "set-name matching still respects the selected kind");
+        }
+        tab.category_.setSelectedId(4, juce::dontSendNotification);
+        tab.favorite_only_.setToggleState(true, juce::dontSendNotification);
+        tab.selected_filter_tags_ = {"kept"};
+        refresh();
+        check(header(1).revision == 1 && header(1).total_members == 3,
+            "matching set name keeps favorite and tag filters active");
+        tab.favorite_only_.setToggleState(false, juce::dontSendNotification);
+        refresh();
+        check(header(1).revision == 2, "matching set name keeps the selected tag constraint");
+        tab.selected_filter_tags_.clear();
+        tab.filter_.setText({}, false);
+        tab.category_.setSelectedId(4, juce::dontSendNotification);
+        tab.expanded_sets_ = {1, 2, 3};
+        refresh();
+        const auto source = index(LibraryManagerRowRole::Member, 1, LibraryManagerKind::Opll, opll);
+        juce::SparseSet<int> drag_rows;
+        drag_rows.addRange({source, source + 1});
+        const auto description = tab.table_model_.getDragSourceDescription(drag_rows);
+        check(description.toString() == "mgstc-tone-membership" && tab.drag_items_.size() == 1,
+            "JUCE child-row drag hook prepares the actual selected membership");
+        check(!tab.table_model_.mayDragToExternalWindows(), "set membership drag stays in its own window");
+        const auto target = index(LibraryManagerRowRole::SetHeader, 2, LibraryManagerKind::Scc, 0);
+        tab.completeDrop(target, true);
+        check(mgstc::app::librarySetContains(members, 1, false, opll)
+            && mgstc::app::librarySetContains(members, 2, false, opll) && saved == 1,
+            "Ctrl drop adds target membership and preserves source without duplicating the sound");
+        check(timbres.entries().size() == 2, "Ctrl copy preserves the body library IDs");
+        const auto move_source = index(LibraryManagerRowRole::Member, 1, LibraryManagerKind::Opll, opll);
+        juce::SparseSet<int> move_rows;
+        move_rows.addRange({move_source, move_source + 1});
+        const auto move_description = tab.table_model_.getDragSourceDescription(move_rows);
+        const auto move_target = index(LibraryManagerRowRole::SetHeader, 2, LibraryManagerKind::Scc, 0);
+        tab.setSize(UiLayout::libraryManagerW, UiScale::sx(650));
+        const auto position = tab.table_.getCellPosition(LibraryManagerTableModel::kName, move_target, true).getCentre();
+        juce::DragAndDropTarget::SourceDetails own_drag(move_description, &tab.table_, position);
+        check(tab.table_.isInterestedInDragSource(own_drag), "own table accepts the native row drag");
+        const auto menu_anchor = tab.rowContextMenuAnchor(tab.displayed_rows_[static_cast<std::size_t>(move_target)]);
+        check(menu_anchor == tab.table_.localAreaToGlobal(
+            tab.table_.getCellPosition(LibraryManagerTableModel::kName, move_target, true)),
+            "right-click and Shift-F10 anchor the menu to the selected item row");
+        check(menu_anchor.getBottom() < tab.table_.getScreenBounds().getBottom(),
+            "row menu anchor does not use the entire table bottom");
+        auto stale_menu_row = tab.displayed_rows_[static_cast<std::size_t>(move_target)];
+        stale_menu_row.id = stale_menu_row.set_id = 99999;
+        check(tab.rowContextMenuAnchor(stale_menu_row).isEmpty(),
+            "missing item cannot fall back to a menu at the window bottom");
+
+        juce::Component foreign;
+        juce::DragAndDropTarget::SourceDetails foreign_drag(move_description, &foreign, position);
+        check(!tab.table_.isInterestedInDragSource(foreign_drag), "foreign drags cannot reuse stale membership state");
+        tab.completeDrop(move_target, false);
+        check(!mgstc::app::librarySetContains(members, 1, false, opll)
+            && mgstc::app::librarySetContains(members, 2, false, opll) && saved == 2,
+            "plain and Shift move remove only source membership, including an already populated destination");
+        check(mgstc::app::librarySetContains(members, 1, false, scc)
+            && mgstc::app::librarySetContains(members, 1, true, composite),
+            "moving a sound leaves the other set members intact");
+        std::vector<LibraryManagerRow> exported;
+        tab.setExportHandler([&](const auto& rows) { exported = rows; });
+        tab.table_.selectRow(index(LibraryManagerRowRole::SetHeader, 2, LibraryManagerKind::Scc, 0));
+        tab.updateDetail();
+        check(tab.export_button_.isEnabled(), "export button enables for a set selection");
+        tab.export_button_.onClick();
+        check(exported.size() == 1 && exported.front().role == LibraryManagerRowRole::SetHeader
+            && exported.front().id == 2, "bottom export button forwards the selected set to the existing queue handler");
+        const auto previous_scale = UiScale::active_percent;
+        for (const int percent : {75, 100, 125}) {
+            UiScale::setActivePercent(percent);
+            tab.setSize(UiLayout::libraryManagerW, UiScale::sx(650));
+            check(tab.export_button_.getRight() + UiLayout::panelGap <= tab.close_.getX(),
+                "close button has the wider separation after export");
+            check(tab.detail_toggle_.getRight() + UiLayout::controlGap <= tab.duplicate_.getX(),
+                "footer controls remain nonoverlapping at each supported scale");
+            for (const juce::Button* button : std::initializer_list<const juce::Button*>{&tab.tree_mode_, &tab.new_set_, &tab.detail_toggle_,
+                    &tab.duplicate_, &tab.remove_, &tab.assign_tags_, &tab.load_edit_, &tab.export_button_, &tab.close_})
+                check(tab.getLocalBounds().contains(button->getBounds()), "footer button stays inside the library window");
+        }
+        UiScale::setActivePercent(previous_scale);
+        tab.setReplaceMode(LibraryManagerKind::Scc, [](auto) {});
+        check(!tab.export_button_.isVisible(), "replacement picker keeps its established limited operation scope");
+    }
+};
+
 namespace mgstc::app {
 
 struct SatelliteEditorParityTestAccess {
@@ -4618,6 +4787,8 @@ void testPluginEditor() {
     juce::Button* focus_button = nullptr;
     juce::Button* compact_button = nullptr;
     juce::Button* file_menu = nullptr;
+    std::array<juce::Button*, 4> source_buttons{};
+    bool layer_library_present = false;
     bool spectrum_enabled = false;
     juce::Button* spectrum_button = nullptr;
     mgstc::app::SoundOutputSwitch* output_switch = nullptr;
@@ -4631,11 +4802,16 @@ void testPluginEditor() {
             output_switch = control;
         if (auto* button = dynamic_cast<juce::Button*>(component)) {
             const auto text = button->getButtonText();
-            if (text == juce::String::fromUTF8("ライブラリ")) library_toggle = button;
+            if (text == juce::String::fromUTF8("保存 / ライブラリ")) library_toggle = button;
             if (text == juce::String::fromUTF8("カウント編集")) count_tab = button;
             if (text == juce::String::fromUTF8("編集に集中")) focus_button = button;
             if (text == juce::String::fromUTF8("概要を縮小")) compact_button = button;
             if (text == juce::String::fromUTF8("ファイル")) file_menu = button;
+            const auto tip = button->getTooltip();
+            if (tip == juce::String::fromUTF8("MGSCソースを開く")) source_buttons[0] = button;
+            if (tip == juce::String::fromUTF8("MGSCソースを書き出す")) source_buttons[1] = button;
+            if (tip == juce::String::fromUTF8("貼り付け (Ctrl+V)")) source_buttons[2] = button;
+            if (tip == juce::String::fromUTF8("コピー (Ctrl+C)")) source_buttons[3] = button;
             if (text == juce::String::fromUTF8("エミュ") && button->isVisible()) ++emu_buttons;
             if (text == juce::String::fromUTF8("実機") && button->isVisible()) ++hardware_buttons;
             if (text == juce::String::fromUTF8("スペアナ")) {
@@ -4657,6 +4833,8 @@ void testPluginEditor() {
                 opll_hidden = true;
             }
         }
+        if (auto* label = dynamic_cast<juce::Label*>(component))
+            if (label->getText() == juce::String::fromUTF8("レイヤー用単音色")) layer_library_present = true;
         for (int index = 0; index < component->getNumChildComponents(); ++index) {
             self(self, component->getChildComponent(index));
         }
@@ -4683,10 +4861,21 @@ void testPluginEditor() {
             "render shared main screen");
     };
     capture("main-editor.png");
-    require(compact_button && file_menu, "density and file menu controls are present");
-    file_menu->onClick();
-    juce::PopupMenu::dismissAllActiveMenus();
-    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    require(compact_button && !file_menu && !layer_library_present,
+        "density control remains; obsolete file menu and layer library panel are removed");
+    for (std::size_t index = 0; index < source_buttons.size(); ++index) {
+        auto* button = source_buttons[index];
+        if (button) std::cout << "source toolbar " << index << " bounds="
+            << button->getBounds().toString() << " visible=" << button->isVisible()
+            << " enabled=" << button->isEnabled() << "\n";
+        require(button && button->isVisible() && button->isEnabled() && button->onClick
+                && dynamic_cast<juce::DrawableButton*>(button)
+                && button->getWidth() == UiLayout::iconButton && button->getHeight() == UiLayout::toolbarH,
+            "MGSC and clipboard toolbar uses the shared enabled icon controls");
+        if (index > 0)
+            require(button->getX() == source_buttons[index - 1]->getRight() + UiLayout::controlGap
+                && button->getY() == source_buttons[0]->getY(), "source toolbar order matches single-tone editors");
+    }
     compact_button->setToggleState(true, juce::dontSendNotification);
     compact_button->onClick();
     capture("main-compact.png");
@@ -7481,6 +7670,7 @@ int main() {
             testCompositePlaybackWaveform();
             testScopeFrameDistributorReaders();
             testProcessorOfflineAndTransport();
+            LibraryManagerListTabTestAccess::run();
             testLibraryPreviewsPreserveCommittedPluginState();
             testProcessorHardwareRoutingWithMockRpc();
             testOpllKeyoffSilenceDeadline();
@@ -7564,6 +7754,7 @@ int main() {
         testCompositePlaybackWaveform();
         testScopeFrameDistributorReaders();
         testProcessorOfflineAndTransport();
+        LibraryManagerListTabTestAccess::run();
         testLibraryPreviewsPreserveCommittedPluginState();
         testProcessorHardwareRoutingWithMockRpc();
         testOpllKeyoffSilenceDeadline();

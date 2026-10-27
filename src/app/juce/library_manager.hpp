@@ -70,6 +70,8 @@ struct LibraryManagerRow {
     LibraryManagerRowRole role{LibraryManagerRowRole::Timbre};
     std::uint64_t set_id{};
     bool expanded{false};
+    std::uint32_t total_members{};
+    bool show_total_members{};
 };
 
 [[nodiscard]] inline bool libraryManagerRowIsBody(
@@ -112,6 +114,7 @@ public:
     using SelectionHandler = std::function<void()>;
     using SortHandler = std::function<void()>;
     using RowHandler = std::function<void(const LibraryManagerRow&)>;
+    using DragHandler = std::function<juce::var(const juce::SparseSet<int>&)>;
     using MiniPaintHandler = std::function<void(
         juce::Graphics&,
         juce::Rectangle<float>,
@@ -155,6 +158,26 @@ public:
 
     void setContextMenuHandler(RowHandler handler) {
         context_menu_handler_ = std::move(handler);
+    }
+
+    void setDragHandler(DragHandler handler) {
+        drag_handler_ = std::move(handler);
+    }
+
+    juce::var getDragSourceDescription(const juce::SparseSet<int>& rows) override {
+        return drag_handler_ ? drag_handler_(rows) : juce::var{};
+    }
+
+    bool mayDragToExternalWindows() const override { return false; }
+
+    [[nodiscard]] static juce::String headerCountText(const LibraryManagerRow& row) {
+        auto text = juce::String(static_cast<int>(row.revision))
+            + juce::String::fromUTF8(" 件");
+        if (row.show_total_members)
+            text += juce::String::fromUTF8(" / 全 ")
+                + juce::String(static_cast<int>(row.total_members))
+                + juce::String::fromUTF8(" 件");
+        return text;
     }
 
     void setMiniPaintHandler(MiniPaintHandler handler) {
@@ -206,8 +229,7 @@ public:
         }
         if (libraryManagerRowIsHeader(row)) {
             if (column_id == kTags) {
-                return juce::String(static_cast<int>(row.revision))
-                    + juce::String::fromUTF8(" 件");
+                return headerCountText(row);
             }
             return {};
         }
@@ -473,6 +495,7 @@ private:
     RowHandler expand_handler_;
     RowHandler context_menu_handler_;
     MiniPaintHandler mini_paint_handler_;
+    DragHandler drag_handler_;
     bool recent_used_mode_{};
     int sort_column_id_{kName};
     bool sort_forwards_{true};
@@ -481,6 +504,7 @@ private:
 class LibraryManagerListTab final
     : public juce::Component,
       public juce::DragAndDropContainer {
+    friend struct LibraryManagerListTabTestAccess;
 public:
     using PreviewCallback =
         std::function<void(LibraryManagerKind, std::uint64_t)>;
@@ -576,7 +600,7 @@ public:
         tree_mode_.onClick = [this] { refreshTable(false); };
         addAndMakeVisible(tree_mode_);
 
-        new_set_.setButtonText(juce::String::fromUTF8("セット"));
+        new_set_.setButtonText(juce::String::fromUTF8("セットを追加"));
         new_set_.setTooltip(juce::String::fromUTF8(
             "空のセットを追加します。音色自体は作りません"));
         new_set_.onClick = [this] { createSet(); };
@@ -592,6 +616,9 @@ public:
         addAndMakeVisible(detail_toggle_);
 
         table_model_.setTable(&table_);
+        table_model_.setDragHandler([this](const juce::SparseSet<int>& rows) {
+            return prepareRowDrag(rows);
+        });
         table_model_.setPreviewHandler(
             [this](const LibraryManagerRow& row) {
                 if (preview_ && libraryManagerRowIsBody(row)) {
@@ -711,7 +738,7 @@ public:
         duplicate_.onClick = [this] { duplicateSelected(); };
         addAndMakeVisible(duplicate_);
         remove_.setButtonText(
-            juce::String::fromUTF8("選択を削除"));
+            juce::String::fromUTF8("削除"));
         remove_.onClick = [this] { deleteSelected(); };
         addAndMakeVisible(remove_);
         assign_tags_.setButtonText(
@@ -719,9 +746,15 @@ public:
         assign_tags_.onClick = [this] { assignTagsToSelected(); };
         addAndMakeVisible(assign_tags_);
         load_edit_.setButtonText(
-            juce::String::fromUTF8("読込して編集"));
+            juce::String::fromUTF8("編集"));
         load_edit_.onClick = [this] { loadSelectedForEdit(); };
         addAndMakeVisible(load_edit_);
+        export_button_.setButtonText(juce::String::fromUTF8("エクスポートに追加"));
+        export_button_.onClick = [this] {
+            if (export_add_) export_add_(selectedRows());
+        };
+        export_button_.setEnabled(false);
+        addAndMakeVisible(export_button_);
         close_.setButtonText(juce::String::fromUTF8("閉じる"));
         close_.onClick = [this] { closeParentDialog(); };
         addAndMakeVisible(close_);
@@ -730,7 +763,7 @@ public:
             "選択した音色を、開いたチャンネルの基本音色へコピーします"));
         replace_.onClick = [this] { replaceSelected(); };
         replace_.setVisible(false);
-        addAndMakeVisible(replace_);
+        addChildComponent(replace_);
 
         refreshTable(true);
     }
@@ -747,6 +780,7 @@ public:
     void setExportHandler(
         std::function<void(const std::vector<LibraryManagerRow>&)> handler) {
         export_add_ = std::move(handler);
+        updateExportButton();
     }
 
     void setReplaceMode(
@@ -769,6 +803,7 @@ public:
         remove_.setVisible(!replace_mode_);
         assign_tags_.setVisible(!replace_mode_);
         load_edit_.setVisible(!replace_mode_);
+        export_button_.setVisible(!replace_mode_);
         replace_.setVisible(replace_mode_);
         setDetailFieldsEditable(!replace_mode_);
         refreshTable(true);
@@ -833,24 +868,26 @@ public:
         auto buttons = area.removeFromBottom(textButtonH);
         tree_mode_.setBounds(buttons.removeFromLeft(libraryButtonMinW));
         buttons.removeFromLeft(controlGap);
-        new_set_.setBounds(buttons.removeFromLeft(libraryButtonMinW));
+        new_set_.setBounds(buttons.removeFromLeft(libraryManageButtonW + sm));
         buttons.removeFromLeft(controlGap);
         detail_toggle_.setBounds(buttons.removeFromLeft(libraryButtonMinW));
         buttons.removeFromLeft(controlGap);
         close_.setBounds(buttons.removeFromRight(libraryButtonMinW));
-        buttons.removeFromRight(controlGap);
+        buttons.removeFromRight(panelGap);
         if (replace_.isVisible()) {
             replace_.setBounds(
                 buttons.removeFromRight(libraryManageButtonW));
         } else {
+            export_button_.setBounds(buttons.removeFromRight(libraryManageButtonW + libraryButtonMinW));
+            buttons.removeFromRight(controlGap);
             load_edit_.setBounds(
-                buttons.removeFromRight(libraryManageButtonW + xs));
+                buttons.removeFromRight(libraryButtonMinW));
             buttons.removeFromRight(controlGap);
             assign_tags_.setBounds(
                 buttons.removeFromRight(libraryManageButtonW));
             buttons.removeFromRight(controlGap);
             remove_.setBounds(
-                buttons.removeFromRight(libraryManageButtonW));
+                buttons.removeFromRight(libraryButtonMinW));
             buttons.removeFromRight(controlGap);
             duplicate_.setBounds(
                 buttons.removeFromRight(libraryButtonMinW));
@@ -1224,7 +1261,8 @@ private:
                                 bool favorite,
                                 const std::vector<std::string>& tags,
                                 const std::string& name,
-                                const std::string& memo) {
+                                const std::string& memo,
+                                bool set_name_matches = false) {
             if (!categoryAccepts(kind)) {
                 return false;
             }
@@ -1235,7 +1273,7 @@ private:
                     tags, selected_filter_tags_)) {
                 return false;
             }
-            return textMatches(
+            return set_name_matches || textMatches(
                 juce::String::fromUTF8(name.c_str()),
                 juce::String::fromUTF8(
                     mgstc::engine::serializeTimbreTags(tags).c_str()),
@@ -1257,7 +1295,8 @@ private:
 
         auto append_member = [&](std::uint64_t set_id,
                                   bool composite,
-                                  std::uint64_t body_id) {
+                                  std::uint64_t body_id,
+                                  bool set_name_matches) {
             if (composite) {
                 const auto* entry =
                     composites ? composites->find(body_id) : nullptr;
@@ -1267,7 +1306,8 @@ private:
                         entry->timbre.favorite,
                         entry->timbre.tags,
                         entry->timbre.name,
-                        entry->timbre.memo)) {
+                        entry->timbre.memo,
+                        set_name_matches)) {
                     return false;
                 }
                 LibraryManagerRow row{
@@ -1298,7 +1338,8 @@ private:
                     entry->favorite,
                     entry->tags,
                     entry->name,
-                    entry->memo)) {
+                    entry->memo,
+                    set_name_matches)) {
                 return false;
             }
             LibraryManagerRow row{
@@ -1332,17 +1373,18 @@ private:
                 });
             const auto saved_size = rows.size();
             const bool open = searching || setIsExpanded(set.id);
-            if (open) {
-                for (const auto& member : owned) {
-                    if (member.composite_id != 0) {
-                        append_member(set.id, true, member.composite_id);
-                    } else if (member.timbre_id != 0) {
-                        append_member(set.id, false, member.timbre_id);
-                    }
+            const bool set_name_matches = filter.isNotEmpty()
+                && juce::String::fromUTF8(set.name.c_str()).containsIgnoreCase(filter);
+            for (const auto& member : owned) {
+                if (member.composite_id != 0) {
+                    append_member(set.id, true, member.composite_id, set_name_matches);
+                } else if (member.timbre_id != 0) {
+                    append_member(set.id, false, member.timbre_id, set_name_matches);
                 }
             }
             const auto visible = static_cast<std::uint32_t>(
                 rows.size() - saved_size);
+            if (!open) rows.resize(saved_size);
             const bool name_matches = textMatches(
                 juce::String::fromUTF8(set.name.c_str()),
                 {},
@@ -1357,12 +1399,12 @@ private:
             header.set_id = set.id;
             header.name = set.name;
             header.memo = set.memo;
-            header.revision = open
-                ? visible
-                : static_cast<std::uint32_t>(owned.size());
+            header.revision = visible;
+            header.total_members = static_cast<std::uint32_t>(owned.size());
+            header.show_total_members = !showsAllCategories();
             header.updated_unix_seconds = set.updated_unix_seconds;
             header.expanded = open;
-            if (visible > 0) {
+            if (open && visible > 0) {
                 rows.insert(rows.begin() + static_cast<std::ptrdiff_t>(saved_size), header);
             } else {
                 rows.push_back(header);
@@ -1548,7 +1590,8 @@ private:
                     }
                 }
                 rows.push_back(
-                    {kind,
+                    {entry.category == mgstc::engine::TimbreCategory::Scc
+                         ? LibraryManagerKind::Scc : LibraryManagerKind::Opll,
                      entry.id,
                      entry.name,
                      entry.tags,
@@ -1622,7 +1665,16 @@ private:
         return selected;
     }
 
+    void updateExportButton() {
+        const auto rows = selectedRows();
+        export_button_.setEnabled(static_cast<bool>(export_add_)
+            && std::any_of(rows.begin(), rows.end(), [](const auto& row) {
+                return row.role == LibraryManagerRowRole::SetHeader || libraryManagerRowIsBody(row);
+            }));
+    }
+
     void updateDetail() {
+        updateExportButton();
         const auto previous = detail_row_;
         const auto selected = selectedRows();
         syncing_detail_ = true;
@@ -1674,8 +1726,7 @@ private:
                 juce::dontSendNotification);
             detail_category_.setText(
                 juce::String::fromUTF8("セット  ")
-                    + juce::String(static_cast<int>(row.revision))
-                    + juce::String::fromUTF8(" 件"),
+                    + LibraryManagerTableModel::headerCountText(row),
                 juce::dontSendNotification);
             detail_favorite_.setText({}, juce::dontSendNotification);
             rebuildDetailTagChips();
@@ -2681,58 +2732,16 @@ private:
         }
     }
 
-    [[nodiscard]] std::vector<LibrarySetDragItem> dragItemsForRow(
-        int row_number) const {
-        std::vector<LibraryManagerRow> chosen;
-        const auto selected = selectedRows();
-        const auto* clicked = table_model_.rowAt(row_number);
-        if (clicked == nullptr || !libraryManagerRowIsBody(*clicked)) {
-            return {};
+    juce::var prepareRowDrag(const juce::SparseSet<int>& rows) {
+        drag_items_.clear();
+        if (replace_mode_) return {};
+        for (int i = 0; i < rows.size(); ++i) {
+            const auto* row = table_model_.rowAt(rows[i]);
+            if (row == nullptr || !libraryManagerRowIsBody(*row)) continue;
+            drag_items_.push_back({row->role == LibraryManagerRowRole::Member ? row->set_id : 0,
+                row->kind == LibraryManagerKind::Composite, row->id});
         }
-        const bool clicked_selected = std::any_of(
-            selected.begin(),
-            selected.end(),
-            [&](const LibraryManagerRow& row) {
-                return row.role == clicked->role
-                    && row.set_id == clicked->set_id
-                    && row.kind == clicked->kind
-                    && row.id == clicked->id;
-            });
-        if (clicked_selected) {
-            for (const auto& row : selected) {
-                if (libraryManagerRowIsBody(row)) {
-                    chosen.push_back(row);
-                }
-            }
-        } else {
-            chosen.push_back(*clicked);
-        }
-        std::vector<LibrarySetDragItem> items;
-        for (const auto& row : chosen) {
-            LibrarySetDragItem item;
-            item.source_set_id =
-                row.role == LibraryManagerRowRole::Member ? row.set_id : 0;
-            item.composite = row.kind == LibraryManagerKind::Composite;
-            item.body_id = row.id;
-            items.push_back(item);
-        }
-        return items;
-    }
-
-    [[nodiscard]] bool canDragRow(int row_number) const {
-        return !dragItemsForRow(row_number).empty();
-    }
-
-    void startRowDrag(int row_number) {
-        drag_items_ = dragItemsForRow(row_number);
-        if (drag_items_.empty()) {
-            return;
-        }
-        startDragging(
-            juce::var("mgstc-tone-membership"),
-            &table_,
-            juce::ScaledImage{},
-            false);
+        return drag_items_.empty() ? juce::var{} : juce::var("mgstc-tone-membership");
     }
 
     [[nodiscard]] bool dropInterested(const juce::var& description) const {
@@ -2740,7 +2749,7 @@ private:
             && !drag_items_.empty();
     }
 
-    void completeDrop(int row_number) {
+    void completeDrop(int row_number, bool ctrl_add) {
         const auto items = drag_items_;
         drag_items_.clear();
         if (items.empty() || !tone_members_) {
@@ -2773,9 +2782,7 @@ private:
         if (members == nullptr || !persist_sets_) {
             return;
         }
-        const bool ctrl =
-            juce::ModifierKeys::getCurrentModifiers().isCtrlDown();
-        if (!applyLibrarySetDrop(*members, items, target, ctrl)) {
+        if (!applyLibrarySetDrop(*members, items, target, ctrl_add)) {
             refreshTable(false);
             return;
         }
@@ -2829,7 +2836,20 @@ private:
         refreshTable(false);
     }
 
+    [[nodiscard]] juce::Rectangle<int> rowContextMenuAnchor(const LibraryManagerRow& anchor) {
+        const int row = indexOfDisplayedRow(anchor);
+        if (row < 0) return {};
+        table_.scrollToEnsureRowIsOnscreen(row);
+        const auto cell = table_.getCellPosition(LibraryManagerTableModel::kName, row, true);
+        auto visible = cell.getIntersection(table_.getLocalBounds());
+        if (visible.isEmpty())
+            visible = cell.withX(0).withWidth(table_.getWidth()).getIntersection(table_.getLocalBounds());
+        return visible.isEmpty() ? juce::Rectangle<int>{} : table_.localAreaToGlobal(visible);
+    }
+
     void showRowContextMenu(const LibraryManagerRow& anchor) {
+        const auto target = rowContextMenuAnchor(anchor);
+        if (target.isEmpty()) return;
         juce::PopupMenu menu;
         menu.addItem(1, juce::String::fromUTF8("セットを追加"));
         const bool header =
@@ -2884,7 +2904,8 @@ private:
         const auto selected = selectedRows();
         juce::Component::SafePointer<LibraryManagerListTab> safe(this);
         menu.showMenuAsync(
-            juce::PopupMenu::Options().withTargetComponent(&table_),
+            juce::PopupMenu::Options().withTargetComponent(&table_)
+                .withTargetScreenArea(target),
             [safe, anchor, selected](int result) {
                 if (safe == nullptr || result == 0) {
                     return;
@@ -3001,25 +3022,6 @@ private:
             setWantsKeyboardFocus(true);
         }
 
-        void mouseDown(const juce::MouseEvent& event) override {
-            drag_row_ = rowUnder(event);
-            drag_started_ = false;
-            juce::TableListBox::mouseDown(event);
-        }
-
-        void mouseDrag(const juce::MouseEvent& event) override {
-            if (!drag_started_
-                && event.getDistanceFromDragStart() >= 8
-                && owner_.canDragRow(drag_row_)) {
-                drag_started_ = true;
-                owner_.startRowDrag(drag_row_);
-                return;
-            }
-            if (!drag_started_) {
-                juce::TableListBox::mouseDrag(event);
-            }
-        }
-
         bool keyPressed(const juce::KeyPress& key) override {
             if (key == juce::KeyPress::deleteKey
                 || key == juce::KeyPress::backspaceKey) {
@@ -3052,12 +3054,15 @@ private:
 
         bool isInterestedInDragSource(
             const SourceDetails& details) override {
-            return owner_.dropInterested(details.description);
+            return details.sourceComponent.get() == this
+                && owner_.dropInterested(details.description);
         }
 
         void itemDropped(const SourceDetails& details) override {
-            juce::ignoreUnused(details);
-            owner_.completeDrop(rowUnder(details.localPosition));
+            if (details.sourceComponent.get() != this
+                || !owner_.dropInterested(details.description)) return;
+            owner_.completeDrop(rowUnder(details.localPosition),
+                juce::ModifierKeys::getCurrentModifiers().isCtrlDown());
         }
 
     private:
@@ -3065,15 +3070,7 @@ private:
             return getRowContainingPosition(position.x, position.y);
         }
 
-        [[nodiscard]] int rowUnder(const juce::MouseEvent& event) {
-            const auto position =
-                event.getEventRelativeTo(this).getPosition();
-            return rowUnder(position);
-        }
-
         LibraryManagerListTab& owner_;
-        int drag_row_{-1};
-        bool drag_started_{false};
     };
 
     PreviewCallback preview_;
@@ -3131,6 +3128,7 @@ private:
     juce::TextButton assign_tags_;
     juce::TextButton load_edit_;
     juce::TextButton replace_;
+    juce::TextButton export_button_;
     juce::TextButton close_;
     bool replace_mode_{};
     std::function<void(std::uint64_t)> on_replace_;

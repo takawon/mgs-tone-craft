@@ -2036,20 +2036,6 @@ inline void layoutCompositeLibraryPanel(
             juce::jmax(libraryButtonMinW, extra_row.getWidth() / 2)));
 }
 
-inline void layoutCompositeLayerLibraryPanel(
-    juce::Rectangle<int> panel,
-    juce::Label& title,
-    juce::Label& hint,
-    juce::ToggleButton& favorite_only) {
-    using namespace UiLayout;
-    auto area = panel.reduced(panelPad);
-    title.setBounds(area.removeFromTop(libraryTitleH));
-    area.removeFromTop(sm);
-    hint.setBounds(area.removeFromTop(fieldH * 2));
-    area.removeFromTop(sm);
-    favorite_only.setBounds(area.removeFromTop(fieldH));
-}
-
 // Tab traverses siblings by explicit order, then Y/X. Without this, the right
 // library column interleaves with the left editor by vertical position.
 inline void assignExplicitFocusOrders(
@@ -4231,20 +4217,6 @@ public:
             juce::dontSendNotification);
         composite_library_title_.setFont(UiFonts::heading());
         addAndMakeVisible(composite_library_title_);
-        layer_library_title_.setText(
-            juce::String::fromUTF8("レイヤー用単音色"),
-            juce::dontSendNotification);
-        layer_library_title_.setFont(UiFonts::heading());
-        addAndMakeVisible(layer_library_title_);
-        layer_library_hint_.setText(
-            juce::String::fromUTF8(
-                "チャンネル行の初期設定でライブラリ音色を選びます。"
-                "ここは候補の★絞り込みです。"),
-            juce::dontSendNotification);
-        layer_library_hint_.setFont(UiFonts::body());
-        layer_library_hint_.setJustificationType(
-            juce::Justification::topLeft);
-        addAndMakeVisible(layer_library_hint_);
         name_.setText(
             juce::String::fromUTF8(timbre_.name.c_str()), false);
         name_.onTextChange = [this] {
@@ -4267,32 +4239,14 @@ public:
         };
         addAndMakeVisible(favorite_);
 
-        configureButton(file_menu_, juce::String::fromUTF8("ファイル"),
-            juce::String::fromUTF8("総合音色の読み込み・保存・コピー・MGSC入出力"),
-            [this] {
-                juce::PopupMenu menu;
-                menu.addItem(1, juce::String::fromUTF8("総合音色を開く… (.mgstc)"));
-                menu.addItem(2, juce::String::fromUTF8("総合音色を保存… (.mgstc)"));
-                menu.addSeparator();
-                menu.addItem(3, juce::String::fromUTF8("コピー (Ctrl+C)"));
-                menu.addItem(4, juce::String::fromUTF8("貼り付け (Ctrl+V)"));
-                menu.addSeparator();
-                menu.addItem(5, juce::String::fromUTF8("MGSCソースを開く…"));
-                menu.addItem(6, juce::String::fromUTF8("MGSCソースを書き出す…"));
-                menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&file_menu_),
-                    [safe = juce::Component::SafePointer<CompositeEditorComponent>(this), generation = host_restore_generation_](int result) {
-                        if (safe == nullptr || safe->host_restore_generation_ != generation) return;
-                        switch (result) {
-                        case 1: safe->openCompositeFile(); break;
-                        case 2: safe->saveCompositeFile(); break;
-                        case 3: safe->copyCompositeProgram(); break;
-                        case 4: safe->pasteCompositeProgram(); break;
-                        case 5: safe->openMgsCompositeFile(); break;
-                        case 6: safe->saveMgsCompositeFile(); break;
-                        default: break;
-                        }
-                    });
-            });
+        configureIconButton(mgsc_open_, EditorIcon::Open,
+            juce::String::fromUTF8("MGSCソースを開く"), [this] { openMgsCompositeFile(); });
+        configureIconButton(mgsc_save_, EditorIcon::Save,
+            juce::String::fromUTF8("MGSCソースを書き出す"), [this] { saveMgsCompositeFile(); });
+        configureIconButton(clipboard_paste_, EditorIcon::Paste,
+            juce::String::fromUTF8("貼り付け (Ctrl+V)"), [this] { pasteCompositeProgram(); });
+        configureIconButton(clipboard_copy_, EditorIcon::Copy,
+            juce::String::fromUTF8("コピー (Ctrl+C)"), [this] { copyCompositeProgram(); });
         configureIconButton(
             undo_,
             EditorIcon::Undo,
@@ -4359,16 +4313,6 @@ public:
             refreshCompositeSelector();
         });
         addAndMakeVisible(composite_set_filter_);
-        layer_favorite_only_.setButtonText(
-            juce::String::fromUTF8("レイヤー候補 ★のみ"));
-        layer_favorite_only_.setLookAndFeel(
-            &switch_look_and_feel_);
-        layer_favorite_only_.onClick = [this] {
-            refreshTimbreSelectors();
-            syncControlsFromModel();
-        };
-        addAndMakeVisible(layer_favorite_only_);
-
         new_.setButtonText(juce::String::fromUTF8("新規"));
         new_.onClick = [this] { newCompositeTimbre(); };
         addAndMakeVisible(new_);
@@ -4576,7 +4520,7 @@ public:
         history_cursor_ = 0;
         updateHistoryButtons();
 
-        library_toggle_.setButtonText(juce::String::fromUTF8("ライブラリ"));
+        library_toggle_.setButtonText(juce::String::fromUTF8("保存 / ライブラリ"));
         library_toggle_.setClickingTogglesState(true);
         library_toggle_.onClick = [this] { resized(); repaint(); };
         addAndMakeVisible(library_toggle_);
@@ -4876,7 +4820,6 @@ public:
         stopTimer();
         stopAudition();
         composite_favorite_only_.setLookAndFeel(nullptr);
-        layer_favorite_only_.setLookAndFeel(nullptr);
         for (std::size_t index = 0; index < enabled_.size(); ++index) {
             enabled_[index].setLookAndFeel(nullptr);
             mute_[index].setLookAndFeel(nullptr);
@@ -5449,8 +5392,6 @@ public:
         description_.setFont(UiFonts::body());
         master_volume_label_.setFont(UiFonts::body());
         composite_library_title_.setFont(UiFonts::heading());
-        layer_library_title_.setFont(UiFonts::heading());
-        layer_library_hint_.setFont(UiFonts::body());
         UiFonts::styleBodyField(name_);
         UiFonts::styleBodyField(composite_filter_);
         for (auto& editor : layer_name_) {
@@ -5475,7 +5416,6 @@ public:
         paintPageBackground(graphics, getLocalBounds());
         paintRoundedPanelFrame(graphics, editor_panel_bounds_);
         paintRoundedPanelFrame(graphics, composite_library_bounds_);
-        paintRoundedPanelFrame(graphics, layer_library_bounds_);
     }
 
     void resized() override {
@@ -5527,8 +5467,10 @@ public:
         area.removeFromTop(titleH + descriptionH);
         area.removeFromTop(sm);
         auto file_row = area.removeFromTop(toolbarH);
-        file_menu_.setBounds(file_row.removeFromLeft(compositeSelectorW));
-        file_row.removeFromLeft(controlGap);
+        for (auto* button : {&mgsc_open_, &mgsc_save_, &clipboard_paste_, &clipboard_copy_}) {
+            button->setBounds(file_row.removeFromLeft(iconButton));
+            file_row.removeFromLeft(controlGap);
+        }
         for (auto* button : {&undo_, &redo_}) {
             button->setBounds(file_row.removeFromLeft(iconButton));
             file_row.removeFromLeft(controlGap);
@@ -5550,13 +5492,9 @@ public:
                 &composite_tag_filter_,
                 &tag_manage_, &composite_favorite_only_, &composite_ab_, &composite_sort_,
                 &composite_select_, &load_, &delete_, &rename_, &tags_, &favorite_,
-                &save_, &save_as_, &new_, &duplicate_, &layer_library_title_,
-                &layer_library_hint_, &layer_favorite_only_}) {
+                &save_, &save_as_, &new_, &duplicate_}) {
             c->setVisible(library_open);
         }
-        layer_library_bounds_ =
-            library_column.removeFromBottom(compositeLayerLibraryH);
-        library_column.removeFromBottom(sm);
         composite_library_bounds_ = library_column;
         layoutCompositeLibraryPanel(
             composite_library_bounds_,
@@ -5580,12 +5518,6 @@ public:
                 save_as_,
                 new_,
                 duplicate_});
-        layoutCompositeLayerLibraryPanel(
-            layer_library_bounds_,
-            layer_library_title_,
-            layer_library_hint_,
-            layer_favorite_only_);
-
         library_toggle_.setBounds(file_row.removeFromRight(compositeSelectorW));
         file_row.removeFromRight(sm);
         file_row.removeFromLeft(sm);
@@ -5709,8 +5641,7 @@ private:
                  &save_,
                  &save_as_,
                  &new_,
-                 &duplicate_,
-                 &layer_favorite_only_}) {
+                 &duplicate_}) {
             component->setExplicitFocusOrder(library_order++);
         }
         int editor_order = 200;
@@ -5724,10 +5655,13 @@ private:
             component->setExplicitFocusOrder(editor_order++);
         }
         performance_keyboard_.setExplicitFocusOrder(400);
-        file_menu_.setExplicitFocusOrder(70);
-        undo_.setExplicitFocusOrder(71);
-        redo_.setExplicitFocusOrder(72);
-        import_wave_.setExplicitFocusOrder(73);
+        mgsc_open_.setExplicitFocusOrder(70);
+        mgsc_save_.setExplicitFocusOrder(71);
+        clipboard_paste_.setExplicitFocusOrder(72);
+        clipboard_copy_.setExplicitFocusOrder(73);
+        undo_.setExplicitFocusOrder(74);
+        redo_.setExplicitFocusOrder(75);
+        import_wave_.setExplicitFocusOrder(76);
         name_.setExplicitFocusOrder(80);
         library_toggle_.setExplicitFocusOrder(90);
         audition_.setExplicitFocusOrder(199);
@@ -7049,17 +6983,9 @@ private:
                     == mgstc::engine::TimbreSource::Scc
                 ? mgstc::engine::TimbreCategory::Scc
                 : mgstc::engine::TimbreCategory::Opll;
-            const auto assigned_id =
-                timbre_.layers[index].base_timbre
-                ? std::optional<std::uint64_t>{
-                      timbre_.layers[index].base_timbre->library_id}
-                : std::nullopt;
             std::vector<const mgstc::engine::TimbreLibraryEntry*> ordered;
             for (const auto& entry : timbre_library_.entries()) {
-                if (entry.category == category
-                    && (!layer_favorite_only_.getToggleState()
-                        || entry.favorite
-                        || (assigned_id && *assigned_id == entry.id))) {
+                if (entry.category == category) {
                     ordered.push_back(&entry);
                 }
             }
@@ -7520,15 +7446,12 @@ private:
         }
         if (!caps.tone_library) {
             greyOutHostControl(composite_library_title_);
-            greyOutHostControl(layer_library_title_);
-            greyOutHostControl(layer_library_hint_);
             greyOutHostControl(composite_filter_);
             greyOutHostControl(composite_set_filter_);
             greyOutHostControl(composite_tag_filter_);
             greyOutHostControl(tag_manage_);
             greyOutHostControl(composite_favorite_only_);
             greyOutHostControl(composite_sort_);
-            greyOutHostControl(layer_favorite_only_);
             greyOutHostControl(composite_select_);
             greyOutHostControl(new_);
             greyOutHostControl(load_);
@@ -8019,8 +7942,6 @@ private:
     juce::Label title_;
     juce::Label description_;
     juce::Label composite_library_title_;
-    juce::Label layer_library_title_;
-    juce::Label layer_library_hint_;
     juce::Label name_label_;
     juce::TextEditor name_;
     juce::TextButton tags_;
@@ -8032,7 +7953,6 @@ private:
     juce::TextButton composite_tag_filter_;
     juce::ToggleButton composite_favorite_only_;
     juce::ComboBox composite_sort_;
-    juce::ToggleButton layer_favorite_only_;
     juce::ComboBox composite_select_;
     juce::TextButton new_;
     juce::TextButton load_;
@@ -8069,7 +7989,6 @@ private:
     CompositeTimeline timeline_;
     juce::Rectangle<int> editor_panel_bounds_;
     juce::Rectangle<int> composite_library_bounds_;
-    juce::Rectangle<int> layer_library_bounds_;
     juce::TextButton open_scc_;
     juce::TextButton open_opll_;
     juce::TextButton spectrogram_;
@@ -8081,7 +8000,10 @@ private:
     SoundOutputSwitch output_switch_;
     juce::Slider master_volume_;
     juce::Label master_volume_label_;
-    juce::TextButton file_menu_;
+    juce::DrawableButton mgsc_open_{"MGSC open", juce::DrawableButton::ImageOnButtonBackground};
+    juce::DrawableButton mgsc_save_{"MGSC save", juce::DrawableButton::ImageOnButtonBackground};
+    juce::DrawableButton clipboard_paste_{"paste", juce::DrawableButton::ImageOnButtonBackground};
+    juce::DrawableButton clipboard_copy_{"copy", juce::DrawableButton::ImageOnButtonBackground};
     juce::DrawableButton undo_{
         "undo", juce::DrawableButton::ImageOnButtonBackground};
     juce::DrawableButton redo_{

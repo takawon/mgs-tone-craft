@@ -3417,22 +3417,10 @@ public:
     using RateEditCallback = std::function<void()>;
     using DuplicateCallback = std::function<void()>;
     using RemoveCallback = std::function<void()>;
-    using AuditionCallback = std::function<void()>;
 
     CompositeLayerSetupView() {
         source_.setFont(UiFonts::heading());
         addAndMakeVisible(source_);
-        mute_.setButtonText(juce::String::fromUTF8("ミュート"));
-        solo_.setButtonText(juce::String::fromUTF8("ソロ"));
-        for (auto* toggle : {&mute_, &solo_}) {
-            toggle->setLookAndFeel(&switch_look_and_feel_);
-            toggle->onClick = [this] {
-                if (changed_) {
-                    changed_(true);
-                }
-            };
-            addAndMakeVisible(*toggle);
-        }
         UiFonts::styleBodyField(name_);
         name_.onTextChange = [this] {
             if (changed_) {
@@ -3519,13 +3507,6 @@ public:
             }
         };
         addAndMakeVisible(timbre_settings_);
-        preview_.setButtonText(juce::String::fromUTF8("試聴（1秒）"));
-        preview_.setTooltip(juce::String::fromUTF8(
-            "現在の初期設定を含む総合音色を1秒試聴します"));
-        preview_.onClick = [this] {
-            if (audition_callback_) audition_callback_();
-        };
-        addAndMakeVisible(preview_);
         channel_.onChange = [this] {
             if (changed_) {
                 changed_(true);
@@ -3763,7 +3744,7 @@ public:
     }
 
     ~CompositeLayerSetupView() override {
-        for (auto* toggle : {&mute_, &solo_, &rate_kind_, &h_}) {
+        for (auto* toggle : {&rate_kind_, &h_}) {
             toggle->setLookAndFeel(nullptr);
         }
     }
@@ -3789,8 +3770,7 @@ public:
         LfoCallback lfo,
         RateEditCallback rate_edit,
         DuplicateCallback duplicate,
-        RemoveCallback remove,
-        AuditionCallback audition) {
+        RemoveCallback remove) {
         changed_ = std::move(changed);
         edit_callback_ = std::move(edit);
         pick_ = std::move(pick);
@@ -3798,7 +3778,6 @@ public:
         rate_edit_callback_ = std::move(rate_edit);
         duplicate_callback_ = std::move(duplicate);
         remove_callback_ = std::move(remove);
-        audition_callback_ = std::move(audition);
     }
 
     void setDuplicateEnabled(bool enabled) {
@@ -3828,8 +3807,6 @@ public:
                 : layer.source == mgstc::engine::TimbreSource::Scc
                     ? juce::Colour(0xFF53E3A6)
                     : juce::Colour(0xFFFFA75E));
-        mute_.setToggleState(layer.muted || !layer.enabled, juce::dontSendNotification);
-        solo_.setToggleState(layer.solo, juce::dontSendNotification);
         name_.setText(juce::String::fromUTF8(layer.name.c_str()), false);
         envelope_number_.setValue(
             layer.envelope_number, juce::dontSendNotification);
@@ -4003,9 +3980,6 @@ public:
     }
 
     void applyToLayer(mgstc::engine::CompositeLayer& layer) const {
-        layer.enabled = true;
-        layer.muted = mute_.getToggleState();
-        layer.solo = solo_.getToggleState();
         layer.name = name_.getText().toStdString();
         layer.envelope_number = static_cast<std::uint8_t>(
             juce::jlimit(0, 31, juce::roundToInt(envelope_number_.getValue())));
@@ -4112,11 +4086,6 @@ public:
         auto title = row();
         source_.setBounds(title.removeFromLeft(setupSourceLabelW));
         channel_.setBounds(title);
-        auto switches = row();
-        for (auto* toggle : {&mute_, &solo_}) {
-            toggle->setBounds(switches.removeFromLeft(switchControlWidth(toggle->getButtonText(), fieldH)));
-            switches.removeFromLeft(controlGap);
-        }
         name_.setBounds(row());
         section(section_bounds_[0]);
         auto identity = row();
@@ -4171,7 +4140,6 @@ public:
             mixer_mode_.setBounds({}); mixer_mode_label_.setBounds({});
             mixer_noise_.setBounds({}); mixer_noise_label_.setBounds({});
         }
-        preview_.setBounds(row());
         auto actions = row();
         duplicate_.setBounds(actions.removeFromLeft((actions.getWidth() - controlGap) / 2));
         actions.removeFromLeft(controlGap);
@@ -4270,19 +4238,15 @@ private:
     RateEditCallback rate_edit_callback_;
     DuplicateCallback duplicate_callback_;
     RemoveCallback remove_callback_;
-    AuditionCallback audition_callback_;
     bool assigning_{};
     bool scc_number_edited_{};
     SwitchLookAndFeel switch_look_and_feel_;
     juce::Label source_;
-    juce::ToggleButton mute_;
-    juce::ToggleButton solo_;
     juce::TextEditor name_;
     juce::Slider envelope_number_;
     juce::ToggleButton rate_kind_;
     juce::TextButton rate_edit_;
     juce::TextButton timbre_settings_;
-    juce::TextButton preview_;
     juce::ComboBox channel_;
     juce::TextButton duplicate_;
     juce::TextButton remove_;
@@ -4392,8 +4356,9 @@ private:
             const int index = offset + i;
             auto row = std::make_unique<CommandButton>(commands[i] + "   ...");
             row->setTooltip(commands[i] + juce::String::fromUTF8("：クリックで移動／削除"));
-            row->onClick = [safe = juce::Component::SafePointer<CountCommandStackView>(this), index] {
-                if (safe) safe->showCommandMenu(index);
+            row->onClick = [safe = juce::Component::SafePointer<CountCommandStackView>(this), index,
+                anchor = juce::Component::SafePointer<juce::Component>(row.get())] {
+                if (safe && anchor) safe->showCommandMenu(index, *anchor);
             };
             addAndMakeVisible(*row); rows_.push_back(std::move(row));
         }
@@ -4424,7 +4389,7 @@ private:
         auto* child = getComponentAt(e.getPosition());
         if (auto* button = dynamic_cast<juce::Button*>(child)) button->triggerClick();
     }
-    void showCommandMenu(int index) {
+    void showCommandMenu(int index, juce::Component& anchor) {
         const bool after = index >= static_cast<int>(before_.size());
         juce::PopupMenu menu;
         menu.addItem(1, juce::String::fromUTF8("削除"));
@@ -4434,7 +4399,7 @@ private:
         // Reject a stale popup after switching count/channel or changing the list.
         const auto before = before_, after_commands = after_;
         const int count = count_;
-        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(anchor),
             [safe = juce::Component::SafePointer<CountCommandStackView>(this),
                 index, count, before, after_commands, generation = action_generation_](int result) {
                 if (!safe || safe->action_generation_ != generation
@@ -4883,7 +4848,7 @@ public:
             const int i = point.y / overviewRowHeight();
             if (i >= 0 && i < static_cast<int>(timbre_.layers.size())) selectOverviewLayer(i);
         };
-        setup_tab_.setButtonText(juce::String::fromUTF8("初期設定"));
+        setup_tab_.setButtonText(juce::String::fromUTF8("初期設定 / 編集"));
         count_tab_.setButtonText(juce::String::fromUTF8("カウント編集"));
         focus_.setButtonText(juce::String::fromUTF8("編集に集中"));
         for (auto* button : {&setup_tab_, &count_tab_, &focus_}) {
@@ -5036,6 +5001,39 @@ public:
             UiScale::setActivePercent(percent);
             setSize(UiScale::sx(1528), UiScale::sx(750));
             refreshUiScaleFonts();
+            check(setup_tab_.getButtonText() == juce::String::fromUTF8("初期設定 / 編集"),
+                "setup tab label does not describe initial editing");
+            for (const auto& template_layer : model.layers) {
+                CompositeLayerSetupView compact_setup;
+                compact_setup.setSize(UiLayout::compositeSetupColumnW,
+                    UiLayout::panelPad * 2 + (UiLayout::fieldH + UiLayout::sm) * 16
+                        + (UiLayout::libraryTitleH + UiLayout::sm) * 3);
+                juce::TextEditor* setup_name = nullptr;
+                for (auto* child : compact_setup.getChildren()) {
+                    if (auto* name = dynamic_cast<juce::TextEditor*>(child)) setup_name = name;
+                    if (const auto* button = dynamic_cast<const juce::Button*>(child))
+                        check(button->getButtonText() != juce::String::fromUTF8("ミュート")
+                            && button->getButtonText() != juce::String::fromUTF8("ソロ")
+                            && button->getButtonText() != juce::String::fromUTF8("試聴（1秒）"),
+                            "removed setup control remains in the component tree");
+                }
+                check(setup_name != nullptr, "setup name editor is missing");
+                if (setup_name == nullptr) continue;
+                check(setup_name->getY() == UiLayout::panelPad + UiLayout::fieldH + UiLayout::sm,
+                    "removed setup switch row left an empty gap");
+                for (const bool enabled : {false, true})
+                    for (const bool muted : {false, true})
+                        for (const bool solo : {false, true}) {
+                            auto layer = template_layer;
+                            layer.enabled = enabled; layer.muted = muted; layer.solo = solo;
+                            compact_setup.syncFromLayer(layer);
+                            setup_name->setText("Edited setup name", false);
+                            compact_setup.applyToLayer(layer);
+                            check(layer.enabled == enabled && layer.muted == muted && layer.solo == solo
+                                && layer.name == "Edited setup name",
+                                "setup name edit changed enabled/mute/solo state");
+                        }
+            }
             const auto before = timbre_;
             const auto caption_bounds = editHeaderCaptionBounds();
             check(!caption_bounds.intersects(morph_bank_label_.getBounds())
@@ -6561,7 +6559,7 @@ public:
         inspector_content_.setSize(juce::jmax(1, side.getWidth() - kScrollBarSize),
             count_inspector_ ? UiLayout::compositeInspectorContentH
                 + (UiLayout::fieldH + UiLayout::sm) * 5
-                : panelPad * 2 + (fieldH + sm) * 18 + (libraryTitleH + sm) * 3);
+                : panelPad * 2 + (fieldH + sm) * 16 + (libraryTitleH + sm) * 3);
         overview_view_.setVisible(!focus_.getToggleState());
         overview_view_.setBounds(overviewArea());
         layoutOverview();
@@ -10666,7 +10664,9 @@ private:
             menu.addSubMenu(commands[i].text, sub);
         }
         const auto original = timbre_;
-        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
+        const auto screen_point = localPointToGlobal(point);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this)
+                .withTargetScreenArea({screen_point.x, screen_point.y, 1, 1}),
             [safe = juce::Component::SafePointer<Impl>(this), original, commands, layer_index](int result) {
                 if (safe == nullptr || result == 0 || safe->timbre_ != original) return;
                 if (result == 1 || result == 2) {
@@ -13429,9 +13429,6 @@ private:
                                 safe->requestRemoveLayer(layer_index);
                             }
                         });
-                },
-                [this] {
-                    if (base_audition_) base_audition_();
                 });
             setup->syncFromLayer(timbre_.layers[layer_index]);
         }
