@@ -18,9 +18,14 @@ function Get-MgstcGitHubTextHash([string]$Text) {
 }
 
 function Get-MgstcGitHubAssetDigest($Assets) {
-    $lines = @($Assets | Sort-Object name | ForEach-Object {
-        ([string]$_.name).ToLowerInvariant() + "`t" + ([long]$_.size).ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" + ([string]$_.sha256).ToLowerInvariant()
-    })
+    # Match Prepare's canonical order exactly. Sort-Object uses the current
+    # culture, which can reorder these names differently on the Stage host.
+    $sorted = New-Object 'System.Collections.Generic.SortedDictionary[string,string]' ([StringComparer]::Ordinal)
+    foreach ($asset in $Assets) {
+        $key = ([string]$asset.name).ToLowerInvariant()
+        $sorted.Add($key, $key + "`t" + ([long]$asset.size).ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" + ([string]$asset.sha256).ToLowerInvariant())
+    }
+    $lines = @($sorted.Values)
     return Get-MgstcGitHubTextHash ($lines -join "`n")
 }
 
@@ -51,7 +56,13 @@ function Invoke-MgstcGitHubRequest {
     try {
         $response = Invoke-WebRequest @parameters
         if ($DownloadPath) { return }
-        if ($response.Content) { return $response.Content | ConvertFrom-Json }
+        if ($response.Content) {
+            # Materialize JSON before returning. In Windows PowerShell 5.1,
+            # returning the conversion pipeline can wrap a JSON array as one
+            # Object[] item, breaking callers' batch counts and filters.
+            $parsed = $response.Content | ConvertFrom-Json
+            return $parsed
+        }
         return $null
     } catch {
         $status = 0

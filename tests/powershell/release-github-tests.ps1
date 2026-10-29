@@ -4,6 +4,7 @@
 param([string]$WorkDirectory='')
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot '../../tools/release-github.ps1')
+. (Join-Path $PSScriptRoot '../../tools/release-common.ps1')
 $testRoot=if($WorkDirectory){[IO.Path]::GetFullPath($WorkDirectory)}else{Join-Path ([IO.Path]::GetTempPath()) ('mgstc-release-github-tests-'+[Guid]::NewGuid().ToString('N'))}
 if(Test-Path -LiteralPath $testRoot){throw 'Test output directory must be new.'}
 New-Item -ItemType Directory -Path $testRoot | Out-Null
@@ -88,6 +89,83 @@ function Invoke-TestPublish($Fixture,[switch]$Execute,[switch]$GitHubActions,[sc
 $savedEnvironment=@{}
 foreach($key in @('GITHUB_ACTIONS','GITHUB_EVENT_NAME','GITHUB_REPOSITORY','GITHUB_RUN_ID','GITHUB_EVENT_PATH')){$savedEnvironment[$key]=[Environment]::GetEnvironmentVariable($key)}
 try{
+    # Regression for Prepare/Stage ordering drift. Use the actual v0.365
+    # release inventory and both production digest functions, not mocks.
+    $v365Assets=@(
+        [pscustomobject]@{name='MGSToneCraft-0.365-win64-setup.exe';size=76368206L;sha256='ab552e6949153fcc7ca77e0d0f428288ad4e34eddedbe33d50f76fd6002f1f3c'},
+        [pscustomobject]@{name='MGSToneCraft-0.365-win64.zip';size=99341085L;sha256='7c7ba33bcf97eebb18024d8e2b786aa9625b5e082a1ddb05990ee71271f6e53c'},
+        [pscustomobject]@{name='SHA256SUMS.txt';size=196L;sha256='6d36e42490487f22c560ecbaab615ea4e58fa27b890110f213c63959d42922ff'}
+    )
+    $originalCulture=[Globalization.CultureInfo]::CurrentCulture
+    $originalUiCulture=[Globalization.CultureInfo]::CurrentUICulture
+    try {
+        foreach($cultureName in @('ja-JP','en-US','')) {
+            $culture=if($cultureName){[Globalization.CultureInfo]::GetCultureInfo($cultureName)}else{[Globalization.CultureInfo]::InvariantCulture}
+            [Globalization.CultureInfo]::CurrentCulture=$culture
+            [Globalization.CultureInfo]::CurrentUICulture=$culture
+            $expected=Get-MgstcReleaseAssetDigest $v365Assets
+            Assert-Test ($expected -ceq 'e711a94cb6f270c98d0b2e92a5092de911c29ef7bd52c5703dba6a8c72481353') "v0.365 Prepare digest sample changed under culture '$cultureName'."
+            Assert-Test ((Get-MgstcGitHubAssetDigest $v365Assets) -ceq $expected) "Prepare and Stage asset digests differ under culture '$cultureName'."
+            Assert-Test ((Get-MgstcGitHubAssetDigest @($v365Assets[2],$v365Assets[0],$v365Assets[1])) -ceq $expected) "Stage asset digest depends on input order under culture '$cultureName'."
+            $caseVariant=@($v365Assets | ForEach-Object {[pscustomobject]@{name=$_.name.ToUpperInvariant();size=$_.size;sha256=$_.sha256.ToUpperInvariant()}})
+            Assert-Test ((Get-MgstcReleaseAssetDigest $caseVariant) -ceq $expected -and (Get-MgstcGitHubAssetDigest $caseVariant) -ceq $expected) "Prepare/Stage asset digest differs for case variants under culture '$cultureName'."
+        }
+    } finally {
+        [Globalization.CultureInfo]::CurrentCulture=$originalCulture
+        [Globalization.CultureInfo]::CurrentUICulture=$originalUiCulture
+    }
+
+    # Exercise the production request -> release-list path while the web cmdlet
+    # is isolated. This catches Windows PowerShell 5.1 JSON-array wrapping that
+    # a Transport scriptblock bypasses entirely.
+    $savedGhToken=[Environment]::GetEnvironmentVariable('GH_TOKEN')
+    $savedGithubToken=[Environment]::GetEnvironmentVariable('GITHUB_TOKEN')
+    $savedInvokeWebRequest=Get-Item Function:\Invoke-WebRequest -ErrorAction SilentlyContinue
+    $script:webRequestCalls=0
+    try {
+        $env:GH_TOKEN='unit-test-token-never-used-for-network'
+        $env:GITHUB_TOKEN=''
+        function Invoke-WebRequest {
+            param($Uri,$Method,$Headers,$UseBasicParsing,$ErrorAction,$TimeoutSec)
+            $script:webRequestCalls++
+            if($Headers.Authorization -cne 'Bearer unit-test-token-never-used-for-network'){throw 'Test request did not use the isolated token.'}
+            if($Uri -match '/releases\?per_page=100&page=1$'){
+                $content='[{"tag_name":"v1.1","draft":false,"published_at":"2026-01-02T00:00:00Z"},{"tag_name":"v1.0","draft":true,"published_at":"2026-01-01T00:00:00Z"}]'
+            } elseif($Uri -match '/releases\?per_page=100&page=2$') {
+                $content='[]'
+            } elseif($Uri -match '/fixture/array$') {
+                $content='[{"id":1},{"id":2}]'
+            } elseif($Uri -match '/fixture/object$') {
+                $content='{"id":3}'
+            } elseif($Uri -match '/fixture/one-item-array$') {
+                $content='[{"id":4}]'
+            } elseif($Uri -match '/fixture/empty$') {
+                $content='[]'
+            } else { throw "Unexpected isolated web request: $Method $Uri" }
+            return [pscustomobject]@{Content=$content}
+        }
+
+        $apiArray=@(Invoke-MgstcGitHubRequest -Path '/repos/test/repo/fixture/array')
+        Assert-Test ($apiArray.Count -eq 2 -and $apiArray[0].id -eq 1 -and $apiArray[1].id -eq 2) 'InvokeRequest did not enumerate a JSON array as its elements.'
+        $apiObject=@(Invoke-MgstcGitHubRequest -Path '/repos/test/repo/fixture/object')
+        Assert-Test ($apiObject.Count -eq 1 -and $apiObject[0].id -eq 3) 'InvokeRequest changed a JSON object response shape.'
+        $apiOneItemArray=@(Invoke-MgstcGitHubRequest -Path '/repos/test/repo/fixture/one-item-array')
+        Assert-Test ($apiOneItemArray.Count -eq 1 -and $apiOneItemArray[0] -is [pscustomobject] -and $apiOneItemArray[0].id -eq 4) 'InvokeRequest wrapped a one-item JSON array instead of emitting its object element.'
+        $apiEmpty=@(Invoke-MgstcGitHubRequest -Path '/repos/test/repo/fixture/empty')
+        Assert-Test ($apiEmpty.Count -eq 0) 'InvokeRequest did not preserve an empty JSON array.'
+
+        $apiReleases=@(Get-MgstcGitHubReleases 'test/repo')
+        Assert-Test ($apiReleases.Count -eq 2 -and $apiReleases[0].tag_name -ceq 'v1.1' -and $apiReleases[1].draft -eq $true) 'GetReleases did not preserve both releases across JSON pagination.'
+        $published=@($apiReleases | Where-Object { -not $_.draft })
+        Assert-Test ($published.Count -eq 1 -and $published[0].tag_name -ceq 'v1.1') 'Published release filtering treated a wrapped JSON array as one item.'
+        Assert-Test ($script:webRequestCalls -eq 5) "Unexpected number of isolated web requests: $script:webRequestCalls."
+    } finally {
+        Remove-Item Function:\Invoke-WebRequest -ErrorAction SilentlyContinue
+        if($null -ne $savedInvokeWebRequest){Set-Item Function:\Invoke-WebRequest $savedInvokeWebRequest.ScriptBlock}
+        [Environment]::SetEnvironmentVariable('GH_TOKEN',$savedGhToken)
+        [Environment]::SetEnvironmentVariable('GITHUB_TOKEN',$savedGithubToken)
+    }
+
     $fixture=New-TestCandidate 'read-only'
     $result=Invoke-TestStage $fixture
     Assert-Test ($result.status -eq 'StageValidatedNoWrites' -and $fixture.state.writes.Count -eq 0) 'Stage default performed a write.'
