@@ -2911,6 +2911,18 @@ private:
             content->getWidth(), content->getHeight() + 32);
 
         if (capture_file != nullptr) {
+            // Give fixed-width device controls enough room in documentation.
+            // The ordinary settings dialog keeps its existing dimensions.
+            content->setSize(UiScale::sx(640), content->getHeight());
+            // Public documentation captures must not disclose the installed
+            // device list. These widgets have no commit callbacks attached yet.
+            content->midi_input_.clear(juce::dontSendNotification);
+            content->midi_input_.addItem(
+                juce::String::fromUTF8("MIDI入力なし"), 1);
+            content->midi_input_.setSelectedId(1, juce::dontSendNotification);
+            content->asio_driver_.clear(juce::dontSendNotification);
+            content->asio_driver_.addItem("ASIO driver (example)", 1);
+            content->asio_driver_.setSelectedId(1, juce::dontSendNotification);
             const auto result =
                 writeComponentPngSnapshot(*content, *capture_file);
             delete dialog;
@@ -3496,7 +3508,8 @@ public:
         ImportEditCallback import_edit = {},
         ImportNoteOnCallback import_note_on = {},
         PolyphonicQuery editor_polyphonic = {},
-        std::function<void(const engine::CompositeTimbre&)> patchslide_apply = {})
+        std::function<void(const engine::CompositeTimbre&)> patchslide_apply = {},
+        std::filesystem::path capture_db_directory = {})
         : timbres_(std::move(timbres)),
           composites_(std::move(composites)),
           apply_tag_(std::move(apply_tag)),
@@ -3553,7 +3566,8 @@ public:
                 [this] {
                     performance_keyboard_.allNotesOff();
                     if (all_notes_off_) all_notes_off_();
-                }}, session.backgroundTasks(), session.patchSlideStock());
+                }}, session.backgroundTasks(), session.patchSlideStock(),
+            std::move(capture_db_directory));
         tabs_.addTab(juce::String::fromUTF8("パッチスライド"),
             juce::Colour(UiLayout::panelFill), patchslide_tab_.get(), false);
 
@@ -3694,6 +3708,42 @@ public:
             juce::jlimit(0, tabs_.getNumTabs() - 1, index),
             juce::dontSendNotification);
         resized();
+    }
+
+    void prepareCaptureData() {
+        if (mgstcDiagnosticDataDirectory() == juce::File{}) return;
+        // Self-authored, in-memory examples only: do not save capture fixtures.
+        capture_data_prepared_ = true;
+        timbres_ = {};
+        composites_ = {};
+        const auto now = currentUnixTime();
+        engine::TimbreLibraryEntry triangle;
+        triangle.category = engine::TimbreCategory::Scc;
+        triangle.name = "Demo Triangle";
+        triangle.tags = {"Demo"};
+        triangle.memo = "Screenshot example";
+        const auto waveform = engine::generateSccPreset(
+            engine::SccWavePreset::Triangle, engine::SccHarmonic::One);
+        for (std::size_t i = 0; i < waveform.size(); ++i)
+            triangle.scc_waveform[i] = static_cast<std::uint8_t>(waveform[i]);
+        const auto triangle_id = timbres_.add(std::move(triangle), now);
+        engine::TimbreLibraryEntry square;
+        square.category = engine::TimbreCategory::Scc;
+        square.name = "Demo Square";
+        square.tags = {"Demo"};
+        for (std::size_t i = 0; i < square.scc_waveform.size(); ++i)
+            square.scc_waveform[i] = static_cast<std::uint8_t>(i < 16 ? 127 : -128);
+        const auto square_id = timbres_.add(std::move(square), now);
+        tone_sets_ = {{1, "Demo Set", "Screenshot example", now, now, 1}};
+        tone_members_ = {{1, triangle_id, 0, 0}};
+        if (list_tab_) list_tab_->reloadFromParent();
+        refreshTagManagementFromLibraries();
+        if (export_tab_) {
+            export_tab_->addRequest({false,
+                static_cast<std::uint8_t>(LibraryManagerKind::Scc), triangle_id});
+            export_tab_->addRequest({false,
+                static_cast<std::uint8_t>(LibraryManagerKind::Scc), square_id});
+        }
     }
 
     void setReplaceMode(
@@ -3919,6 +3969,7 @@ private:
     }
 
     bool reloadLibraries() {
+        if (capture_data_prepared_) return true;
         std::string error;
         auto loaded = loadToneLibraries(&error);
         if (!loaded) {
@@ -4038,6 +4089,7 @@ private:
     std::unique_ptr<ToneImportTab> import_tab_;
     std::unique_ptr<ToneExportTab> export_tab_;
     std::uint64_t ui_scale_listener_{};
+    bool capture_data_prepared_{};
 };
 
 class LibraryManagerWindow final : public juce::DocumentWindow {
@@ -4902,6 +4954,17 @@ public:
     }
 
     void prepareVisualInspection() {
+        if (mgstcDiagnosticDataDirectory() != juce::File{} && timbre_.layers.empty()) {
+            timbre_ = mgstc::engine::defaultCompositeTimbre();
+            timbre_.name = "Composite Demo";
+            for (auto& layer : timbre_.layers)
+                mgstc::engine::seedDefaultLayerTimbre(timbre_, layer);
+            composite_program_stale_ = true;
+            syncControlsFromModel();
+            syncTimelineTimbre(true);
+            setEditorBaseline();
+            resetHistoryToCurrent();
+        }
         startAudition();
     }
 
@@ -9304,7 +9367,7 @@ public:
         refreshPresetPreview(false);
         updateStatus(
             juce::String::fromUTF8(
-                "目視検査: 確定（緑）と候補（橙破線）を重ね表示"));
+                "確定（緑）と候補（橙破線）を重ね表示"));
     }
 
     [[nodiscard]] SnapshotResult captureSettingsTab(

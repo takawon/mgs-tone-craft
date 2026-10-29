@@ -270,8 +270,11 @@ int main(int argc, char** argv) {
         ~ScopedStyle() { juce::LookAndFeel::setDefaultLookAndFeel(nullptr); }
     } style;
     try {
+        const auto* test_db_directory = std::getenv("MGSTC_PATCHSLIDE_TEST_DB_DIR");
         mgstc::app::PatchSlideBrowserTestAccess::run(
-            argc > 1 ? std::filesystem::path(argv[1]) : mgstc::engine::PatchSlideDatabase::defaultDirectory(),
+            argc > 1 ? std::filesystem::path(argv[1])
+                : test_db_directory ? std::filesystem::path(test_db_directory)
+                    : mgstc::engine::PatchSlideDatabase::defaultDirectory(),
             argc > 2 ? std::filesystem::path(argv[2])
                 : std::getenv("MGSTC_PATCHSLIDE_SCREENSHOTS")
                     ? std::filesystem::path(std::getenv("MGSTC_PATCHSLIDE_SCREENSHOTS"))

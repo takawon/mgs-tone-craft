@@ -1,7 +1,12 @@
 # サードパーティーライブラリ
 
-本体（MGS Tone Craft）のライセンスはAGPL-3.0-onlyで、全文は`LICENSE`に置く。
-ここでは依存関係の取得方法とライセンスを記録する。
+MGS Tone Craft本体のライセンスはAGPL-3.0-onlyです。全文は`LICENSE`に収録しています。ここでは、使用する第三者のソフトウェア・素材の取得元、ライセンス、同梱条件を説明します。
+
+## Inno Setup標準メッセージ
+
+インストーラーの標準日英メッセージには、[公式Inno Setup 6.7.3配布物](https://github.com/jrsoftware/issrc/releases/tag/is-6_7_3)の`Default.isl`と`Languages/Japanese.isl`を無変更で使用する。`installer/languages/`に固定し、元の著作権・翻訳者表示を保持する。日本語には、Ryou Minakamiの翻訳を基にKoichi Shirasukaが保守する既存の翻訳を使用する。
+
+利用・再配布条件は同梱の`installer/languages/Inno-Setup-LICENSE.txt`を参照する。同ライセンス全文を実行形式にも`licenses/Inno-Setup-LICENSE.txt`として同梱する。MGSTC固有メッセージは`installer/MGSToneCraft.iss`の`[CustomMessages]`で管理する。
 
 ## UIフレームワーク（JUCE）
 
@@ -12,7 +17,7 @@
 | ライセンス | AGPLv3 と商用ライセンスのデュアル。本プロジェクトはAGPLv3側で使用 |
 | 使用モジュール | `juce_gui_extra`、`juce_audio_utils`とその依存モジュール |
 
-- 本体をAGPL-3.0-onlyとすることでJUCEのAGPLv3条件を満たす。商用ライセンスは購入しない。
+- JUCEはAGPLv3の条件に従って使用し、本体をAGPL-3.0-onlyで配布する。商用ライセンスは使用しない。
 - JUCE 8.0.15はスプラッシュ画面を使用しない版であり、`JUCE_DISPLAY_SPLASH_SCREEN`は
   指定しても無視される。表示義務のための追加実装は行わない。
 - Windows Direct2D の `Present1()` Message Thread blocking 対策として、JUCE Forum で
@@ -22,6 +27,10 @@
   上流の JUCE に同等修正が取り込まれたら local patch を削除し、二重適用しない。
 - JUCEモジュールが同梱するzlib、pnglib、jpeglib、HarfBuzzなどの各依存は、
   JUCEソース内の`LICENSE.md`および各ディレクトリのライセンス表示に従う。
+
+### VST3 SDK
+
+製品VST3には、JUCEに同梱されたSteinberg VST3 SDKを使用する。SDKの`juce_audio_processors_headless/format_types/VST3_SDK/LICENSE.txt`には、Steinberg Media Technologies GmbHの2025年MITライセンスが記載されている。セットアップと手動ZIPの両方に、同じ本文を`licenses/Steinberg-VST3-SDK-LICENSE.txt`として収録する。VST3フォルダーを手動で配置するときも、配布物のライセンス文書を保持する。
 
 ### ASIO SDK
 
@@ -108,4 +117,4 @@ MGSDRV/MGSC互換の挙動は、入出力および実機相当の動作観察か
 ものである。
 
 openMSX等の外部実装は、MAmidiMEmo RPCのワイヤ事実確認に限り参照し得るが、
-コード・クラス構成・スレッド処理の移植は行わない（仕様§4.6）。
+コード・クラス構成・スレッド処理の移植は行わない。

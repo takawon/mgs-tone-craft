@@ -543,6 +543,21 @@ try {
         $sourceBefore.modificationDigest -ne $sourceAfter.modificationDigest) {
         throw "Sources changed during validation. Rebuild and rerun affected tests before claiming PASS."
     }
+    # Bind packaging to the exact products produced by this validated build.
+    if ($Configuration -eq 'Release' -and $Target.Count -eq 0) {
+        $productArtifacts = [ordered]@{}
+        $artifactPaths = @('mgstc.exe')
+        $bundleRelative = 'mgstc_vst3_artefacts/Release/VST3/MGS Tone Craft.vst3'
+        $bundlePath = Join-Path $resolvedBuildDirectory $bundleRelative
+        if (-not (Test-Path -LiteralPath $bundlePath -PathType Container)) { throw 'Product VST3 bundle is missing after the full Release build.' }
+        $artifactPaths += @(Get-ChildItem -LiteralPath $bundlePath -Recurse -File | ForEach-Object {
+            $_.FullName.Substring($resolvedBuildDirectory.Length + 1).Replace('\', '/')
+        })
+        foreach ($artifact in $artifactPaths) {
+            $productArtifacts[$artifact] = (Get-FileHash -LiteralPath (Join-Path $resolvedBuildDirectory $artifact) -Algorithm SHA256).Hash
+        }
+        $validation['productArtifacts'] = $productArtifacts
+    }
     $validationPassed = $true
     Write-Host "Validation sources unchanged. Evidence: $validationPath"
 } finally {

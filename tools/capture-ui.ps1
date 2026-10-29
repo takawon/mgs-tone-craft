@@ -8,12 +8,15 @@ param(
         "settings-midi",
         "settings-output",
         "library",
+        "library-patchslide",
         "library-tags",
         "library-import",
+        "library-export",
         "spectrogram",
         "spectrum")]
     [string]$Target = "editor",
-    [string]$OutputPath = ""
+    [string]$OutputPath = "",
+    [string]$PatchSlideDirectory = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,8 +33,10 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
         "settings-midi" { "settings-midi" }
         "settings-output" { "settings-output" }
         "library" { "library-manager" }
+        "library-patchslide" { "library-patchslide" }
         "library-tags" { "library-tags" }
         "library-import" { "library-import" }
+        "library-export" { "library-export" }
         "spectrogram" { "spectrogram-playing" }
         "spectrum" { "spectrum" }
         default { "$Editor-editor" }
@@ -53,6 +58,16 @@ $arguments = @(
     "--capture-target=$Target"
     '"--capture-ui={0}"' -f $absoluteOutput
 )
+if (-not [string]::IsNullOrWhiteSpace($PatchSlideDirectory)) {
+    if (-not [IO.Path]::IsPathRooted($PatchSlideDirectory)) {
+        $PatchSlideDirectory = Join-Path $projectRoot $PatchSlideDirectory
+    }
+    $absolutePatchSlideDirectory = [IO.Path]::GetFullPath($PatchSlideDirectory)
+    if (-not (Test-Path -LiteralPath $absolutePatchSlideDirectory -PathType Container)) {
+        throw "PatchSlide capture directory was not found: $absolutePatchSlideDirectory"
+    }
+    $arguments += '"--capture-db-directory={0}"' -f $absolutePatchSlideDirectory
+}
 $process = Start-Process `
     -FilePath $executable `
     -ArgumentList $arguments `

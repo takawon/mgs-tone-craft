@@ -42,8 +42,10 @@ public:
 
     explicit PatchSlideBrowserComponent(
         Callbacks callbacks, BackgroundTaskBoundary* background_tasks = nullptr,
-        std::shared_ptr<PatchSlideStock> stock = {})
-        : PatchSlideBrowserComponent(std::move(callbacks), background_tasks, {}, std::move(stock)) {}
+        std::shared_ptr<PatchSlideStock> stock = {},
+        std::filesystem::path capture_directory = {})
+        : PatchSlideBrowserComponent(std::move(callbacks), background_tasks,
+                                    std::move(capture_directory), std::move(stock)) {}
 
     [[nodiscard]] static int minimumContentWidth() { return UiScale::sx(1100); }
 

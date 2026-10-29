@@ -1,43 +1,33 @@
 # ソフトウェアエンベロープ互換実装ガイド
 
-実装者・エージェント向け。**MGSDRV 3.20 / MGSC 1.11 互換**の `@e`（シーケンス型）・`@r`（レート型）試聴・出力を、一箇所に集約して誤実装を防ぐための索引である。
+`@e`（シーケンス型）と `@r`（レート型）の試聴・出力に関する、**MGSDRV 3.20／MGSC 1.11 互換**の技術ガイドです。音量がいつ変わるか、命令がどの順序で実行されるかを確認できます。
 
-利用者向けの振る舞い・受け入れ条件の正本は `SPECIFICATION.md` §6。
+**重要**：見た目が同じエンベロープでも、命令の順序や整数計算によって実際の音量変化は異なります。互換性を変更する場合は、命令列と回帰テストの両方で確認してください。
 
-**重要**: `@e` まわりは複雑である。会話ログや UI 都合で挙動を言い換えず、必ず参照実装・マニフェスト・VGM ゴールデンと照合する。
+## 1. このガイドの読み方
 
-## 1. 正本の順序（上から下へ）
+このガイドは、MGSDRV 3.20／MGSC 1.11 との互換性を確認したい利用者と開発者向けです。`@e` の命令順序、時間の進み方、音量変化を説明し、後半で総合音色エディタからの出力規則をまとめます。音色編集の操作は[操作ガイド](USER_GUIDE.md)を参照してください。
 
-| 順 | 文書／コード | 役割 |
-|---|---|---|
-| 1 | `SPECIFICATION.md` §6 | 利用者向け要件（§6.2.1＝互換実行モデル、§6.2.3＝エディタ製品ルール） |
-| 2 | 本書 | 実装索引・変更チェックリスト・ケース ID |
-| 3 | `tools/mgs_envelope_reference.py` | 論理イベントまでの参照実装（`EnvelopeState.tick`） |
-| 4 | `src/engine/envelope_sequence.cpp` | 本番 `@e` ランタイム（`SequenceEnvelopeRuntime`） |
-| 5 | `src/engine/envelope_rate.cpp` | 本番 `@r` ランタイム |
-| 6 | `src/engine/track_runtime.cpp` / `runtime_session.cpp` | トラック合成・キーオン・音量合成・レジスタ映射 |
-| 7 | `tests/fixtures/envelope_compat_manifest.json` | 共有回帰ケース ID（バイト列と期待値） |
-| 8 | `tests/test_envelope_compat_manifest.py` | マニフェスト ↔ 参照実装の一致 |
-| 9 | `tests/test_mgs_envelope_reference.py` | 参照実装の詳細単体テスト |
-| 10 | `tests/cpp/engine_tests.cpp` | C++ ランタイム（マニフェストと同じケース ID を維持） |
-| 11 | `tests/fixtures/mgsdrv_selftest/` | VGM ゴールデン（境界・レート・自動化など） |
+実装を確認する場合は、次のソースを参照できます。
 
-**ルール**: 互換挙動を変えるときは、上表の **3→4→5→7→8→9→10** を同一変更内で更新する。§6 だけ、または UI だけを直して終わらせない。
+| ソース | 担当する処理 |
+|---|---|
+| `src/engine/envelope_sequence.cpp` | シーケンス型 `@e` の実行 |
+| `src/engine/envelope_rate.cpp` | レート型 `@r` の実行 |
+| `src/engine/track_runtime.cpp` / `runtime_session.cpp` | トラックのキーオン、音量合成、レジスタ出力 |
+| `tests/cpp/engine_tests.cpp` | C++ 実装の回帰テスト |
 
-## 2. 互換挙動とエディタ製品ルールの区別
+## 2. 試聴の互換動作とエディタの出力規則
 
-| 種別 | 正本 | 内容 |
-|---|---|---|
-| **MGSDRV 互換試聴** | §6.2.1、本書 §3、`mgs_envelope_reference.py` | 待ちカウンター、バイト列の**記述順**実行、`\` 累積、ランプ `divmod`、ゼロ時間命令 |
-| **エディタ／MGSC 出力** | §6.2.3、§6.1.1、§6.5、本書 §7 | 同一カウント内個数制限、MGSC 直列化順、`]` 以降省略、プレビュー、発音前 MML、仮番号、連続音量の `:` 結合、終端ホールド短縮、1行255文字改行、コンパイル253バイト |
+試聴では、生成された命令列を**記述順のまま**実行します。待ち時間、周波数変更 `\` の累積、音量ランプの整数計算も互換動作の一部です。
 
-試聴引擎はバイト列を**並べ替えない**。エディタが §6.2.3 に従って MGSC バイト列を生成し、それを §6.2.1 の引擎へ渡す。
+一方、エディタは同一カウント内の命令を整理し、MGSC の文字列へ変換します。プレビュー、発音前 MML、仮番号、音量保持の結合、終端の保持省略、1行255文字・本文253バイトの制限も、この出力段階で扱います。試聴エンジンが命令を並べ替えることはありません。
 
-## 3. `@e` 実行モデル
+## 3. `@e` の命令と時間の進み方
 
-`EnvelopeState.tick()`（`tools/mgs_envelope_reference.py`）が再現する MGSDRV 3.20 互換スケジューラーの要点。
+以下では、MGSDRV 3.20 互換の時間進行を説明します。Tick は、エンベロープ処理が進む1回分の単位です。
 
-### 3.1 Tick ループ
+### 3.1 1 Tick 内の処理
 
 1. **待ちカウンター `wait > 0`**: ランプ中なら音量更新（8bit加算後の`divmod`剰余分配）→ `wait--`。まだ `wait > 0` なら Tick 終了。
 2. **`wait == 0`**: ランプ状態をクリアし、命令解釈ループへ。
@@ -49,7 +39,7 @@
 
 キーオン時: `position=0`, `volume=0`, **`wait=1`**。最初の Tick で `wait` を 0 にして先頭命令から解釈開始（EC-001～003）。
 
-### 3.2 バイト列＝実行順（MML 例）
+### 3.2 命令は記述順に実行する（MML の例）
 
 MGSC 上の並びがそのまま実行順。音量命令の**直後**のゼロ時間命令は、当該音量で待ちが発生した**後**、`wait==0` になった Tick から**記述順**で実行される。
 
@@ -80,11 +70,11 @@ MGSC 上の並びがそのまま実行順。音量命令の**直後**のゼロ�
 - **相対加算**。絶対音程指定ではない。
 - **ゼロ時間**。同一 Tick 内で複数 `\` が連続可能。
 - **累積**。各 `\` は直前までの内部周波数を基準に加算。
-- マニフェスト: バイト列 `12 03 12 FF 0F`（`\3\255 f`）→ Tick 0: `+3`, `-1`, 音量 `15`。
+- バイト列の例: `12 03 12 FF 0F`（`\3\255 f`）→ Tick 0: `+3`, `-1`, 音量 `15`。
 
 ### 3.5 音量ランプ — EC-005
 
-float 線形補間**禁止**。整数剰余分配:
+音量ランプは、浮動小数点の線形補間ではなく、次の整数計算で進めます。余りを次の Tick へ持ち越して変化量を配分します。
 
 ```python
 numerator = (ramp_remainder + ramp_magnitude) & 0xFF
@@ -92,10 +82,9 @@ quotient, ramp_remainder = divmod(numerator, ramp_total)
 volume += ramp_direction * quotient
 ```
 
-ランプ開始 Tick では現在音量を一度 emit し、**次 Tick から**更新開始。加算は
-8bitで、桁上がりを除算へ持ち越さない。
+ランプを開始する Tick では、現在の音量を一度出力します。音量の更新は**次の Tick から**始まります。加算結果は8bitの範囲へ折り返し、桁上がりは除算へ持ち越しません。
 
-ステップ幅は次のパターンで決まる（`S.T=C` は先頭の音量命令＋ランプ）。
+ステップ幅は次のパターンで決まります。`S.T=C` は先頭の音量命令とランプを表し、`S` は開始音量、`T` は目標音量、`C` はランプのカウント数です。以下では、音量差の大きさ `ramp_magnitude` を `D`、更新前の剰余 `ramp_remainder` を `R`、8bit加算後の `numerator` を `N` と表します。
 
 1. Tick 0 で開始音量 `S` を1カウント適用し、Tick 1 でランプ開始（まだ `S`）。
 2. 以降 C 回、上式で更新する。`D < C` かつ `R+D < 256` のあいだは、1段階の滞在が
@@ -151,7 +140,7 @@ premaster = max(0, E + V - 15)
 final = max(0, premaster - master_attenuation - track_attenuation)
 ```
 
-OPLL は下位 4bit を `XOR 15` して減衰ニブルへ。詳細は `SPECIFICATION.md` §6.3。
+OPLL では、下位4bitを `XOR 15` で反転し、減衰量を表す4bit値に変換します。
 
 ### 3.7 トラック `k`（PSG／SCC `@e` キーオフ）
 
@@ -161,22 +150,22 @@ OPLL は下位 4bit を `XOR 15` して減衰ニブルへ。詳細は `SPECIFICA
 - `k>=1`: 進行が `k-1` に達した Tick で音量を 1 下げる（キーオフと同じ割り込みから開始）。0 になるまで繰り返す。
 - `@r` と PSG ハードウェアEGでは無効。OPLL はハードウェアキーオフ。
 
-参照: `step_sequence_key_off_decay`（Python）／`stepSequenceKeyOffDecay`（C++）。
+C++ 実装では `stepSequenceKeyOffDecay` がこの処理を担当します。
 
-### 3.8 禁止事項（再発防止）
+### 3.8 実装変更時に避けること
 
 - UI／タイムラインが独自に「音量だけ進める」「ランプを float 補間する」
-- 会話や仕様の言い換えだけで `\` の向き（直前／直後）を決める — **必ず参照実装と EC-007 を見る**
-- ゼロ時間命令の同一 Tick 内順序を、§6.2.3 の MGSC 直列化順と混同して**試聴引擎側で並べ替える**
+- 説明文だけを根拠に `\` の実行位置（直前／直後）を変えること。**§3.2 の命令順序と EC-007 を確認する**
+- ゼロ時間命令の同一 Tick 内順序を、エディタの MGSC 出力順と混同して**試聴エンジン側で並べ替える**
 - 1カウントの`[f]`を待ち無しの`[]`（`0x40 0x60`）へ直列化する。空ループは命令予算超過であり、セッションはそのトラックを故障・音量0にする
 
 ## 4. データの流れ（UI を含む）
 
 ```text
-総合画面タイムライン / 将来のコンパイラ
+総合画面タイムライン / 総合音色コンパイラ
         │
-        ▼  §6.2.3 に従う MGSC 直列化 → MGS バイト列（@e 定義）
-        │  ＋ 発音前トラック MML（§6.5）
+        ▼  MGSC 出力規則に従う命令列の生成 → MGS バイト列（@e 定義）
+        │  ＋ 発音前トラック MML
 SequenceEnvelopeRuntime  ──► MeaningEvent（Volume, Patch, YWrite, FrequencyDelta, …）
         │
         ▼  TrackRuntime::processTick
@@ -185,72 +174,70 @@ RegisterWrite 列（PSG / SCC / OPLL）
         ▼  Chip Rack → 試聴 PCM / VGM 照合 / MGSC 出力検証
 ```
 
-## 5. 変更チェックリスト
+## 5. 互換動作を変更するときの確認
 
-互換挙動を追加・修正するとき:
+1. 利用者から見える命令の意味、時間、音量の要件を確認します。
+2. 本書の該当する説明と、実行エンジンを同じ要件へ合わせます。
+3. 変更に対応する回帰ケースを更新し、命令列と実行結果を照合します。
+4. 総合画面の試聴、MGSC 出力、保存後の再読込にも影響がないか確認します。
 
-1. `SPECIFICATION.md` §6.2.1 に利用者向け要件があるか確認。なければ追記（文書版を上げ §18 に行追加）。
-2. 本書 §3 を更新。
-3. `tools/mgs_envelope_reference.py` を更新。
-4. `src/engine/envelope_sequence.cpp`（および必要なら `envelope_rate.cpp` / `track_runtime.cpp`）を更新。
-5. `tests/fixtures/envelope_compat_manifest.json` にケース ID を追加または期待値を更新。
-6. `tests/test_envelope_compat_manifest.py` が通ることを確認。
-7. `tests/cpp/engine_tests.cpp` の **同じ ID** のテストを更新。
-8. 必要なら `tests/fixtures/mgsdrv_selftest/` に最小 MML/VGM を追加。
-9. 本書 §6 のケース表を更新。
+ケース ID は、説明と回帰テストを対応させるために使います。次節の表で各ケースの目的を確認できます。
 
-## 6. 共有回帰ケース ID
+## 6. 回帰ケース一覧
 
-| ID | 内容 | Python（詳細） | C++ |
-|---|---|---|---|
-| EC-001 | 隣接単音量は 1 Tick ずつ | `test_adjacent_single_count_volumes_are_one_tick_apart` | `testAdjacentVolumesAreOneTickApart` |
-| EC-002 | 4 カウント保持列 | `test_four_count_holds` | `testFourCountHoldsCompat` |
-| EC-003 | 保持終了 Tick で次命令 | `test_hold_count_executes_next_command_when_count_reaches_zero` | （マニフェストのみ。C++ 追加推奨） |
-| EC-004 | `@` / `y` ゼロ時間 | `test_patch_and_register_write_do_not_advance_time` | `testPatchAndRegisterWriteAreZeroTime` |
-| EC-005 | ランプ剰余分配 | `test_ramp_uses_remainder_distribution_and_starts_next_tick` | `testRampUsesIntegerRemainderDistribution` |
-| EC-006 | ループに暗黙待ちなし | `test_loop_has_no_implicit_wait` | （マニフェストのみ） |
-| EC-007 | `\` 累積ゼロ時間 | `test_frequency_changes_are_zero_time_and_cumulative_in_mapping_layer` | `testFrequencyDeltasAreSignedAndCumulativeEvents` |
-| EC-008 | 無待ちループは命令予算で停止 | — | `testNoWaitLoopHitsInstructionBudget` |
-| EC-009 | `f=<n>` 自動音量ランプの `2n cc` | `test_automatic_volume_opcode_uses_target_and_duration` | `testAutomaticVolumeOpcode` |
-| EC-010 | `f.0=100`の実測更新Tick | `test_f_to_zero_over_100_matches_observed_driver_ticks` | `testFToZeroOver100MatchesObservedDriverTicks` |
-| EC-011 | count 255の8bit剰余折り返し | `test_count_255_ramp_uses_eight_bit_accumulator_wrap` | `testCount255RampUsesEightBitAccumulatorWrap` |
-| EC-012 | 生count 0は実行Tickを消費 | `test_zero_count_ramp_consumes_its_execution_tick` | `testZeroCountRampConsumesItsExecutionTick` |
-| EC-013～016 | duration 50／5・開始値`f`／`c`の実測更新Tick | `test_observed_duration_50_and_5_ramp_ticks` | `testObservedDuration50And5RampTicks` |
-| EC-017 | 上昇`0.f=50`は下降と同じステップ幅 | `test_ramp_step_widths_follow_eight_bit_remainder_pattern` | `testRampStepWidthsFollowEightBitRemainderPattern` |
-| EC-018 | `f.0=242`の8bit折り返しで目標未到達 | `test_ramp_step_widths_follow_eight_bit_remainder_pattern` | `testRampStepWidthsFollowEightBitRemainderPattern` |
-| EC-019 | `c.0=254`は8bit折り返しで`c`のまま | `test_ramp_step_widths_follow_eight_bit_remainder_pattern` | `testRampStepWidthsFollowEightBitRemainderPattern` |
+| ID | 確認する動作 |
+|---|---|
+| EC-001 | 隣接単音量は 1 Tick ずつ |
+| EC-002 | 4 カウント保持列 |
+| EC-003 | 保持終了 Tick で次命令 |
+| EC-004 | `@` / `y` ゼロ時間 |
+| EC-005 | ランプ剰余分配 |
+| EC-006 | ループに暗黙待ちなし |
+| EC-007 | `\` 累積ゼロ時間 |
+| EC-008 | 無待ちループは命令予算で停止 |
+| EC-009 | `f=<n>` 自動音量ランプの `2n cc` |
+| EC-010 | `f.0=100`の実測更新Tick |
+| EC-011 | count 255の8bit剰余折り返し |
+| EC-012 | 生count 0は実行Tickを消費 |
+| EC-013～016 | duration 50／5・開始値`f`／`c`の実測更新Tick |
+| EC-017 | 上昇`0.f=50`は下降と同じステップ幅 |
+| EC-018 | `f.0=242`の8bit折り返しで目標未到達 |
+| EC-019 | `c.0=254`は8bit折り返しで`c`のまま |
 
-期待バイト列と論理イベントは `tests/fixtures/envelope_compat_manifest.json` を正とする。
+## 7. C++ テストを実行する
 
-## 7. テストの実行
+Windows ではプロジェクトルートから、ビルドラッパーを使って実行します。必要な開発環境は[ビルド手順](../BUILDING.md)を参照してください。
 
-```text
-# マニフェスト ↔ 参照実装（Python）
-python -m unittest tests.test_envelope_compat_manifest
-
-# 参照実装の既存単体
-python -m unittest tests.test_mgs_envelope_reference
-
-# C++ コア（ビルド後）
-ctest -R engine
+```powershell
+.\tools\build.cmd -Configuration Release -TestRegex mgstc_engine_tests
 ```
+
+ローカル専用の回帰データを必要とするテストは、公開チェックアウトでは skip される場合があります。自動テストの成功だけで、実機・すべての DAW・聴感での動作を確認したことにはなりません。
 
 ## 8. 総合画面・MGSC 出力
 
-現状 Alpha 未保証の領域。着手時は **仕様 §6.2.4** と **ENGINE_DESIGN §11.4** を正とする。
+以下は総合音色エディタの表示と MGSC 出力に関する規則です。Alpha 段階のため、総合音色のポータブル保存形式には、版をまたぐアップグレード互換の保証はありません。
 
-- `@e`を使うチャンネル 1 本 = `@e` バイト列 1 本 + 共有の終端／ループ（§6、§12.0）。初期全音量のみでシーケンス命令が無いチャンネルはMGSC出力・MMLプレビューに`@e`定義／参照を出さず、番号も予約しない。内部の既定ENV実行は維持する。
+- `@e`を使うチャンネル 1 本 = `@e` バイト列 1 本 + 共有の終端／ループ。初期全音量のみでシーケンス命令が無いチャンネルはMGSC出力・MMLプレビューに`@e`定義／参照を出さず、番号も予約しない。内部の既定ENV実行は維持する。
 - 総合試聴はMGSC出力と同じ確定済み命令トークンから1本の`@e`バイト列を作る。音量・音色・`y`・`\`の待ち時間と順序は共通である。保持の終端カウントに並ぶ `\` は次の音量の直前（`e:7.\-127.d:4`）。
-- **カウント命令スタック** — L> 列の `[` 前後ゾーンを UI で分離編集する（`EnvelopeEvent.after_loop_start`）。`[` はゼロ時間アンカーであり、`]` 復帰先は `[` 直後（§6.2.3・参照実装 `loop_position`）。MGSC 直列化は **前 → `[` → 後**（`formatMgsCompositeEnvelope`）。`fff[y1,20fff]` と `fffy1,20[fff]` を回帰（engine_tests のループ開始アンカー）。
-- **手動ループと変調** — 初回Bodyへ展開した命令列を各周回で反復する。`]`は周波数・音量・レジスタやトラックLFOの状態をリセットしない。`\`の周回差分は累積し、絶対音量／`y`は同じ命令値を書き直す。初回のグラフで後続周回を正確に示せない場合は初回実効波形を破線にするが、表示上の位相制約で出力・試聴を拒否しない（仕様§6.2.5）。自動ループ最適化の等価性条件は維持する。
-- MGSC 文字列生成は GUI 文字列を正本にせず、カウントブロック列から `f:10`（保持）／`f=10`（自動変化）等へ変換（§6.1）。連続する同一音量は `f:2.e.d:5` へ結合する。定義終端の `f:<n>` は後続命令が無いので `f` にする（`]` 直前は残す）。連続する自動変化は `f.8=10.0=10`。途中のゼロ時間命令は、既定（`詳細`OFF）では出力側だけ `=` を分割し、命令後は次の `target=<n>` だけを続ける（`f.8=5.\20.0=5`）。`詳細`ONでは無分割 `f=<n>` の剰余ランプ Tick 列へ命令を挟み、`=` を再開しない。編集イベントは分割しない。`詳細`は総合形式17のイベントフラグであり、MGSC 本文からは復元しない。形式16以前は `詳細` を false、形式15以前は自動変化も false として読む。
+### ループ位置と繰り返し
+
+- **カウント命令スタック** — L> 列の `[` 前後ゾーンを UI で分離編集する（`EnvelopeEvent.after_loop_start`）。`[` はゼロ時間アンカーであり、`]` 復帰先は `[` 直後。MGSC 直列化は **前 → `[` → 後**（`formatMgsCompositeEnvelope`）。`fff[y1,20fff]` と `fffy1,20[fff]` を回帰（engine_tests のループ開始アンカー）。
+- **手動ループと変調** — 初回Bodyへ展開した命令列を各周回で反復する。`]`は周波数・音量・レジスタやトラックLFOの状態をリセットしない。`\`の周回差分は累積し、絶対音量／`y`は同じ命令値を書き直す。初回のグラフで後続周回を正確に示せない場合は初回実効波形を破線にするが、表示上の位相制約で出力・試聴を拒否しない。自動ループ最適化の等価性条件は維持する。
+### 音量変化と出力サイズ
+
+- MGSC文字列は、GUIの表示文字列ではなくカウントブロック列から生成します。`f:10`（保持）／`f=10`（自動変化）などへ変換し、連続する同一音量は `f:2.e.d:5` へ結合します。定義終端の `f:<n>` は後続命令がないため `f` にしますが、`]` 直前の保持は残します。連続する自動変化は `f.8=10.0=10` となります。
+- 自動変化の途中にゼロ時間命令がある場合、既定（`詳細`OFF）では出力側だけ `=` を分割します。命令の後は次の `target=<n>` だけを続けます（`f.8=5.\20.0=5`）。`詳細`ONでは、分割しない `f=<n>` の剰余ランプTick列へ命令を挟み、`=` を再開しません。いずれも編集イベント自体は分割しません。
+- `詳細`は総合形式17のイベントフラグであり、MGSC本文からは復元しません。形式16以前は `詳細` を false、形式15以前は自動変化も false として読み込みます。
 - `@e` ソースは MGSC の1行255文字制限で `.` 分割改行する（継続行はタブ。コメントは1行なら `}` 後、改行時は `{ ,,` 直後）。本文命令列のコンパイル上限は **253バイト**（文字数ではなく、形式・長さヘッダは含めない）。MGSDRVの定義長フィールドが1バイトであることと、MGSC 1.11の生成上限を混同しない。容量超過時は同一実行カウントの命令群を途中で切らない有効な先頭部分を出力し、試聴にもそのバイト列を使用する。作者データとENDは維持し、最初の除外カウントを赤い縦線で示す。ランタイムの命令・待ち・終端保持の互換挙動は変更しない。
 - 変調展開後の定義が上限を超えるときはMGSC出力・試聴を拒否し、総合画面の状態表示で対象チャンネルとコンパイルバイト数を赤字で知らせる。
-- 同一カウント内のゼロ時間命令は §6.2.3 に従って MGSC へ直列化。**試聴は生成後のバイト列を §3 の引擎へ渡す。**
+- 同一カウント内のゼロ時間命令は エディタの出力規則に従って MGSC へ直列化。**試聴は生成後のバイト列を §3 の実行モデルへ渡す。**
+### グラフ表示と発音前の設定
+
 - 音量レーンの編集座標は 0～15 を等間隔にし、チップ固有の論理音量カーブは半透明の実効値オーバーレイとして表示する。自動変化区間の実効バーは試聴と同じ `@e` バイト列を `SequenceEnvelopeRuntime` で進めた音量に同期する。PCM 波形を音量編集値へ逆算しない。
 - 自動変化ONの編集棒は開始音量から終端音量を結ぶラインであり、斜め点線は使わない。
-- SCC／PSG／OPLL 各エンベロープ下の `@e<n> = { ... }` プレビュー（§6.1.1）。
-- 発音前 MML（§6.5）、`@e` 仮番号（§6.5.2）、演奏キー度数コメント（§6.5.3）。仮番号／`k`／`p`／`so`および§6.5.3コメントは総合初期設定・試聴・トラック／定義プレビューへ実装済み。MGSC 先頭 `r`／`r%` 直列化は未実装。
-- 発音前のトラック`@\`は`@e`内`\`やトラック`\`の生`FrequencyDelta`ではない。PSG／SCCは音程表へ16bit加算してからオクターブ分シフトし、OPLLは`n=0`を除き`floor(d*(n+1)/256)`でF-numberを補間する。提示されたMGSDRV VGM（o4cの正負境界と別オクターブ）はPSG／SCCとOPLLで別の回帰列として保つ。
-- パッチスライド／オリジナル`y`・TL·FB自動時の先頭 `@` 自動挿入（§6.5.1）。
-- `@e` 内 `\<n>` GUI は中央 0 二極グラフ（§6.2.2）。累積表示↔`\` 差分は直列化器が担当。
+- SCC／PSG／OPLL 各エンベロープ下の `@e<n> = { ... }` プレビュー。
+- 発音前 MML、`@e` 仮番号、演奏キー度数コメント。仮番号／`k`／`p`／`so`および演奏キー度数コメントは総合初期設定・試聴・トラック／定義プレビューへ実装済み。MGSC 先頭 `r`／`r%` 直列化は未実装。
+- 発音前のトラック`@\`は`@e`内`\`やトラック`\`の生`FrequencyDelta`ではない。PSG／SCCは音程表へ16bit加算してからオクターブ分シフトし、OPLLは`n=0`を除き`floor(d*(n+1)/256)`でF-numberを補間する。PSG／SCC と OPLL では、o4c の正負境界と別オクターブを、それぞれ別の回帰ケースで確認する。
+- パッチスライド／オリジナル`y`・TL·FB自動時の先頭 `@` 自動挿入。
+- `@e` 内 `\<n>` GUI は中央 0 二極グラフ。累積表示↔`\` 差分は直列化器が担当。

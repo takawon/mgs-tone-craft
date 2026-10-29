@@ -1,277 +1,141 @@
 # MGS Tone Craft
 
-MGS Tone Craft（MGSTC）は、MGSDRV向けの音色エディタです。
-PSG（YM2149）、SCC、OPLL（YM2413）の音色を編集・試聴し、
-MGSCで使える定義テキストの作成を支援します。
+**OPLL・SCC・PSGを重ねて、MSX／MGSDRV向けの複合音色を作るWindows用音色エディタです。**
 
-本ソフトウェアは、[OpenAI Codex](https://openai.com/codex/) と
-[Cursor](https://cursor.com/) によるバイブコーディング（対話的なAI支援開発）で作成しています。
+MGS Tone Craft（MGSTC）は、MSXやMGSDRVで使う音色を、音を聴きながら作るためのアプリです。OPLLのパラメーターやSCCの波形を編集するほか、複数の音源を重ねて、音量や音程の変化をひとつの時間軸で調整できます。作った音色は、MGSCで使う定義ソースとして出力できます。
 
-**現状は Alpha（機能限定の公開）です。** 仕様や操作性は今後変わることがあります。Alpha ではバージョン間のアップグレード互換（設定 INI・音色ライブラリ・複合保存などの移行）は保証しません。互換の維持は Beta 以降で開始します。
+![開発版0.365の総合音色エディタ。複数音源のレイヤーと共通の時間軸で編集](docs/screenshots/main.png)
 
-### 総合画面
+**このREADMEと画像はv0.365の機能・操作を説明しています。** 配布版ごとの公開状況と内容は[GitHub Releases](https://github.com/takawon/mgs-tone-craft/releases)を確認してください。Alphaのため操作や画面は今後変わります。ユーザー音色ライブラリSQLiteの後方互換方針は[保存データの互換性](#保存データの互換性)を参照してください。
 
-![総合画面](docs/screenshots/main.png)
+<!-- mgstc:download:start -->
+## ダウンロードと導入
 
-※画面は開発中のものです
+[GitHub Releases一覧](https://github.com/takawon/mgs-tone-craft/releases)で対象版のRelease Notesと添付ファイルを確認し、使う版に合った配布物を選んでください。Alphaのpre-releaseも一覧に含まれます。ここに記載した構成のすべてが各過去版に提供されるとは限りません。
 
-### リアルタイムスペクトログラム／スペクトラム
-
-![OPLL単音試聴中のスペクトログラム](docs/screenshots/spectrogram-playing.png)
-
-![スペクトラム表示](docs/screenshots/spectrum.png)
-
-総合／SCC／OPLLから同じ共有窓を開きます。スペクトログラムとスペクトラムを切り替えられ、音源色／疑似カラー、履歴、比較保持に対応します。窓の操作中も、直前のエディタへPCキー／MIDI入力を渡せます。
-
-※画面は開発中のものです
-
-### OPLL 音色エディタ
-
-![OPLL 音色エディタ](docs/screenshots/opll-editor.png)
-
-※画面は開発中のものです
-
-### SCC 音色エディタ
-
-![SCC 音色エディタ](docs/screenshots/scc-editor.png)
-
-数値波形入力の分解能、補間演算子、括弧による時間配分、`SCCWAV`共有形式は[SCC数値波形入力ガイド](docs/SCC_NUMERIC_WAVE.md)を参照してください。
-
-※画面は開発中のものです
-
-### アプリ設定（View / MIDI / Output）
-
-![アプリ設定 View](docs/screenshots/settings-view.png)
-
-![アプリ設定 MIDI](docs/screenshots/settings-midi.png)
-
-![アプリ設定 Output](docs/screenshots/settings-output.png)
-
-※画面は開発中のものです
-
-### 音色ライブラリ管理
-
-![音色ライブラリ管理](docs/screenshots/library-manager.png)
-
-![タグ管理](docs/screenshots/library-tags.png)
-
-![インポート](docs/screenshots/library-import.png)
-
-※画面は開発中のものです
-
-## Alpha でできること（概要）
-
-- **総合音色**: PSG／SCC／OPLLチャンネルを共通時間軸で重ね、音量・音程・休符・`@e`／`@r`・LFO（`h`）などを編集。開く／保存／コピー／貼り付け、MGSCソースのプレビュー
-- **SCC単音色**: 32サンプル波形の編集、プリセット／マージ、タグ付きライブラリ保存、`@s`定義の確認・入出力
-- **OPLL単音色**: MOD／CARパラメーター編集、EG補助操作、タグ付きライブラリ保存、`@v`定義の確認・入出力
-- **スペアナ**: 総合／SCC／OPLLから開く共有窓。スペクトログラムとスペクトラム、音源別表示、強調率、履歴と比較
-- **タグ検索・管理**: 78種類の標準タグと独自タグを複数設定し、複数タグのAND条件またはタグだけで絞り込み。独自タグは全ライブラリを対象に名前変更・統合・削除
-- **ライブラリ管理**: モデルレス独立窓。★お気に入り、並べ替え、名前変更・参照安全な削除、選択時試聴とA/B比較。変更は開いている各エディタ一覧へ即時反映
-- **インポート**: 非圧縮MGS、MML／MUS、MuSICA VCD、SCC-Musixx SNG、VGM／VGZの完成したOPLL／SCC／総合音色を候補化し、既存ライブラリへ登録（圧縮MGSは拒否。`.mgstc`取込は別操作のまま）
-- **複合音色との連携**: 割当済みSCC／OPLL音色を対応エディタで開き、総合出音を聴きながら編集・保存反映
-- **試聴**: 画面鍵盤、PCキーボード、MIDI入力、内蔵エミュレータ。1秒プレビューON／OFF。スペアナ操作中も直前エディタへ鍵盤入力を委譲
-- **VST3 Instrument**（Stage C）: DAW から 48 kHz で Note On／Off を受け、総合音色を stereo で返す。レイヤー開始遅延は Engine frame で sample-accurate。エディタ・プリセット・任意サンプルレートは未対応。ビルド成果物の置き場は [BUILDING.md](BUILDING.md) を参照
-- **実機演奏**: MAmi-VSIF dongle／MAmidiMEmo 経由で MSX 実機へ出力して発音できる
-- **変換**: WAV／Audacityからの近似変換、SCC↔OPLLの相互近似変換
-
-総合の音量は 0～15 等間隔で編集でき、チップ固有の論理カーブを重ねて表示します。
-「自動変化」は開始～終端のラインと MGSC `f=<n>`／`2n cc` ランプへ変換されます。
-曲全体の本格的な `.MUS` 出力は未保証です。
-
-音色ライブラリは `%LOCALAPPDATA%\MgsToneCraft\tone_library.sqlite` に保存します。
-この SQLite Schema v1 以降は、新しい MGSTC が古い DB を順に migration して読めます。
-旧独自形式のライブラリファイルからは引き継ぎません。設定 INI と単体交換用 `.mgstc` は
-Alpha のため版間互換を保証しません。大切な音色は MGSC 定義テキスト（`.txt`）や
-クリップボードでも控えておくことを推奨します。
-
-## 入手方法
-
-次の2通りで配布します。
-
-1. **ソース**（このリポジトリ）— 自分でビルドする場合は [BUILDING.md](BUILDING.md) を参照
-2. **Windows用ZIP**（GitHub Releases など）— `mgstc.exe` と同梱ライセンス一式
-
-ZIP版では、環境によって
-[Microsoft Visual C++ Redistributable](https://learn.microsoft.com/ja-jp/cpp/windows/latest-supported-vc-redist)
-の導入が必要な場合があります。
-
-## 更新履歴
-
-変更内容は次の2か所に載せます（バイナリ更新時は両方を更新します）。
-
-- 通し履歴: [CHANGELOG.md](CHANGELOG.md)
-- 各版の配布ノート: [GitHub Releases](https://github.com/takawon/mgs-tone-craft/releases)
-
-## 動作環境
-
-- Windows 10 / 11
-- 音声出力（既定WASAPI、任意でASIOドライバー）
-- （任意）MIDIキーボードなどの Windows MIDI 入力デバイス
-- （任意）Audacity（`mod-script-pipe` 有効時のみ「Audacityから変換」を利用）
-
-## 使い方（最短）
-
-1. ZIPを展開して `mgstc.exe` を起動する（またはソースからビルドする）
-2. 総合画面でチャンネルを追加して重ねる、または右上から SCC／OPLL 単音色エディタを開く
-3. 鍵盤／PCキー／MIDIで試聴しながら編集する（`スペアナ`で周波数表示も確認できる）
-4. 右側の MGSC 定義プレビューをコピーして、自分の MML へ貼り付ける  
-   （ライブラリ保存とインポートも利用できる。Alpha のため保存形式の互換は未保証）
-
-### Audacity連携を使う場合
-
-「Audacityから変換」を使う前に、Audacityの「編集」→「環境設定」→「モジュール」で
-`mod-script-pipe` を有効にし、Audacityを再起動してください。
-有効中は同じPC上の他プログラムからもAudacityを操作できる状態になります。
-使わない期間は無効に戻すことを推奨します。
-
-## 画面ごとの操作ガイド
-
-### 総合音色エディタ
-
-- 起動直後はチャンネル 0 件です。`PSG追加`／`SCC追加`／`OPLL追加`で必要な音源だけを足します
-- 各チャンネルの右で`複製`（同じ音源の空き番号へ）／`Ch.削除`できます
-- 共通時間軸で音量・音程・休符などを編集します。音量の「自動変化」と「詳細」は MGSC のランプ出力に影響します
-- 初期設定の`h`からソフトウェア LFO 窓を開きます。波形は約 60Hz の水平保持→垂直ジャンプ、縦軸は音程オフセット ±127 です。`p`（PSG／SCC）と`h`は同時には使えません
-- 右上は`スペアナ`／`SCC音色`／`OPLL音色`／1秒プレビューON／OFFです。ONのときは編集変更で最後の手動音程を約1秒鳴らします
-- 開く／保存／貼り付け／コピー／Undo／Redoは、編集中の総合プログラム全体（単エントリ`.mgstc`と同じ形式）を対象にします
-- プレビューは`@s`／`@v`／`@e`／`@r`とトラック設定を含む MGSC ソースです。曲全体の`.MUS`としては未保証です
-
-### SCC単音色エディタ
-
-- 波形グラフを枠内でドラッグして32サンプルを描画できます
-- 各サンプルは10進／16進の数値欄からも編集できます
-- プリセットを選び、倍音倍率・マージ条件を調整してから `適用` で確定します  
-  （候補中は橙破線プレビュー。`Random`は選択前に波形を確定せず `？` を出します。`取消` で破棄、`A/B` で確定波形と候補を比較試聴）
-- 平均化／正規化／反転、位相左右・全体上下、縦倍率バーなどの加工が使えます
-- 上部アイコンからファイル読込・保存（`.txt`）、コピー／貼り付け、Undo／Redo、WAV／Audacity変換が行えます
-- 右側の音色ライブラリと、常時表示の `@s` プレビューを併用できます
-
-### OPLL単音色エディタ
-
-- MOD／CARのパラメーター（AM、PM、EG、KR、WS、MULT、KSL、TL、AR、DR、SL、RR、FB など）を編集します
-- 固定音色1～15は選択で試聴し、「編集音色へ読込」でオリジナル音色へコピーしてから編集します
-- MOD／CARのエンベロープ表示と `@v` プレビューが編集内容へ同期します。AR・DR/SL・独立RRの赤い操作点で実効EGを補助編集できます
-- 上部から `.txt` の読込・保存、コピー／貼り付け、Undo／Redo、WAV／Audacity変換が行えます
-- SCC画面と同様、右側ライブラリと `@v` プレビューを利用できます
-
-SCC／OPLLは別ウィンドウとして同時に開けます。閉じても編集状態は保持され、再表示で初期化し直しません。各画面の右上から相手側エディタと共有スペアナへ移れます。
-
-### スペアナ（共有窓）
-
-- 総合／SCC／OPLLの`スペアナ`から、アプリ全体で1つの窓を開きます
-- `スペクトログラム`と`スペクトラム`を切り替えます。切替だけでは取得済みの履歴を捨てません
-- スペクトログラムは時間×対数周波数です。`音源色`（PSG／SCC／OPLLの色重ね）と`疑似カラー`（ON音源の合算強度）を選べます。`強調率`0～100%で実在ピーク周辺だけを際立たせます
-- スペクトラムは対数周波数×dBです。チャンネル別の色線と合成の白線、最大5秒の履歴、ピークの周波数・音名・レベル、比較保持、表示停止と過去位置の確認ができます。履歴線は確定したあとは変形しません
-- ピンONでは他の MGSTC 窓より前を維持しますが、OS全体の常時最前面にはしません。設定などのモーダル中はピン前面を掛けません
-- この窓がアクティブな間も、直前に選んでいた総合／SCC／OPLLへPCキー／MIDIを渡せます。別エディタを前面にすると入力先が移り、窓を閉じるか他アプリへ移ると解除します
-
-### ライブラリ管理・インポート
-
-- 総合／SCC／OPLLの`ライブラリ管理`からモデルレスな独立窓を開きます。開いたまま各エディタを編集でき、保存・削除・改名・★・タグ・インポート登録は各一覧へすぐ出ます
-- タブは`音色一覧`／`タグ管理`／`インポート`です
-- `インポート`は完成した音色だけを候補にします。対応は非圧縮MGS、MML／MUS定義、MuSICA VCD、SCC-Musixx SNG、VGM／VGZです。圧縮MGSは開きません。右パネルの`.mgstc`取込／書出は従来どおり別操作です
-- 複数ファイルを一度に開けます。ファイル見出しの下へ候補が並び、列はチェック／音源名／波形／名前／編集／★／登録です。新規のチェックはOFF、`選択項目を登録`でチェック済みの未登録を一括登録します。リストはアプリ終了まで残ります（窓を閉じても消えません）
-- 名前の既定は`接頭辞 - 識別子`です。曲名（MGSヘッダ／`#title`）が無ければファイル名、音色番号・音色名が無ければ`00`連番です。登録前に編集できます
-- MGS／MMLの総合候補は、実際に使われた`@e`だけを取り込みます。OPLL 7～9chはリズムONの時点だけ除外します。使用時点に波形／パッチが無ければその音源の初期設定を使います
-- 波形クリックや行選択で1秒プレビューできます。この試聴ではエディタを前面化しません。`編集`はプレビューを止めてから未登録のまま対応エディタへ載せます。PCキー／MIDIは該当エディタの Poly／Mono に従います
-
-## 鍵盤・PCキー・MIDIの基本操作
-
-- **画面鍵盤**: `C1`～`B8` をクリック／ドラッグして試聴します（MGSDRV／MGSCの`o1c`～`o8b`に対応）
-- **PCキー（下段）**: `Z S X D C V G B H N J M`（`Z`＝基準オクターブの C）
-- **PCキー（上段）**: `Q 2 W 3 E R …`（下段より1オクターブ上）
-- **オクターブ移動**: `Page Down`／`Page Up`（画面上は `PgDn`／`PgUp`）
-- **Ctrl**: 押している間は PCキー演奏を停止します（入力欄での通常キー入力向け）
-- **発音モード**: 鍵盤上部の `Poly`／`Mono` で切替（初期は `Poly`）
-- **MIDI**: アプリ設定の `MIDI` タブで入力デバイスを選択。接続状態は鍵盤上部に表示されます
-- 入力欄にフォーカスがある間は PCキー演奏を行わず、文字入力を優先します
-- スペアナ共有窓を操作している間は、直前の総合／SCC／OPLLへ PCキー／MIDI を渡し続けます
-
-## ライブラリ保存・`.mgstc`／`.txt` 入出力
-
-| 種類 | 用途 |
+| 配布形式 | 選び方・導入 |
 |---|---|
-| 音色ライブラリ（アプリ内） | `%LOCALAPPDATA%\MgsToneCraft\tone_library.sqlite`。名前・タグ・メモ・お気に入り付きで SCC／OPLL／総合音色を保存・検索・読込 |
-| `.mgstc` | ライブラリ項目の外部取込／書出（編集用。1件単位のやり取り向け。SQLite とは別形式） |
-| インポート | MGS／MML／VCD／SNG／VGM などから完成音色を候補化し、既存ライブラリへ登録 |
-| `.txt` | MGSC の `@s`／`@v` 定義テキストとしてのファイル保存・読込 |
+| Windowsインストーラー（EXE） | `MGSToneCraft-<VERSION>-win64-setup.exe`。通常はこちらを選び、案内に従って導入します |
+| Windows手動導入ZIP | `MGSToneCraft-<VERSION>-win64.zip`。全体を展開し、同梱の`INSTALL.txt`（日本語）または`INSTALL.en.txt`（英語）に従って配置します |
+| ソースZIP／tar.gz | GitHubがタグから提供するSource codeアーカイブ。実行ファイルの配布ZIPとは別で、[BUILDING.md](BUILDING.md)に従うビルドが必要です |
 
-- ライブラリ操作は右側パネルで、保存済み一覧の右に `読込`／`削除`、音色名欄の右に `名前変更`、編集行に `保存`／`別名保存`／`新規`、その下に `取込`／`書出` です。保存済みへ戻す場合は一覧から再読込します（未保存時は確認します）。複製したい場合は `読込` のあと `別名保存` を使います
-- `ライブラリ管理`では音色一覧の整理（複製・削除・タグ付与・読込）、タグ管理、外部形式からのインポートができます。独自タグの名前変更・統合・削除は全SCC／OPLL／複合音色が対象です（標準タグは対象外）
-- **アプリ内ライブラリは `tone_library.sqlite`（Schema v1）です。** これ以降の Schema は新しい MGSTC が読めます。旧独自ライブラリファイルと単体 `.mgstc` の版間移行は保証しません
-- 音色定義ファイルの拡張子は `.txt` に統一しています
-- 重要な音色は `@s`／`@v` の `.txt` やクリップボードでもバックアップしてください
+インストーラーでは、**MGS Tone Craft本体を必ずインストールし、VST3プラグインは必要な場合だけ選択します（新規インストール時はOFF）**。表示言語は日本語・英語から選べます。更新時は前回のコンポーネント選択を引き継ぎます。
 
-## MGSC 定義のコピー／貼り付け
+OPLL PatchSlide用の共有データは、3ファイルを一組として`%ProgramData%\OPLL_PatchSlide_DB\`へ配置します。ユーザーが作った音色は`%LOCALAPPDATA%\MgsToneCraft\tone_library.sqlite`に保存されます。ユーザー音色・設定は配布物に含めず、通常の導入・更新で削除しません。
 
-- エディタ右側（またはプレビュー欄）に、現在の確定音色の MGSC 定義が常時表示されます
-- **コピー**: ツールバーのコピー、または入力欄以外で `Ctrl+C`  
-  Unicode と ANSI（CP932）の両方を登録するため、多くのエディタへ貼れます
-- **貼り付け**: ツールバーの貼り付け、または入力欄以外で `Ctrl+V`  
-  `@s`／`@v` 定義を取り込めます。不正な内容では編集中音色を変更しません
-- SCCでは貼り付け時、WAV → 背景画像 → MGSC テキストの順で処理します
-- 一時出力番号（SCC: 0～31、OPLL: 15～31）を変えると、プレビュー内の番号が追従します
-- コピーした定義を自分の `.MUS`／MML ソースへ貼り付けて MGSC 1.11 で利用できます
-- 総合画面のコピー／貼り付けは、`@s`／`@v`／`@e`／`@r`と番号付きトラック設定を含む MGSC ソースです。曲全体の`.MUS`出力とは別です
+**旧版から更新する前に、音色と設定をバックアップしてください。** v0.285の旧独自形式ライブラリ（`timbre-library-v1.mgstc`、`composite-timbre-library-v1.mgstc`）は、v0.365で直接読み込めず、自動移行もされません。バックアップしただけで新版で使えるようになるわけではありません。元ファイルを保管し、対応する移行方法を確認してください。SQLite形式のライブラリとは互換性の扱いが異なります。[保存データの互換性](#保存データの互換性)も確認してください。
 
-## 設定（View・MIDI・マスターボリューム・即時発音）
+アンインストール時は、ユーザーデータと共有DBを削除するか、それぞれ選べます。初期値は**ユーザーデータ削除がOFF、共有DB削除がON**です。共有DBを他のアプリでも使っている場合は、削除をOFFにしてください。
 
-右上のアプリ設定から共通設定を変更します。
+手動ZIPにはアンインストーラーがありません。配置・更新・削除の手順は、同梱の`INSTALL.txt`（日本語）／`INSTALL.en.txt`（英語）を参照してください。外部ランタイム・ASIOドライバー・MAmidiMEmo本体は同梱しません。配布物を作る方は[BUILDING.md](BUILDING.md)を参照してください。
+<!-- mgstc:download:end -->
 
-- **Viewタブ**: 画面の大きさ（125%／100%／75%）。編集画面・ダイアログなどアプリ全体の表示倍率。ウィンドウ位置・サイズは保存しません。編集画面では `Ctrl`± で一時上書き、`Ctrl`+`0` で View の既定へ戻せます
-- **MIDIタブ**: 入力デバイスの選択・一覧更新、受信チャンネルなど
-- **Outputタブ**: PC音声出力（既定WASAPI／ASIO）、ASIOドライバーと設定画面、および試聴出力先（内蔵エミュレータ／MAmi-VSIF dongle・MAmidiMEmo 経由の実機など）
-- **Aboutタブ**: アプリ名・バージョン、著作権、[GitHub](https://github.com/takawon/mgs-tone-craft)、[X](https://x.com/takawo_n)の表示
+## 主な機能
 
-ASIOを選ぶと、ドライバーの実サンプルレートが48kHz以外の場合は48kHzの
-エンジン出力をリアルタイム変換します。状態欄に変換元・変換先レートを表示し、
-ASIOを開始できない場合は理由を表示して既定のWASAPIへ戻ります。
+### 複合音色とWAV変換
 
-画面上の操作:
+- PSG（YM2149）／SCC／OPLL（YM2413）のレイヤーを共通時間軸で編集・試聴。
+- 音量・音程・休符・ループ、ソフトウェアエンベロープ`@e`／`@r`、LFO、SCCモーフなどを組み合わせた音作り。
+- WAVから複合音色や単音色への近似変換。候補を試聴・比較してから適用できます。元のWAVと同じ音の再現を保証する機能ではありません。
+- MGSCの`@s`／`@v`／`@e`／`@r`と演奏設定を含むソースの確認・コピー・入出力。曲全体の完成した`.MUS`を書き出す機能とは別です。
 
-- **マスターボリューム**（右上）: 0～100%。チップ側の音量値は変えず、最終PCMだけ調整。全画面で同期し、再起動後も復元します
-- **即時発音**（総合／SCC／OPLLのスピーカーアイコン）: ONだとパラメーター変更のたびに最後の手動音程で約1秒試聴します。OFFでも鍵盤／PCキー／MIDIの手動試聴は使えます
+### OPLLとSCCの単音色編集
 
-設定の一部は `%LOCALAPPDATA%\MgsToneCraft\` 配下に保存されます。
+OPLLのMOD／CARパラメーターとエンベロープを編集し、SCCでは32サンプルの波形を描画・数値編集できます。プリセット、候補のA/B比較、波形加工、単音色の近似変換にも対応します。
 
-## ライセンス
+![OPLLのパラメーターとエンベロープを編集する画面](docs/screenshots/opll-editor.png)
 
-GNU Affero General Public License v3.0 only（AGPL-3.0-only）。全文は [LICENSE](LICENSE)。
+![SCCの32サンプル波形と数値入力・補間を編集する画面](docs/screenshots/scc-editor.png)
 
-- JUCE 8 は AGPLv3／商用のデュアルライセンスのうち、本プロジェクトは AGPLv3 側で使用
-- 音源エミュレータ（emu2149／emu2212／emu2413）は MIT（`third_party` にライセンス全文を同梱）
-- 詳細は [THIRD_PARTY.md](THIRD_PARTY.md)
-- `assets` の図案は本プロジェクトの自作物です
+SCCの数値入力は、16～256段階の分解能、5種類の補間曲線、括弧による時間配分、`SCCWAV`形式の共有に対応します。例と制限は[数値波形入力ガイド](docs/SCC_NUMERIC_WAVE.md)へ。
 
-## フィードバック
+### 音色ライブラリ、セット、Furnace入出力
 
-不具合や要望は[GitHubリポジトリ](https://github.com/takawon/mgs-tone-craft)のIssueへお願いします。
-Alphaのため、内部の設計書・詳細仕様書は公開していません。
+**音色一覧／パッチスライド／タグ管理／インポート／エクスポート**の5タブから音色を整理します。94種類の標準タグと独自タグ、★、検索・並べ替え、複数のセットへの所属に対応します。セットの所属解除・削除と、音色本体の削除は別の操作です。
 
-## 使用ライブラリ・参考資料
+![音色一覧とセットを管理する開発版のライブラリ画面](docs/screenshots/library-manager.png)
 
-### 使用ライブラリ
+非圧縮MGS、MML／MUS、MuSICA VCD、SCC-Musixx SNG、VGM／VGZなどから完成音色を候補として取り込み、試聴してから登録できます。Furnaceの`.fui`／`.fuw`とMGSTCの`.mgstc`の入出力も扱います。対応する音源やマクロに制限があり、Furnaceへの複合音色出力は静的な音色設定のみの部分変換です。警告・変換結果を確認してください。
 
-- [JUCE](https://juce.com/)（Raw Material Software Limited）— UI／オーディオ基盤（AGPLv3 側で使用）
-- [emu2149](https://github.com/digital-sound-antiques/emu2149)（Digital Sound Antiques）— YM2149（PSG）エミュレータ
-- [emu2212](https://github.com/digital-sound-antiques/emu2212)（Digital Sound Antiques）— SCC エミュレータ
-- [emu2413](https://github.com/digital-sound-antiques/emu2413)（Digital Sound Antiques）— YM2413（OPLL）エミュレータ
-- [rpclib](https://github.com/rpclib/rpclib)（Tamás Szelei）— MAmidiMEmo 連携用 RPC クライアント
+### OPLL PatchSlideを探索
 
-### 参考にしたサイト・資料
+OPLL PatchSlideには**12,180の候補**があり、音を聴き比べながら音色を探せます。タグのAND／OR検索や16群・64群の分類で候補を絞り、`Standard B`で似ている順に並べたり、`Variation`で変化を探したりできます。気になる候補は一時ストックへ置き、総合音色への適用やライブラリへの登録に使えます。
 
-- [MGSDRV API仕様](https://gigamix.hatenablog.com/entry/mgsdrv/api-specifications)（GIGAMIX / Ain）
-- [MGSC 1.11ユーザーマニュアル](https://www.gigamix.jp/mgsdrv/MGSC111.TXT)（GIGAMIX / Ain）
-- [MGSDRVテクニック・資料集](https://gigamix.hatenablog.com/entry/mgsdrv/technique)（GIGAMIX / Ain）
-- [MGSDRV v3.xxデータ形式解析](https://github.com/digital-sound-antiques/mgsc/blob/main/mgs-format.md)（Digital Sound Antiques）
-- [YM2413アプリケーションマニュアル](https://d4.princess.ne.jp/msx/datas/OPLL/YM2413AP.html)（d4 / princess.ne.jp）
-- [MAmidiMEmo](https://github.com/110-kenichi/MAmidiMEmo)（110-kenichi）— 実機音源RPCプロキシ（本体は同梱しません）
-- [MAmidiMEmoNEMO readMe](https://github.com/uniskie/MSX_DOCUMENTS/blob/main/MAmidiMEmoNEMO/readMe.md)（uniskie）— MAmidiMEmo 利用の参考
-- [msxplay-js](https://github.com/digital-sound-antiques/msxplay-js) / [libkss-js](https://github.com/digital-sound-antiques/libkss-js)（Digital Sound Antiques）— 試聴バランス等の参考
-- [Wavetable Synthesizer algorithm](https://www.mathworks.com/help/audio/ref/wavetablesynthesizer-system-object.html)（MathWorks）
-- [A Data-Driven Approach to Wavetable-Synthesis](https://www.creative-technologies.de/a-data-driven-approach-to-wavetable-synthesis/)（Creative Technologies）
-- [JUCE `dsp::FFT` Class Reference](https://docs.juce.com/master/classjuce_1_1dsp_1_1FFT.html)（JUCE）— 実数FFT処理のAPI参照
-- [JUCE `dsp::WindowingFunction` Class Reference](https://docs.juce.com/master/classjuce_1_1dsp_1_1WindowingFunction.html)（JUCE）— Hann窓処理のAPI参照
-- [NumPy Discrete Fourier Transform (DFT)](https://numpy.org/doc/2.2/reference/routines.fft.html)（NumPy）— FFT／DFTの定義
-- [SciPy `detrend`](https://docs.scipy.org/doc/scipy-1.14.0/reference/generated/scipy.signal.detrend.html)（SciPy）— DC／定常成分除去の参考
-- [SciPy `correlation_lags`](https://docs.scipy.org/doc/scipy-1.11.1/reference/generated/scipy.signal.correlation_lags.html)（SciPy）— 時系列遅延の参考
+![パッチスライドの分類・候補一覧・一時ストックを使う探索画面](docs/screenshots/patchslide.png)
+
+12,180はDB全体の件数であり、全候補の安全性・音質を保証する数ではありません。`Rejectも表示`は既定OFFです。一時ストックはアプリ／プラグインインスタンスの終了を越えて保存されません。DBが未配置・不整合でも、既存の音色編集は利用できます。DB3ファイルの配置と対応セットは[BUILDING.md](BUILDING.md)を参照してください。
+
+### 試聴、解析、実機出力
+
+画面鍵盤、PCキー、MIDIで試聴し、スペクトログラム／スペクトラムで音を確認できます。履歴、ピーク情報、比較保持、音源別の色分けを使えます。スペアナ画面の操作中も、直前に使っていたエディタへ鍵盤入力を送れます。
+
+![試聴音の周波数成分と履歴を表示するスペクトラム](docs/screenshots/spectrum.png)
+
+StandaloneではWindows音声出力（WASAPI／ASIO）を選択でき、対応機材・設定があればMAmi-VSIFやMAmidiMEmo経由の実機出力も使えます。外部ドライバー、MAmidiMEmo本体、機材は同梱しません。Audacity連携は任意で、通常のWAVファイル変換には不要です。
+
+### StandaloneとVST3
+
+VST3対応DAWでも、総合音色エディタ、レイヤーごとの音色編集、ライブラリ、PatchSlide、解析画面を使えます。総合音色とマスターボリュームは、プラグインごとにDAWのプロジェクトへ保存・復元できます（Plugin State）。プロジェクトに保存した音色は、ライブラリの登録内容とは独立して復元できます。
+
+| 項目 | Standalone | VST3 |
+|---|---|---|
+| 音声・MIDIの管理 | アプリのWindowsデバイス設定 | DAW |
+| SCC／OPLL編集 | 独立した単音色画面と総合のレイヤー編集 | 総合音色に属するレイヤー編集 |
+| 音声出力 | PC音声／対応する実機経路 | stereo出力、音声入力・MIDI出力なし |
+| 設定・状態 | アプリ設定、ライブラリ、ポータブル音色 | インスタンス単位のPlugin State。Standaloneのデバイス設定は共有しません |
+
+VST3のホストサンプルレートは44.1／48／88.2／96 kHzに対応し、48 kHz以外は内部の48 kHzエンジンとの間で変換します。ホストパラメーター自動化とプリセットブラウザは未対応です。全DAW・実機・組合せでの実動作を保証するものではありません。
+
+<!-- mgstc:whats-new:start -->
+## What's New — v0.365
+
+v0.365で追加・変更した機能です。比較元は[前回の有効なWindows配布版 v0.285](https://github.com/takawon/mgs-tone-craft/releases/tag/v0.285)です。対象版の配布内容と検証範囲はReleases一覧のRelease Notesを参照してください。
+
+1. **DAWでも音色を編集** — VST3プラグインに対応しました。総合音色の編集・解析に加え、音色と音量をDAWのプロジェクトへ保存・復元できます。対応するサンプルレートでは内部エンジンとの変換も行います。
+2. **WAVを音作りの出発点に** — WAVから複合音色への変換候補を試聴・比較できます。SCCモーフは区間ごとの変化を編集できます。変換は元の音を完全に再現するものではありません。
+3. **音色をセットで整理** — 5タブのライブラリ画面で、セットへの複数所属、94種類の標準タグ、Furnace形式の入出力を使えます。
+4. **OPLL PatchSlideで音色を探索** — 12,180候補を分類・類似検索し、試聴して一時ストックに追加できます。ストックはアプリ／プラグインの終了時に消えます。候補を総合音色へ適用することもできます。
+5. **数値と式でSCC波形を作成** — SCCWAV数値入力に、分解能の選択、5種類の補間、時間配分、共有用の形式を追加しました。[入力例](docs/SCC_NUMERIC_WAVE.md)を参照してください。
+6. **日英の導入案内と保存データの注意** — 日本語・英語のインストーラーと手動導入ガイドを用意しました。発行元表記は`Takawo.`です。SQLiteライブラリの互換方針と、旧独自形式ライブラリが自動移行されないことを案内しています。
+
+詳細は[CHANGELOG](CHANGELOG.md)と[Release Notes](https://github.com/takawon/mgs-tone-craft/releases)へ。
+<!-- mgstc:whats-new:end -->
+
+## 最初の使い方
+
+以下はv0.365の操作です。使用する版の説明・画面を確認してください。
+
+1. 起動した総合画面で`+ チャンネル`を押し、`PSG 追加`／`SCC 追加`／`OPLL 追加`から使う音源を選びます。
+2. `初期設定 / 編集`と`カウント編集`で音色・エンベロープ・音程変化を編集します。
+3. 画面鍵盤、PCの`Z S X D C V …`、MIDIで試聴。`スペアナ`で音の変化を確認できます。
+4. `保存 / ライブラリ`から音色を保存し、MGSCソースをコピーまたは書き出して、自分のMMLに組み込みます。
+
+画面ごとの手順、鍵盤配列、セット、インポート・エクスポート、設定は[操作ガイド](docs/USER_GUIDE.md)へ。[画面一覧](docs/screenshots/README.md)には設定や管理タブも掲載しています。
+
+## 動作環境と制限
+
+- Windows 10／11、64-bit。VST3にはVST3対応DAWが必要です。
+- StandaloneのASIO出力には対応ドライバーが必要です。環境によっては[Microsoft Visual C++ Redistributable](https://learn.microsoft.com/ja-jp/cpp/windows/latest-supported-vc-redist)の導入が必要です。
+- MIDI機器、Audacity、実機出力機材は任意です。Audacity連携の準備と注意は[操作ガイド](docs/USER_GUIDE.md)を参照してください。
+- 圧縮MGSはインポートしません。外部ファイルの任意の断片や曲全体を、そのままMGSTCの編集モデルへ復元する機能ではありません。
+- Alphaであり、機器・DAWでの確認範囲とコード／自動テストで確認した範囲は区別しています。
+
+### 保存データの互換性
+
+**ユーザー音色ライブラリ`tone_library.sqlite`は、Alphaを含め、保存データの意味を保った読込・段階的な移行を保証する方針です。** Schema v1を起点とし、現行はSchema v2です。保存済みの音色・セット・タグ・メタデータを対象とし、旧DBにない追加値は未設定として扱い、必要な既定値や値の変換は個別仕様に従います。
+
+この方針はSQLite形式の音色ライブラリが対象です。Schema v1からv2へは既存データを保って移行し、移行に失敗した場合も元のデータベースを保護します。
+
+v0.285の旧独自形式ライブラリ（`timbre-library-v1.mgstc`、`composite-timbre-library-v1.mgstc`）は、v0.365では直接読み込めず、自動移行もしません。更新前に旧ファイルをバックアップし、対応する移行方法を確認してください。保管は元ファイルを失わないためのもので、新版での利用を保証するものではありません。
+
+新しいDBを古いMGSTCで読む前方互換性、設定INI・交換／ポータブル`.mgstc`のAlpha版間互換は保証しません。また、音源エンジンや内部演算が変わった場合、出音や波形が以前と完全に一致するとは限りません。音色DBのバックアップに加え、必要に応じてMGSC定義テキストも控えておくことを推奨します。
+
+## ドキュメント・開発・ライセンス
+
+- [操作ガイド](docs/USER_GUIDE.md)／[SCC数値波形入力](docs/SCC_NUMERIC_WAVE.md)／[画面一覧](docs/screenshots/README.md)
+- [更新履歴](CHANGELOG.md)／[GitHub Releases](https://github.com/takawon/mgs-tone-craft/releases)／[ビルド手順](BUILDING.md)／[リリース運用](docs/RELEASING.md)
+- 発行元・メーカー名：**Takawo.**　製品ライセンス：**AGPL-3.0-only**（[LICENSE](LICENSE)）
+- JUCE、音源エミュレータ、SQLite、rpclib、Inno Setup標準翻訳等の条件は[THIRD_PARTY.md](THIRD_PARTY.md)へ。外部ツール本体の同梱を意味しません。
+- 不具合・要望は[GitHub Issues](https://github.com/takawon/mgs-tone-craft/issues)へ。使用版、Standalone／VST3、再現手順を添えてください。音色DBや個人情報を無断で公開しないようご注意ください。
+
+本プロジェクトは[OpenAI Codex](https://openai.com/codex/)と[Cursor](https://cursor.com/)による対話的なAI支援開発を利用しています。利用ライブラリ・公開参考資料の一覧は[操作ガイドの付録](docs/USER_GUIDE.md#参考資料)に整理しています。

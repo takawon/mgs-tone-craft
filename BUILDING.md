@@ -1,8 +1,21 @@
 # MGS Tone Craft ビルド手順
 
+## まずビルドして起動する
+
+1. Windows 10／11にVisual StudioのC++開発環境、Windows SDK、CMake 3.25以上、Ninja、Gitを用意します。[必要環境](#必要環境)に詳細があります。初回は依存ソースの取得にネットワーク接続も必要です。
+2. プロジェクトルートの通常のPowerShellで、次を実行します。Visual Studioの環境設定からビルド・テストまで、ラッパーが順に実行します。
+
+   ```powershell
+   .\tools\build.cmd -Configuration Release
+   ```
+
+3. 成功したら、ビルドログに表示されたBuild treeの`mgstc.exe`を起動します。ASCII文字だけの通常のチェックアウトでは、既定の場所は`build\mgstc.exe`です。日本語を含むプロジェクトパスや`-BuildDirectory`指定時は出力先が変わるため、ログの場所を確認してください。製品VST3の出力先は[現在のターゲット](#現在のターゲット)に記載しています。
+
+OPLL PatchSlideはDBを別途配置しなくてもビルドできます。探索機能を使う場合は、下記の手動配置を行ってください。配布物を作る場合は[共通配布物とリリース準備](#共通配布物とリリース準備)、起動に問題がある場合は[起動診断と画面キャプチャ](#起動診断と画面キャプチャ)、日本語パスや依存記録の問題は[日本語パスについて](#日本語パスについて)を参照してください。
+
 ## OPLL PatchSlide DBの手動配置
 
-共通の`ProgramData\OPLL_PatchSlide_DB`フォルダ（通常は`C:\ProgramData\OPLL_PatchSlide_DB`）に次の3ファイルを手動配置してください。Standalone／VST3は同じファイルを読み取り専用で使います。ビルド・起動での自動コピーは行いません。
+開発用のアプリでOPLL PatchSlideを使う場合は、共通の`%ProgramData%\OPLL_PatchSlide_DB\`フォルダー（通常は`C:\ProgramData\OPLL_PatchSlide_DB\`）へ、次の3ファイルを配置してください。StandaloneとVST3は同じファイルを読み取り専用で使います。ビルド時や起動時には自動コピーしません。
 
 | ファイル | 初期版（13,950候補）のSHA-256 | 重複パッチ除外更新版（12,180候補）のSHA-256 |
 |---|---|---|
@@ -10,13 +23,68 @@
 | `patchslide_search.sqlite` | `0f086f089c4373490988302031a6dd4545f441cd50ec3e3a24a6e43d41b8b3e1` | `14b17f3b5458d3887a1aa73f53eeb71b6a9cff1f01280eb7c965dc1d10f0075f` |
 | `manifest.json` | `4b2c918887dec0c257811c34b8e886c323fc1697bdbf205af1e4e5b021ec2880` | `839ecd1659616dc7e8731ee9e046db10da0cdbedf8f03ef401286f0c70330a10` |
 
-同じ12,180候補のcompact版も受け入れます。SHA-256は本体DB `67e3de24979e2c3fe0817653fa8fce6386ee91099b9a615d4231a7a32512d0a0`、検索DB `a7b43f1121e2355f2023488f078cdbe7c8f952d028b6602291cc4a6616e47fa1`、manifest `d912cf65a8f61fe4a1a3d5c07746525401038521cf48b3bf3cce51b7d6c7eb93` です。
+同じ12,180候補を収録したcompact版も使用できます。SHA-256は本体DB `67e3de24979e2c3fe0817653fa8fce6386ee91099b9a615d4231a7a32512d0a0`、検索DB `a7b43f1121e2355f2023488f078cdbe7c8f952d028b6602291cc4a6616e47fa1`、manifest `d912cf65a8f61fe4a1a3d5c07746525401038521cf48b3bf3cce51b7d6c7eb93` です。
 
 3ファイルは同じセットで揃え、版を混在させないでください。
 
-ライブラリ管理の「パッチスライド」を開いて認識を確認します。配置後は再起動またはタブ内の再読込を行ってください。欠損・破損・対応不一致はタブに表示され、既存のライブラリ・編集・演奏は引き続き利用できます。SQLiteの更新中ファイルやjournal／WALは配置せず、完成した3ファイルを使います。Pythonや生成ツールは実行時に不要です。
+配置後はアプリを再起動するか、ライブラリ管理の「パッチスライド」タブで再読込し、候補が表示されることを確認してください。ファイルの不足・破損・組み合わせの不一致は同じタブに表示されます。その場合も、既存のライブラリ、音色編集、演奏は利用できます。
 
-DBを含むインストーラー・配布ZIP・GitHub Releaseは今回作成しません。登録・保存済みの総合音色はDBなしでも利用できます。
+SQLiteの更新中ファイルやjournal／WALは配置せず、完成した3ファイルを使ってください。アプリの実行にPythonやDB生成ツールは不要です。
+
+登録・保存済みの総合音色はDBなしでも利用できます。開発時は上記の手動配置を使い、インストーラー版ではセットアップが正式DBを配置します。アプリによる自動展開は行いません。
+
+## Windowsインストーラーのローカル生成（Phase 1）
+
+[Inno Setup 6.7.3](https://jrsoftware.org/isdl.php)を導入し、両製品をReleaseでビルドします。配布定義で固定した版とコンパイラーのSHAを照合するため、別の版では生成できません。コンパイラをPATHへ追加するか、生成時に`-IsccPath`で`ISCC.exe`を指定します。
+
+日英対応はInno Setup 6.7.3で検証します。標準メッセージは、公式6.7.3配布物の`Default.isl`と`Languages/Japanese.isl`を変更せず`installer/languages/`へ固定しています。ビルドPCの翻訳ファイルへ依存せず、生成入口で両ファイルのSHA-256を検査します。追加ダウンロードや手動配置は不要です。出典と利用条件は`THIRD_PARTY.md`、同フォルダの`Inno-Setup-LICENSE.txt`に記録しています。
+
+起動時に言語選択を表示し、WindowsのUI言語が日本語なら日本語、英語なら英語、それ以外なら英語を初期選択します。更新では前回の言語を可能な限り引き継ぎ、手動変更もできます。アンインストーラーは導入時の選択言語を使用します。独自画面・警告・補助スクリプトの固定メッセージは`[CustomMessages]`から取得します。OS/.NET由来の詳細診断、製品名、ファイル名、保存先は翻訳しません。更新時に別名のショートカットを増やさないため、既存ショートカットのファイル名は維持し、アンインストールの説明tooltipを翻訳します。今後のUI追加時も日英のメッセージと同じ置換引数を必ず用意します。
+
+```powershell
+.\tools\build.cmd -Configuration Release
+.\tools\build-installer.ps1 -DbSourceDirectory '<正式compact版の引渡しフォルダ>'
+```
+
+`-BuildDirectory`（既定`build`）、`-OutputDirectory`（既定`dist`）を指定できます。`-ValidateOnly`は生成せず前提素材を検査します。ソース定義は`installer/distribution.json`へ集約し、セットアップと手動ZIPが同じ正式素材を使います。コンパイラーはInno Setup 6.7.3本体と必要な補助ファイルのSHAを固定しています。
+
+## 共通配布物とリリース準備
+
+通常のリリース準備には`tools/prepare-release.ps1`を使います。StandaloneとVST3をRelease構成でビルドして全回帰テストを実行し、共通の配布素材から日英セットアップ、製品VST3・正式DB同梱ZIP、チェックサム、Notesを生成します。この処理ではタグ作成、アップロード、公開は行いません。DBの正式引渡し元は引数で指定し、ProgramDataから配布用ファイルを収集しないでください。
+
+```powershell
+.\tools\prepare-release.ps1 -PreviousTag '<前回公開タグ>' -PreviousCommit '<実SHA40桁>' `
+  -DbSourceDirectory '<正式DB引渡しフォルダー>' -IsccPath '<6.7.3のISCC.exe>' -Prototype
+```
+
+初回は通常ビルドで依存ソースを取得しておきます。Prepareは既存の`build/_deps`を指定して通信なしにビルドし、未取得なら停止します。未コミット作業での試作には`-Prototype`を使い、公開へ進めません。公開候補には、確定コミットと一致するソース・文書・画像と、そのdigestに対する人手レビューが必要です。
+
+個別のZIP生成入口は次のとおりです。既存の`Configuration`／`Version`指定は維持しつつ、Release以外や実製品と違う版は拒否します。出力が既存なら新しいフォルダーを指定します。
+
+```powershell
+.\tools\package-release.ps1 -DbSourceDirectory '<正式DB引渡しフォルダー>' `
+  -IsccPath '<6.7.3のISCC.exe>' -OutputDirectory '<新規出力フォルダー>'
+```
+
+生成物には、日本語の`INSTALL.txt`、英語の`INSTALL.en.txt`、READMEからたどる公開ガイドと画像、必要なライセンスを含めます。導入ガイドは両方ともUTF-8 BOM付き・CRLFで保存してください。導入先、前提環境、更新・削除の注意を揃え、手順を変更するときは日英両方を同時に更新します。
+
+生成前、実ZIPの再展開後、公開ゲートで、両ファイルの存在と共通記載事項を検証します。文章の意味が一致するかは、別途文書レビューで確認します。EXEとZIPは同じ`payload/`から生成でき、ZIPは再展開して全ファイルのSHAを照合します。正式ビルド証跡ともEXE・製品VST3フォルダー内の全ファイルのSHAを照合し、診断版、余分なファイル、入力の変更を拒否します。
+
+運用コマンド、レビュー記録、Stage→draft確認→別承認→Publish、GitHub Environmentの手動設定、失敗時の手順は[リリース運用ガイド](docs/RELEASING.md)を参照してください。Actionsは手動起動専用で既存draftを扱い、クラウド上でDB取得や別のバイナリ生成を行いません。workflowの運用開始には別途承認されたcommit／pushとEnvironment設定が必要です。
+
+前提素材は現行`VERSION`と一致するReleaseの`mgstc.exe`、製品`MGS Tone Craft.vst3`バンドル全体、12,180候補の正式compact DB3ファイル、製品文書および依存ライセンスです。DBは実行時のProgramDataから収集せず、正式引渡しフォルダを明示します。定義内の3SHA、manifestの件数・版・DBへの参照、x64形式、製品VST3 ID、バージョン、Release構成を検査し、不足・不一致なら失敗します。製品版`0.xxx`はWindows/VST3メタデータに`0.xxx.0`として記録します。
+
+出力は`dist/MGSToneCraft-<VERSION>-win64-setup.exe`と、同梱ファイルのSHA-256・件数・セットアップSHAを記録した`.exe.payload.json`です。生成は既存Release成果物を再利用し、自動ビルド・署名・公開はしません。
+
+製品の発行元・VST3メーカー名は`Takawo.`です。EXE／VST3の会社情報、VST3のFactory／ClassのVendor、セットアップの会社情報を生成入口で照合します。更新したインストーラーを適用すると「プログラムと機能」の発行元へ反映されます。DAWに古いメーカー名が残る場合はプラグインを再スキャンしてください。
+
+セットアップは管理者権限でStandaloneをProgram Filesの`MgsToneCraft`、任意VST3を64-bit Common Filesの`VST3/MGS Tone Craft.vst3`、必須DBをProgramDataの`OPLL_PatchSlide_DB`へ配置します。VST3は新規時OFF、更新時は前回選択を引き継ぎます。選択を外すと既知の製品VST3ファイルを除去し、未知ファイルは保持します。
+
+DBの更新前にはMGSTC・DAW・他のDB利用アプリを終了してください。3ファイルの排他取得・退避・セット置換を行い、失敗は復元または明確なエラーにします。SQLite sidecarや中断トランザクションのmarkerがあれば更新を拒否します。中断時はmarkerに記録された退避先を保全して復旧を確認してください。再起動待ちの強制上書きはしません。
+
+アンインストールでは「ユーザーデータ削除」OFF、「共有DB削除」ONの独立チェックを表示します。削除時には対象と警告を再確認します。ユーザーデータの現行保存先は`%LOCALAPPDATA%/MgsToneCraft`です。現セッションのWindowsユーザーを特定できなければユーザー削除を無効にします。削除対象は同フォルダの`tone_library.sqlite`、そのSQLite sidecar、`settings-v1.ini`のみです。未知ファイル、バックアップ、他ユーザーは保持します。通常の導入・更新は既存のユーザーデータへ触れません。独立選択を確実に確認するため、無人アンインストールは受け付けません。
+
+配布前は隔離Windows環境で新規・上書き・再導入、VST3選択変更、使用中DBの更新拒否、アンインストール4通り、標準ユーザー／別管理者のUACを試験します。導入・更新前後のユーザーDB／設定SHA、導入後DB3SHA、未知ファイル保持、Start Menu／登録の重複、実DAWでの認識・開閉も確認してください。生成成功や自動回帰はこれらの実機試験の代わりにはなりません。
 
 ## 必要環境
 
@@ -33,8 +101,7 @@ DBを含むインストーラー・配布ZIP・GitHub Releaseは今回作成し�
 `git`がPATHに無い場合、`tools\build.cmd`はVisual Studio同梱のGitを探して
 プロセス内のPATHへ追加する。見つからない場合は導入を促して停止する。
 
-アプリの表示バージョンは、作業ツリーに`SPECIFICATION.md`がある場合はそこから、
-無い場合（公開ソースのみのクローンなど）はルートの`VERSION`から読み取る。
+公開ソースのアプリ表示バージョンは、ルートの`VERSION`から読み取る。開発用の版指定を併用する場合も、配布時は同じ版に揃える。
 
 現在の開発環境では、Visual Studio 2026、MSVC 19.51、Windows SDK
 10.0.26100.0、CMake 4.2で動作確認している。
@@ -78,7 +145,7 @@ exeとCTestも指定先を使用し、別ツリーのexeが上書きされて誤
 > を実行し、ログがReleaseのBuild treeを示すことを確認してから`build\mgstc.exe`を
 > 起動する。
 
-通常のBuildでは現行UIを正式な`build\mgstc.exe`として生成する。従来の
+通常のビルドでは、現行UIのアプリを`build\mgstc.exe`に生成する。従来の
 旧Win32 GUI版はソースを含めて削除済みであり、JUCE版だけをビルドする。JUCEは8.0.15の公式コミット
 `91ad83ae34a81e0833b1a2b0866f54846370ae53`へ固定し、構成時に
 公式GitHubリポジトリから取得する。
@@ -147,6 +214,10 @@ Ninjaの依存走査統計もログへ出す。CMake profileの子工程はconfi
 独立レビューは対象差分を固定して読み取りで行い、後続修正を影響範囲だけ再確認する。
 
 ### 画面のPNG目視検査
+
+READMEと[操作ガイド](docs/USER_GUIDE.md)、[画面一覧](docs/screenshots/README.md)の公開画像は、撮影後に目視で現行UI・文字・個人情報を確認します。`library-patchslide`と`library-export`も撮影でき、撮影時だけ自作のサンプル音色／セットを表示します。設定のMIDI／ASIO欄は固定の例示表示へ置き換え、実機材名を画像へ出しません。通常起動や保存データは変更しません。PatchSlide撮影は読み取り専用DBの検索結果を最大15秒待つため、結果が出たか画像で確認してください。全撮影対象と再撮影コマンドは画面一覧にまとめています。
+
+共有配置を変更せず撮影する場合は`-PatchSlideDirectory '<DB3ファイルのフォルダー>'`を指定できます。この指定は撮影プロセスだけに適用され、通常起動の参照先・DB自動配置・DB内容は変更しません。PatchSlide browserの回帰テストにも`MGSTC_PATCHSLIDE_TEST_DB_DIR`で既存DBフォルダーを指定でき、未指定なら従来どおり共有配置を検証します。
 
 Windowsの画面キャプチャAPIに依存せず、JUCE自身にクライアント領域を描画させて
 PNGを生成できる。通常のBuild後に次を実行する。
@@ -278,7 +349,7 @@ Visual StudioのDeveloper PowerShellでも同じラッパーを使用する。
 - `mgstc`
   - 1組の共有エンジン・WASAPI／ASIO選択出力・MIDI入力を使用するアプリ本体
 - `mgstc_vst3`
-  - 48kHz VST3 Instrument（Layer Start Delay 含む）。`mgstc_engine` と `juce_audio_processors` のみ。WASAPI／ASIO／Windows MIDI は開かない。ビルド後にシステムへ自動コピーしない（`COPY_PLUGIN_AFTER_BUILD` は FALSE）
+  - 48 kHz内部エンジンのVST3 Instrument（Layer Start Delayを含む）。ホストの44.1／48／88.2／96 kHzに対応する。`mgstc_engine` と `juce_audio_processors` のみ。WASAPI／ASIO／Windows MIDI は開かない。ビルド後にシステムへ自動コピーしない（`COPY_PLUGIN_AFTER_BUILD` は FALSE）
 - `mgstc_vst3_diag`
   - Stage D.2 診断 VST3。製品 `mgstc_vst3` とは別成果物。`MGSTC_VST3_DIAG_MODE` で経路だけを切り替える（既定 `OFF`）。製品機能ではない
 - `mgstc_realtime_engine_host_tests` / `mgstc_layer_delay_scheduler_tests` / `mgstc_vst3_processor_tests` / `mgstc_vst3_diag_null_tests` / `mgstc_vst3_diag_lat0_tests`
@@ -298,7 +369,7 @@ VST3 bundle は JUCE artefacts 配下に生成される（構成ディレクト�
 <build-tree>\mgstc_vst3_artefacts\<Config>\VST3\MGS Tone Craft.vst3
 ```
 
-DAW のプラグインパスへこの bundle を追加するか、ホストのスキャン対象に含める。Stage C は 48,000 Hz のみ発音する。
+DAWのプラグインパスへこのVST3フォルダーを追加するか、ホストのスキャン対象に含める。製品VST3はホストの44.1／48／88.2／96 kHzに対応する。48 kHz以外では、内部の48 kHzエンジンからホストのレートへ変換する。
 
 Cubase 非48 kHz フリーズ隔離（Stage D.2）の診断 VST3 は通常の `mgstc_vst3` とは別ターゲット `mgstc_vst3_diag` である。既定は `OFF`（診断ターゲットを作らない）。CMake キャッシュ `MGSTC_VST3_DIAG_MODE` で `OFF` / `NON48_NULL` / `NON48_NULL_LAT0` / `NON48_ENGINE_ONLY` / `NON48_SRC_ZERO` / `NORMAL_NO_LATENCY_NOTIFY` を選ぶ。通常 Release の `mgstc_vst3` は常に診断 OFF のまま。診断 bundle の典型パス:
 
@@ -313,11 +384,7 @@ Plugin Code は製品と同じ `Mgti` なので、Cubase には診断 bundle だ
 
 ## バージョン表記
 
-`About`タブに出るバージョンは、CMakeのconfigure時に
-[SPECIFICATION.md](SPECIFICATION.md)の`文書版`行を読み取り、
-`MGSTC_DOC_VERSION`として`mgstc`へ渡している。
-仕様書側の文書版を上げれば次のビルドで自動的に再configureされるため、
-ソース側の版数を書き換える必要はない。
+公開ソースでは、CMakeのconfigure時に`VERSION`を読み取り、`MGSTC_DOC_VERSION`として製品へ渡す。表示版、ファイル情報、配布物の版を一致させ、ソース内の表示文字列を個別に書き換えない。
 
 ## 日本語パスについて
 
@@ -360,4 +427,4 @@ wrapper の明示引数を初期 cache より後に指定し、今回の構成�
 
 `mgstc --verify-startup` は、私有の一時設定・ライブラリで通常の初期化とnativeウィンドウ生成を行い、初回描画とデバイス隔離を確認して終了する。CTestの `mgstc_startup_smoke_tests` からも実行する。作業ディレクトリの `startup-verification.txt` に結果を残す。PC Audio、実MIDI、MAmidiMEmo接続は開始しない。
 
-`--capture-ui` も設定・ライブラリを私有一時フォルダへ隔離し、外部デバイスを開始しない。利用者の音色・設定を撮影する操作ではなく、既定状態の診断用画像を生成する。workspace回帰の成功、native起動診断、実デバイス／DAW／聴感の確認はそれぞれ別に扱う。
+`--capture-ui`も設定とライブラリを専用の一時フォルダーに隔離し、外部デバイスへ接続しない。利用者の音色や設定を撮影するのではなく、既定状態の診断用画像を生成する。自動回帰テスト、ネイティブウィンドウの起動診断、実デバイス・DAW・聴感の確認は、それぞれ別の検証として扱う。

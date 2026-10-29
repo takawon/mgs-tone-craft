@@ -67,6 +67,20 @@ elseif(EXISTS "${MGSTC_VERSION_FILE}")
     )
 endif()
 message(STATUS "MGSTC document version: ${MGSTC_DOC_VERSION}")
+set(MGSTC_BINARY_VERSION "${MGSTC_DOC_VERSION}.0")
+set(MGSTC_PUBLISHER "Takawo.")
+# JUCE's rcfile command does not depend on its configure-time Info.txt.
+# Regenerate Windows metadata when the product version or publisher changes, without
+# rebuilding resources on every unchanged configure.
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mgstc-product-version.txt"
+    CONTENT "${MGSTC_BINARY_VERSION}\n${MGSTC_PUBLISHER}\n")
+function(mgstc_track_resource_version target)
+    if(WIN32)
+        get_target_property(_mgstc_generated ${target} JUCE_GENERATED_SOURCES_DIRECTORY)
+        add_custom_command(OUTPUT "${_mgstc_generated}/${target}_resources.rc"
+            APPEND DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/mgstc-product-version.txt")
+    endif()
+endfunction()
 
 # MAmidiMEmo chip_server speaks msgpack-RPC (rpclib). Pin a published
 # release; protocol is compatible with the copy bundled in MAmidiMEmo.
@@ -305,10 +319,12 @@ if(WIN32)
 
         juce_add_gui_app(
             mgstc
+            VERSION "${MGSTC_BINARY_VERSION}"
             PRODUCT_NAME "MGS Tone Craft"
-            COMPANY_NAME "MGS Tone Craft"
+            COMPANY_NAME "${MGSTC_PUBLISHER}"
             BUNDLE_ID "com.mgstonecraft.mgstc"
         )
+        mgstc_track_resource_version(mgstc)
         set_target_properties(
             mgstc
             PROPERTIES
@@ -480,7 +496,8 @@ if(WIN32)
 
         juce_add_plugin(
             mgstc_vst3
-            COMPANY_NAME "MGS Tone Craft"
+            VERSION "${MGSTC_BINARY_VERSION}"
+            COMPANY_NAME "${MGSTC_PUBLISHER}"
             BUNDLE_ID "com.mgstonecraft.mgstc.instrument"
             IS_SYNTH TRUE
             NEEDS_MIDI_INPUT TRUE
@@ -498,12 +515,13 @@ if(WIN32)
             PLUGIN_CHANNEL_CONFIGURATIONS "{0, 2}"
         )
         mgstc_configure_vst3_target(mgstc_vst3 0)
+        mgstc_track_resource_version(mgstc_vst3)
 
         mgstc_vst3_diag_mode_id(_mgstc_vst3_diag_id "${MGSTC_VST3_DIAG_MODE}")
         if(_mgstc_vst3_diag_id GREATER 0)
             juce_add_plugin(
                 mgstc_vst3_diag
-                COMPANY_NAME "MGS Tone Craft"
+                COMPANY_NAME "${MGSTC_PUBLISHER}"
                 BUNDLE_ID "com.mgstonecraft.mgstc.instrument"
                 IS_SYNTH TRUE
                 NEEDS_MIDI_INPUT TRUE
@@ -523,6 +541,7 @@ if(WIN32)
             mgstc_configure_vst3_target(
                 mgstc_vst3_diag ${_mgstc_vst3_diag_id}
             )
+            mgstc_track_resource_version(mgstc_vst3_diag)
         endif()
     endif()
 endif()

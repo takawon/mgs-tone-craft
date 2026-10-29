@@ -1,0 +1,79 @@
+﻿MGS Tone Craft - Windows x64 manual installation (English)
+Japanese: INSTALL.txt / English: INSTALL.en.txt
+
+Follow this guide to install MGS Tone Craft manually from the ZIP.
+For the usual installation, the setup EXE lets you choose locations and features
+on screen. The ZIP and setup EXE contain the same program files and OPLL PatchSlide
+data, but file placement and component selection differ.
+This does not mean that every DAW, device or audio configuration has been tested.
+
+Before updating, back up your library and settings.
+v0.365 cannot read or automatically migrate the old v0.285 library files,
+timbre-library-v1.mgstc and composite-timbre-library-v1.mgstc.
+Keep the originals and check for a supported migration method before updating.
+Keeping a backup does not make these files usable in the new version.
+These files are separate from the current tone_library.sqlite library and its
+compatibility policy. See README.md for data compatibility and backup advice.
+
+1. Extract the standalone application
+   Create a new, writable folder dedicated to MGS Tone Craft.
+   Extract the entire ZIP there, preserving its folder structure.
+   Do not mix it with other applications or personal files. Keep the documents and licenses.
+   Do not run the application from inside the ZIP.
+   MGS Tone Craft requires Windows 10/11 x64. Launch it in step 4.
+
+2. Install the VST3 plugin if needed
+   Close your DAWs. Copy the entire "MGS Tone Craft.vst3" folder, including
+   Contents and all its files, into:
+     %CommonProgramFiles%\VST3\
+   A typical 64-bit location is C:\Program Files\Common Files\VST3\.
+   Create the destination VST3 directory if it does not exist. Administrative permission may be needed.
+   Do not copy just the binary inside the folder or substitute a diagnostic plugin.
+   Keep the distribution's LICENSE, THIRD_PARTY.md and licenses/ documents.
+   After copying, rescan plugins in your DAW.
+   If you also use the setup EXE, check the destination and the version you intend to use.
+   Overwriting the same VST3 folder also replaces the plugin installed by the setup EXE.
+
+3. Install the OPLL PatchSlide data
+   Before replacing the shared database, close MGSTC, all DAWs, and every other
+   application using it. Back up all three existing files together.
+   Copy all three files from this ZIP's OPLL_PatchSlide_DB folder to:
+     %ProgramData%\OPLL_PatchSlide_DB\
+   The files are patchslide.sqlite, patchslide_search.sqlite and manifest.json.
+   Create the destination folder if it does not exist.
+   Do not mix files from different versions. Check the destination folder's
+   permissions and copy with administrative permission if needed.
+   Other applications may also use this shared database. The setup EXE checks
+   whether files are in use and attempts to restore the previous files if an update fails.
+   Copying files manually from the ZIP does not perform that update process.
+   Without the database, PatchSlide is unavailable, but other timbre editing remains available.
+
+4. Keep your user data and launch the application
+   Your library and settings are stored in:
+     %LOCALAPPDATA%\MgsToneCraft\
+   Do not copy, replace or delete the existing tone_library.sqlite or
+   settings-v1.ini as part of installation or an update.
+   Launch mgstc.exe from the extracted folder, or load the VST3 plugin in your DAW.
+   To use OPLL PatchSlide, check that candidates appear from the data you installed.
+
+5. Updates and removal
+   Close applications using the program or VST3 folder before overwriting it.
+   Keep your library and settings. Follow the precautions in step 3 when updating
+   the shared database.
+   To remove a manual installation, delete only the dedicated extraction folder
+   created in step 1 and the "MGS Tone Craft.vst3" folder you placed yourself.
+   Do not delete the shared VST3 directory or any folder containing unrelated files.
+   This is manual removal, not the setup EXE's uninstaller.
+   Deleting the shared database may prevent other applications from using PatchSlide.
+   Check for other users first. If removing the database, delete only the three files
+   listed in step 3. Do not delete ProgramData itself or unknown files in the database folder.
+   In the setup EXE's uninstaller, user-data deletion defaults to OFF and shared-database
+   deletion defaults to ON. Turn shared-database deletion OFF if other applications use it.
+   Deleting user data is permanent. Delete it only if you intend to erase it.
+
+6. Dependencies and licensing
+   Microsoft Visual C++ Redistributable, ASIO drivers and MAmidiMEmo itself are
+   not included. Install required runtimes and drivers from their official sources.
+   External hardware and software each require their own setup.
+   See README.md, BUILDING.md, THIRD_PARTY.md, LICENSE and licenses/ for details.
+   Product publisher/manufacturer: Takawo. Product license: AGPL-3.0-only.

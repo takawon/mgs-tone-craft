@@ -1,0 +1,104 @@
+{
+  "compilerVersion": "6.7.3",
+  "compilerSha256": "0a8757031b33777e4c9cbffee40f11a5062b36d25cbe144c1db73b6102b80ad7",
+  "languageFiles": {
+    "Default.isl": "42a5f6f7dbbddf26cc278f67db5d894235ce1d126a6856702e31bd02023a1316",
+    "Japanese.isl": "d5450537bb128112347bf86a4bdc3a4be0605414df0bc4fc90f55aaef1ba369b"
+  },
+  "dbVersion": "patchslide-pruned-v1-compact",
+  "candidateCount": 12180,
+  "dbFiles": {
+    "patchslide.sqlite": "67e3de24979e2c3fe0817653fa8fce6386ee91099b9a615d4231a7a32512d0a0",
+    "patchslide_search.sqlite": "a7b43f1121e2355f2023488f078cdbe7c8f952d028b6602291cc4a6616e47fa1",
+    "manifest.json": "d912cf65a8f61fe4a1a3d5c07746525401038521cf48b3bf3cce51b7d6c7eb93"
+  },
+  "documents": [
+    "LICENSE",
+    "THIRD_PARTY.md",
+    "README.md",
+    "CHANGELOG.md",
+    "BUILDING.md"
+  ],
+  "documentation": [
+    "docs/USER_GUIDE.md",
+    "docs/SCC_NUMERIC_WAVE.md",
+    "docs/screenshots/README.md"
+  ],
+  "installerOnlyFiles": {
+    "app/installer/Manage-InstallerData.ps1": "installer/Manage-InstallerData.ps1",
+    "recipe/MGSToneCraft.iss": "installer/MGSToneCraft.iss",
+    "recipe/languages/Default.isl": "installer/languages/Default.isl",
+    "recipe/languages/Japanese.isl": "installer/languages/Japanese.isl"
+  },
+  "licenses": {
+    "emu2149-LICENSE.txt": "third_party/emu2149/LICENSE",
+    "emu2212-LICENSE.txt": "third_party/emu2212/LICENSE",
+    "emu2413-LICENSE.txt": "third_party/emu2413/LICENSE",
+    "sqlite-LICENSE.txt": "third_party/sqlite/LICENSE",
+    "JUCE-LICENSE.md": "_deps/juce-src/LICENSE.md",
+    "rpclib-LICENSE.md": "_deps/rpclib-src/LICENSE.md",
+    "Steinberg-ASIO-SDK-LICENSE.txt": "_deps/juce-src/modules/juce_audio_devices/native/asio/LICENSE.txt",
+    "Inno-Setup-LICENSE.txt": "installer/languages/Inno-Setup-LICENSE.txt",
+    "Steinberg-VST3-SDK-LICENSE.txt": "_deps/juce-src/modules/juce_audio_processors_headless/format_types/VST3_SDK/LICENSE.txt"
+  },
+  "compilerSupportFiles": {
+    "ISCmplr.dll": "85a1e3090d3a5b85319f001b7c8f9ecfad45f37eff030a67bbe29ef58b7aa2c3",
+    "ISPP.dll": "bde04be7f4a55ca56afb6b06600d7cbe8326fac468ac3f2885b80eefb3ed2a7a",
+    "ISPPBuiltins.iss": "bc765e1121a95dc602ca1248b484418cecc6db9d4b6f4dae58e9a2c35262527c",
+    "Setup.e32": "a80d75ba8d8c336050c37f7707de8bb017cc93597329e0ea18d474156b3e0da5",
+    "SetupLdr.e32": "5475964893adbb33ccc420ad4d88bbdff27dfaaca7580cd6058ea2798893490d",
+    "SetupLdr.e64": "e38f2140e6bfd86c6ddc69c98f46475080c75fd5ee4be701ceff9c842c6c5019",
+    "SetupCustomStyle.e32": "9675a2a5c78c66b691cc80270031da42bebad5725fbf60853cb4e5f90251bd5e",
+    "islzma.dll": "8af307ce3738ab1d37cc7e76b2f76615e2045597d4367c3e40d52b5f2fbd353d",
+    "islzma32.exe": "fd977c3ac44c56997d2b4fd6647e97e2457c43991a6ae26a4b2252c0eabdfebb",
+    "islzma64.exe": "87a50495aff580b78cad57906a765d3cf28ca508cfa95c24c1247c286ddf71b2",
+    "is7z.dll": "f97cda058bfe97a7e9ced5cde7018bbc26e35155c3c7405c6146808f8d06806d",
+    "is7zxa.dll": "e3cef67858843c554100126f04932be327097777865e4eb82951dd97cdb28942",
+    "is7zxr.dll": "728b368dc4f2831cc4d13291f46eeaf9f89b7e3a91356cf793c330e953b8e17b",
+    "isbunzip.dll": "31d04c1e4bfdfa34704c142fa98f80c0a3076e4b312d6ada57c4be9d9c7dcf26",
+    "isbzip.dll": "8072e83385afc4a84006271a87a11fc0a22b149cbd77322669ca56c470d28ced",
+    "isunzlib.dll": "8287d0e287a66ee78537c8d1d98e426562b95c50f569b92cea9ce36a9fa57e64",
+    "iszlib.dll": "14c0d4a2a41572384f8309cdf03de5c6e7ed46bef64cce70d989b2665eff1a47",
+    "SetupClassicIcon.ico": "fa07ed17dff186a5b46c16861158bf3a36b67d84ff7a7bf9a58eaad28143d827",
+    "WizClassicImage-IS.bmp": "1b73df0b89a2943f34582cf81c2d8ed7b1ce4cfb54d86ce58ebd6dd0e1e05f5d",
+    "WizClassicImage.bmp": "d148dc2569e9abc4b4da650b1920ef1ffdc10bbd6bc2e20a97ce44b1f9f78aea",
+    "WizClassicSmallImage-IS.bmp": "ae94cd61179bc1869d0082b1fa8c189f8487d106712b48a2a6c6a035d370bfb4",
+    "WizClassicSmallImage.bmp": "a7e560d419e85daf80cce980baa124ef7c73197d0f51a59a19f1866ee8edfe8c"
+  },
+  "productBundleFiles": [
+    "Contents/Resources/moduleinfo.json",
+    "Contents/x86_64-win/MGS Tone Craft.vst3"
+  ],
+  "manualInstallFiles": {
+    "INSTALL.txt": "installer/INSTALL.txt",
+    "INSTALL.en.txt": "installer/INSTALL.en.txt"
+  },
+  "manualInstallRequiredText": [
+    "INSTALL.txt",
+    "INSTALL.en.txt",
+    "mgstc.exe",
+    "Windows 10/11 x64",
+    "MGS Tone Craft.vst3",
+    "Contents",
+    "%CommonProgramFiles%\\VST3\\",
+    "C:\\Program Files\\Common Files\\VST3\\",
+    "OPLL_PatchSlide_DB",
+    "%ProgramData%\\OPLL_PatchSlide_DB\\",
+    "patchslide.sqlite",
+    "patchslide_search.sqlite",
+    "manifest.json",
+    "%LOCALAPPDATA%\\MgsToneCraft\\",
+    "tone_library.sqlite",
+    "settings-v1.ini",
+    "Microsoft Visual C++ Redistributable",
+    "ASIO",
+    "MAmidiMEmo",
+    "README.md",
+    "BUILDING.md",
+    "THIRD_PARTY.md",
+    "LICENSE",
+    "licenses/",
+    "Takawo.",
+    "AGPL-3.0-only"
+  ]
+}

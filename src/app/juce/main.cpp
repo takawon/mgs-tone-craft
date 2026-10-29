@@ -2532,6 +2532,14 @@ private:
             }
             snapshot_file_ = juce::File::getCurrentWorkingDirectory()
                 .getChildFile(snapshot_path);
+            const auto capture_db_directory = arguments
+                .getValueForOption("--capture-db-directory")
+                .trim()
+                .trimCharactersAtStart("\"")
+                .trimCharactersAtEnd("\"");
+            if (capture_db_directory.isNotEmpty()) {
+                snapshot_db_directory_ = std::filesystem::path(capture_db_directory.toWideCharPointer());
+            }
             auto capture_target = arguments
                 .getValueForOption("--capture-target")
                 .trim()
@@ -3409,10 +3417,14 @@ private:
                 : SnapshotResult::MissingContent;
         } else if (snapshot_target_ == "library") {
             result = captureLibraryManagerSnapshot(snapshot_file_, 0);
+        } else if (snapshot_target_ == "library-patchslide") {
+            result = captureLibraryManagerSnapshot(snapshot_file_, 1);
         } else if (snapshot_target_ == "library-tags") {
             result = captureLibraryManagerSnapshot(snapshot_file_, 2);
         } else if (snapshot_target_ == "library-import") {
             result = captureLibraryManagerSnapshot(snapshot_file_, 3);
+        } else if (snapshot_target_ == "library-export") {
+            result = captureLibraryManagerSnapshot(snapshot_file_, 4);
         } else if (snapshot_target_ == "spectrogram" || snapshot_target_ == "spectrum") {
             auto* const content = spectrogram_window_ != nullptr
                 ? spectrogram_window_->snapshotContent()
@@ -3431,11 +3443,13 @@ private:
     [[nodiscard]] SnapshotResult captureLibraryManagerSnapshot(
         const juce::File& output_file,
         int tab_index) {
-        ScopedLibraryIpcLock lock(
-            tag_management_lock_);
         std::string error;
-        auto loaded = loadToneLibraries(&error);
-        if (!lock.isLocked() || !loaded
+        std::optional<ToneLibrarySnapshot> loaded;
+        {
+            ScopedLibraryIpcLock lock(tag_management_lock_);
+            if (lock.isLocked()) loaded = loadToneLibraries(&error);
+        }
+        if (!loaded
             || midi_service_ == nullptr
             || audio_service_ == nullptr
             || editor_session_ == nullptr) {
@@ -3453,8 +3467,18 @@ private:
             [] {},
             [](LibraryManagerKind, std::uint64_t, std::uint8_t) {},
             [](LibraryManagerKind, std::uint8_t) {},
-            [] {});
+            [] {}, {}, {}, {}, {}, {}, snapshot_db_directory_);
+        content.prepareCaptureData();
         content.setCaptureTab(tab_index);
+        if (tab_index == 1) {
+            // Only this isolated documentation path pumps messages while the
+            // real read-only catalog worker loads. Never wait under the shared
+            // library lock, and leave a slow/error result visible for review.
+            const auto deadline = juce::Time::getMillisecondCounterHiRes() + 15000.0;
+            while (juce::Time::getMillisecondCounterHiRes() < deadline) {
+                if (!juce::MessageManager::getInstance()->runDispatchLoopUntil(50)) break;
+            }
+        }
         return writeComponentPngSnapshot(content, output_file);
     }
 
@@ -3490,6 +3514,7 @@ private:
     juce::InterProcessLock tag_management_lock_{
         "MgsToneCraftTimbreLibraryV1"};
     juce::File snapshot_file_;
+    std::filesystem::path snapshot_db_directory_;
     MgstcLookAndFeel look_and_feel_;
 };
 

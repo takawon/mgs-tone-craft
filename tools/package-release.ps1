@@ -1,103 +1,37 @@
-[CmdletBinding()]
+﻿[CmdletBinding(DefaultParameterSetName='Inputs')]
 param(
-    [string]$Configuration = "Release",
-    [string]$Version = "",
-    [string]$OutputDirectory = ""
+    [Parameter(Mandatory=$true,ParameterSetName='Inputs')][string]$DbSourceDirectory,
+    [Parameter(Mandatory=$true,ParameterSetName='Prepared')][string]$PreparedStage,
+    [ValidateSet('Release')][string]$Configuration='Release',
+    [string]$Version='', [string]$BuildDirectory='build',
+    [string]$OutputDirectory='dist', [string]$IsccPath='', [switch]$ValidateOnly
 )
-
-$ErrorActionPreference = "Stop"
-$projectRoot = Split-Path -Parent $PSScriptRoot
-
-if (-not $OutputDirectory) {
-    $OutputDirectory = Join-Path $projectRoot "dist"
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'distribution-common.ps1')
+$root=Split-Path -Parent $PSScriptRoot
+$output=Get-MgstcAbsolutePath $OutputDirectory $root
+$ownedStage=$false
+if($PSCmdlet.ParameterSetName -eq 'Inputs') {
+    $material=Get-MgstcDistributionInput -ProjectRoot $root -DbSourceDirectory $DbSourceDirectory -BuildDirectory $BuildDirectory -IsccPath $IsccPath
+    if($Version -and $Version -ne $material.version){throw 'Requested ZIP version differs from VERSION and validated products.'}
+    if($ValidateOnly){Write-Output "Validated manual ZIP inputs for $($material.version).";return}
+    New-Item -ItemType Directory -Path $output -Force | Out-Null
+    $PreparedStage=Join-Path $output ('.zip-stage-'+[guid]::NewGuid().ToString('N'))
+    New-MgstcDistributionStage -Material $material -StageDirectory $PreparedStage | Out-Null
+    $ownedStage=$true
 }
-
-$exePath = Join-Path $projectRoot "build\mgstc.exe"
-if (-not (Test-Path -LiteralPath $exePath)) {
-    throw "build\mgstc.exe was not found. Build Release first."
-}
-
-if (-not $Version) {
-    $versionFile = Join-Path $projectRoot "VERSION"
-    if (Test-Path -LiteralPath $versionFile) {
-        $Version = (Get-Content -LiteralPath $versionFile -TotalCount 1).Trim()
+try {
+    $report=Test-MgstcDistributionStage -StageDirectory $PreparedStage -ProjectRoot $root
+    if($Version -and $Version -ne $report.version){throw 'Requested ZIP version differs from the common stage.'}
+    if($ValidateOnly){Write-Output "Validated prepared manual ZIP inputs for $($report.version).";return}
+    $artifact=New-MgstcManualZip -StageDirectory $PreparedStage -OutputDirectory $output -ProjectRoot $root
+    [IO.File]::WriteAllText(($artifact.path+'.payload.json'),($artifact | Select-Object files,bytes,sha256 | ConvertTo-Json -Depth 8),(New-Object Text.UTF8Encoding($false)))
+    Write-Output $artifact.path
+} finally {
+    if($ownedStage) {
+        $resolved=[IO.Path]::GetFullPath($PreparedStage)
+        if((Split-Path -Parent $resolved) -ne $output -or (Split-Path -Leaf $resolved) -notlike '.zip-stage-*'){throw 'Unsafe ZIP staging cleanup path.'}
+        Remove-Item -LiteralPath $resolved -Recurse -Force
     }
 }
-if (-not $Version) {
-    $specPath = Join-Path $projectRoot "SPECIFICATION.md"
-    if (Test-Path -LiteralPath $specPath) {
-        foreach ($line in Get-Content -LiteralPath $specPath -TotalCount 8) {
-            if ($line -match ':\s*([0-9]+(?:\.[0-9]+)?)\s*$' -and $line -match '0\.|1\.') {
-                $Version = $Matches[1]
-                break
-            }
-        }
-    }
-}
-if (-not $Version) {
-    $Version = "alpha"
-}
-
-$stageRoot = Join-Path $env:TEMP ("mgstc-dist-" + [Guid]::NewGuid().ToString("N"))
-$stageDir = Join-Path $stageRoot "MGSToneCraft"
-New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
-
-Copy-Item -LiteralPath $exePath -Destination (Join-Path $stageDir "mgstc.exe")
-Copy-Item -LiteralPath (Join-Path $projectRoot "LICENSE") `
-    -Destination (Join-Path $stageDir "LICENSE")
-Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") `
-    -Destination (Join-Path $stageDir "README.md")
-Copy-Item -LiteralPath (Join-Path $projectRoot "THIRD_PARTY.md") `
-    -Destination (Join-Path $stageDir "THIRD_PARTY.md")
-$changelog = Join-Path $projectRoot "CHANGELOG.md"
-if (Test-Path -LiteralPath $changelog) {
-    Copy-Item -LiteralPath $changelog `
-        -Destination (Join-Path $stageDir "CHANGELOG.md")
-}
-
-$licensesDir = Join-Path $stageDir "licenses"
-New-Item -ItemType Directory -Path $licensesDir -Force | Out-Null
-foreach ($name in @("emu2149", "emu2212", "emu2413", "sqlite")) {
-    $src = Join-Path $projectRoot "third_party\$name\LICENSE"
-    Copy-Item -LiteralPath $src `
-        -Destination (Join-Path $licensesDir "$name-LICENSE.txt")
-}
-$asioLicense = $null
-$configKey = $Configuration.ToLowerInvariant()
-$asioCandidates = New-Object System.Collections.Generic.List[string]
-$asioRel = "_deps\juce-src\modules\juce_audio_devices\native\asio\LICENSE.txt"
-$asioCandidates.Add(
-    (Join-Path $env:LOCALAPPDATA "MgsToneCraft\cmake-build-$configKey\$asioRel"))
-$localCmakeRoots = Join-Path $env:LOCALAPPDATA "MgsToneCraft"
-if (Test-Path -LiteralPath $localCmakeRoots) {
-    Get-ChildItem -LiteralPath $localCmakeRoots -Directory -Filter "cmake-build-*" |
-        ForEach-Object {
-            $asioCandidates.Add((Join-Path $_.FullName $asioRel))
-        }
-}
-$asioCandidates.Add((Join-Path $projectRoot "build\$asioRel"))
-foreach ($candidate in $asioCandidates) {
-    if (Test-Path -LiteralPath $candidate) {
-        $asioLicense = $candidate
-        break
-    }
-}
-if (-not $asioLicense) {
-    throw "JUCE ASIO license was not found. Build $Configuration before packaging."
-}
-Copy-Item -LiteralPath $asioLicense `
-    -Destination (Join-Path $licensesDir "Steinberg-ASIO-SDK-LICENSE.txt")
-
-New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-$zipName = "MGSToneCraft-$Version-win64.zip"
-$zipPath = Join-Path $OutputDirectory $zipName
-if (Test-Path -LiteralPath $zipPath) {
-    Remove-Item -LiteralPath $zipPath -Force
-}
-
-Compress-Archive -Path (Join-Path $stageRoot "*") `
-    -DestinationPath $zipPath `
-    -CompressionLevel Optimal
-Remove-Item -LiteralPath $stageRoot -Recurse -Force
-
-Write-Output $zipPath
