@@ -67,7 +67,8 @@ bool layerUsesSequenceEnvelope(const CompositeLayer& layer) noexcept {
     if (!layer.modulation_profiles.empty() || !layer.register_auto_profiles.empty()
         || layer.volume_modulation.enabled || layer.pitch_modulation.enabled
         || layer.opll_tl_modulation.enabled || layer.opll_fb_modulation.enabled
-        || layer.opll_tl_auto.active() || layer.opll_fb_auto.active()) {
+        || layer.opll_tl_auto.active() || layer.opll_fb_auto.active()
+        || layer.psg_noise_auto.active() || layer.psg_noise_modulation.enabled) {
         return true;
     }
     const auto& timeline = layer.envelope_timeline;
@@ -289,7 +290,9 @@ std::optional<std::size_t> duplicateCompositeLayer(
     // TL/FB auto is chip-wide exclusive; the original keeps ownership.
     layer.opll_tl_auto = {};
     layer.opll_fb_auto = {};
-    layer.register_auto_profiles.clear();
+    std::erase_if(layer.register_auto_profiles, [](const auto& profile) {
+        return profile.target != OpllRegisterAutoTarget::Noise;
+    });
     disableCompositeModulation(layer, CompositeModulationTarget::TotalLevel);
     disableCompositeModulation(layer, CompositeModulationTarget::Feedback);
     layer.envelope_number = layer.volume_envelope.kind == EnvelopeKind::Rate

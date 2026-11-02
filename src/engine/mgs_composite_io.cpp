@@ -721,6 +721,21 @@ bool parseSequence(
             });
             continue;
         }
+        if (character == 'n' || character == 'N' || character == '/' || character == '*') {
+            const bool noise = character == 'n' || character == 'N';
+            ++position;
+            const auto begin = position;
+            while (position < body.size() && std::isdigit(static_cast<unsigned char>(body[position]))) ++position;
+            int value{};
+            if (begin == position || !decimal(std::string_view(body).substr(begin, position - begin),
+                    0, noise ? 31 : 3, value)) {
+                addIssue(issues, "invalid PSG envelope command");
+                continue;
+            }
+            timbre.push_back({.kind = noise ? EnvelopeEventKind::Noise : EnvelopeEventKind::ToneNoiseMode,
+                .value = value, .count = count, .after_loop_start = after_loop_start});
+            continue;
+        }
         if (character == 'y' || character == 'Y') {
             ++position;
             const auto register_begin = position;

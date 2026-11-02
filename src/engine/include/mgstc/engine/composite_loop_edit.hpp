@@ -12,17 +12,19 @@ inline void preserveBoundaryCommandOrder(CompositeLayer& layer,
                                         bool group_sides = true) {
     const auto automaticActive = [&](OpllRegisterAutoTarget target) {
         const auto& base = target == OpllRegisterAutoTarget::TotalLevel
-            ? layer.opll_tl_auto : layer.opll_fb_auto;
+            ? layer.opll_tl_auto : target == OpllRegisterAutoTarget::Noise
+                ? layer.psg_noise_auto : layer.opll_fb_auto;
         return compositeRegisterAutoAt(layer, target, count).active()
             || compositeRegisterAutoAt(layer, target, count, false).active()
             || (count ? compositeRegisterAutoAt(layer, target, count - 1).active() : base.active());
     };
     for (auto target : {CompositeModulationTarget::Pitch, CompositeModulationTarget::Volume,
-                        CompositeModulationTarget::TotalLevel, CompositeModulationTarget::Feedback}) {
+                        CompositeModulationTarget::TotalLevel, CompositeModulationTarget::Feedback, CompositeModulationTarget::Noise}) {
         const bool automatic = target == CompositeModulationTarget::TotalLevel
             ? automaticActive(OpllRegisterAutoTarget::TotalLevel)
             : target == CompositeModulationTarget::Feedback
-                && automaticActive(OpllRegisterAutoTarget::Feedback);
+                ? automaticActive(OpllRegisterAutoTarget::Feedback)
+                : target == CompositeModulationTarget::Noise && automaticActive(OpllRegisterAutoTarget::Noise);
         const bool active = automatic || compositeModulationAt(layer, target, count).enabled
             || compositeModulationAt(layer, target, count, false).enabled
             || (count ? compositeModulationAt(layer, target, count - 1).enabled

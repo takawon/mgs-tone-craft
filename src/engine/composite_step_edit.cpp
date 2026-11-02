@@ -127,7 +127,7 @@ CompositeStepEditResult editCompositeSteps(
     const auto original_length = source.envelope_timeline.length_counts;
     if (start_count > original_length || original_length > 65'535
         || maximum_length == 0 || maximum_length > 65'535
-        || static_cast<std::uint8_t>(lane) > static_cast<std::uint8_t>(CompositeStepEditLane::Fb)
+        || static_cast<std::uint8_t>(lane) > static_cast<std::uint8_t>(CompositeStepEditLane::Mode)
         || static_cast<std::int64_t>(start_count) + delta < 0)
         return reject("編集位置がタイムラインの範囲外です。");
     if (delta == 0) { result.accepted = true; return result; }
@@ -142,13 +142,16 @@ CompositeStepEditResult editCompositeSteps(
         return isSelected(lane, target == CompositeModulationTarget::Pitch
             ? CompositeStepEditLane::Pitch : target == CompositeModulationTarget::Volume
                 ? CompositeStepEditLane::Volume : target == CompositeModulationTarget::TotalLevel
-                    ? CompositeStepEditLane::Tl : CompositeStepEditLane::Fb);
+                    ? CompositeStepEditLane::Tl : target == CompositeModulationTarget::Noise
+                        ? CompositeStepEditLane::Noise : CompositeStepEditLane::Fb);
     };
     const auto selectedManual = [&](const EnvelopeEvent& event) {
         return (event.kind == EnvelopeEventKind::Timbre
                 && isSelected(lane, CompositeStepEditLane::Timbre))
             || (event.kind == EnvelopeEventKind::RegisterWrite
-                && isSelected(lane, CompositeStepEditLane::RegisterWrite));
+                && isSelected(lane, CompositeStepEditLane::RegisterWrite))
+            || (event.kind == EnvelopeEventKind::Noise && isSelected(lane, CompositeStepEditLane::Noise))
+            || (event.kind == EnvelopeEventKind::ToneNoiseMode && isSelected(lane, CompositeStepEditLane::Mode));
     };
     const auto atJoin = [&](std::uint32_t count) {
         return count >= mapping.boundary() && count <= start_count;
@@ -163,7 +166,8 @@ CompositeStepEditResult editCompositeSteps(
         || std::any_of(layer.register_auto_profiles.begin(), layer.register_auto_profiles.end(),
             [&](const auto& profile) {
                 return selectedTarget(profile.target == OpllRegisterAutoTarget::TotalLevel
-                    ? CompositeModulationTarget::TotalLevel : CompositeModulationTarget::Feedback)
+                    ? CompositeModulationTarget::TotalLevel : profile.target == OpllRegisterAutoTarget::Noise
+                        ? CompositeModulationTarget::Noise : CompositeModulationTarget::Feedback)
                     && atJoin(profile.count);
             })
         || std::any_of(layer.derived_command_placements.begin(), layer.derived_command_placements.end(),
@@ -174,14 +178,15 @@ CompositeStepEditResult editCompositeSteps(
         // Preserve its authoring and execution order by rejecting the edit.
         const bool other_manual = std::any_of(source.timbre_automation.begin(), source.timbre_automation.end(),
             [&](const auto& event) { return !selectedManual(event) && event.count == mapping.boundary()
-                && (event.kind == EnvelopeEventKind::Timbre || event.kind == EnvelopeEventKind::RegisterWrite); })
+                && (event.kind == EnvelopeEventKind::Timbre || event.kind == EnvelopeEventKind::RegisterWrite
+                    || event.kind == EnvelopeEventKind::Noise || event.kind == EnvelopeEventKind::ToneNoiseMode); })
             || (!isSelected(lane, CompositeStepEditLane::Pitch)
                 && std::any_of(source.pitch_envelope.events.begin(), source.pitch_envelope.events.end(),
                     [&](const auto& event) { return event.kind == EnvelopeEventKind::Pitch
                         && event.count == mapping.boundary(); }));
         bool other_derived = false;
         for (auto target : {CompositeModulationTarget::Pitch, CompositeModulationTarget::TotalLevel,
-                            CompositeModulationTarget::Feedback}) {
+                            CompositeModulationTarget::Feedback, CompositeModulationTarget::Noise}) {
             if (selectedTarget(target)) continue;
             other_derived |= compositeModulationAt(source, target, mapping.boundary()).enabled
                 || compositeModulationAt(source, target, mapping.boundary(), false).enabled
@@ -191,14 +196,16 @@ CompositeStepEditResult editCompositeSteps(
                 [&](const auto& profile) { return profile.target == target && profile.count == mapping.boundary(); });
             if (target != CompositeModulationTarget::Pitch) {
                 const auto auto_target = target == CompositeModulationTarget::TotalLevel
-                    ? OpllRegisterAutoTarget::TotalLevel : OpllRegisterAutoTarget::Feedback;
+                    ? OpllRegisterAutoTarget::TotalLevel : target == CompositeModulationTarget::Noise
+                        ? OpllRegisterAutoTarget::Noise : OpllRegisterAutoTarget::Feedback;
                 other_derived |= std::any_of(source.register_auto_profiles.begin(), source.register_auto_profiles.end(),
                     [&](const auto& profile) { return profile.target == auto_target && profile.count == mapping.boundary(); });
                 other_derived |= compositeRegisterAutoAt(source, auto_target, mapping.boundary()).active()
                     || compositeRegisterAutoAt(source, auto_target, mapping.boundary(), false).active()
                     || (mapping.boundary() ? compositeRegisterAutoAt(source, auto_target, mapping.boundary() - 1).active()
                         : (auto_target == OpllRegisterAutoTarget::TotalLevel
-                            ? source.opll_tl_auto : source.opll_fb_auto).active());
+                            ? source.opll_tl_auto : auto_target == OpllRegisterAutoTarget::Noise
+                                ? source.psg_noise_auto : source.opll_fb_auto).active());
             }
         }
         if (other_manual || other_derived)
@@ -228,7 +235,8 @@ CompositeStepEditResult editCompositeSteps(
                     layer.modulation_profiles[index] = source.modulation_profiles[index];
             for (std::size_t index = 0; index < layer.register_auto_profiles.size(); ++index) {
                 const auto target = layer.register_auto_profiles[index].target == OpllRegisterAutoTarget::TotalLevel
-                    ? CompositeModulationTarget::TotalLevel : CompositeModulationTarget::Feedback;
+                    ? CompositeModulationTarget::TotalLevel : layer.register_auto_profiles[index].target == OpllRegisterAutoTarget::Noise
+                        ? CompositeModulationTarget::Noise : CompositeModulationTarget::Feedback;
                 if (!selectedTarget(target)) layer.register_auto_profiles[index] = source.register_auto_profiles[index];
             }
             for (std::size_t index = 0; index < source.derived_command_placements.size(); ++index)
@@ -258,7 +266,8 @@ CompositeStepEditResult editCompositeSteps(
                 joined.push_back({event.count, event.after_loop_start, &event.command_order, 0});
         for (auto& profile : layer.register_auto_profiles) {
             const auto target = profile.target == OpllRegisterAutoTarget::TotalLevel
-                ? CompositeModulationTarget::TotalLevel : CompositeModulationTarget::Feedback;
+                ? CompositeModulationTarget::TotalLevel : profile.target == OpllRegisterAutoTarget::Noise
+                        ? CompositeModulationTarget::Noise : CompositeModulationTarget::Feedback;
             if (selectedTarget(target) && profile.count >= mapping.boundary() && profile.count <= start_count)
                 joined.push_back({profile.count, profile.after_loop_start, &profile.command_order, 2});
         }
@@ -311,7 +320,9 @@ CompositeStepEditResult editCompositeSteps(
             if ((target == CompositeStepEditLane::Timbre
                 && event.kind != EnvelopeEventKind::Timbre)
                 || (target == CompositeStepEditLane::RegisterWrite
-                && event.kind != EnvelopeEventKind::RegisterWrite)) {
+                && event.kind != EnvelopeEventKind::RegisterWrite)
+                || (target == CompositeStepEditLane::Noise && event.kind != EnvelopeEventKind::Noise)
+                || (target == CompositeStepEditLane::Mode && event.kind != EnvelopeEventKind::ToneNoiseMode)) {
                 moved.push_back(event);
                 continue;
             }
@@ -384,11 +395,19 @@ CompositeStepEditResult editCompositeSteps(
         ? restoreState(EnvelopeEventKind::Timbre) : std::vector<EnvelopeEvent>{};
     auto restored_y = isSelected(lane, CompositeStepEditLane::RegisterWrite)
         ? restoreState(EnvelopeEventKind::RegisterWrite) : std::vector<EnvelopeEvent>{};
+    auto restored_noise = isSelected(lane, CompositeStepEditLane::Noise)
+        ? restoreState(EnvelopeEventKind::Noise) : std::vector<EnvelopeEvent>{};
+    auto restored_mode = isSelected(lane, CompositeStepEditLane::Mode)
+        ? restoreState(EnvelopeEventKind::ToneNoiseMode) : std::vector<EnvelopeEvent>{};
     if (!moveEvents(layer.volume_envelope.events, CompositeStepEditLane::Volume)
         || !moveEvents(layer.pitch_envelope.events, CompositeStepEditLane::Pitch)
         || !moveEvents(layer.timbre_automation, CompositeStepEditLane::Timbre)
-        || !moveEvents(layer.timbre_automation, CompositeStepEditLane::RegisterWrite))
+        || !moveEvents(layer.timbre_automation, CompositeStepEditLane::RegisterWrite)
+        || !moveEvents(layer.timbre_automation, CompositeStepEditLane::Noise)
+        || !moveEvents(layer.timbre_automation, CompositeStepEditLane::Mode))
         return reject("移動先がENDまたは編集上限を超えるため移動できません。");
+    layer.timbre_automation.insert(layer.timbre_automation.begin(), restored_noise.begin(), restored_noise.end());
+    layer.timbre_automation.insert(layer.timbre_automation.begin(), restored_mode.begin(), restored_mode.end());
     layer.timbre_automation.insert(layer.timbre_automation.begin(), restored_y.begin(), restored_y.end());
     layer.timbre_automation.insert(layer.timbre_automation.begin(), restored_tones.begin(), restored_tones.end());
     if (isSelected(lane, CompositeStepEditLane::Volume)) {
@@ -432,6 +451,8 @@ CompositeStepEditResult editCompositeSteps(
             static_cast<std::uint8_t>(tl_initial))
         || !moveLane(CompositeStepEditLane::Fb, layer.opll_fb_auto, layer.opll_fb_modulation,
             static_cast<std::uint8_t>(fb_initial))
+        || !moveLane(CompositeStepEditLane::Noise, layer.psg_noise_auto, layer.psg_noise_modulation,
+            sequenceEnvelopeMixer(source.volume_envelope.rate).noise)
         || (isSelected(lane, CompositeStepEditLane::Volume)
             && !moveModulation(layer.volume_modulation, mapping, content_limit))
         || (isSelected(lane, CompositeStepEditLane::Pitch)
@@ -455,12 +476,14 @@ CompositeStepEditResult editCompositeSteps(
     }
     for (auto& profile : layer.register_auto_profiles) {
         const auto target = profile.target == OpllRegisterAutoTarget::TotalLevel
-            ? CompositeModulationTarget::TotalLevel : CompositeModulationTarget::Feedback;
+            ? CompositeModulationTarget::TotalLevel : profile.target == OpllRegisterAutoTarget::Noise
+                        ? CompositeModulationTarget::Noise : CompositeModulationTarget::Feedback;
         if (!selectedTarget(target)) continue;
         if (!moveProfilePosition(profile)
             || !moveAuto(profile.lane, mapping, content_limit,
                 static_cast<std::uint8_t>(target == CompositeModulationTarget::TotalLevel
-                    ? tl_initial : fb_initial)))
+                    ? tl_initial : target == CompositeModulationTarget::Noise
+                        ? sequenceEnvelopeMixer(source.volume_envelope.rate).noise : fb_initial)))
             return reject("自動設定の移動先が編集範囲に収まりません。");
     }
     for (auto& placement : layer.derived_command_placements) {
@@ -469,7 +492,7 @@ CompositeStepEditResult editCompositeSteps(
             return reject("命令配置の移動先が編集範囲に収まりません。");
     }
     if (delta < 0) {
-        std::array<const CompositeDerivedCommandPlacement*, 4> first{};
+        std::array<const CompositeDerivedCommandPlacement*, 5> first{};
         for (const auto& placement : layer.derived_command_placements) {
             if (placement.count != mapping.boundary() || !selectedTarget(placement.target)) continue;
             auto& selected = first[static_cast<std::size_t>(placement.target)];
@@ -477,7 +500,7 @@ CompositeStepEditResult editCompositeSteps(
         }
         // One implicit phase update remains at the joined count. Explicit
         // authored profile transitions keep their individual positions.
-        std::array<std::optional<std::uint32_t>, 4> keep;
+        std::array<std::optional<std::uint32_t>, 5> keep;
         for (std::size_t index = 0; index < first.size(); ++index)
             if (first[index]) keep[index] = first[index]->command_order;
         std::erase_if(layer.derived_command_placements, [&](const auto& placement) {

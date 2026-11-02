@@ -398,6 +398,15 @@ struct SatelliteEditorParityTestAccess {
         for (const int percent : {75,100,125}) {
             editor.applyEditorUiScale(percent);
             check(!editor.random_reroll_.isVisible(), "canvas preserves hidden non-Random control");
+            for (auto* button : {&editor.numeric_copy_, &editor.numeric_paste_}) {
+                check(button->getStyle() == juce::DrawableButton::ImageOnButtonBackground,
+                    "SCCWAV clipboard controls retain a visible button background");
+                check(button->getWidth() == UiLayout::fieldH && button->getHeight() == UiLayout::fieldH,
+                    "SCCWAV clipboard buttons fit within the numeric row");
+                auto* hit = editor.waveform_content_.getComponentAt(button->getBounds().getCentre());
+                check(hit == button || button->isParentOf(hit),
+                    "SCCWAV clipboard buttons must receive clicks above the graph");
+            }
             const auto graph = editor.graph_.graphBounds();
             check(graph.getHeight() >= 256, "scaled graph retains 256 mouse positions");
             const auto row = editor.numeric_input_.getBounds();
@@ -3925,7 +3934,19 @@ void testPluginStateFoundation() {
         .selected_layer = 1,
         .editor_tab = 3,
     };
-    const auto psg = documentFrom(psgOnlyTimbre(), 0, {});
+    auto psg = documentFrom(psgOnlyTimbre(), 0, {});
+    psg.sound.layers[0].volume_envelope.rate.tone_mode = 1;
+    psg.sound.layers[0].volume_envelope.rate.noise = 6;
+    psg.sound.layers[0].timbre_automation = {
+        {.kind = mgstc::engine::EnvelopeEventKind::ToneNoiseMode, .value = 3, .count = 2},
+        {.kind = mgstc::engine::EnvelopeEventKind::Noise, .value = 31, .count = 4},
+    };
+    psg.sound.layers[0].psg_noise_auto = {
+        .mode = mgstc::engine::OpllRegisterAutoMode::FreeCurve,
+        .start_count = 5, .free_curve = {0, 15, 31}};
+    psg.sound.layers[0].psg_noise_modulation = {
+        .enabled = true, .mode = mgstc::engine::ModulationMode::Oscillate,
+        .delay = 1, .depth = 3, .speed = 2, .roughness = -1};
     const auto scc = documentFrom(sccOnlyTimbre(), 0, editor);
     const auto opll = documentFrom(opllOnlyTimbre(), 382, editor);
     auto composite = documentFrom(compositeTimbre(), 382, editor);
@@ -4261,10 +4282,16 @@ void testSccMorphPluginStateCompatibility() {
     const auto framed = mgstc::plugin::serializePluginState(document);
     // v21 adds only the five global morph bytes.
     // v20 adds four six-byte modulation settings before the embedded count.
-    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3}, std::uint8_t{4}, std::uint8_t{5}}) {
+    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3}, std::uint8_t{4}, std::uint8_t{5}, std::uint8_t{6}}) {
         auto legacy = original;
-        require(legacy.size() >= 45, "legacy sound fixture tail exists");
-        legacy.erase(legacy.end() - 21, legacy.end() - 9);
+        require(legacy.size() >= 64, "legacy sound fixture tail exists");
+        std::vector<std::uint8_t> unset_noise(19, 0);
+        unset_noise[6] = 1;
+        unset_noise[7] = 1;
+        require(std::equal(unset_noise.begin(), unset_noise.end(), legacy.end() - 42),
+            "legacy fixture has the unset v25 Noise auto/modulation addition");
+        legacy.erase(legacy.end() - 42, legacy.end() - 23);
+        if (version <= 5) legacy.erase(legacy.end() - 21, legacy.end() - 9);
         if (version <= 3) legacy.erase(legacy.end() - 11, legacy.end() - 9);
         if (version <= 2) legacy.resize(legacy.size() - 5);
         if (version == 1) {
@@ -4291,7 +4318,7 @@ void testSccMorphPluginStateCompatibility() {
                 static_cast<unsigned>(version), static_cast<unsigned>(parsed.status));
         }
         require(parsed.status == mgstc::plugin::PluginStateStatus::Ok,
-                "legacy v1/v2/v3/v4/v5 plugin sound payload readable");
+                "legacy v1/v2/v3/v4/v5/v6 plugin sound payload readable");
         auto expected_legacy_sound = document.sound;
         if (version <= 2) expected_legacy_sound.scc_morph_algorithm_version = 1;
         require(soundBytes(parsed.document.sound) == soundBytes(expected_legacy_sound),
@@ -4784,6 +4811,8 @@ void testPluginEditor() {
 
     juce::Button* library_toggle = nullptr;
     juce::Button* count_tab = nullptr;
+    juce::Button* audition_footer = nullptr;
+    juce::Button* stop_footer = nullptr;
     juce::Button* focus_button = nullptr;
     juce::Button* compact_button = nullptr;
     juce::Button* file_menu = nullptr;
@@ -4804,6 +4833,8 @@ void testPluginEditor() {
             const auto text = button->getButtonText();
             if (text == juce::String::fromUTF8("保存 / ライブラリ")) library_toggle = button;
             if (text == juce::String::fromUTF8("カウント編集")) count_tab = button;
+            if (text == juce::String::fromUTF8("試聴 1秒")) audition_footer = button;
+            if (text == juce::String::fromUTF8("全停止")) stop_footer = button;
             if (text == juce::String::fromUTF8("編集に集中")) focus_button = button;
             if (text == juce::String::fromUTF8("概要を縮小")) compact_button = button;
             if (text == juce::String::fromUTF8("ファイル")) file_menu = button;
@@ -4885,6 +4916,13 @@ void testPluginEditor() {
     library_toggle->onClick();
     require(library_manage && library_manage->isVisible(),
         "library manager becomes visible when the library panel opens");
+    for (auto* button : {audition_footer, stop_footer}) {
+        require(button != nullptr, "composite audition footer control exists");
+        require(button->getX() >= UiLayout::panelPad * 2, "audition footer keeps a margin from the left panel edge");
+        auto* parent = button->getParentComponent();
+        auto* hit = parent->getComponentAt(button->getBounds().getCentre());
+        require(hit == button || button->isParentOf(hit), "extended inspector must not cover footer controls");
+    }
     capture("main-library.png");
     library_toggle->setToggleState(false, juce::dontSendNotification);
     library_toggle->onClick();

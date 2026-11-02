@@ -253,6 +253,8 @@ public:
             modulation(layer.volume_modulation);
             modulation(layer.opll_tl_modulation);
             modulation(layer.opll_fb_modulation);
+            registerAuto(layer.psg_noise_auto);
+            modulation(layer.psg_noise_modulation);
             enumeration(layer.scc_output_allocation);
             boolean(layer.scc_output_start.has_value());
             if (layer.scc_output_start) unsignedInteger(*layer.scc_output_start, 1);
@@ -400,7 +402,7 @@ public:
         value.scc_morph = {};
         value.scc_morph.distribution_mode = SccMorphDistributionMode::ToneDistribution;
         value.command_order = 0;
-        if (!enumeration(value.kind, 6)
+        if (!enumeration(value.kind, format_version_ >= 25 ? 8 : 6)
             || !integer(value.value, 4)
             || !integer(value.secondary, 4)
             || !integer(value.count, 4)) {
@@ -620,11 +622,13 @@ public:
         }
         // Each SQLite payload version names a fixed portable sound layout:
         // v1=v19, v2=v20 modulation, v3=v21 morphing, v4=v22 channel ranges,
-        // v5=v23 distribution/plans, v6=v24 modulation/register-auto profiles.
+        // v5=v23 distribution/plans, v6=v24 modulation/register-auto profiles,
+        // v7=v25 PSG noise authoring.
         // The DB schema version and the portable file header are separate.
         format_version_ = payload_version == 1 ? 19
             : payload_version == 2 ? 20 : payload_version == 3 ? 21
-            : payload_version == 4 ? 22 : payload_version == 5 ? 23 : 24;
+            : payload_version == 4 ? 22 : payload_version == 5 ? 23
+            : payload_version == 6 ? 24 : 25;
         return soundBody(value);
     }
 
@@ -826,6 +830,8 @@ public:
                     || !modulation(layer.opll_fb_modulation))) {
                 return false;
             }
+            if (format_version_ >= 25
+                && (!registerAuto(layer.psg_noise_auto) || !modulation(layer.psg_noise_modulation))) return false;
             layer.scc_output_allocation = SccOutputAllocationMode::LegacyBank;
             layer.scc_output_start.reset();
             if (format_version_ >= 22) {
@@ -850,7 +856,7 @@ public:
                 }
                 layer.modulation_profiles.resize(profile_count);
                 for (auto& profile : layer.modulation_profiles) {
-                    if (!enumeration(profile.target, 3)
+                    if (!enumeration(profile.target, format_version_ >= 25 ? 4 : 3)
                         || !integer(profile.count, 4)
                         || profile.count > 65535
                         || !boolean(profile.after_loop_start)
@@ -865,7 +871,7 @@ public:
                 }
                 layer.register_auto_profiles.resize(profile_count);
                 for (auto& profile : layer.register_auto_profiles) {
-                    if (!enumeration(profile.target, 1)
+                    if (!enumeration(profile.target, format_version_ >= 25 ? 2 : 1)
                         || !integer(profile.count, 4)
                         || profile.count > 65535
                         || !boolean(profile.after_loop_start)
@@ -882,7 +888,7 @@ public:
                 for (auto& placement : layer.derived_command_placements) {
                     if (!integer(placement.count, 4)
                         || placement.count > 65535
-                        || !enumeration(placement.target, 3)
+                        || !enumeration(placement.target, format_version_ >= 25 ? 4 : 3)
                         || !boolean(placement.after_loop_start)
                         || !integer(placement.command_order, 4)) {
                         return false;

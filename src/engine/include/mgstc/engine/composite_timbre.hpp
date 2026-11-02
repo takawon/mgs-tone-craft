@@ -34,6 +34,8 @@ enum class EnvelopeEventKind : std::uint8_t {
     RegisterWrite,
     LoopStart,
     LoopEnd,
+    Noise,
+    ToneNoiseMode,
 };
 
 enum class TimbrePick : std::uint8_t {
@@ -321,6 +323,7 @@ enum class OpllRegisterAutoMode : std::uint8_t {
 enum class OpllRegisterAutoTarget : std::uint8_t {
     TotalLevel = 0,
     Feedback = 1,
+    Noise = 2,
 };
 
 // Authoring model for OPLL MOD TL / FB time evolution. Distinct from the
@@ -329,6 +332,8 @@ enum class OpllRegisterAutoTarget : std::uint8_t {
 // Packing: reg2 = KSL|TL, reg3 = KSL|waves|FB — only the TL/FB field is
 // replaced; other co-resident bits come from the active original image.
 // Unavailable while the active `@` (or base) is an OPLL ROM timbre.
+// The same bounded authoring shape is also used by PSG Noise (0..31),
+// expanded to ordinary n commands without OPLL register packing.
 struct OpllRegisterAutoLane {
     OpllRegisterAutoMode mode{OpllRegisterAutoMode::Off};
     std::uint32_t start_count{};
@@ -348,7 +353,7 @@ struct OpllRegisterAutoLane {
 };
 
 enum class CompositeModulationTarget : std::uint8_t {
-    Pitch, Volume, TotalLevel, Feedback,
+    Pitch, Volume, TotalLevel, Feedback, Noise,
 };
 
 // Ordered author settings, evaluated against the original key-on count.
@@ -386,12 +391,14 @@ struct CompositeDerivedCommandPlacement {
 
 [[nodiscard]] constexpr std::uint8_t opllRegisterAutoValueMax(
     OpllRegisterAutoTarget target) noexcept {
-    return target == OpllRegisterAutoTarget::TotalLevel ? 63 : 7;
+    return target == OpllRegisterAutoTarget::TotalLevel ? 63
+        : target == OpllRegisterAutoTarget::Noise ? 31 : 7;
 }
 
 [[nodiscard]] constexpr std::uint8_t opllRegisterAutoRegisterNumber(
     OpllRegisterAutoTarget target) noexcept {
-    return target == OpllRegisterAutoTarget::TotalLevel ? 2 : 3;
+    return target == OpllRegisterAutoTarget::TotalLevel ? 2
+        : target == OpllRegisterAutoTarget::Noise ? 6 : 3;
 }
 
 enum class StartDelayForm : std::uint8_t {
@@ -491,6 +498,8 @@ struct CompositeLayer {
     OpllRegisterAutoLane opll_fb_auto;
     ModulationParameters opll_tl_modulation;
     ModulationParameters opll_fb_modulation;
+    OpllRegisterAutoLane psg_noise_auto;
+    ModulationParameters psg_noise_modulation;
     std::vector<CompositeModulationProfile> modulation_profiles;
     std::vector<OpllRegisterAutoProfile> register_auto_profiles;
     std::vector<CompositeDerivedCommandPlacement> derived_command_placements;
@@ -515,7 +524,7 @@ struct OriginalTimbreAllocationStarts {
 struct CompositeTimbre {
     // Portable .mgstc / clipboard layout (name, tags, memo, favorite, then
     // sound body). Independent of SQLite kCompositeSoundPayloadVersion.
-    static constexpr std::uint32_t kFormatVersion = 24;
+    static constexpr std::uint32_t kFormatVersion = 25;
     static constexpr std::uint32_t kMinimumReadableFormatVersion = 5;
 
     std::uint32_t format_version{kFormatVersion};

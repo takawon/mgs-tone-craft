@@ -17,6 +17,7 @@ namespace mgstc::engine {
     case CompositeModulationTarget::Volume: return layer.volume_modulation;
     case CompositeModulationTarget::TotalLevel: return layer.opll_tl_modulation;
     case CompositeModulationTarget::Feedback: return layer.opll_fb_modulation;
+    case CompositeModulationTarget::Noise: return layer.psg_noise_modulation;
     }
     return layer.pitch_modulation;
 }
@@ -73,7 +74,8 @@ template<class Profile>
     }
     return selected ? selected->lane
         : target == OpllRegisterAutoTarget::TotalLevel
-            ? layer.opll_tl_auto : layer.opll_fb_auto;
+            ? layer.opll_tl_auto : target == OpllRegisterAutoTarget::Noise
+            ? layer.psg_noise_auto : layer.opll_fb_auto;
 }
 
 [[nodiscard]] inline OpllRegisterAutoLane& editCompositeRegisterAutoAt(
@@ -105,6 +107,7 @@ inline void disableCompositeModulation(
     case CompositeModulationTarget::Volume: layer.volume_modulation.enabled = false; break;
     case CompositeModulationTarget::TotalLevel: layer.opll_tl_modulation.enabled = false; break;
     case CompositeModulationTarget::Feedback: layer.opll_fb_modulation.enabled = false; break;
+    case CompositeModulationTarget::Noise: layer.psg_noise_modulation.enabled = false; break;
     }
     std::erase_if(layer.modulation_profiles,
         [target](const auto& profile) { return profile.target == target; });
@@ -113,7 +116,8 @@ inline void disableCompositeModulation(
 inline void disableCompositeRegisterAuto(
     CompositeLayer& layer, OpllRegisterAutoTarget target) {
     (target == OpllRegisterAutoTarget::TotalLevel
-        ? layer.opll_tl_auto : layer.opll_fb_auto) = {};
+        ? layer.opll_tl_auto : target == OpllRegisterAutoTarget::Noise
+            ? layer.psg_noise_auto : layer.opll_fb_auto) = {};
     std::erase_if(layer.register_auto_profiles,
         [target](const auto& profile) { return profile.target == target; });
 }
@@ -121,7 +125,8 @@ inline void disableCompositeRegisterAuto(
 [[nodiscard]] inline bool compositeHasRegisterAuto(
     const CompositeLayer& layer, OpllRegisterAutoTarget target) noexcept {
     if ((target == OpllRegisterAutoTarget::TotalLevel
-            ? layer.opll_tl_auto : layer.opll_fb_auto).active()) return true;
+            ? layer.opll_tl_auto : target == OpllRegisterAutoTarget::Noise
+            ? layer.psg_noise_auto : layer.opll_fb_auto).active()) return true;
     return std::any_of(layer.register_auto_profiles.begin(),
         layer.register_auto_profiles.end(), [target](const auto& profile) {
             return profile.target == target && profile.lane.active();
@@ -133,6 +138,47 @@ inline void disableCompositeRegisterAuto(
     for (const auto& placement : layer.derived_command_placements)
         if (placement.count == count && placement.target == target) return &placement;
     return nullptr;
+}
+
+[[nodiscard]] inline std::uint8_t psgEnvelopeValueAt(
+    const CompositeLayer& layer, EnvelopeEventKind kind,
+    std::uint32_t count, bool after = true) noexcept {
+    const auto mixer = sequenceEnvelopeMixer(layer.volume_envelope.rate);
+    std::uint8_t value = kind == EnvelopeEventKind::Noise ? mixer.noise : mixer.tone_mode;
+    const EnvelopeEvent* selected = nullptr;
+    for (const auto& event : layer.timbre_automation) {
+        const bool direct = event.kind == EnvelopeEventKind::RegisterWrite
+            && event.value == (kind == EnvelopeEventKind::Noise ? 6 : 7);
+        if ((!direct && event.kind != kind) || event.count > count
+            || (event.count == count && !after && event.after_loop_start)) continue;
+        if (!selected || !compositeProfilePrecedes(event, *selected)) selected = &event;
+    }
+    if (selected) {
+        if (selected->kind == EnvelopeEventKind::RegisterWrite) {
+            if (kind == EnvelopeEventKind::Noise) value = static_cast<std::uint8_t>(selected->secondary & 31);
+            else if (layer.channel < 3) value = static_cast<std::uint8_t>(
+                ((selected->secondary & (1 << layer.channel)) ? 0 : 1)
+                | ((selected->secondary & (1 << (layer.channel + 3))) ? 0 : 2));
+        } else value = static_cast<std::uint8_t>(std::clamp(selected->value, 0,
+            kind == EnvelopeEventKind::Noise ? 31 : 3));
+    }
+    return value;
+}
+
+[[nodiscard]] inline std::uint8_t psgNoiseValueAtCount(
+    const CompositeLayer& layer, std::uint32_t count, bool after,
+    const std::vector<EnvelopeEvent>& expanded_events) noexcept {
+    auto value = sequenceEnvelopeMixer(layer.volume_envelope.rate).noise;
+    const EnvelopeEvent* selected = nullptr;
+    for (const auto& event : expanded_events) {
+        if ((event.kind != EnvelopeEventKind::Noise
+                && !(event.kind == EnvelopeEventKind::RegisterWrite && event.value == 6))
+            || event.count > count
+            || (event.count == count && !after && event.after_loop_start)) continue;
+        if (!selected || !compositeProfilePrecedes(event, *selected)) selected = &event;
+    }
+    return selected ? static_cast<std::uint8_t>(selected->kind == EnvelopeEventKind::RegisterWrite
+        ? selected->secondary & 31 : std::clamp(selected->value, 0, 31)) : value;
 }
 
 [[nodiscard]] inline ModulationParameters clampModulation(

@@ -142,6 +142,7 @@ public:
     void cancelPendingDialogs();
     void refreshUiScaleFonts();
     void setInspectorVisible(bool visible);
+    void setInspectorFooterExtension(int height);
     [[nodiscard]] static juce::String verifyWorkspace(const juce::File& snapshot_directory);
     [[nodiscard]] bool appendScopeFrame(
         const engine::OpllScopeFrame& frame,

@@ -79,7 +79,8 @@ opllOriginalRegisterImageAt(
 // any lane was forced Off.
 bool enforceOpllRegisterAutoExclusivity(CompositeTimbre& timbre);
 
-// Expands free-curve points to RegisterWrite events (yreg,data).
+// Expands authoring to RegisterWrite events (yreg,data), or Noise events
+// for the PSG Noise target.
 // Point i is written at start_count + i * coarseness.
 // Packing uses a fixed base_register_byte; prefer
 // expandOpllLayerRegisterAutos for product output.

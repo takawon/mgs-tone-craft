@@ -7,7 +7,7 @@
 namespace mgstc::engine {
 
 enum class CompositeStepEditLane : std::uint8_t {
-    All, Volume, Pitch, Timbre, RegisterWrite, Tl, Fb,
+    All, Volume, Pitch, Timbre, RegisterWrite, Tl, Fb, Noise, Mode,
 };
 
 struct CompositeStepEditResult {

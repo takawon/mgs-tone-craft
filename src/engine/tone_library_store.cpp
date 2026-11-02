@@ -1093,7 +1093,7 @@ bool ToneLibraryDatabase::loadComposites(
             continue;
         }
         if (payload_version != 1 && payload_version != 2 && payload_version != 3
-            && payload_version != 4 && payload_version != 5
+            && payload_version != 4 && payload_version != 5 && payload_version != 6
             && payload_version
                 != static_cast<sqlite3_int64>(kCompositeSoundPayloadVersion)) {
             setError(error, "unsupported composite sound payload version");

@@ -25,7 +25,9 @@ void maybeOptimizeModulationLoop(
         || !layer.register_auto_profiles.empty()
         || !layer.derived_command_placements.empty()
         || layer.opll_tl_auto.active()
-        || layer.opll_fb_auto.active()) {
+        || layer.opll_fb_auto.active()
+        || compositeHasModulation(layer, CompositeModulationTarget::Noise)
+        || compositeHasRegisterAuto(layer, OpllRegisterAutoTarget::Noise)) {
         return;
     }
     const ModulationParameters* selected = nullptr;
@@ -70,7 +72,8 @@ void maybeOptimizeModulationLoop(
         || later(layer.pitch_envelope.events, EnvelopeEventKind::Pitch,
                  EnvelopeEventKind::Pitch)
         || later(layer.timbre_automation, EnvelopeEventKind::Timbre,
-                 EnvelopeEventKind::RegisterWrite)) {
+                 EnvelopeEventKind::RegisterWrite)
+        || later(layer.timbre_automation, EnvelopeEventKind::Noise, EnvelopeEventKind::ToneNoiseMode)) {
         return;
     }
     if (active_count > 1) {
@@ -297,13 +300,15 @@ void maybeOptimizeModulationLoop(
             layer.timbre_automation,
             mgstc::engine::EnvelopeEventKind::Timbre);
         for (const auto& event : layer.timbre_automation) {
-            if (event.kind
-                != mgstc::engine::EnvelopeEventKind::RegisterWrite) {
+            if (event.kind != mgstc::engine::EnvelopeEventKind::RegisterWrite
+                && event.kind != mgstc::engine::EnvelopeEventKind::Noise
+                && event.kind != mgstc::engine::EnvelopeEventKind::ToneNoiseMode) {
                 continue;
             }
             // Poly secondary composite voices omit shared original-tone
             // y (regs 0–7). Channel-local y stays.
             if (!include_original_tone_y
+                && event.kind == mgstc::engine::EnvelopeEventKind::RegisterWrite
                 && event.value >= 0
                 && event.value <= 7) {
                 continue;
@@ -737,6 +742,12 @@ void maybeOptimizeModulationLoop(
                 {0x10, number.value_or(0)});
             break;
         }
+        case mgstc::engine::EnvelopeEventKind::Noise:
+            bytecode.push_back(static_cast<std::uint8_t>(0x80 | std::clamp(event.value, 0, 31)));
+            break;
+        case mgstc::engine::EnvelopeEventKind::ToneNoiseMode:
+            bytecode.push_back(static_cast<std::uint8_t>(0xA0 | std::clamp(event.value, 0, 3)));
+            break;
         case mgstc::engine::EnvelopeEventKind::RegisterWrite:
             bytecode.insert(
                 bytecode.end(),
@@ -856,6 +867,8 @@ void maybeOptimizeModulationLoop(
     disableCompositeModulation(base_layer, CompositeModulationTarget::Volume);
     disableCompositeModulation(base_layer, CompositeModulationTarget::TotalLevel);
     disableCompositeModulation(base_layer, CompositeModulationTarget::Feedback);
+    disableCompositeModulation(base_layer, CompositeModulationTarget::Noise);
+    disableCompositeRegisterAuto(base_layer, OpllRegisterAutoTarget::Noise);
     disableCompositeRegisterAuto(base_layer, OpllRegisterAutoTarget::TotalLevel);
     disableCompositeRegisterAuto(base_layer, OpllRegisterAutoTarget::Feedback);
     base_layer.register_auto_profiles.clear();
@@ -884,11 +897,100 @@ CompositeLayer expandCompositeLayerModulations(
         disableCompositeModulation(expanded, CompositeModulationTarget::Volume);
         disableCompositeModulation(expanded, CompositeModulationTarget::TotalLevel);
         disableCompositeModulation(expanded, CompositeModulationTarget::Feedback);
+        disableCompositeModulation(expanded, CompositeModulationTarget::Noise);
+        disableCompositeRegisterAuto(expanded, OpllRegisterAutoTarget::Noise);
         return expanded;
     }
     if (optimize_loop) {
         maybeOptimizeModulationLoop(expanded, library);
     }
+    if (layer.source == TimbreSource::Psg
+        && (compositeHasModulation(layer, CompositeModulationTarget::Noise)
+            || compositeHasRegisterAuto(layer, OpllRegisterAutoTarget::Noise))) {
+        const auto end = std::min(layer.envelope_timeline.loop_end_count.value_or(
+            layer.envelope_timeline.length_counts), layer.envelope_timeline.length_counts);
+        const OpllRegisterAutoLane* active_auto = &layer.psg_noise_auto;
+        const ModulationParameters* active_mod = &layer.psg_noise_modulation;
+        std::map<const OpllRegisterAutoLane*, std::map<std::uint32_t, std::uint8_t>> schedules;
+        const auto schedule = [&](const OpllRegisterAutoLane& lane) {
+            auto& values = schedules[&lane];
+            for (const auto& event : expandOpllRegisterAuto(lane,
+                    OpllRegisterAutoTarget::Noise, 0, end))
+                values[event.count] = static_cast<std::uint8_t>(event.value);
+        };
+        schedule(*active_auto);
+        for (const auto& profile : layer.register_auto_profiles)
+            if (profile.target == OpllRegisterAutoTarget::Noise) schedule(profile.lane);
+        auto base = static_cast<int>(sequenceEnvelopeMixer(layer.volume_envelope.rate).noise);
+        std::optional<int> previous;
+        for (std::uint32_t count = 0; count <= end; ++count) {
+            struct Change {
+                bool after; std::uint32_t order; int priority;
+                const OpllRegisterAutoLane* automatic{};
+                const ModulationParameters* modulation{};
+                const EnvelopeEvent* manual{};
+            };
+            std::vector<Change> changes;
+            const bool anchor = layer.envelope_timeline.loop_start_count == count;
+            const auto* placement = compositeDerivedPlacementAt(layer,
+                CompositeModulationTarget::Noise, count);
+            const bool has_profile = std::any_of(layer.modulation_profiles.begin(), layer.modulation_profiles.end(),
+                [&](const auto& profile) { return profile.target == CompositeModulationTarget::Noise && profile.count == count; })
+                || std::any_of(layer.register_auto_profiles.begin(), layer.register_auto_profiles.end(),
+                [&](const auto& profile) { return profile.target == OpllRegisterAutoTarget::Noise && profile.count == count; });
+            changes.push_back({placement ? placement->after_loop_start
+                    : !has_profile && anchor && active_mod->enabled && !active_auto->active(),
+                placement ? placement->command_order : 0, 1});
+            for (const auto& event : layer.timbre_automation)
+                if (event.count == count && (event.kind == EnvelopeEventKind::Noise
+                    || (event.kind == EnvelopeEventKind::RegisterWrite && event.value == 6)))
+                    changes.push_back({event.after_loop_start, event.command_order, 0, nullptr, nullptr, &event});
+            for (const auto& profile : layer.register_auto_profiles)
+                if (profile.target == OpllRegisterAutoTarget::Noise && profile.count == count)
+                    changes.push_back({profile.after_loop_start, profile.command_order, 2, &profile.lane});
+            for (const auto& profile : layer.modulation_profiles)
+                if (profile.target == CompositeModulationTarget::Noise && profile.count == count)
+                    changes.push_back({profile.after_loop_start, profile.command_order, 2, nullptr, &profile.parameters});
+            const bool closing = layer.envelope_timeline.loop_end_count == count;
+            std::stable_sort(changes.begin(), changes.end(), [closing](const auto& a, const auto& b) {
+                if (a.after != b.after) return closing ? a.after : !a.after;
+                if (a.order && b.order) return a.order < b.order;
+                if (a.order != b.order) return a.order != 0;
+                return a.priority < b.priority;
+            });
+            for (const auto& change : changes) {
+                if (change.manual) {
+                    base = std::clamp(change.manual->kind == EnvelopeEventKind::Noise
+                        ? change.manual->value : change.manual->secondary & 31, 0, 31);
+                    previous.reset();
+                    continue;
+                }
+                if (change.automatic) active_auto = change.automatic;
+                if (change.modulation) active_mod = change.modulation;
+                const auto& values = schedules[active_auto];
+                const bool generator = !change.automatic && !change.modulation;
+                if (generator && active_auto->active() && !values.contains(count)) continue;
+                auto found = values.upper_bound(count);
+                const bool auto_value = active_auto->active() && found != values.begin();
+                const bool active = auto_value || active_mod->enabled || change.modulation;
+                if (!active) continue;
+                const auto value = auto_value ? static_cast<int>(std::prev(found)->second)
+                    : modulationEffectiveValueAtCount(*active_mod, count, base, 0, 31);
+                if (generator && previous == value) continue;
+                if (generator && !auto_value && !previous && value == base) {
+                    previous = value;
+                    continue;
+                }
+                expanded.timbre_automation.push_back({.kind = EnvelopeEventKind::Noise,
+                    .value = value, .count = count, .after_loop_start = change.after,
+                    .command_order = change.order});
+                previous = value;
+                if (auto_value) base = value;
+            }
+        }
+    }
+    disableCompositeModulation(expanded, CompositeModulationTarget::Noise);
+    disableCompositeRegisterAuto(expanded, OpllRegisterAutoTarget::Noise);
     // The evaluator and compiler share these exact 60 Hz count values.
     // Only the temporary copy receives derived ENV commands.
     disableCompositeModulation(expanded, CompositeModulationTarget::Pitch);
@@ -1031,6 +1133,8 @@ bool compositeModulationLoopRepresentable(
             CompositeModulationTarget::TotalLevel, start);
         steady.opll_fb_modulation = compositeModulationAt(layer,
             CompositeModulationTarget::Feedback, start);
+        steady.psg_noise_modulation = compositeModulationAt(layer, CompositeModulationTarget::Noise, start);
+        steady.psg_noise_auto = compositeRegisterAutoAt(layer, OpllRegisterAutoTarget::Noise, start);
         steady.opll_tl_auto = compositeRegisterAutoAt(layer,
             OpllRegisterAutoTarget::TotalLevel, start);
         steady.opll_fb_auto = compositeRegisterAutoAt(layer,
@@ -1084,7 +1188,8 @@ bool compositeModulationLoopRepresentable(
     if (!phase_fits(layer.pitch_modulation, true)
         || !phase_fits(layer.volume_modulation, false)
         || !phase_fits(layer.opll_tl_modulation, false)
-        || !phase_fits(layer.opll_fb_modulation, false)) {
+        || !phase_fits(layer.opll_fb_modulation, false)
+        || !phase_fits(layer.psg_noise_modulation, false)) {
         return false;
     }
 
@@ -1125,6 +1230,20 @@ bool compositeModulationLoopRepresentable(
             }
         }
     }
+    if (layer.source == TimbreSource::Psg) {
+        const auto& automatic = layer.psg_noise_auto;
+        if (automatic.mode == OpllRegisterAutoMode::Lfo && automatic.depth != 0) {
+            const auto period = 4U * std::max<unsigned>(1, automatic.change_speed)
+                * std::max<unsigned>(1, automatic.coarseness);
+            if (start < automatic.start_count || (end - start) % period != 0) return false;
+        } else if (automatic.active()
+            && opllRegisterAutoValueAt(automatic, OpllRegisterAutoTarget::Noise,
+                    start == 0 ? 0 : start - 1, timeline.length_counts)
+                != opllRegisterAutoValueAt(automatic, OpllRegisterAutoTarget::Noise,
+                    end - 1, timeline.length_counts)) return false;
+        if (!stable_step(layer.psg_noise_modulation,
+                psgEnvelopeValueAt(layer, EnvelopeEventKind::Noise, start), 31)) return false;
+    }
     if (layer.opll_tl_modulation.enabled
         || layer.opll_fb_modulation.enabled) {
         if (std::any_of(
@@ -1164,16 +1283,24 @@ bool compositeLoopEffectiveWaveformFirstPassOnly(
     if ((target == CompositeModulationTarget::TotalLevel
             || target == CompositeModulationTarget::Feedback)
         && layer.source != TimbreSource::Opll) return false;
+    if (target == CompositeModulationTarget::Noise) {
+        if (layer.source != TimbreSource::Psg) return false;
+        return !compositeModulationLoopRepresentable(layer, library)
+            || std::any_of(layer.timbre_automation.begin(), layer.timbre_automation.end(),
+                [&](const auto& event) { return event.kind == EnvelopeEventKind::Noise
+                    && event.count > *timeline.loop_start_count && event.count <= *timeline.loop_end_count; });
+    }
     auto isolated = layer;
     for (const auto other : {CompositeModulationTarget::Pitch,
             CompositeModulationTarget::Volume, CompositeModulationTarget::TotalLevel,
-            CompositeModulationTarget::Feedback}) {
+            CompositeModulationTarget::Feedback, CompositeModulationTarget::Noise}) {
         if (other != target) disableCompositeModulation(isolated, other);
     }
     if (target != CompositeModulationTarget::TotalLevel)
         disableCompositeRegisterAuto(isolated, OpllRegisterAutoTarget::TotalLevel);
     if (target != CompositeModulationTarget::Feedback)
         disableCompositeRegisterAuto(isolated, OpllRegisterAutoTarget::Feedback);
+    disableCompositeRegisterAuto(isolated, OpllRegisterAutoTarget::Noise);
     if (!compositeModulationLoopRepresentable(isolated, library)) return true;
     const auto start = *timeline.loop_start_count;
     const auto end = *timeline.loop_end_count;

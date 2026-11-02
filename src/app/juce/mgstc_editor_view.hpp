@@ -5549,7 +5549,7 @@ public:
         const bool library_open = library_toggle_.getToggleState();
         auto library_column = library_open ? area.removeFromRight(libraryWidth) : juce::Rectangle<int>{};
         if (library_open) area.removeFromRight(panelGap);
-        timeline_.setInspectorVisible(!library_open);
+        timeline_.setInspectorVisible(true);
         for (auto* c : std::initializer_list<juce::Component*>{
                 &composite_library_title_, &composite_filter_, &composite_set_filter_,
                 &composite_tag_filter_,
@@ -5589,19 +5589,28 @@ public:
 
         editor_panel_bounds_ = area;
         auto editor = area.reduced(panelPad);
-        auto footer = editor.removeFromBottom(statusH);
+        const int footer_height = statusH + sm;
+        auto footer = editor.removeFromBottom(footer_height);
+        footer.removeFromBottom(sm);
+        footer.removeFromLeft(panelPad);
         audition_.setBounds(footer.removeFromLeft(compositeAuditionW));
         footer.removeFromLeft(controlGap);
         stop_.setBounds(footer.removeFromLeft(compositeStopW));
         footer.removeFromLeft(controlGap);
-        status_.setBounds(footer);
+        status_.setBounds(footer.withTrimmedRight(
+            compositeInspectorColumnW + panelPad + panelGap));
         editor.removeFromBottom(sm);
         auto summary = editor.removeFromTop(fieldH);
         resource_.setBounds(summary.removeFromLeft(summary.getWidth() / 2));
         summary.removeFromLeft(sm);
         warning_.setBounds(summary);
         editor.removeFromTop(sm);
-        timeline_.setBounds(editor);
+        timeline_.setInspectorFooterExtension(footer_height + sm);
+        timeline_.setBounds(editor.withBottom(
+            editor.getBottom() + footer_height + sm));
+        audition_.toFront(false);
+        stop_.toFront(false);
+        status_.toFront(false);
         applyCompositeFocusOrder();
     }
 
@@ -8816,10 +8825,10 @@ public:
             scale_previewing_ = true;
         };
         vertical_scale_.onValueChange = [this] {
-            scale_reset_.setButtonText(
+            scale_reset_.setText(
                 juce::String(
                     juce::roundToInt(vertical_scale_.getValue()))
-                + "%");
+                + "%", juce::dontSendNotification);
             if (!scale_previewing_
                 && !vertical_scale_.isMouseButtonDown()) {
                 return;
@@ -8843,24 +8852,15 @@ public:
                     scale_source_, percent));
             vertical_scale_.setValue(
                 100.0, juce::dontSendNotification);
-            scale_reset_.setButtonText("100%");
+            scale_reset_.setText("100%", juce::dontSendNotification);
         };
         addAndMakeVisible(vertical_scale_);
 
-        configureButton(
-            scale_reset_,
-            "100%",
-            juce::String::fromUTF8(
-                "クリックすると倍率表示を100%へ戻します。"
-                "この操作では波形を拡縮しません"),
-            [this] {
-                vertical_scale_.setValue(
-                    100.0, juce::dontSendNotification);
-                scale_reset_.setButtonText("100%");
-                if (scale_previewing_) {
-                    graph_.setPreview(scc_wave_, scale_source_);
-                }
-            });
+        scale_reset_.setText("100%", juce::dontSendNotification);
+        scale_reset_.setJustificationType(juce::Justification::centred);
+        scale_reset_.setInterceptsMouseClicks(false, false);
+        scale_reset_.setFont(UiFonts::body());
+        addAndMakeVisible(scale_reset_);
 
         graph_.setWaveform(scc_wave_);
         graph_.setCommitCallback(
@@ -8921,12 +8921,29 @@ public:
         numeric_help_button_.setMouseClickGrabsKeyboardFocus(false);
         numeric_input_.onReturnKey = [this] { finishNumericEdit(); };
         addAndMakeVisible(numeric_input_);
-        configureButton(numeric_copy_, "Copy", juce::String::fromUTF8("分解能付き数値波形をコピー"),
-            [this] {
+        const auto configure_numeric_icon = [this](
+            juce::DrawableButton& button,
+            EditorIcon icon,
+            const juce::String& tooltip,
+            std::function<void()> action) {
+            const auto normal = makeEditorIcon(icon, juce::Colour(0xFFE6EDF3));
+            const auto over = makeEditorIcon(icon, juce::Colour(0xFF53E3A6));
+            const auto down = makeEditorIcon(icon, juce::Colour(0xFF2AD6C9));
+            const auto disabled = makeEditorIcon(icon, juce::Colour(0xFF68737E));
+            button.setImages(normal.get(), over.get(), down.get(), disabled.get());
+            button.setTooltip(tooltip);
+            button.setTitle(tooltip);
+            button.setDescription(tooltip);
+            button.onClick = std::move(action);
+            waveform_content_.addAndMakeVisible(button);
+        };
+        configure_numeric_icon(numeric_copy_, EditorIcon::Copy,
+            juce::String::fromUTF8("分解能付き数値波形をコピー"), [this] {
                 const auto parsed = parseSccNumericWave(numeric_input_.getText().toStdString(), numeric_resolution_.getSelectedId(), true);
                 if (parsed.value) juce::SystemClipboard::copyTextToClipboard(juce::String(parsed.value->sharedText()));
             });
-        configureButton(numeric_paste_, "Paste", juce::String::fromUTF8("数値波形式またはSCCWAVを貼り付け"),
+        configure_numeric_icon(numeric_paste_, EditorIcon::Paste,
+            juce::String::fromUTF8("数値波形式またはSCCWAVを貼り付け"),
             [this] { pasteNumericText(juce::SystemClipboard::getTextFromClipboard()); });
         numeric_resolution_.setExplicitFocusOrder(350);
         numeric_input_.setExplicitFocusOrder(351);
@@ -8940,6 +8957,8 @@ public:
         waveform_content_.addAndMakeVisible(numeric_help_button_);
         waveform_content_.addAndMakeVisible(numeric_copy_);
         waveform_content_.addAndMakeVisible(numeric_paste_);
+        numeric_copy_.toFront(false);
+        numeric_paste_.toFront(false);
         waveform_viewport_.setViewedComponent(&waveform_content_, false);
         waveform_viewport_.setScrollBarsShown(true, false);
         waveform_viewport_.setExplicitFocusOrder(300);
@@ -9341,7 +9360,7 @@ public:
         editor_viewport_.setViewedComponent(&editor_canvas_, false);
         editor_viewport_.setScrollBarsShown(true, true);
         addAndMakeVisible(editor_viewport_);
-        setSize(UiLayout::editorWindowW, UiLayout::editorWindowH + UiScale::sx(180));
+        setSize(UiLayout::editorWindowW, UiLayout::editorWindowH);
         {
             juce::Component::SafePointer<SccEditorComponent> safe(this);
             ui_scale_listener_ = UiScale::addGlobalListener([safe] {
@@ -9790,7 +9809,7 @@ public:
         applyScaledContentSize(
             *this,
             UiLayout::editorWindowW,
-            UiLayout::editorWindowH + UiScale::sx(180),
+            UiLayout::editorWindowH,
             true);
     }
 
@@ -9953,9 +9972,11 @@ public:
         numeric_row = numeric_row.removeFromBottom(fieldH);
         numeric_resolution_.setBounds(numeric_row.removeFromLeft(UiScale::sx(78)));
         numeric_row.removeFromLeft(controlGap);
-        numeric_paste_.setBounds(numeric_row.removeFromRight(UiScale::sx(68)));
+        numeric_paste_.setBounds(numeric_row.removeFromRight(fieldH));
+        numeric_paste_.setEdgeIndent(xs);
         numeric_row.removeFromRight(controlGap);
-        numeric_copy_.setBounds(numeric_row.removeFromRight(UiScale::sx(68)));
+        numeric_copy_.setBounds(numeric_row.removeFromRight(fieldH));
+        numeric_copy_.setEdgeIndent(xs);
         numeric_row.removeFromRight(controlGap);
         numeric_help_button_.setBounds(numeric_row.removeFromRight(fieldH));
         numeric_row.removeFromRight(controlGap);
@@ -12448,8 +12469,8 @@ private:
     SccNumericTextEditor numeric_input_;
     juce::TextButton numeric_help_button_;
     std::unique_ptr<SccNumericHelp> numeric_help_;
-    juce::TextButton numeric_copy_;
-    juce::TextButton numeric_paste_;
+    juce::DrawableButton numeric_copy_{"SCC numeric copy", juce::DrawableButton::ImageOnButtonBackground};
+    juce::DrawableButton numeric_paste_{"SCC numeric paste", juce::DrawableButton::ImageOnButtonBackground};
     juce::Component waveform_content_;
     SccEditorViewport waveform_viewport_;
     SccEditorCanvas editor_canvas_;
@@ -12507,7 +12528,7 @@ private:
     juce::DrawableButton shift_down_{
         "shift down", juce::DrawableButton::ImageOnButtonBackground};
     juce::Slider vertical_scale_;
-    juce::TextButton scale_reset_;
+    juce::Label scale_reset_;
     juce::TextButton background_load_;
     juce::TextButton background_clear_;
     juce::ToggleButton background_visible_;
@@ -13377,7 +13398,7 @@ public:
             400);
         setSize(
             UiLayout::editorWindowW,
-            UiLayout::editorWindowH + UiScale::sx(112));
+            UiLayout::editorWindowH);
         {
             juce::Component::SafePointer<OpllEditorComponent> safe(this);
             ui_scale_listener_ = UiScale::addGlobalListener([safe] {

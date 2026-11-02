@@ -835,7 +835,7 @@ std::size_t wavToneStorage(const CompositeTimbre& tone) {
             + layer.volume_envelope.events.capacity() * sizeof(EnvelopeEvent)
             + layer.pitch_envelope.events.capacity() * sizeof(EnvelopeEvent)
             + layer.name.capacity() + layer.opll_tl_auto.free_curve.capacity()
-            + layer.opll_fb_auto.free_curve.capacity();
+            + layer.opll_fb_auto.free_curve.capacity() + layer.psg_noise_auto.free_curve.capacity();
         bytes += layer.modulation_profiles.capacity() * sizeof(CompositeModulationProfile)
             + layer.register_auto_profiles.capacity() * sizeof(OpllRegisterAutoProfile)
             + layer.derived_command_placements.capacity() * sizeof(CompositeDerivedCommandPlacement);
@@ -1071,6 +1071,7 @@ bool stationaryLoop(const CompositeLayer& layer) {
         && !layer.pitch_modulation.enabled && !layer.volume_modulation.enabled
         && !layer.opll_tl_modulation.enabled && !layer.opll_fb_modulation.enabled
         && !layer.opll_tl_auto.active() && !layer.opll_fb_auto.active()
+        && !layer.psg_noise_auto.active() && !layer.psg_noise_modulation.enabled
         && std::none_of(layer.volume_envelope.events.begin(), layer.volume_envelope.events.end(),
             [&](const auto& event) {
                 return event.count > *timeline.loop_start_count;
@@ -1079,6 +1080,7 @@ bool stationaryLoop(const CompositeLayer& layer) {
             [&](const auto& event) {
                 return event.count >= *timeline.loop_start_count
                     && (event.kind == EnvelopeEventKind::RegisterWrite
+                        || event.kind == EnvelopeEventKind::Noise || event.kind == EnvelopeEventKind::ToneNoiseMode
                         || (event.kind == EnvelopeEventKind::Timbre && event.count > *timeline.loop_start_count));
             });
 }

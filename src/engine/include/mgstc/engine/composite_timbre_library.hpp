@@ -93,7 +93,7 @@ deserializeCompositeSoundPayload(
     std::uint32_t payload_version,
     std::string* error = nullptr);
 
-// SQLite composite sound-only blob. Independent of portable .mgstc format 24.
-inline constexpr std::uint32_t kCompositeSoundPayloadVersion = 6;
+// SQLite composite sound-only blob. Independent of portable .mgstc format 25.
+inline constexpr std::uint32_t kCompositeSoundPayloadVersion = 7;
 
 }  // namespace mgstc::engine

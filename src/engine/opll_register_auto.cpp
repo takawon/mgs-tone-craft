@@ -30,8 +30,8 @@ void appendWrite(
     std::uint32_t count,
     std::uint8_t value) {
     events.push_back({
-        .kind = EnvelopeEventKind::RegisterWrite,
-        .value = opllRegisterAutoRegisterNumber(target),
+        .kind = target == OpllRegisterAutoTarget::Noise ? EnvelopeEventKind::Noise : EnvelopeEventKind::RegisterWrite,
+        .value = target == OpllRegisterAutoTarget::Noise ? value : opllRegisterAutoRegisterNumber(target),
         .secondary = packOpllRegisterAutoByte(
             target, base_register_byte, value),
         .count = count,
@@ -169,7 +169,7 @@ void appendWrite(
     if (target == OpllRegisterAutoTarget::TotalLevel) {
         return static_cast<std::uint8_t>(packed & 0x3F);
     }
-    return static_cast<std::uint8_t>(packed & 0x07);
+    return static_cast<std::uint8_t>(packed & (target == OpllRegisterAutoTarget::Noise ? 31 : 7));
 }
 
 [[nodiscard]] std::map<std::uint32_t, std::uint8_t> fieldSchedule(
@@ -209,7 +209,7 @@ struct AutomationAtCount {
     add_schedule(layer.opll_tl_auto, OpllRegisterAutoTarget::TotalLevel);
     add_schedule(layer.opll_fb_auto, OpllRegisterAutoTarget::Feedback);
     for (const auto& profile : layer.register_auto_profiles)
-        add_schedule(profile.lane, profile.target);
+        if (profile.target != OpllRegisterAutoTarget::Noise) add_schedule(profile.lane, profile.target);
     const auto auto_value = [&](const OpllRegisterAutoLane& lane,
                                 std::uint32_t count) -> std::optional<std::uint8_t> {
         for (const auto& [owner, schedule] : schedules) {
@@ -238,7 +238,7 @@ struct AutomationAtCount {
     };
     std::map<std::uint32_t, std::vector<Action>> profile_actions;
     for (const auto& profile : layer.register_auto_profiles)
-        profile_actions[profile.count].push_back({nullptr, &profile, nullptr,
+        if (profile.target != OpllRegisterAutoTarget::Noise) profile_actions[profile.count].push_back({nullptr, &profile, nullptr,
             profile.target, profile.after_loop_start, profile.command_order});
     for (const auto& profile : layer.modulation_profiles) {
         if (profile.target != CompositeModulationTarget::TotalLevel
@@ -369,6 +369,7 @@ std::uint8_t packOpllRegisterAutoByte(
     OpllRegisterAutoTarget target,
     std::uint8_t base_register_byte,
     std::uint8_t value) noexcept {
+    if (target == OpllRegisterAutoTarget::Noise) return static_cast<std::uint8_t>(value & 31);
     if (target == OpllRegisterAutoTarget::TotalLevel) {
         // Reg 2: KSL[7:6] | TL[5:0]
         return static_cast<std::uint8_t>(

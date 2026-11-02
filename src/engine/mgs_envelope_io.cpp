@@ -379,6 +379,10 @@ void collapseTrailingHold(std::vector<std::string>& tokens) {
         } else if (token.front() == '\\') {
             bytes.insert(bytes.end(), {0x12,
                 static_cast<std::uint8_t>(number(std::string_view(token).substr(1)))});
+        } else if (token.front() == 'n') {
+            bytes.push_back(static_cast<std::uint8_t>(0x80 | number(std::string_view(token).substr(1))));
+        } else if (token.front() == '/') {
+            bytes.push_back(static_cast<std::uint8_t>(0xA0 | number(std::string_view(token).substr(1))));
         } else if (token.front() == 'y') {
             const auto comma = token.find(',');
             bytes.insert(bytes.end(), {0x11,
@@ -659,6 +663,16 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
             states[event.count].ordered_commands.push_back({
                 "@" + std::to_string(*number), event.command_order,
                 event.after_loop_start, false});
+        } else if (event.kind == EnvelopeEventKind::Noise || event.kind == EnvelopeEventKind::ToneNoiseMode) {
+            const bool noise = event.kind == EnvelopeEventKind::Noise;
+            if (layer.source != TimbreSource::Psg || event.value < 0 || event.value > (noise ? 31 : 3)) {
+                addIssueOnce(result, MgsEnvelopeIssue::InvalidRegisterWrite);
+                continue;
+            }
+            const auto token = std::string(noise ? "n" : "/") + std::to_string(event.value);
+            appendToken(tokens, token);
+            states[event.count].ordered_commands.push_back({token,
+                event.command_order, event.after_loop_start, false});
         } else if (event.kind == EnvelopeEventKind::RegisterWrite) {
             const auto maximum_register =
                 layer.source == TimbreSource::Psg ? 15 : 56;

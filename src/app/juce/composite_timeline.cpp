@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -2187,6 +2188,7 @@ enum class TimelineModulationTarget : std::uint8_t {
     Tremolo,
     TotalLevel,
     Feedback,
+    Noise,
 };
 
 [[nodiscard]] juce::String timelineModulationName(
@@ -2196,6 +2198,7 @@ enum class TimelineModulationTarget : std::uint8_t {
     case TimelineModulationTarget::Tremolo: return "Tremolo";
     case TimelineModulationTarget::TotalLevel: return "TL LFO";
     case TimelineModulationTarget::Feedback: return "FB LFO";
+    case TimelineModulationTarget::Noise: return "Noise LFO";
     }
     return {};
 }
@@ -2207,10 +2210,22 @@ public:
     static constexpr int kPreviewCounts = 512;
     struct Data {
         TimelineModulationTarget target{};
+        int free_curve_start_count{};
         std::array<std::optional<int>, kPreviewCounts + 1> base{}, free_curve{};
     };
 
     explicit TimelineModulationWavePreview(Data data) : data_(std::move(data)) {}
+
+    void setFreeCurve(const std::vector<std::uint8_t>& values) {
+        for (int count = 0; count <= kPreviewCounts; ++count) {
+            const auto index = count - data_.free_curve_start_count;
+            auto& value = data_.free_curve[static_cast<std::size_t>(count)];
+            value = index >= 0 && !values.empty()
+                ? std::optional<int>(std::min<int>(31, values[std::min(static_cast<std::size_t>(index), values.size() - 1)]))
+                : std::nullopt;
+        }
+        repaint();
+    }
 
     void setSettings(mgstc::engine::ModulationParameters settings, bool free_curve) {
         settings_ = settings;
@@ -2303,6 +2318,7 @@ private:
         case TimelineModulationTarget::Tremolo: return {0, 15};
         case TimelineModulationTarget::TotalLevel: return {0, 63};
         case TimelineModulationTarget::Feedback: return {0, 7};
+        case TimelineModulationTarget::Noise: return {0, 31};
         }
         return {0, 15};
     }
@@ -2315,14 +2331,18 @@ class TimelineModulationDialogContent final : public juce::Component {
 public:
     using ChangeCallback = std::function<void(
         const mgstc::engine::ModulationParameters&, bool)>;
+    using RandomCallback = std::function<std::vector<std::uint8_t>()>;
 
     TimelineModulationDialogContent(
         TimelineModulationTarget target,
         mgstc::engine::ModulationParameters initial,
         bool free_curve,
         TimelineModulationWavePreview::Data preview_data,
-        ChangeCallback on_change)
-        : on_change_(std::move(on_change)), wave_(std::move(preview_data)) {
+        ChangeCallback on_change,
+        RandomCallback on_random = {})
+        : on_change_(std::move(on_change)), on_random_(std::move(on_random)),
+          target_(target),
+          wave_(std::move(preview_data)) {
         title_.setText(timelineModulationName(target), juce::dontSendNotification);
         title_.setFont(UiFonts::heading());
         addAndMakeVisible(title_);
@@ -2339,7 +2359,8 @@ public:
         mode_.addItem(juce::String::fromUTF8("上昇"), 2);
         mode_.addItem(juce::String::fromUTF8("下降"), 3);
         if (target == TimelineModulationTarget::TotalLevel
-            || target == TimelineModulationTarget::Feedback) {
+            || target == TimelineModulationTarget::Feedback
+            || target == TimelineModulationTarget::Noise) {
             mode_.addItem(juce::String::fromUTF8("自由曲線"), 4);
         }
         mode_.onChange = [this] { updateParamAvailability(); commit(); };
@@ -2371,6 +2392,23 @@ public:
             }
         };
         addAndMakeVisible(close_);
+
+        random_.setButtonText(juce::String::fromUTF8("ランダム"));
+        random_.setTooltip(juce::String::fromUTF8("0～31のNoise LFO曲線をランダムに生成して試聴します"));
+        random_.onClick = [this] {
+            if (!on_random_) return;
+            const auto values = on_random_();
+            if (values.empty()) return;
+            assigning_ = true;
+            enabled_.setToggleState(true, juce::dontSendNotification);
+            mode_.setSelectedId(4, juce::dontSendNotification);
+            assigning_ = false;
+            updateParamAvailability();
+            wave_.setFreeCurve(values);
+            updateWave();
+        };
+        addChildComponent(random_);
+        random_.setVisible(target == TimelineModulationTarget::Noise);
 
         assigning_ = true;
         enabled_.setToggleState(initial.enabled || free_curve,
@@ -2418,8 +2456,12 @@ public:
         wave_.setBounds(area.removeFromTop(compositeLfoWaveH));
         area.removeFromTop(sm);
         hint_.setBounds(area.removeFromTop(fieldH * 2));
-        close_.setBounds(area.removeFromBottom(textButtonH)
-            .removeFromLeft(libraryButtonMinW));
+        auto footer = area.removeFromBottom(textButtonH);
+        close_.setBounds(footer.removeFromRight(libraryButtonMinW));
+        if (random_.isVisible()) {
+            footer.removeFromRight(controlGap);
+            random_.setBounds(footer.removeFromRight(libraryButtonMinW));
+        }
     }
 
     [[nodiscard]] bool verifyPreviewLayoutAndDelay(int delay) const {
@@ -2461,7 +2503,9 @@ private:
         }
         depth_.setEnabled(mode_.getSelectedId() == 1);
         hint_.setText(free_curve
-            ? juce::String::fromUTF8("自由曲線は TL/FB 自動レーンで描画します。")
+            ? juce::String::fromUTF8(target_ == TimelineModulationTarget::Noise
+                ? "自由曲線は Noise LFO レーンで描画します。"
+                : "自由曲線は TL/FB 自動レーンで描画します。")
             : juce::String::fromUTF8(
                 "上昇／下降では深さを使わず、粗さの絶対値で変化します。"),
             juce::dontSendNotification);
@@ -2490,6 +2534,8 @@ private:
     }
 
     ChangeCallback on_change_;
+    RandomCallback on_random_;
+    TimelineModulationTarget target_{};
     bool assigning_{};
     SwitchLookAndFeel switch_look_and_feel_;
     juce::Label title_, mode_label_, delay_label_, depth_label_, speed_label_,
@@ -2498,7 +2544,7 @@ private:
     juce::ComboBox mode_;
     juce::Slider delay_, depth_, speed_, roughness_;
     TimelineModulationWavePreview wave_;
-    juce::TextButton close_;
+    juce::TextButton random_, close_;
 };
 
 [[nodiscard]] juce::Rectangle<float> rateEnvelopePlotRect(
@@ -4474,6 +4520,8 @@ public:
         parameter_.addItem(juce::String::fromUTF8("Y-Register y"), 6);
         parameter_.addItem(juce::String::fromUTF8("TL変調"), 4);
         parameter_.addItem(juce::String::fromUTF8("FB変調"), 5);
+        parameter_.addItem(juce::String::fromUTF8("モード /"), 8);
+        parameter_.addItem(juce::String::fromUTF8("ノイズ周波数 n"), 7);
         parameter_.setSelectedId(1, juce::dontSendNotification);
         parameter_.setTooltip(
             juce::String::fromUTF8(
@@ -4625,15 +4673,21 @@ public:
         apply_.setTooltip(
             juce::String::fromUTF8(
                 "表示中のカウントへ入力値を設定します。"
-                "TL/FB変調では開始ステップとパラメーターを確定します"));
+                "自由曲線では開始ステップとパラメーターを確定します"));
         apply_.onClick = [this] {
             if (selectedEditMode() != EditMode::Draw) {
                 return;
             }
+            const auto* auto_lane = selectedRegisterAutoLane();
+            const bool free_curve = auto_lane != nullptr
+                && auto_lane->mode == mgstc::engine::OpllRegisterAutoMode::FreeCurve;
+            if (selectedParameter() == Parameter::Mode
+                || (selectedParameter() == Parameter::Noise && !free_curve)) {
+                editPoint(selected_count_, value_.getText().getIntValue(), true);
+                return;
+            }
             if (isRegisterAutoParameter(selectedParameter())) {
-                if (selectedRegisterAutoLane() != nullptr
-                    && selectedRegisterAutoLane()->mode
-                        == mgstc::engine::OpllRegisterAutoMode::FreeCurve) {
+                if (free_curve) {
                     applyRegisterAutoFromEditors(true);
                 } else {
                     openTimelineModulationDialog(
@@ -4801,8 +4855,8 @@ public:
         modulation_issue_.setColour(
             juce::Label::textColourId, juce::Colour(0xFFE7A083));
         inspector_content_.addAndMakeVisible(modulation_issue_);
-        constexpr std::array<const char*, 4> modulation_labels{
-            "Pitch", "Tremolo", "TL", "FB"};
+        constexpr std::array<const char*, 5> modulation_labels{
+            "Pitch", "Tremolo", "TL", "FB", "Noise"};
         for (std::size_t index = 0; index < modulation_labels.size(); ++index) {
             auto& label = modulation_labels_[index];
             label.setText(modulation_labels[index], juce::dontSendNotification);
@@ -4900,6 +4954,11 @@ public:
     void setInspectorVisible(bool visible) {
         if (inspector_visible_ == visible) return;
         inspector_visible_ = visible;
+        resized(); repaint();
+    }
+
+    void setInspectorFooterExtension(int height) {
+        inspector_footer_extension_ = juce::jmax(0, height);
         resized(); repaint();
     }
 
@@ -5225,9 +5284,9 @@ public:
             check(graphArea().getHeight() > editor.getHeight(), "focus mode did not enlarge editor");
             focus_.setToggleState(false, juce::dontSendNotification);
             focus_.onClick();
-            setInspectorVisible(false);
-            check(graphArea().getWidth() > editor.getWidth(), "library replacement did not reclaim inspector");
             setInspectorVisible(true);
+            check(!inspectorArea().isEmpty(), "library view hid the editor inspector");
+            check(graphArea().getWidth() < getWidth(), "editor inspector did not reserve its column");
             check(callbacks == 0 && timbre_ == before, "navigation changed model or issued edit callback");
             check(graphArea().getWidth() > UiScale::sx(700), "detail graph too narrow");
             check(inspector_view_.getBounds().getIntersection(graphArea()).isEmpty(), "inspector overlaps graph");
@@ -5976,6 +6035,140 @@ public:
             hover_preview_value_.reset(); hover_mouse_pos_.reset();
         }
 
+        // PSG commands must be editable in the shared Standalone/VST3 timeline.
+        auto psg_model = mgstc::engine::defaultCompositeTimbre();
+        for (auto& layer : psg_model.layers) layer.volume_envelope.kind = mgstc::engine::EnvelopeKind::Sequence;
+        setTimbre(psg_model, true); selectOverviewLayer(0); setCountInspector(true);
+        edit_mode_.setSelectedId(static_cast<int>(EditMode::Draw), juce::dontSendNotification);
+        const auto psg_slots = makeEditLaneSlots(graph_bounds_[0], timbre_.layers[0].source);
+        check(psg_slots.timbre.isEmpty() && !psg_slots.mode.isEmpty() && !psg_slots.noise.isEmpty()
+                && psg_slots.register_write.getBottom() == psg_slots.mode.getY()
+                && psg_slots.mode.getBottom() == psg_slots.noise.getY(),
+            "PSG command lane order or removal of timbre lane failed");
+        check(!modulation_toggles_[2].isVisible() && !modulation_toggles_[3].isVisible()
+                && modulation_toggles_[4].isVisible() && modulation_toggles_[4].isEnabled()
+                && modulation_settings_[4].isEnabled() && parameter_.indexOfItemId(3) < 0,
+            "PSG exposes unavailable TL/FB/timbre controls or lacks Noise");
+        selected_count_ = 3;
+        parameter_.setSelectedId(static_cast<int>(Parameter::Mode), juce::dontSendNotification);
+        value_.setText("3", false); apply_.onClick();
+        check(storedValueAt(timbre_.layers[0], Parameter::Mode, 3) == 3,
+            "PSG mode Apply did not write Mix");
+        {
+            const auto saved_layer = timbre_.layers[0];
+            for (std::uint8_t channel = 0; channel < 3; ++channel) {
+                auto& layer = timbre_.layers[0];
+                layer = saved_layer;
+                layer.channel = channel;
+                layer.envelope_timeline.loop_start_count = 4;
+                layer.envelope_timeline.loop_end_count = 8;
+                layer.timbre_automation = {
+                    {.kind = mgstc::engine::EnvelopeEventKind::RegisterWrite,
+                     .value = 7, .secondary = 0, .count = 4,
+                     .after_loop_start = true, .command_order = 3},
+                    {.kind = mgstc::engine::EnvelopeEventKind::RegisterWrite,
+                     .value = 7, .secondary = 1 << channel, .count = 4,
+                     .command_order = 1},
+                    {.kind = mgstc::engine::EnvelopeEventKind::ToneNoiseMode,
+                     .value = 1, .count = 4,
+                     .after_loop_start = true, .command_order = 2},
+                };
+                selected_count_ = 4;
+                loop_insert_after_ = false;
+                syncPointEditors();
+                check(value_.getText() == "2",
+                    "Mode editor must reflect this PSG channel's y7 before the loop");
+                apply_.onClick();
+                check(storedValueAt(layer, Parameter::Mode, 4) == 2,
+                    "applying the displayed Mode must not change Noise to Tone");
+                loop_insert_after_ = true;
+                syncPointEditors();
+                check(value_.getText() == "3",
+                    "Mode editor must honor y7 command order after the same loop count");
+            }
+            timbre_.layers[0] = saved_layer;
+            selected_count_ = 3;
+            loop_insert_after_ = false;
+        }
+        parameter_.setSelectedId(static_cast<int>(Parameter::Noise), juce::dontSendNotification);
+        value_.setText("31", false); apply_.onClick();
+        check(psgNoiseValueAt(timbre_.layers[0], 3) == 31,
+            "PSG noise Apply did not retain upper boundary");
+        auto settings = mgstc::engine::ModulationParameters{};
+        settings.enabled = true; settings.mode = mgstc::engine::ModulationMode::StepDown;
+        settings.speed = 1; settings.roughness = 2;
+        applyTimelineModulation(0, TimelineModulationTarget::Noise, settings, false);
+        check(timbre_.layers[0].psg_noise_modulation.enabled,
+            "Noise settings did not reach authoring state");
+        applyTimelineModulation(0, TimelineModulationTarget::Noise, settings, true);
+        parameter_.setSelectedId(static_cast<int>(Parameter::Noise), juce::dontSendNotification);
+        editRegisterAutoFreeCurve(4, 17, true);
+        check(selectedRegisterAutoLane() && !selectedRegisterAutoLane()->free_curve.empty()
+                && psgNoiseValueAt(timbre_.layers[0], 4) == 17,
+            "Noise free-curve editing did not reach rendered command values");
+        {
+            const auto before = timbre_.layers[0];
+            const auto configure_fields = [&] {
+                selected_count_ = 6;
+                syncRegisterAutoEditors();
+                auto_depth_.setText("13", false);
+                auto_speed_.setText("3", false);
+                auto_coarseness_.setText("2", false);
+                auto_stop_.setText("7", false);
+            };
+            configure_fields();
+            callbacks = 0;
+            apply_.onClick();
+            const auto clicked = timbre_.layers[0];
+            const auto* lane = selectedRegisterAutoLane();
+            check(lane && lane->start_count == 6 && lane->depth == 13
+                    && lane->change_speed == 3 && lane->coarseness == 2
+                    && lane->stop_position == 7
+                    && lane->free_curve == before.psg_noise_auto.free_curve
+                    && clicked.timbre_automation == before.timbre_automation
+                    && callbacks == 1,
+                "Noise FreeCurve Apply must commit parameters once without adding n");
+            timbre_.layers[0] = before;
+            configure_fields();
+            callbacks = 0;
+            auto_coarseness_.onReturnKey();
+            check(timbre_.layers[0] == clicked && callbacks == 1,
+                "Noise FreeCurve Apply and Enter must produce the same authoring state");
+        }
+        timbre_.layers[0].envelope_timeline.loop_start_count = 8;
+        timbre_.layers[0].envelope_timeline.loop_end_count = 12;
+        selected_count_ = 8;
+        for (const auto parameter : {Parameter::Noise, Parameter::Mode}) {
+            parameter_.setSelectedId(static_cast<int>(parameter), juce::dontSendNotification);
+            loop_insert_after_ = false; editPoint(8, 1, true);
+            loop_insert_after_ = true; editPoint(8, 2, true);
+            const auto kind = eventKindFor(parameter);
+            int before = 0, after = 0;
+            for (const auto& event : timbre_.layers[0].timbre_automation)
+                if (event.kind == kind && event.count == 8) {
+                    if (event.after_loop_start && event.value == 2) ++after;
+                    if (!event.after_loop_start && event.value == 1) ++before;
+                }
+            check(before == 1 && after == 1, "PSG edit overwrote the other loop zone");
+        }
+        auto saved_audition = base_audition_;
+        int auditions = 0; base_audition_ = [&] { ++auditions; };
+        timbre_.layers[0].envelope_timeline.length_counts = 300;
+        syncInspector();
+        const auto random1 = generateRandomNoiseCurve(0);
+        const auto random2 = generateRandomNoiseCurve(0);
+        check(random1.size() == 301 && random2.size() == 301
+                && random1 != random2 && auditions == 2
+                && std::all_of(random2.begin(), random2.end(), [](auto value) { return value <= 31; }),
+            "Noise random must regenerate through END and invoke the existing audition");
+        base_audition_ = saved_audition;
+        save("workspace-psg-noise-mode");
+        selectOverviewLayer(1); setCountInspector(true);
+        check(!modulation_toggles_[2].isVisible() && !modulation_toggles_[3].isVisible()
+                && !modulation_toggles_[4].isVisible(), "SCC exposes TL/FB/Noise controls");
+        selectOverviewLayer(2); setCountInspector(true);
+        check(modulation_toggles_[2].isVisible() && modulation_toggles_[3].isVisible()
+                && !modulation_toggles_[4].isVisible(), "OPLL modulation controls regressed");
         model.layers.clear(); setTimbre(model, true);
         check(selected_layer_ == -1 && !envelope_mml_preview_.isVisible(), "empty model retained editable controls");
         check(psg_add_.isVisible() && scc_add_.isVisible() && opll_add_.isVisible()
@@ -7191,6 +7384,8 @@ public:
         else if (graphStrip(slots.pitch).contains(point)) lane = Lane::Pitch;
         else if (graphStrip(slots.timbre).contains(point)) lane = Lane::Timbre;
         else if (graphStrip(slots.register_write).contains(point)) lane = Lane::RegisterWrite;
+        else if (graphStrip(slots.noise).contains(point)) lane = Lane::Noise;
+        else if (graphStrip(slots.mode).contains(point)) lane = Lane::Mode;
         else if (graphStrip(slots.tl_auto).contains(point)) lane = Lane::Tl;
         else if (graphStrip(slots.fb_auto).contains(point)) lane = Lane::Fb;
         if (!lane) return;
@@ -7555,6 +7750,27 @@ public:
                 repaint();
                 return;
             }
+            if (slots.mode.contains(event.getPosition())) {
+                parameter_.setSelectedId(static_cast<int>(Parameter::Mode), juce::dontSendNotification);
+                juce::PopupMenu menu;
+                menu.addItem(1, "Tone"); menu.addItem(2, "Noise"); menu.addItem(3, "Mix");
+                menu.addItem(4, "Mute");
+                const int count = selected_count_;
+                const int layer = selected_layer_;
+                const auto generation = dialog_generation_;
+                menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea(
+                    localAreaToGlobal(slots.mode)),
+                    [safe = juce::Component::SafePointer<Impl>(this), count, layer, generation](int id) {
+                        if (safe == nullptr || id == 0 || safe->dialog_generation_ != generation || safe->selected_layer_ != layer) return;
+                        safe->parameter_.setSelectedId(static_cast<int>(Parameter::Mode), juce::dontSendNotification);
+                        safe->editPoint(count, id == 4 ? 0 : id, true);
+                    });
+                drawing_ = false; repaint(); return;
+            }
+            if (slots.noise.contains(event.getPosition())) {
+                pending_auto_settings_ = TimelineModulationTarget::Noise;
+                drawing_ = false; repaint(); return;
+            }
             if (slots.tl_auto.contains(event.getPosition())
                 || slots.fb_auto.contains(event.getPosition())) {
                 const bool tl = slots.tl_auto.contains(event.getPosition());
@@ -7872,7 +8088,8 @@ private:
 
     static constexpr mgstc::engine::CompositeModulationTarget kEffectiveWaveformTargets[]{
         mgstc::engine::CompositeModulationTarget::Pitch, mgstc::engine::CompositeModulationTarget::Volume,
-        mgstc::engine::CompositeModulationTarget::TotalLevel, mgstc::engine::CompositeModulationTarget::Feedback};
+        mgstc::engine::CompositeModulationTarget::TotalLevel, mgstc::engine::CompositeModulationTarget::Feedback,
+        mgstc::engine::CompositeModulationTarget::Noise};
 
     [[nodiscard]] static mgstc::engine::CompositeModulationTarget coreModulationTarget(TimelineModulationTarget target) {
         return static_cast<mgstc::engine::CompositeModulationTarget>(target);
@@ -7897,6 +8114,7 @@ private:
         case TimelineModulationTarget::Tremolo: return layer.volume_modulation;
         case TimelineModulationTarget::TotalLevel: return layer.opll_tl_modulation;
         case TimelineModulationTarget::Feedback: return layer.opll_fb_modulation;
+        case TimelineModulationTarget::Noise: return layer.psg_noise_modulation;
         }
         return layer.pitch_modulation;
     }
@@ -7904,22 +8122,29 @@ private:
     [[nodiscard]] const mgstc::engine::OpllRegisterAutoLane* freeCurveFor(
         mgstc::engine::CompositeLayer& layer,
         TimelineModulationTarget target) {
-        if (target == TimelineModulationTarget::TotalLevel || target == TimelineModulationTarget::Feedback)
+        if (target == TimelineModulationTarget::TotalLevel || target == TimelineModulationTarget::Feedback
+            || target == TimelineModulationTarget::Noise)
             return &mgstc::engine::compositeRegisterAutoAt(layer, target == TimelineModulationTarget::TotalLevel
-                ? mgstc::engine::OpllRegisterAutoTarget::TotalLevel : mgstc::engine::OpllRegisterAutoTarget::Feedback,
+                ? mgstc::engine::OpllRegisterAutoTarget::TotalLevel : target == TimelineModulationTarget::Noise
+                ? mgstc::engine::OpllRegisterAutoTarget::Noise : mgstc::engine::OpllRegisterAutoTarget::Feedback,
                 static_cast<std::uint32_t>(juce::jmax(0, selected_count_)), loop_insert_after_ || !isLoopStartCount(layer, selected_count_));
         return nullptr;
     }
 
     [[nodiscard]] mgstc::engine::OpllRegisterAutoLane* editableFreeCurveFor(
         mgstc::engine::CompositeLayer& layer, TimelineModulationTarget target) {
-        if (target != TimelineModulationTarget::TotalLevel && target != TimelineModulationTarget::Feedback) return nullptr;
+        if (target != TimelineModulationTarget::TotalLevel
+            && target != TimelineModulationTarget::Feedback
+            && target != TimelineModulationTarget::Noise) return nullptr;
         const auto field = target == TimelineModulationTarget::TotalLevel
-            ? mgstc::engine::OpllRegisterAutoTarget::TotalLevel : mgstc::engine::OpllRegisterAutoTarget::Feedback;
+            ? mgstc::engine::OpllRegisterAutoTarget::TotalLevel
+            : target == TimelineModulationTarget::Noise ? mgstc::engine::OpllRegisterAutoTarget::Noise
+            : mgstc::engine::OpllRegisterAutoTarget::Feedback;
         if (isLoopStartCount(layer, selected_count_) || !layer.register_auto_profiles.empty())
             return &mgstc::engine::editCompositeRegisterAutoAt(layer, field,
                 static_cast<std::uint32_t>(juce::jmax(0, selected_count_)), loop_insert_after_);
-        return target == TimelineModulationTarget::TotalLevel ? &layer.opll_tl_auto : &layer.opll_fb_auto;
+        return target == TimelineModulationTarget::TotalLevel ? &layer.opll_tl_auto
+            : target == TimelineModulationTarget::Noise ? &layer.psg_noise_auto : &layer.opll_fb_auto;
     }
 
     void syncTimelineModulationControls() {
@@ -7930,8 +8155,9 @@ private:
             const bool supported = selected
                 && timbre_.layers[static_cast<std::size_t>(selected_layer_)]
                     .volume_envelope.kind == mgstc::engine::EnvelopeKind::Sequence
-                && (index < 2 || timbre_.layers[static_cast<std::size_t>(selected_layer_)]
-                    .source == mgstc::engine::TimbreSource::Opll);
+                && (index < 2 || (index < 4
+                    ? timbre_.layers[static_cast<std::size_t>(selected_layer_)].source == mgstc::engine::TimbreSource::Opll
+                    : timbre_.layers[static_cast<std::size_t>(selected_layer_)].source == mgstc::engine::TimbreSource::Psg));
             bool active = false;
             if (supported) {
                 auto& layer = timbre_.layers[static_cast<std::size_t>(selected_layer_)];
@@ -7958,6 +8184,8 @@ private:
         auto& layer = timbre_.layers[layer_index];
         if (layer.volume_envelope.kind != mgstc::engine::EnvelopeKind::Sequence)
             return;
+        if (target == TimelineModulationTarget::Noise
+            && layer.source != mgstc::engine::TimbreSource::Psg) return;
         if ((target == TimelineModulationTarget::TotalLevel
                 || target == TimelineModulationTarget::Feedback)
             && layer.source != mgstc::engine::TimbreSource::Opll) return;
@@ -8042,6 +8270,7 @@ private:
         if (preview_curve.free_curve.empty()) preview_curve.free_curve.push_back(preview_curve.depth);
         const auto register_target = target == TimelineModulationTarget::TotalLevel
             ? mgstc::engine::OpllRegisterAutoTarget::TotalLevel
+            : target == TimelineModulationTarget::Noise ? mgstc::engine::OpllRegisterAutoTarget::Noise
             : mgstc::engine::OpllRegisterAutoTarget::Feedback;
         for (int count = 0; count <= TimelineModulationWavePreview::kPreviewCounts; ++count) {
             auto& base = preview_data.base[static_cast<std::size_t>(count)];
@@ -8049,6 +8278,14 @@ private:
                 base = cumulativePitchAt(layer, count);
             } else if (volumes) {
                 base = static_cast<int>((*volumes)[static_cast<std::size_t>(count)]);
+            } else if (target == TimelineModulationTarget::Noise) {
+                base = mgstc::engine::psgEnvelopeValueAt(layer,
+                    mgstc::engine::EnvelopeEventKind::Noise,
+                    static_cast<std::uint32_t>(count),
+                    true);
+                preview_data.free_curve[static_cast<std::size_t>(count)] =
+                    mgstc::engine::opllRegisterAutoValueAt(preview_curve, register_target,
+                        static_cast<std::uint32_t>(count), layer.envelope_timeline.length_counts);
             } else if (const auto regs = mgstc::engine::opllOriginalRegisterImageAt(
                     layer, static_cast<std::uint32_t>(count), library, true, false)) {
                 base = target == TimelineModulationTarget::TotalLevel
@@ -8071,6 +8308,10 @@ private:
                     safe->applyTimelineModulation(
                         layer_index, target, settings, use_free_curve);
                 }
+            },
+            [safe = juce::Component::SafePointer<Impl>(this), layer_index, target]() {
+                if (target != TimelineModulationTarget::Noise || safe == nullptr) return std::vector<std::uint8_t>{};
+                return safe->generateRandomNoiseCurve(layer_index);
             });
         pending_dialogs_.emplace_back(dialog);
         dialog->setUsingNativeTitleBar(true);
@@ -8081,6 +8322,29 @@ private:
         dialog->enterModalState(true, nullptr, true);
     }
 
+    [[nodiscard]] std::vector<std::uint8_t> generateRandomNoiseCurve(std::size_t layer_index) {
+        if (layer_index >= timbre_.layers.size()) return {};
+        auto& layer = timbre_.layers[layer_index];
+        if (layer.source != mgstc::engine::TimbreSource::Psg
+            || layer.volume_envelope.kind != mgstc::engine::EnvelopeKind::Sequence) return {};
+        const auto length = std::min<std::uint32_t>(layer.envelope_timeline.length_counts,
+            mgstc::engine::kMgscEnvelopeUiLengthCap);
+        std::vector<std::uint8_t> values(static_cast<std::size_t>(length) + 1);
+        std::random_device random_device;
+        std::mt19937 random(random_device());
+        std::uniform_int_distribution<int> value(0, 31);
+        for (auto& sample : values) sample = static_cast<std::uint8_t>(value(random));
+        auto* lane = editableFreeCurveFor(layer, TimelineModulationTarget::Noise);
+        lane->start_count = 0; lane->coarseness = 1;
+        lane->free_curve = values;
+        lane->mode = mgstc::engine::OpllRegisterAutoMode::FreeCurve;
+        auto settings = editableModulationFor(layer, TimelineModulationTarget::Noise);
+        settings.enabled = true;
+        applyTimelineModulation(layer_index, TimelineModulationTarget::Noise, settings, true);
+        if (base_audition_) base_audition_();
+        return values;
+    }
+
     juce::Rectangle<int> inspectorArea() const {
         auto a = getLocalBounds().reduced(UiLayout::panelPad);
         a.removeFromTop(timelineChromeHeight());
@@ -8089,6 +8353,7 @@ private:
     juce::Rectangle<int> workspaceArea() const {
         auto a = getLocalBounds().reduced(UiLayout::panelPad);
         a.removeFromTop(timelineChromeHeight());
+        a.removeFromBottom(inspector_footer_extension_);
         if (inspector_visible_) a.removeFromRight(UiLayout::compositeInspectorColumnW + UiLayout::panelGap);
         return a;
     }
@@ -8216,6 +8481,8 @@ private:
         OpllTlAuto = 4,
         OpllFbAuto = 5,
         RegisterWrite = 6,
+        Noise = 7,
+        Mode = 8,
     };
 
     enum class EditMode : int {
@@ -8233,14 +8500,15 @@ private:
     [[nodiscard]] static bool isRegisterAutoParameter(
         Parameter parameter) noexcept {
         return parameter == Parameter::OpllTlAuto
-            || parameter == Parameter::OpllFbAuto;
+            || parameter == Parameter::OpllFbAuto || parameter == Parameter::Noise;
     }
 
     [[nodiscard]] bool selectedLayerShowsRegisterAuto() const noexcept {
         return selected_layer_ >= 0
             && selected_layer_ < static_cast<int>(timbre_.layers.size())
-            && timbre_.layers[static_cast<std::size_t>(selected_layer_)].source
-                == mgstc::engine::TimbreSource::Opll;
+            && (timbre_.layers[static_cast<std::size_t>(selected_layer_)].source
+                == mgstc::engine::TimbreSource::Opll || (selectedParameter() == Parameter::Noise
+                && timbre_.layers[static_cast<std::size_t>(selected_layer_)].source == mgstc::engine::TimbreSource::Psg));
     }
 
     [[nodiscard]] mgstc::engine::OpllRegisterAutoLane* selectedRegisterAutoLane() {
@@ -8258,6 +8526,7 @@ private:
     [[nodiscard]] mgstc::engine::OpllRegisterAutoLane* editableSelectedRegisterAutoLane() {
         if (!selectedLayerShowsRegisterAuto() || !isRegisterAutoParameter(selectedParameter())) return nullptr;
         return editableFreeCurveFor(timbre_.layers[static_cast<std::size_t>(selected_layer_)],
+            selectedParameter() == Parameter::Noise ? TimelineModulationTarget::Noise :
             selectedParameter() == Parameter::OpllTlAuto ? TimelineModulationTarget::TotalLevel : TimelineModulationTarget::Feedback);
     }
 
@@ -8269,7 +8538,8 @@ private:
 
     [[nodiscard]] mgstc::engine::OpllRegisterAutoTarget
     selectedRegisterAutoTarget() const noexcept {
-        return selectedParameter() == Parameter::OpllFbAuto
+        return selectedParameter() == Parameter::Noise ? mgstc::engine::OpllRegisterAutoTarget::Noise
+            : selectedParameter() == Parameter::OpllFbAuto
             ? mgstc::engine::OpllRegisterAutoTarget::Feedback
             : mgstc::engine::OpllRegisterAutoTarget::TotalLevel;
     }
@@ -8300,6 +8570,7 @@ private:
         }
         const auto& layer =
             timbre_.layers[static_cast<std::size_t>(selected_layer_)];
+        if (selectedParameter() == Parameter::Noise) return layer.source == mgstc::engine::TimbreSource::Psg;
         if (layer.source != mgstc::engine::TimbreSource::Opll) {
             return false;
         }
@@ -8317,10 +8588,10 @@ private:
         const auto target = selectedRegisterAutoTarget();
         const bool owned = enabled
             && selected
-            && mgstc::engine::opllRegisterAutoOwnedByLayer(
+            && (target == mgstc::engine::OpllRegisterAutoTarget::Noise || mgstc::engine::opllRegisterAutoOwnedByLayer(
                    timbre_,
                    static_cast<std::size_t>(selected_layer_),
-                   target);
+                   target));
         const bool count_ok =
             enabled && owned && registerAutoAvailableAtSelectedCount();
         // Other OPLL layers may view Off, but cannot take ownership.
@@ -8388,6 +8659,7 @@ private:
             static_cast<mgstc::engine::OpllRegisterAutoMode>(
                 juce::jlimit(0, 4, auto_mode_.getSelectedId() - 1));
         if (next_mode != mgstc::engine::OpllRegisterAutoMode::Off
+            && target != mgstc::engine::OpllRegisterAutoTarget::Noise
             && !mgstc::engine::opllRegisterAutoOwnedByLayer(
                    timbre_, layer_index, target)) {
             reportStatus(juce::String::fromUTF8(
@@ -8426,6 +8698,7 @@ private:
         if (lane->mode == mgstc::engine::OpllRegisterAutoMode::FreeCurve) {
             auto& layer = timbre_.layers[layer_index];
             editableModulationFor(layer,
+                target == mgstc::engine::OpllRegisterAutoTarget::Noise ? TimelineModulationTarget::Noise :
                 target == mgstc::engine::OpllRegisterAutoTarget::TotalLevel
                     ? TimelineModulationTarget::TotalLevel
                     : TimelineModulationTarget::Feedback).enabled = false;
@@ -8458,7 +8731,7 @@ private:
         const auto layer_index =
             static_cast<std::size_t>(selected_layer_);
         const auto target = selectedRegisterAutoTarget();
-        if (!mgstc::engine::opllRegisterAutoOwnedByLayer(
+        if (target != mgstc::engine::OpllRegisterAutoTarget::Noise && !mgstc::engine::opllRegisterAutoOwnedByLayer(
                 timbre_, layer_index, target)) {
             if (commit) {
                 reportStatus(juce::String::fromUTF8(
@@ -8467,7 +8740,7 @@ private:
             return;
         }
         const auto& layer = timbre_.layers[layer_index];
-        if (!mgstc::engine::opllRegisterAutoAvailableAt(
+        if (target != mgstc::engine::OpllRegisterAutoTarget::Noise && !mgstc::engine::opllRegisterAutoAvailableAt(
                 layer,
                 static_cast<std::uint32_t>(juce::jmax(0, timeline_count)),
                 !isLoopStartCount(layer, timeline_count) || loop_insert_after_)) {
@@ -8549,6 +8822,7 @@ private:
                         : UiLayout::editPitchLaneMinH - UiLayout::fieldH);
             }
             return UiLayout::compositeEditLaneH - UiLayout::envelopePreviewH
+                + (timbre_.layers[static_cast<std::size_t>(lane_index)].source == mgstc::engine::TimbreSource::Psg ? UiLayout::registerAutoLaneH : 0)
                 + commandSummaryHeight() - UiLayout::commandSummaryH
                 - (pitchLaneExpanded() ? 0
                     : UiLayout::editPitchLaneMinH - UiLayout::fieldH);
@@ -8733,6 +9007,8 @@ private:
             return juce::String::fromUTF8("音色番号");
         case Parameter::RegisterWrite:
             return juce::String::fromUTF8("Y-Register y");
+        case Parameter::Noise: return juce::String::fromUTF8("ノイズ周波数 n");
+        case Parameter::Mode: return juce::String::fromUTF8("モード /");
         case Parameter::OpllTlAuto:
             return juce::String::fromUTF8("TL変調");
         case Parameter::OpllFbAuto:
@@ -8870,6 +9146,8 @@ private:
             return {kPitchCommandMin, kPitchCommandMax};
         case Parameter::Timbre:
             return {0, 31};
+        case Parameter::Noise: return {0, 31};
+        case Parameter::Mode: return {0, 3};
         case Parameter::RegisterWrite:
             return {0, 255};
         case Parameter::OpllTlAuto:
@@ -8913,6 +9191,8 @@ private:
         if (parameter == Parameter::RegisterWrite) {
             return mgstc::engine::EnvelopeEventKind::RegisterWrite;
         }
+        if (parameter == Parameter::Noise) return mgstc::engine::EnvelopeEventKind::Noise;
+        if (parameter == Parameter::Mode) return mgstc::engine::EnvelopeEventKind::ToneNoiseMode;
         return mgstc::engine::EnvelopeEventKind::Timbre;
     }
 
@@ -9170,6 +9450,10 @@ private:
                 layer, static_cast<std::uint32_t>(count))) {
             return;
         }
+        if (parameter == Parameter::Noise && selectedRegisterAutoLane()
+            && selectedRegisterAutoLane()->mode != mgstc::engine::OpllRegisterAutoMode::FreeCurve) {
+            editPoint(count, valueFromY(bounds, point.y, 0, 31), commit); return;
+        }
         if (isRegisterAutoParameter(parameter)) {
             const auto [minimum, maximum] = valueRangeFor(parameter);
             editRegisterAutoFreeCurve(
@@ -9355,6 +9639,13 @@ private:
         const mgstc::engine::CompositeLayer& layer,
         Parameter parameter,
         int timeline_count) const {
+        if (parameter == Parameter::Noise) return psgNoiseValueAt(layer, timeline_count);
+        if (parameter == Parameter::Mode) {
+            return mgstc::engine::psgEnvelopeValueAt(layer,
+                mgstc::engine::EnvelopeEventKind::ToneNoiseMode,
+                static_cast<std::uint32_t>(juce::jmax(0, timeline_count)),
+                loop_insert_after_ || !isLoopStartCount(layer, timeline_count));
+        }
         if (isRegisterAutoParameter(parameter)) {
             const auto target = parameter == Parameter::OpllTlAuto
                 ? mgstc::engine::OpllRegisterAutoTarget::TotalLevel
@@ -9504,6 +9795,8 @@ private:
                 {Parameter::Pitch, slots.pitch, pitchLaneExpanded()},
                 {Parameter::Timbre, slots.timbre, false},
                 {Parameter::RegisterWrite, slots.register_write, false},
+                {Parameter::Mode, slots.mode, false},
+                {Parameter::Noise, slots.noise, true},
                 {Parameter::OpllTlAuto, slots.tl_auto, true},
                 {Parameter::OpllFbAuto, slots.fb_auto, true},
             };
@@ -9570,8 +9863,10 @@ private:
                           "元音域からの累積オフセット。"
                           "「設定」は入力値を1個の\\として追加。"
                           "Shift＋ドラッグでも同一カウントへ追加"));
+        } else if (selectedParameter() == Parameter::Noise) {
+            value_.setTooltip(juce::String::fromUTF8("ノイズ周波数 n（0～31）。設定で選択カウントへ命令を追加"));
         } else if (isRegisterAutoParameter(selectedParameter())) {
-            const bool available = mgstc::engine::opllRegisterAutoAvailableAt(
+            const bool available = selectedParameter() == Parameter::Noise || mgstc::engine::opllRegisterAutoAvailableAt(
                 selected,
                 static_cast<std::uint32_t>(juce::jmax(0, selected_count_)),
                 !isLoopStartCount(selected, selected_count_) || loop_insert_after_);
@@ -9612,6 +9907,8 @@ private:
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
             return;
         }
+        if ((selectedParameter() == Parameter::Noise || selectedParameter() == Parameter::Mode)
+            && timbre_.layers[static_cast<std::size_t>(selected_layer_)].source != mgstc::engine::TimbreSource::Psg) return;
         if (selectedParameter() == Parameter::Pitch) {
             addPitchCommand(timeline_count, parameter_value, commit);
             return;
@@ -9628,6 +9925,18 @@ private:
         auto& events = selectedEvents(
             timbre_.layers[static_cast<std::size_t>(selected_layer_)]);
         const auto kind = selectedEventKind();
+        const bool psg_command = kind == mgstc::engine::EnvelopeEventKind::Noise || kind == mgstc::engine::EnvelopeEventKind::ToneNoiseMode;
+        const bool after = psg_command && newCommandAfterLoopStart(static_cast<std::uint32_t>(timeline_count));
+        if (psg_command) {
+            auto found = std::find_if(events.begin(), events.end(), [=](const auto& event) {
+                return event.kind == kind && event.count == static_cast<std::uint32_t>(timeline_count) && event.after_loop_start == after;
+            });
+            if (found != events.end()) found->value = parameter_value;
+            else events.push_back({.kind = kind, .value = parameter_value,
+                .count = static_cast<std::uint32_t>(timeline_count), .after_loop_start = after});
+            std::stable_sort(events.begin(), events.end(), mgstc::engine::compositeProfilePrecedes<mgstc::engine::EnvelopeEvent>);
+            notifyLayerEdit(timeline_count, parameter_value, commit); return;
+        }
         bool automatic = false;
         bool precise = false;
         std::int32_t ramp_start_metadata = 0;
@@ -10071,7 +10380,8 @@ private:
         const std::vector<std::pair<int, int>>& points,
         int minimum,
         int maximum,
-        juce::Colour colour) const {
+        juce::Colour colour,
+        const mgstc::engine::CompositeLayer* noise_layer = nullptr) const {
         if (points.empty() || bounds.isEmpty()) {
             return;
         }
@@ -10099,7 +10409,9 @@ private:
         }
         path.lineTo(static_cast<float>(bounds.getRight()), y);
         graphics.setColour(colour);
-        graphics.strokePath(path, juce::PathStrokeType(2.0F));
+        if (noise_layer) strokeEffectiveWaveform(graphics, path, bounds, *noise_layer,
+            mgstc::engine::CompositeModulationTarget::Noise, 2.0F);
+        else graphics.strokePath(path, juce::PathStrokeType(2.0F));
         for (const auto& [timeline_count, parameter_value] : points) {
             const float px = static_cast<float>(
                 xForCount(bounds, timeline_count));
@@ -10333,6 +10645,7 @@ private:
         juce::Rectangle<int> pitch;
         juce::Rectangle<int> timbre;
         juce::Rectangle<int> register_write;
+        juce::Rectangle<int> mode, noise;
         juce::Rectangle<int> tl_auto;
         juce::Rectangle<int> fb_auto;
         juce::Rectangle<int> preview;
@@ -10365,8 +10678,12 @@ private:
         const bool has_register = showsRegisterLane(source);
         const int marker_h = UiLayout::editMarkerLaneH;
         if (has_register) {
-            slots.timbre = content.removeFromTop(marker_h);
+            if (source != mgstc::engine::TimbreSource::Psg) slots.timbre = content.removeFromTop(marker_h);
             slots.register_write = content.removeFromTop(marker_h);
+            if (source == mgstc::engine::TimbreSource::Psg) {
+                slots.mode = content.removeFromTop(marker_h);
+                slots.noise = content.removeFromTop(UiLayout::registerAutoLaneH);
+            }
         } else {
             slots.timbre = content.removeFromTop(marker_h);
             slots.register_write = {};
@@ -10441,6 +10758,9 @@ private:
             const auto& e = layer.timbre_automation[index];
             if (e.kind == mgstc::engine::EnvelopeEventKind::Timbre)
                 commands.push_back({Parameter::Timbre, index, e.count, e.after_loop_start, timbreCommandLabel(e)});
+            else if (e.kind == mgstc::engine::EnvelopeEventKind::Noise || e.kind == mgstc::engine::EnvelopeEventKind::ToneNoiseMode)
+                commands.push_back({e.kind == mgstc::engine::EnvelopeEventKind::Noise ? Parameter::Noise : Parameter::Mode,
+                    index, e.count, e.after_loop_start, juce::String(e.kind == mgstc::engine::EnvelopeEventKind::Noise ? "n" : "/") + juce::String(e.value)});
             else if (e.kind == mgstc::engine::EnvelopeEventKind::RegisterWrite)
                 commands.push_back({Parameter::RegisterWrite, index, e.count, e.after_loop_start,
                     formatRegisterGroupLabel(layer, e.count, {&e})});
@@ -10462,9 +10782,11 @@ private:
             const auto& value = profile.parameters;
             const auto parameter_kind = profile.target == mgstc::engine::CompositeModulationTarget::Pitch ? Parameter::Pitch
                 : profile.target == mgstc::engine::CompositeModulationTarget::Volume ? Parameter::Volume
+                : profile.target == mgstc::engine::CompositeModulationTarget::Noise ? Parameter::Noise
                 : profile.target == mgstc::engine::CompositeModulationTarget::TotalLevel ? Parameter::OpllTlAuto : Parameter::OpllFbAuto;
             const auto name = profile.target == mgstc::engine::CompositeModulationTarget::Pitch ? "Pitch"
                 : profile.target == mgstc::engine::CompositeModulationTarget::Volume ? "Tremolo"
+                : profile.target == mgstc::engine::CompositeModulationTarget::Noise ? "Noise"
                 : profile.target == mgstc::engine::CompositeModulationTarget::TotalLevel ? "TL" : "FB";
             commands.push_back({parameter_kind, index, profile.count,
                 parameter_kind == Parameter::Volume && isLoopStartCount(layer, static_cast<int>(profile.count))
@@ -10477,9 +10799,9 @@ private:
         for (std::size_t index = 0; index < layer.register_auto_profiles.size(); ++index) {
             const auto& profile = layer.register_auto_profiles[index];
             const auto& value = profile.lane;
-            commands.push_back({profile.target == mgstc::engine::OpllRegisterAutoTarget::TotalLevel ? Parameter::OpllTlAuto : Parameter::OpllFbAuto,
+            commands.push_back({profile.target == mgstc::engine::OpllRegisterAutoTarget::Noise ? Parameter::Noise : profile.target == mgstc::engine::OpllRegisterAutoTarget::TotalLevel ? Parameter::OpllTlAuto : Parameter::OpllFbAuto,
                 index, profile.count, profile.after_loop_start,
-                juce::String(profile.target == mgstc::engine::OpllRegisterAutoTarget::TotalLevel ? "TL " : "FB ")
+                juce::String(profile.target == mgstc::engine::OpllRegisterAutoTarget::Noise ? "Noise " : profile.target == mgstc::engine::OpllRegisterAutoTarget::TotalLevel ? "TL " : "FB ")
                     + juce::String(static_cast<int>(value.mode)) + " / " + juce::String(static_cast<int>(value.depth))
                     + " / " + juce::String(static_cast<int>(value.change_speed)) + " / " + juce::String(static_cast<int>(value.coarseness))
                     + " / " + juce::String(static_cast<int>(value.stop_position)), 2});
@@ -10576,6 +10898,8 @@ private:
         if (slots.pitch.contains(point)) return Parameter::Pitch;
         if (slots.timbre.contains(point)) return Parameter::Timbre;
         if (slots.register_write.contains(point)) return Parameter::RegisterWrite;
+        if (slots.mode.contains(point)) return Parameter::Mode;
+        if (slots.noise.contains(point)) return Parameter::Noise;
         if (slots.tl_auto.contains(point)) return Parameter::OpllTlAuto;
         if (slots.fb_auto.contains(point)) return Parameter::OpllFbAuto;
         return std::nullopt;
@@ -10715,6 +11039,8 @@ private:
             {Parameter::Pitch, slots.pitch, pitchLaneExpanded()},
             {Parameter::Timbre, slots.timbre, false},
             {Parameter::RegisterWrite, slots.register_write, false},
+                {Parameter::Mode, slots.mode, false},
+                {Parameter::Noise, slots.noise, true},
             {Parameter::OpllTlAuto, slots.tl_auto, true},
             {Parameter::OpllFbAuto, slots.fb_auto, true},
         };
@@ -10735,7 +11061,7 @@ private:
                     isRegisterAutoParameter(hit.parameter);
                 // Free-curve is mouse-traced; rise/fall/LFO are param-driven
                 // lines (still selectable). Only free-curve starts a draw.
-                if (!isRegisterAutoParameter(hit.parameter) || free_curve) {
+                if (!isRegisterAutoParameter(hit.parameter) || free_curve || hit.parameter == Parameter::Noise) {
                     edit_draw_bounds_ = graphStrip(hit.slot);
                 } else {
                     edit_draw_bounds_.reset();
@@ -10922,6 +11248,8 @@ private:
         if (!slots.register_write.isEmpty()) {
             paintRegisterLane(graphics, slots.register_write, layer, colour);
         }
+        if (!slots.mode.isEmpty()) paintPsgModeLane(graphics, slots.mode, layer, colour);
+        if (!slots.noise.isEmpty()) paintPsgNoiseLane(graphics, slots.noise, layer, colour);
         if (!slots.tl_auto.isEmpty()) {
             paintRegisterAutoLane(
                 graphics, slots.tl_auto, layer, colour,
@@ -10933,7 +11261,7 @@ private:
                 Parameter::OpllFbAuto, juce::String::fromUTF8("FB変調"));
         }
         auto output_bounds = graphStrip(slots.volume).getUnion(graphStrip(slots.pitch));
-        for (const auto slot : {slots.timbre, slots.register_write,
+        for (const auto slot : {slots.timbre, slots.register_write, slots.mode, slots.noise,
                                slots.tl_auto, slots.fb_auto}) {
             if (!slot.isEmpty()) {
                 output_bounds = output_bounds.getUnion(graphStrip(slot));
@@ -11358,6 +11686,7 @@ private:
         juce::Colour colour,
         Parameter parameter,
         const juce::String& title) {
+        if (slot.isEmpty()) return;
         auto caption = parameter == Parameter::Pitch ? juce::String{} : title;
         if (parameter == Parameter::Timbre
             && timbre_.layers[layer_index].source == mgstc::engine::TimbreSource::Scc)
@@ -11489,6 +11818,74 @@ private:
             }
         }
         return grouped;
+    }
+
+    [[nodiscard]] const std::vector<mgstc::engine::EnvelopeEvent>& psgNoiseEvents(
+        const mgstc::engine::CompositeLayer& layer) const {
+        if (!noise_cache_input_ || *noise_cache_input_ != layer) {
+            noise_cache_input_ = layer;
+            noise_cache_events_ = mgstc::engine::expandCompositeLayerModulations(layer, nullptr, false).timbre_automation;
+            std::stable_sort(noise_cache_events_.begin(), noise_cache_events_.end(),
+                mgstc::engine::compositeProfilePrecedes<mgstc::engine::EnvelopeEvent>);
+        }
+        return noise_cache_events_;
+    }
+
+    [[nodiscard]] int psgNoiseValueAt(const mgstc::engine::CompositeLayer& layer, int count) const {
+        return mgstc::engine::psgNoiseValueAtCount(layer, static_cast<std::uint32_t>(juce::jmax(0, count)),
+            loop_insert_after_ || !isLoopStartCount(layer, count), psgNoiseEvents(layer));
+    }
+
+    void paintPsgNoiseLane(juce::Graphics& graphics, juce::Rectangle<int> slot,
+        const mgstc::engine::CompositeLayer& layer, juce::Colour colour) {
+        paintEditSubLaneChrome(graphics, slot, Parameter::Noise, juce::String::fromUTF8("ノイズ周波数 n"));
+        auto plot = graphStrip(slot);
+        juce::Graphics::ScopedSaveState clipped(graphics);
+        graphics.reduceClipRegion(plot);
+        std::vector<std::pair<int, int>> points{{0, mgstc::engine::sequenceEnvelopeMixer(layer.volume_envelope.rate).noise}};
+        for (const auto& event : psgNoiseEvents(layer))
+            if (event.kind == mgstc::engine::EnvelopeEventKind::Noise || (event.kind == mgstc::engine::EnvelopeEventKind::RegisterWrite && event.value == 6))
+                points.emplace_back(static_cast<int>(event.count), event.kind == mgstc::engine::EnvelopeEventKind::Noise ? event.value : event.secondary & 31);
+        std::stable_sort(points.begin(), points.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        if (!points.empty()) drawSteppedValuePath(graphics, plot, points, 0, 31, colour, &layer);
+        drawLaneCommandLabels(graphics, plot, layer, Parameter::Noise, colour);
+    }
+
+    void paintPsgModeLane(juce::Graphics& graphics, juce::Rectangle<int> slot,
+        const mgstc::engine::CompositeLayer& layer, juce::Colour colour) const {
+        paintEditSubLaneChrome(graphics, slot, Parameter::Mode, juce::String::fromUTF8("モード /"));
+        const auto plot = graphStrip(slot);
+        const auto commands = laneCommands(layer, Parameter::Mode);
+        graphics.setFont(UiFonts::dense());
+        for (std::size_t i = 0; i < commands.size(); ++i) {
+            const auto& command = commands[i];
+            const auto& event = layer.timbre_automation[command.index];
+            const int raw_left = xForCount(plot, static_cast<int>(command.count));
+            const bool split = isLoopStartCount(layer, static_cast<int>(command.count));
+            const int half = split ? (xForCount(plot, static_cast<int>(command.count) + 1) - raw_left) / 2 : 0;
+            const int start_x = raw_left + (split && command.after ? half : 0);
+            int end_x = plot.getRight();
+            if (i + 1 < commands.size()) {
+                const auto& next = commands[i + 1];
+                end_x = xForCount(plot, static_cast<int>(next.count));
+                if (isLoopStartCount(layer, static_cast<int>(next.count)) && next.after)
+                    end_x += (xForCount(plot, static_cast<int>(next.count) + 1) - end_x) / 2;
+            }
+            const int left_x = juce::jmax(plot.getX(), start_x);
+            const int right = juce::jmin(plot.getRight(), end_x);
+            if (left_x >= right) continue;
+            auto area = plot.withX(left_x).withRight(right);
+            graphics.setColour(colour);
+            const char* name = event.value == 1 ? "Tone" : event.value == 2 ? "Noise" : event.value == 3 ? "Mix" : "Mute";
+            const int label_width = juce::GlyphArrangement::getStringWidthInt(graphics.getCurrentFont(), name) + UiLayout::xs;
+            graphics.drawText(name, area.withWidth(juce::jmin(right - area.getX(), label_width)), juce::Justification::centredLeft, false);
+            const float left = static_cast<float>(area.getX() + label_width);
+            const float y = static_cast<float>(area.getCentreY());
+            if (left >= right || event.value == 0) continue;
+            juce::Line<float> line(left, y, static_cast<float>(right), y);
+            if (event.value == 1) graphics.drawLine(line, 1.5F);
+            else { const float dashes[]{event.value == 2 ? 1.0F : 5.0F, 3.0F}; graphics.drawDashedLine(line, dashes, 2, 1.5F); }
+        }
     }
 
     void paintRegisterLane(
@@ -13247,8 +13644,16 @@ private:
             }
             return;
         }
-        if (slots.tl_auto.contains(point) || slots.fb_auto.contains(point)) {
-            const auto target = slots.tl_auto.contains(point)
+        if (slots.mode.contains(point) || slots.noise.contains(point)) {
+            const auto kind = slots.mode.contains(point) ? mgstc::engine::EnvelopeEventKind::ToneNoiseMode : mgstc::engine::EnvelopeEventKind::Noise;
+            const auto before = layer.timbre_automation.size();
+            const bool after = newCommandAfterLoopStart(count);
+            std::erase_if(layer.timbre_automation, [=](const auto& event) { return event.kind == kind && event.count == count && event.after_loop_start == after; });
+            if (before != layer.timbre_automation.size()) { notifyDelete(juce::String::fromUTF8("命令を削除しました")); return; }
+            if (slots.mode.contains(point)) return;
+        }
+        if (slots.noise.contains(point) || slots.tl_auto.contains(point) || slots.fb_auto.contains(point)) {
+            const auto target = slots.noise.contains(point) ? mgstc::engine::OpllRegisterAutoTarget::Noise : slots.tl_auto.contains(point)
                 ? mgstc::engine::OpllRegisterAutoTarget::TotalLevel
                 : mgstc::engine::OpllRegisterAutoTarget::Feedback;
             const auto& selected_auto = mgstc::engine::compositeRegisterAutoAt(layer, target, count,
@@ -13260,7 +13665,7 @@ private:
                     "TL/FB変調の右クリック削除は自由曲線のみです"
                     "（上昇／下降／LFOはモードやパラメーターで変更）"));
                 parameter_.setSelectedId(
-                    slots.tl_auto.contains(point)
+                    slots.noise.contains(point) ? static_cast<int>(Parameter::Noise) : slots.tl_auto.contains(point)
                         ? static_cast<int>(Parameter::OpllTlAuto)
                         : static_cast<int>(Parameter::OpllFbAuto),
                     juce::dontSendNotification);
@@ -13642,6 +14047,24 @@ private:
             && selected_layer_ < static_cast<int>(lane_frames_.size())
             && !lane_frames_[static_cast<std::size_t>(selected_layer_)]
                     .isEmpty();
+        if (show) {
+            const auto source = timbre_.layers[static_cast<std::size_t>(selected_layer_)].source;
+            const int previous = parameter_.getSelectedId();
+            parameter_.clear(juce::dontSendNotification);
+            parameter_.addItem(juce::String::fromUTF8("音量"), 1);
+            parameter_.addItem(juce::String::fromUTF8("音程"), 2);
+            if (source != mgstc::engine::TimbreSource::Psg) parameter_.addItem(juce::String::fromUTF8("@音色"), 3);
+            if (source != mgstc::engine::TimbreSource::Scc) parameter_.addItem("Y-Register y", 6);
+            if (source == mgstc::engine::TimbreSource::Psg) {
+                parameter_.addItem(juce::String::fromUTF8("モード /"), 8);
+                parameter_.addItem(juce::String::fromUTF8("ノイズ周波数 n"), 7);
+            }
+            if (source == mgstc::engine::TimbreSource::Opll) {
+                parameter_.addItem(juce::String::fromUTF8("TL変調"), 4);
+                parameter_.addItem(juce::String::fromUTF8("FB変調"), 5);
+            }
+            parameter_.setSelectedId(parameter_.indexOfItemId(previous) >= 0 ? previous : 1, juce::dontSendNotification);
+        }
         const bool show_rate = show
             && timbre_.layers[
                 static_cast<std::size_t>(selected_layer_)]
@@ -13650,7 +14073,7 @@ private:
         const bool show_auto = show && !show_rate
             && selectedLayerShowsRegisterAuto()
             && (selectedParameter() == Parameter::OpllTlAuto
-                || selectedParameter() == Parameter::OpllFbAuto)
+                || selectedParameter() == Parameter::OpllFbAuto || selectedParameter() == Parameter::Noise)
             && selectedRegisterAutoLane() != nullptr
             && selectedRegisterAutoLane()->mode
                 == mgstc::engine::OpllRegisterAutoMode::FreeCurve;
@@ -13673,8 +14096,10 @@ private:
                 && modulation_issue_.getText().isNotEmpty());
             for (std::size_t i = 0; i < modulation_toggles_.size(); ++i) {
                 modulation_labels_[i].setVisible(false);
-                modulation_toggles_[i].setVisible(visible && !show_rate && count_inspector_);
-                modulation_settings_[i].setVisible(visible && !show_rate && count_inspector_);
+                const auto source = show ? timbre_.layers[static_cast<std::size_t>(selected_layer_)].source : mgstc::engine::TimbreSource::Scc;
+                const bool supported = i < 2 || (i < 4 ? source == mgstc::engine::TimbreSource::Opll : source == mgstc::engine::TimbreSource::Psg);
+                modulation_toggles_[i].setVisible(supported && visible && !show_rate && count_inspector_);
+                modulation_settings_[i].setVisible(supported && visible && !show_rate && count_inspector_);
             }
             edit_mode_.setVisible(visible && !show_rate);
             parameter_.setVisible(visible && !show_rate);
@@ -13716,6 +14141,7 @@ private:
         }
         modulation_heading_.setBounds(row());
         for (std::size_t i = 0; i < modulation_toggles_.size(); ++i) {
+            if (!modulation_toggles_[i].isVisible()) continue;
             auto modulation_row = row();
             modulation_labels_[i].setBounds({});
             modulation_settings_[i].setBounds(
@@ -13774,6 +14200,7 @@ private:
     juce::TextButton setup_tab_, count_tab_, focus_;
     bool count_inspector_{};
     bool inspector_visible_{true};
+    int inspector_footer_extension_{};
     mgstc::engine::OriginalTimbreAllocationStarts allocation_starts_;
     mgstc::engine::CompositeTimbre timbre_;
     mgstc::engine::CompositeTimbre last_published_timbre_;
@@ -13795,9 +14222,9 @@ private:
     SwitchLookAndFeel modulation_switch_look_and_feel_;
     juce::Label modulation_heading_;
     juce::Label modulation_issue_;
-    std::array<juce::Label, 4> modulation_labels_;
-    std::array<juce::ToggleButton, 4> modulation_toggles_;
-    std::array<juce::TextButton, 4> modulation_settings_;
+    std::array<juce::Label, 5> modulation_labels_;
+    std::array<juce::ToggleButton, 5> modulation_toggles_;
+    std::array<juce::TextButton, 5> modulation_settings_;
     juce::Label auto_depth_label_;
     juce::Label auto_speed_label_;
     juce::Label auto_coarseness_label_;
@@ -13806,6 +14233,8 @@ private:
     juce::TextEditor auto_speed_;
     juce::TextEditor auto_coarseness_;
     juce::TextEditor auto_stop_;
+    mutable std::optional<mgstc::engine::CompositeLayer> noise_cache_input_;
+    mutable std::vector<mgstc::engine::EnvelopeEvent> noise_cache_events_;
     juce::Label inspector_selection_;
     juce::Label length_label_;
     juce::Label loop_start_label_;
@@ -14136,6 +14565,10 @@ bool CompositeTimeline::appendScopeFrame(
 
 void mgstc::app::CompositeTimeline::setInspectorVisible(bool visible) {
     impl_->setInspectorVisible(visible);
+}
+
+void mgstc::app::CompositeTimeline::setInspectorFooterExtension(int height) {
+    impl_->setInspectorFooterExtension(height);
 }
 
 juce::String mgstc::app::CompositeTimeline::verifyWorkspace(const juce::File& directory) {

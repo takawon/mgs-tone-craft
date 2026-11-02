@@ -4298,6 +4298,18 @@ void testToneLibrarySqliteV1RoundTripAndPortableFormat() {
     std::filesystem::remove(db_path, remove_error);
 }
 
+// These legacy fixtures contain one layer, no embedded tones, no manual
+// allocation start, and empty v24 profile vectors. Validate the exact v25
+// addition before removing it; a changed layout must fail here explicitly.
+void removeUnsetNoiseAuthoringFromSingleLayerFixture(std::string& payload) {
+    REQUIRE_EQ(payload.size() >= std::size_t{42}, true);
+    std::string expected(19, '\0');
+    expected[6] = 1; // Noise auto change speed.
+    expected[7] = 1; // Noise auto coarseness.
+    REQUIRE_EQ(payload.substr(payload.size() - 42, 19), expected);
+    payload.erase(payload.size() - 42, 19);
+}
+
 void testToneLibraryStartupRecovery() {
     using namespace mgstc::engine;
     const auto db_path = std::filesystem::temp_directory_path()
@@ -4323,8 +4335,10 @@ void testToneLibraryStartupRecovery() {
         REQUIRE_EQ(database.open(path, &error), true);
         REQUIRE_EQ(database.replaceAll(originals, original_composites, &error), true);
     }
-    // A valid legacy v5 row must not trigger recovery or be lost beside v6.
+    // Valid legacy v5/v6 rows must not trigger recovery or be lost beside v7.
     auto old_payload = serializeCompositeSoundPayload(composite);
+    removeUnsetNoiseAuthoringFromSingleLayerFixture(old_payload);
+    const auto previous_v6_payload = old_payload;
     old_payload.erase(old_payload.size() - 21, 12); // Empty v24 profile vectors.
     sqlite3* raw = nullptr;
     REQUIRE_EQ(sqlite3_open(path.c_str(), &raw), SQLITE_OK);
@@ -4334,6 +4348,13 @@ void testToneLibraryStartupRecovery() {
         -1, &update, nullptr), SQLITE_OK);
     REQUIRE_EQ(sqlite3_bind_blob(update, 1, old_payload.data(),
         static_cast<int>(old_payload.size()), SQLITE_TRANSIENT), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_step(update), SQLITE_DONE);
+    sqlite3_finalize(update);
+    REQUIRE_EQ(sqlite3_prepare_v2(raw,
+        "UPDATE composite_timbres SET payload_version = 6, payload = ? WHERE id = 3;",
+        -1, &update, nullptr), SQLITE_OK);
+    REQUIRE_EQ(sqlite3_bind_blob(update, 1, previous_v6_payload.data(),
+        static_cast<int>(previous_v6_payload.size()), SQLITE_TRANSIENT), SQLITE_OK);
     REQUIRE_EQ(sqlite3_step(update), SQLITE_DONE);
     sqlite3_finalize(update);
     sqlite3_close(raw);
@@ -4532,6 +4553,7 @@ void testSccMorphDistributionPersistence() {
     REQUIRE_EQ(static_cast<unsigned char>(current_old[at + marker.size()]), 2U);
     REQUIRE_EQ(current_old[at + marker.size() + 1], '\0');
     auto old_payload = current_old;
+    removeUnsetNoiseAuthoringFromSingleLayerFixture(old_payload);
     old_payload.erase(old_payload.size() - 21, 12); // v24 empty profile vectors
     old_payload.erase(at + marker.size(), 6); // v23 fields + v24 command order
     const auto hex = [](std::string_view value) {
@@ -4551,6 +4573,13 @@ void testSccMorphDistributionPersistence() {
     auto encoded = current_file.substr(blob_at, blob_end - blob_at);
     const auto encoded_at = encoded.find(hex(marker));
     REQUIRE_EQ(encoded_at != std::string::npos, true);
+    // Hex payload uses two characters per byte; remove the same validated
+    // v25 Noise addition as in the binary fixture before the v24 vectors.
+    std::string unset_noise(19, '\0');
+    unset_noise[6] = 1;
+    unset_noise[7] = 1;
+    REQUIRE_EQ(encoded.substr(encoded.size() - 84, 38), hex(unset_noise));
+    encoded.erase(encoded.size() - 84, 38);
     encoded.erase(encoded.size() - 42, 24); // v24 empty profile vectors
     encoded.erase(encoded_at + marker.size() * 2, 12);
     for (const auto version : {21U, 22U}) {
@@ -4612,6 +4641,7 @@ void testSccMorphDistributionPersistence() {
     // Existing disabled events also read Tone when no distribution field exists.
     auto disabled = current_old;
     disabled[at + marker.size() - 10] = 0;
+    removeUnsetNoiseAuthoringFromSingleLayerFixture(disabled);
     disabled.erase(disabled.size() - 21, 12);
     disabled.erase(at + marker.size(), 6);
     const auto disabled_decoded = deserializeCompositeSoundPayload(disabled, 4, &error);
@@ -4677,6 +4707,7 @@ void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
     REQUIRE_EQ(current_blob[current_blob.size() - 2], '\0');
     REQUIRE_EQ(current_blob[current_blob.size() - 1], '\0');
     auto previous_v1_blob = current_blob;
+    removeUnsetNoiseAuthoringFromSingleLayerFixture(previous_v1_blob);
     previous_v1_blob.erase(previous_v1_blob.size() - 21, 12); // v24 empty profile vectors
     previous_v1_blob.erase(previous_v1_blob.size() - 11, 2); // v4 per-layer allocation bytes
     previous_v1_blob.erase(previous_v1_blob.size() - 5, 5);
@@ -4699,6 +4730,7 @@ void testPreviousCompositeLibraryPayloadLoadsAndUpgradesOnSave() {
     };
     auto current_blob_with_modulation = serializeCompositeSoundPayload(current);
     auto previous_v2_blob = current_blob_with_modulation;
+    removeUnsetNoiseAuthoringFromSingleLayerFixture(previous_v2_blob);
     previous_v2_blob.erase(previous_v2_blob.size() - 21, 12); // v24 empty profile vectors
     previous_v2_blob.erase(previous_v2_blob.size() - 11, 2); // v4 per-layer allocation bytes
     previous_v2_blob.erase(previous_v2_blob.size() - 5, 5);
@@ -7178,6 +7210,27 @@ void testCompositeSequenceEnvelopeHeaderModeNoise() {
     REQUIRE_EQ(parsed.volume_envelope.rate.noise, static_cast<std::uint8_t>(9));
     REQUIRE_EQ(parsed.volume_envelope.events.empty(), false);
     REQUIRE_EQ(parsed.volume_envelope.events.front().value, 15);
+    parsed.timbre_automation = {
+        {.kind = EnvelopeEventKind::ToneNoiseMode, .value = 0, .count = 0,
+         .command_order = 1},
+        {.kind = EnvelopeEventKind::Noise, .value = 31, .count = 0,
+         .command_order = 2},
+    };
+    const auto live_mode_noise = formatMgsCompositeEnvelope(parsed, 0);
+    REQUIRE_EQ(live_mode_noise.valid(), true);
+    REQUIRE_EQ(live_mode_noise.body.find("/0.n31") != std::string::npos, true);
+    CompositeLayer parsed_live;
+    parsed_live.source = TimbreSource::Psg;
+    issues.clear();
+    REQUIRE_EQ(parseMgsSequenceBody("1,2,f./3.n31", parsed_live, issues), true);
+    REQUIRE_EQ(issues.empty(), true);
+    REQUIRE_EQ(parsed_live.timbre_automation.size(), std::size_t{2});
+    REQUIRE_EQ(parsed_live.timbre_automation[0].kind, EnvelopeEventKind::ToneNoiseMode);
+    REQUIRE_EQ(parsed_live.timbre_automation[0].value, 3);
+    REQUIRE_EQ(parsed_live.timbre_automation[0].count, 1);
+    REQUIRE_EQ(parsed_live.timbre_automation[1].kind, EnvelopeEventKind::Noise);
+    REQUIRE_EQ(parsed_live.timbre_automation[1].value, 31);
+    REQUIRE_EQ(parsed_live.timbre_automation[1].count, 1);
 
     CompositeLayer volume_zero;
     volume_zero.source = TimbreSource::Psg;
@@ -7185,6 +7238,73 @@ void testCompositeSequenceEnvelopeHeaderModeNoise() {
     REQUIRE_EQ(parseMgsSequenceBody("0.f", volume_zero, issues), true);
     REQUIRE_EQ(rateEnvelopeIsUnset(volume_zero.volume_envelope.rate), true);
     REQUIRE_EQ(volume_zero.volume_envelope.events.size() >= 2, true);
+}
+
+void testPsgModeNoiseBothSidesOfSameLoopCount() {
+    using namespace mgstc::engine;
+    CompositeLayer layer;
+    layer.source = TimbreSource::Psg;
+    layer.volume = 15;
+    layer.envelope_timeline = {.length_counts = 12, .loop_start_count = 8, .loop_end_count = 10};
+    layer.volume_envelope.events = {{.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0}};
+    layer.timbre_automation = {
+        {.kind = EnvelopeEventKind::ToneNoiseMode, .value = 1, .count = 8,
+         .after_loop_start = false, .command_order = 1},
+        {.kind = EnvelopeEventKind::Noise, .value = 5, .count = 8,
+         .after_loop_start = false, .command_order = 2},
+        {.kind = EnvelopeEventKind::ToneNoiseMode, .value = 2, .count = 8,
+         .after_loop_start = true, .command_order = 3},
+        {.kind = EnvelopeEventKind::Noise, .value = 20, .count = 8,
+         .after_loop_start = true, .command_order = 4},
+    };
+    REQUIRE_EQ(psgEnvelopeValueAt(layer, EnvelopeEventKind::ToneNoiseMode, 8, false), 1);
+    REQUIRE_EQ(psgEnvelopeValueAt(layer, EnvelopeEventKind::Noise, 8, false), 5);
+    REQUIRE_EQ(psgEnvelopeValueAt(layer, EnvelopeEventKind::ToneNoiseMode, 8, true), 2);
+    REQUIRE_EQ(psgEnvelopeValueAt(layer, EnvelopeEventKind::Noise, 8, true), 20);
+    const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(formatted.valid(), true);
+    const auto bracket = formatted.body.find('[');
+    REQUIRE_EQ(bracket != std::string::npos, true);
+    REQUIRE_EQ(formatted.body.find("/1.n5") < bracket, true);
+    REQUIRE_EQ(formatted.body.find("/2.n20") > bracket, true);
+    const auto compiled = compileCompositeEnvelopes(layer, {}).volume;
+    REQUIRE_EQ(compiled, formatted.bytecode);
+    CompositeLayer parsed;
+    parsed.source = TimbreSource::Psg;
+    std::vector<std::string> issues;
+    REQUIRE_EQ(parseMgsSequenceBody(formatted.body, parsed, issues), true);
+    REQUIRE_EQ(issues.empty(), true);
+    REQUIRE_EQ(parsed.timbre_automation.size(), std::size_t{4});
+    for (std::size_t index = 0; index < parsed.timbre_automation.size(); ++index) {
+        const auto& event = parsed.timbre_automation[index];
+        REQUIRE_EQ(event.count, 8U);
+        REQUIRE_EQ(event.after_loop_start, index >= 2);
+        REQUIRE_EQ(event.kind, layer.timbre_automation[index].kind);
+        REQUIRE_EQ(event.value, layer.timbre_automation[index].value);
+    }
+    REQUIRE_EQ(compileCompositeEnvelopes(parsed, {}).volume, compiled);
+    SequenceEnvelopeRuntime runtime(compiled);
+    runtime.resetForKeyOn();
+    EventBuffer buffer(32);
+    std::vector<MeaningEvent> commands;
+    for (int count = 0; count <= 12; ++count) {
+        buffer.clear();
+        REQUIRE_EQ(runtime.processTick(buffer), SequenceError::None);
+        for (const auto& event : buffer.events())
+            if (event.kind == MeaningEventKind::ToneNoiseMode || event.kind == MeaningEventKind::Noise)
+                commands.push_back(event);
+    }
+    const std::vector<MeaningEvent> expected{
+        {8, MeaningEventKind::ToneNoiseMode, 1, 0},
+        {8, MeaningEventKind::Noise, 5, 0},
+        {8, MeaningEventKind::ToneNoiseMode, 2, 0},
+        {8, MeaningEventKind::Noise, 20, 0},
+        {10, MeaningEventKind::ToneNoiseMode, 2, 0},
+        {10, MeaningEventKind::Noise, 20, 0},
+        {12, MeaningEventKind::ToneNoiseMode, 2, 0},
+        {12, MeaningEventKind::Noise, 20, 0},
+    };
+    REQUIRE_EQ(commands, expected);
 }
 
 void testCompositeSoloPitchAndChannelValidation() {
@@ -8298,6 +8418,20 @@ void testCompositeModulationAllTargetsRoundTripThroughLibrary() {
         .speed = 29,
         .roughness = -8,
     };
+    auto& psg = composite.layers[0];
+    psg.psg_noise_modulation = {
+        .enabled = true,
+        .mode = ModulationMode::Oscillate,
+        .delay = 3,
+        .depth = 5,
+        .speed = 2,
+        .roughness = -1,
+    };
+    psg.psg_noise_auto = {
+        .mode = OpllRegisterAutoMode::FreeCurve,
+        .start_count = 4,
+        .free_curve = {0, 31, 255},
+    };
 
     CompositeTimbreLibrary library;
     const auto id = library.add(composite, 100);
@@ -8312,6 +8446,130 @@ void testCompositeModulationAllTargetsRoundTripThroughLibrary() {
     REQUIRE_EQ(entry->timbre.layers[2].volume_modulation, layer.volume_modulation);
     REQUIRE_EQ(entry->timbre.layers[2].opll_tl_modulation, layer.opll_tl_modulation);
     REQUIRE_EQ(entry->timbre.layers[2].opll_fb_modulation, layer.opll_fb_modulation);
+    REQUIRE_EQ(entry->timbre.layers[0].psg_noise_modulation, psg.psg_noise_modulation);
+    REQUIRE_EQ(entry->timbre.layers[0].psg_noise_auto, psg.psg_noise_auto);
+}
+
+void testPsgNoiseAutomationUsesNoiseRangeAndMixerInitialValue() {
+    using namespace mgstc::engine;
+    CompositeLayer layer;
+    layer.source = TimbreSource::Psg;
+    layer.envelope_timeline.length_counts = 8;
+    layer.volume_envelope.rate.tone_mode = 3;
+    layer.volume_envelope.rate.noise = 7;
+    REQUIRE_EQ(psgEnvelopeValueAt(layer, EnvelopeEventKind::ToneNoiseMode, 0), 3);
+    REQUIRE_EQ(psgEnvelopeValueAt(layer, EnvelopeEventKind::Noise, 0), 7);
+
+    layer.timbre_automation = {
+        {.kind = EnvelopeEventKind::ToneNoiseMode, .value = 2, .count = 2},
+        {.kind = EnvelopeEventKind::Noise, .value = 29, .count = 3},
+    };
+    REQUIRE_EQ(psgEnvelopeValueAt(layer, EnvelopeEventKind::ToneNoiseMode, 1), 3);
+    REQUIRE_EQ(psgEnvelopeValueAt(layer, EnvelopeEventKind::ToneNoiseMode, 2), 2);
+    REQUIRE_EQ(psgEnvelopeValueAt(layer, EnvelopeEventKind::Noise, 2), 7);
+    REQUIRE_EQ(psgEnvelopeValueAt(layer, EnvelopeEventKind::Noise, 3), 29);
+
+    const auto free_curve = expandOpllRegisterAuto(
+        {.mode = OpllRegisterAutoMode::FreeCurve, .start_count = 1,
+         .free_curve = {0, 31, 255}},
+        OpllRegisterAutoTarget::Noise, 0, 8);
+    REQUIRE_EQ(free_curve.size(), std::size_t{3});
+    REQUIRE_EQ(free_curve[0].kind, EnvelopeEventKind::Noise);
+    REQUIRE_EQ(free_curve[0].value, 0);
+    REQUIRE_EQ(free_curve[1].value, 31);
+    REQUIRE_EQ(free_curve[2].value, 31);
+    auto direct = layer;
+    direct.timbre_automation.push_back({.kind = EnvelopeEventKind::RegisterWrite,
+        .value = 6, .secondary = 0xBD, .count = 4});
+    REQUIRE_EQ(psgEnvelopeValueAt(direct, EnvelopeEventKind::Noise, 4), 29);
+    REQUIRE_EQ(psgNoiseValueAtCount(direct, 4, true, direct.timbre_automation), 29);
+    direct.timbre_automation.push_back({.kind = EnvelopeEventKind::RegisterWrite,
+        .value = 7, .secondary = 0xF6, .count = 5});
+    REQUIRE_EQ(psgEnvelopeValueAt(direct, EnvelopeEventKind::ToneNoiseMode, 5), 3);
+
+    layer.psg_noise_modulation = {
+        .enabled = true, .mode = ModulationMode::StepUp,
+        .delay = 0, .depth = 100, .speed = 0, .roughness = 3};
+    const auto modulated = expandCompositeLayerModulations(layer, nullptr, false);
+    const auto generated = std::count_if(
+        modulated.timbre_automation.begin(), modulated.timbre_automation.end(),
+        [](const auto& event) { return event.kind == EnvelopeEventKind::Noise; });
+    REQUIRE_EQ(generated > 0, true);
+    REQUIRE_EQ(std::all_of(modulated.timbre_automation.begin(),
+        modulated.timbre_automation.end(), [](const auto& event) {
+            return event.kind != EnvelopeEventKind::Noise
+                || (event.value >= 0 && event.value <= 31);
+        }), true);
+}
+void testPsgNoiseAutomationCountsAndOffRestore() {
+    using namespace mgstc::engine;
+    OpllRegisterAutoLane lane{.mode = OpllRegisterAutoMode::Rise,
+        .start_count = 2, .depth = 4, .change_speed = 3, .coarseness = 2,
+        .stop_position = 11};
+    const auto rise = expandOpllRegisterAuto(lane, OpllRegisterAutoTarget::Noise, 0, 10);
+    REQUIRE_EQ(rise.size(), std::size_t{4});
+    for (std::size_t i = 0; i < rise.size(); ++i) {
+        REQUIRE_EQ(rise[i].count, 2U + static_cast<unsigned>(i) * 2U);
+        REQUIRE_EQ(rise[i].value, std::min(11, 4 + static_cast<int>(i) * 3));
+    }
+    lane.mode = OpllRegisterAutoMode::Fall;
+    lane.depth = 11;
+    lane.stop_position = 4;
+    const auto fall = expandOpllRegisterAuto(lane, OpllRegisterAutoTarget::Noise, 0, 10);
+    REQUIRE_EQ(fall.size(), std::size_t{4});
+    REQUIRE_EQ(fall[0].value, 11);
+    REQUIRE_EQ(fall[1].value, 8);
+    REQUIRE_EQ(fall[2].value, 5);
+    REQUIRE_EQ(fall[3].value, 4);
+    lane = {.mode = OpllRegisterAutoMode::Lfo, .start_count = 1,
+        .depth = 4, .change_speed = 1, .coarseness = 1, .stop_position = 8};
+    const auto lfo = expandOpllRegisterAuto(lane, OpllRegisterAutoTarget::Noise, 0, 5);
+    REQUIRE_EQ(lfo.size(), std::size_t{5});
+    REQUIRE_EQ(lfo[0].value, 4);
+    REQUIRE_EQ(lfo[1].value, 8);
+    REQUIRE_EQ(lfo[2].value, 12);
+    REQUIRE_EQ(lfo[3].value, 8);
+    REQUIRE_EQ(lfo[4].value, 4);
+
+    CompositeLayer layer;
+    layer.source = TimbreSource::Psg;
+    layer.envelope_timeline.length_counts = 8;
+    assignSequenceEnvelopeMixer(layer.volume_envelope.rate, 3, 7);
+    layer.psg_noise_modulation = {.enabled = true, .mode = ModulationMode::StepUp,
+        .roughness = 2};
+    layer.modulation_profiles.push_back({CompositeModulationTarget::Noise, 4, false, {}});
+    const auto expanded = expandCompositeLayerModulations(layer, nullptr, false);
+    REQUIRE_EQ(psgNoiseValueAtCount(layer, 4, true, expanded.timbre_automation), 7);
+    REQUIRE_EQ(psgNoiseValueAtCount(layer, 7, true, expanded.timbre_automation), 7);
+    // A profile before a same-count n must use the old baseline, then the
+    // ordinary generator runs after explicitly ordered commands.
+    layer.psg_noise_modulation = {};
+    layer.modulation_profiles = {{CompositeModulationTarget::Noise, 2, false,
+        {.enabled = true, .mode = ModulationMode::StepUp, .roughness = 2}, 1}};
+    layer.timbre_automation = {{.kind = EnvelopeEventKind::Noise, .value = 20,
+        .count = 2, .command_order = 2}};
+    const auto ordered = expandCompositeLayerModulations(layer, nullptr, false);
+    const auto first_profile_write = std::find_if(ordered.timbre_automation.begin(),
+        ordered.timbre_automation.end(), [](const auto& event) {
+            return event.kind == EnvelopeEventKind::Noise && event.count == 2 && event.command_order == 1;
+        });
+    REQUIRE_EQ(first_profile_write != ordered.timbre_automation.end(), true);
+    REQUIRE_EQ(first_profile_write->value, 11);
+    REQUIRE_EQ(psgNoiseValueAtCount(layer, 2, true, ordered.timbre_automation), 24);
+    layer.psg_noise_modulation = {};
+    layer.modulation_profiles.clear();
+    layer.timbre_automation = {
+        {.kind = EnvelopeEventKind::Noise, .value = 23, .count = 2},
+        {.kind = EnvelopeEventKind::ToneNoiseMode, .value = 2, .count = 3}};
+    const auto inserted = editCompositeSteps(layer, CompositeStepEditLane::All, 2, 2);
+    REQUIRE_EQ(inserted.accepted, true);
+    REQUIRE_EQ(psgEnvelopeValueAt(inserted.layer, EnvelopeEventKind::Noise, 3), 7);
+    REQUIRE_EQ(psgEnvelopeValueAt(inserted.layer, EnvelopeEventKind::Noise, 4), 23);
+    REQUIRE_EQ(psgEnvelopeValueAt(inserted.layer, EnvelopeEventKind::ToneNoiseMode, 5), 2);
+    const auto removed = editCompositeSteps(layer, CompositeStepEditLane::All, 4, -3);
+    REQUIRE_EQ(removed.accepted, true);
+    REQUIRE_EQ(psgEnvelopeValueAt(removed.layer, EnvelopeEventKind::Noise, 1), 23);
+    REQUIRE_EQ(psgEnvelopeValueAt(removed.layer, EnvelopeEventKind::ToneNoiseMode, 1), 2);
 }
 
 void testAuthoredModulationLoopRepeatsFirstBodyAndInheritsState() {
@@ -9633,6 +9891,10 @@ void testCompositeLoopProfileRoundTripAndLegacyPayload() {
     CompositeTimbre old;
     old.layers.emplace_back(); // No events or profile records in this fixture.
     auto old_payload = serializeCompositeSoundPayload(old);
+    removeUnsetNoiseAuthoringFromSingleLayerFixture(old_payload);
+    const auto previous_v6 = deserializeCompositeSoundPayload(old_payload, 6);
+    REQUIRE_EQ(previous_v6.has_value(), true);
+    REQUIRE_EQ(previous_v6->layers, old.layers);
     old_payload.erase(old_payload.size() - 21, 12); // Remove v24 profile/placement vector counts.
     const auto legacy = deserializeCompositeSoundPayload(old_payload, 5);
     REQUIRE_EQ(legacy.has_value(), true);
@@ -10879,6 +11141,7 @@ int main(int argc, char** argv) {
         {"CompositeAutomaticVolumeRejectsMgscCount240", testCompositeAutomaticVolumeRejectsMgscCount240},
         {"CompositeSequenceEnvelopeHeaderModeNoise",
          testCompositeSequenceEnvelopeHeaderModeNoise},
+        {"PsgModeNoiseBothSidesOfSameLoopCount", testPsgModeNoiseBothSidesOfSameLoopCount},
         {"RateEnvelopeNativePhases", testRateEnvelopeNativePhases},
         {"RateEnvelopeTestRateQuantizedKeyOff", testRateEnvelopeTestRateQuantizedKeyOff},
         {"TraceRateEnvelopePreviewKeyOff", testTraceRateEnvelopePreviewKeyOff},
@@ -11034,6 +11297,8 @@ int main(int argc, char** argv) {
         {"PitchLoopOptimizerHonorsBarriers", testPitchLoopOptimizerHonorsBarriers},
         {"OpllModulationLoopBoundaryWriteRepeats", testOpllModulationLoopBoundaryWriteRepeats},
         {"CompositeModulationAllTargetsRoundTripThroughLibrary", testCompositeModulationAllTargetsRoundTripThroughLibrary},
+        {"PsgNoiseAutomationUsesNoiseRangeAndMixerInitialValue", testPsgNoiseAutomationUsesNoiseRangeAndMixerInitialValue},
+        {"PsgNoiseAutomationCountsAndOffRestore", testPsgNoiseAutomationCountsAndOffRestore},
         {"AuthoredModulationLoopRepeatsFirstBodyAndInheritsState", testAuthoredModulationLoopRepeatsFirstBodyAndInheritsState},
         {"AuthoredLoopRegisterStateAndFirstPassWaveformClassification", testAuthoredLoopRegisterStateAndFirstPassWaveformClassification},
         {"AllCompositeModulationOffPreservesBaseEnvelopeOutput", testAllCompositeModulationOffPreservesBaseEnvelopeOutput},
