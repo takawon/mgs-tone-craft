@@ -2980,6 +2980,9 @@ private:
                     return editor->previewOwnedTimbre(snapshot, note, one_second);
                 return false;
             },
+            [this](bool whole) {
+                if (auto* editor = compositeEditor()) editor->setOwnedEditWholeComposite(whole);
+            },
         };
     }
 

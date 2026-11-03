@@ -3522,8 +3522,7 @@ public:
             "@e の命令列は残し、@r のときは使いません"));
         rate_kind_.onClick = [this] {
             rate_edit_.setEnabled(rate_kind_.getToggleState());
-            const bool psg_sequence = !rate_kind_.getToggleState()
-                && source_.getText() == "PSG";
+            const bool psg_sequence = source_.getText() == "PSG";
             mixer_mode_.setVisible(psg_sequence);
             mixer_mode_label_.setVisible(psg_sequence);
             mixer_noise_.setVisible(psg_sequence);
@@ -3695,6 +3694,10 @@ public:
         configureValueSlider(volume_, 0.0, 15.0, "");
         configureValueSlider(key_off_hang_, 0.0, 255.0, "");
         configureValueSlider(mixer_noise_, 0.0, 31.0, "");
+        mixer_noise_.onValueChange = [this] {
+            if (!assigning_) mixer_noise_edited_ = true;
+            if (!assigning_ && changed_) changed_(false);
+        };
         delay_form_.addItem("r", 1);
         delay_form_.addItem("r%", 2);
         delay_form_.setSelectedId(2, juce::dontSendNotification);
@@ -3708,23 +3711,22 @@ public:
             "発音前休符の記法。r=音符長（テンポ依存）、"
             "r%=48ステップで4分音符（テンポ依存）。@e内の待ちではない"));
         addAndMakeVisible(delay_form_);
-        mixer_mode_.addItem(juce::String::fromUTF8("0 変化なし"), 1);
+        mixer_mode_.addItem(juce::String::fromUTF8("0 ミュート"), 1);
         mixer_mode_.addItem(juce::String::fromUTF8("1 トーン"), 2);
         mixer_mode_.addItem(juce::String::fromUTF8("2 ノイズ"), 3);
         mixer_mode_.addItem(juce::String::fromUTF8("3 トーン+ノイズ"), 4);
         mixer_mode_.setSelectedId(2, juce::dontSendNotification);
         mixer_mode_.setTooltip(juce::String::fromUTF8(
-            "MGSC @e = { Mode, Noise, data } の先頭 Mode。"
-            "キーオン時のトーン／ノイズ（0～3。省略時は1）"));
+            "発音前トラックMML /<n> のMode（0～3）。エンベロープ内の設定とは独立"));
         mixer_mode_.onChange = [this] {
+            if (!assigning_) mixer_mode_edited_ = true;
             if (!assigning_ && changed_) {
                 changed_(true);
             }
         };
         addAndMakeVisible(mixer_mode_);
         mixer_noise_.setTooltip(juce::String::fromUTF8(
-            "MGSC @e = { Mode, Noise, data } の先頭 Noise（0～31。省略時は0）。"
-            "Mode 2以上で有効"));
+            "発音前トラックMML n<n> のNoise周波数（0～31）。エンベロープ内の設定とは独立"));
         pitch_label_.setText(
             juce::String::fromUTF8("相対音程"),
             juce::dontSendNotification);
@@ -3840,6 +3842,7 @@ public:
     void syncFromLayer(const mgstc::engine::CompositeLayer& layer) {
         assigning_ = true;
         scc_number_edited_ = false;
+        mixer_mode_edited_ = mixer_noise_edited_ = false;
         const char* source_name =
             layer.source == mgstc::engine::TimbreSource::Psg
                 ? "PSG"
@@ -4011,17 +4014,15 @@ public:
             juce::dontSendNotification);
         volume_.setValue(layer.volume, juce::dontSendNotification);
         const bool psg_sequence =
-            layer.source == mgstc::engine::TimbreSource::Psg && !rate;
+            layer.source == mgstc::engine::TimbreSource::Psg;
         mixer_mode_.setVisible(psg_sequence);
         mixer_mode_label_.setVisible(psg_sequence);
         mixer_noise_.setVisible(psg_sequence);
         mixer_noise_label_.setVisible(psg_sequence);
-        const auto mixer =
-            mgstc::engine::sequenceEnvelopeMixer(layer.volume_envelope.rate);
         mixer_mode_.setSelectedId(
-            static_cast<int>(mixer.tone_mode) + 1,
+            static_cast<int>(layer.psg_tone_mode.value_or(1)) + 1,
             juce::dontSendNotification);
-        mixer_noise_.setValue(mixer.noise, juce::dontSendNotification);
+        mixer_noise_.setValue(layer.psg_noise.value_or(0), juce::dontSendNotification);
         assigning_ = false;
     }
 
@@ -4057,20 +4058,10 @@ public:
         layer.start_delay_value =
             static_cast<std::uint32_t>(delay_.getValue());
         layer.volume = static_cast<std::uint8_t>(volume_.getValue());
-        if (layer.source == mgstc::engine::TimbreSource::Psg
-            && layer.volume_envelope.kind
-                == mgstc::engine::EnvelopeKind::Sequence) {
-            const auto mode = static_cast<std::uint8_t>(
+        if (layer.source == mgstc::engine::TimbreSource::Psg) {
+            if (mixer_mode_edited_) layer.psg_tone_mode = static_cast<std::uint8_t>(
                 juce::jmax(0, mixer_mode_.getSelectedId() - 1));
-            const auto noise = static_cast<std::uint8_t>(mixer_noise_.getValue());
-            if (mode == mgstc::engine::kMgscSequenceToneModeDefault
-                && noise == mgstc::engine::kMgscSequenceNoiseDefault) {
-                layer.volume_envelope.rate.tone_mode = 0;
-                layer.volume_envelope.rate.noise = 0;
-            } else {
-                layer.volume_envelope.rate.tone_mode = mode;
-                layer.volume_envelope.rate.noise = noise;
-            }
+            if (mixer_noise_edited_) layer.psg_noise = static_cast<std::uint8_t>(mixer_noise_.getValue());
         }
         layer.key_off_hang = static_cast<std::uint8_t>(
             key_off_hang_.getValue());
@@ -4323,6 +4314,7 @@ private:
     juce::Slider volume_;
     juce::Slider key_off_hang_;
     juce::Slider mixer_noise_;
+    bool mixer_mode_edited_{}, mixer_noise_edited_{};
 };
 
 class CountCommandStackView final : public juce::Component {
@@ -4738,6 +4730,26 @@ public:
         inspector_apply_.onClick = [this] { applyInspector(); };
         addAndMakeVisible(inspector_apply_);
 
+        configureInspectorLabel(psg_header_mode_label_, "Mode");
+        configureInspectorLabel(psg_header_noise_label_, "Noise");
+        psg_header_mode_.addItem(juce::String::fromUTF8("0 変化なし"), 1);
+        psg_header_mode_.addItem(juce::String::fromUTF8("1 トーン"), 2);
+        psg_header_mode_.addItem(juce::String::fromUTF8("2 ノイズ"), 3);
+        psg_header_mode_.addItem(juce::String::fromUTF8("3 トーン+ノイズ"), 4);
+        psg_header_mode_.setTooltip(juce::String::fromUTF8(
+            "エンベロープ定義のMode。初期設定のトラック / とは独立。0は変化なし"));
+        psg_header_mode_.onChange = [this] { applyPsgEnvelopeMixer(true); };
+        addAndMakeVisible(psg_header_mode_);
+        psg_header_noise_.setRange(0.0, 31.0, 1.0);
+        psg_header_noise_.setSliderStyle(juce::Slider::LinearHorizontal);
+        psg_header_noise_.setTextBoxStyle(juce::Slider::TextBoxLeft, false, UiLayout::setupSliderTextW,
+            UiLayout::fieldH - UiLayout::panelPad);
+        psg_header_noise_.setTooltip(juce::String::fromUTF8(
+            "エンベロープ定義のNoise（0～31）。Mode 2／3で初期化。両方0なら設定なし"));
+        psg_header_noise_.onValueChange = [this] { applyPsgEnvelopeMixer(false); };
+        psg_header_noise_.onDragEnd = [this] { applyPsgEnvelopeMixer(true); };
+        addAndMakeVisible(psg_header_noise_);
+
         clear_loop_.setButtonText(juce::String::fromUTF8("ループ解除"));
         clear_loop_.setTooltip(juce::String::fromUTF8(
             "選択エンベロープのループ開始と終了を両方解除します"));
@@ -4805,6 +4817,17 @@ public:
             repaint();
         };
         addAndMakeVisible(pitch_lane_toggle_);
+        patchslide_.setButtonText(juce::String::fromUTF8("パッチスライド"));
+        patchslide_.setTooltip(juce::String::fromUTF8("選択OPLLレイヤーの音色変更をパッチスライドから検索します"));
+        patchslide_.setExplicitFocusOrder(225);
+        patchslide_.onClick = [this] {
+            if (patchslide_callback_ && selected_layer_ >= 0
+                && selected_layer_ < static_cast<int>(timbre_.layers.size())
+                && timbre_.layers[static_cast<std::size_t>(selected_layer_)].source == mgstc::engine::TimbreSource::Opll
+                && timbre_.layers[static_cast<std::size_t>(selected_layer_)].volume_envelope.kind == mgstc::engine::EnvelopeKind::Sequence)
+                patchslide_callback_(static_cast<std::size_t>(selected_layer_));
+        };
+        addChildComponent(patchslide_);
         morph_bank_label_.setText("SCC", juce::dontSendNotification);
         morph_bank_label_.setFont(UiFonts::body());
         addAndMakeVisible(morph_bank_label_);
@@ -4843,7 +4866,8 @@ public:
                  &auto_mode_, &auto_depth_, &auto_speed_,
                  &auto_coarseness_, &auto_stop_, &auto_depth_label_,
                  &auto_speed_label_, &auto_coarseness_label_,
-                 &auto_stop_label_}) {
+                 &auto_stop_label_, &psg_header_mode_, &psg_header_noise_,
+                 &psg_header_mode_label_, &psg_header_noise_label_}) {
             inspector_content_.addAndMakeVisible(*c);
         }
 
@@ -5060,6 +5084,45 @@ public:
             UiScale::setActivePercent(percent);
             setSize(UiScale::sx(1528), UiScale::sx(750));
             refreshUiScaleFonts();
+            {
+                std::optional<std::size_t> requested;
+                setPatchSlideCallback([&](std::size_t index) { requested = index; });
+                setTimbre(model, true);
+                for (std::size_t index = 0; index < model.layers.size(); ++index) {
+                    selectOverviewLayer(static_cast<int>(index));
+                    vertical_scroll_.setCurrentRangeStart(0.0, juce::dontSendNotification);
+                    scrollBarMoved(&vertical_scroll_, 0.0);
+                    const bool opll = model.layers[index].source == mgstc::engine::TimbreSource::Opll;
+                    check(patchslide_.isVisible() == opll,
+                        "PatchSlide entry is not limited to the selected OPLL sequence lane");
+                    requested.reset();
+                    patchslide_.onClick();
+                    check(opll ? requested == index : !requested,
+                        "PatchSlide entry routed to the wrong source/layer");
+                    if (opll) {
+                        auto label = makeEditLaneSlots(graph_bounds_[index], model.layers[index].source)
+                            .timbre.removeFromLeft(UiLayout::compositeOverviewLabelW);
+                        check(label.contains(patchslide_.getBounds())
+                                && patchslide_.getX() >= label.getX() + UiScale::sx(46)
+                                && patchslide_.getY() == label.getY()
+                                && label.getHeight() == UiLayout::editMarkerLaneH
+                                && patchslide_.getHeight() == UiLayout::editMarkerLaneH
+                                && patchslide_.getExplicitFocusOrder() == 225,
+                            "PatchSlide entry overlaps the @ caption or escapes the keyboard tab order");
+                        save("patchslide-entry-" + juce::String(percent));
+                    }
+                }
+                auto rate = model;
+                rate.layers[2].volume_envelope.kind = mgstc::engine::EnvelopeKind::Rate;
+                setTimbre(rate, true); selectOverviewLayer(2);
+                check(!patchslide_.isVisible(), "PatchSlide entry appeared on the rate-envelope screen");
+                requested.reset(); patchslide_.onClick();
+                check(!requested, "rate-envelope screen invoked PatchSlide");
+                setPatchSlideCallback({});
+                setTimbre(model, true); selectOverviewLayer(2);
+                check(!patchslide_.isVisible(), "unwired PatchSlide entry exposed an incomplete operation");
+                selectOverviewLayer(0);
+            }
             check(setup_tab_.getButtonText() == juce::String::fromUTF8("初期設定 / 編集"),
                 "setup tab label does not describe initial editing");
             for (const auto& template_layer : model.layers) {
@@ -5092,6 +5155,37 @@ public:
                                 && layer.name == "Edited setup name",
                                 "setup name edit changed enabled/mute/solo state");
                         }
+                if (template_layer.source == mgstc::engine::TimbreSource::Psg) {
+                    juce::ComboBox* track_mode = nullptr;
+                    juce::Slider* track_noise = nullptr;
+                    for (auto* child : compact_setup.getChildren()) {
+                        if (auto* combo = dynamic_cast<juce::ComboBox*>(child);
+                            combo && combo->getTooltip().contains("/<n>")) track_mode = combo;
+                        if (auto* slider = dynamic_cast<juce::Slider*>(child);
+                            slider && slider->getTooltip().contains("n<n>")) track_noise = slider;
+                    }
+                    check(track_mode && track_noise, "PSG track controls are missing from initial setup");
+                    if (track_mode && track_noise) for (const auto kind : {
+                            mgstc::engine::EnvelopeKind::Sequence, mgstc::engine::EnvelopeKind::Rate}) {
+                        auto layer = template_layer;
+                        layer.volume_envelope.kind = kind;
+                        layer.volume_envelope.rate.tone_mode = 2;
+                        layer.volume_envelope.rate.noise = 9;
+                        compact_setup.syncFromLayer(layer);
+                        auto untouched = layer;
+                        compact_setup.applyToLayer(untouched);
+                        check(!untouched.psg_tone_mode && !untouched.psg_noise,
+                            "unrelated setup edits must not populate absent legacy track settings");
+                        check(track_mode->isVisible() && track_noise->isVisible(),
+                            "PSG track controls must be available for both sequence and rate envelopes");
+                        track_mode->setSelectedId(1, juce::sendNotificationSync);
+                        track_noise->setValue(31, juce::sendNotificationSync);
+                        compact_setup.applyToLayer(layer);
+                        check(layer.psg_tone_mode == 0 && layer.psg_noise == 31
+                                && layer.volume_envelope.rate.tone_mode == 2 && layer.volume_envelope.rate.noise == 9,
+                            "initial Mode/Noise must change track MML without altering the envelope header");
+                    }
+                }
             }
             const auto before = timbre_;
             const auto caption_bounds = editHeaderCaptionBounds();
@@ -6039,6 +6133,46 @@ public:
         auto psg_model = mgstc::engine::defaultCompositeTimbre();
         for (auto& layer : psg_model.layers) layer.volume_envelope.kind = mgstc::engine::EnvelopeKind::Sequence;
         setTimbre(psg_model, true); selectOverviewLayer(0); setCountInspector(true);
+        for (const int percent : {75, 100, 125}) {
+            UiScale::setActivePercent(percent);
+            setSize(UiScale::sx(1528), UiScale::sx(750));
+            refreshUiScaleFonts();
+            for (auto* control : std::initializer_list<juce::Component*>{
+                     &psg_header_mode_, &psg_header_noise_,
+                     &psg_header_mode_label_, &psg_header_noise_label_})
+                check(control->getParentComponent() == &inspector_content_
+                        && !control->getBounds().isEmpty()
+                        && inspector_content_.getLocalBounds().contains(control->getBounds()),
+                    "PSG header controls must stay within the count inspector at every UI scale");
+            check(psg_header_mode_.getBottom() <= psg_header_noise_.getY()
+                    && psg_header_noise_.getBottom() <= position_.getY(),
+                "PSG count inspector must order Mode, Noise, then count controls");
+            save("workspace-psg-envelope-header-" + juce::String(percent));
+        }
+        UiScale::setActivePercent(original_scale);
+        setSize(UiScale::sx(1528), UiScale::sx(750));
+        refreshUiScaleFonts();
+        check(psg_header_mode_.isVisible() && psg_header_noise_.isVisible()
+                && psg_header_mode_.getSelectedId() == 1 && psg_header_noise_.getValue() == 0,
+            "count settings must expose the raw unset envelope Mode/Noise pair");
+        psg_header_mode_.setSelectedId(2, juce::sendNotificationSync);
+        check(timbre_.layers[0].volume_envelope.rate.tone_mode == 1
+                && mgstc::engine::layerUsesSequenceEnvelope(timbre_.layers[0])
+                && !timbre_.layers[0].psg_tone_mode && !timbre_.layers[0].psg_noise,
+            "nonzero count header must create an envelope without populating track settings");
+        psg_header_noise_.setValue(7, juce::sendNotificationSync);
+        psg_header_noise_.onDragEnd();
+        check(timbre_.layers[0].volume_envelope.rate.noise == 7,
+            "count Noise must update the envelope definition");
+        psg_header_mode_.setSelectedId(1, juce::sendNotificationSync);
+        psg_header_noise_.setValue(0, juce::sendNotificationSync);
+        psg_header_noise_.onDragEnd();
+        check(!mgstc::engine::layerUsesSequenceEnvelope(timbre_.layers[0]),
+            "both zero count header values must not force an identity envelope");
+        save("workspace-psg-envelope-header");
+        setCountInspector(false);
+        save("workspace-psg-track-settings");
+        setTimbre(psg_model, true); selectOverviewLayer(0); setCountInspector(true);
         edit_mode_.setSelectedId(static_cast<int>(EditMode::Draw), juce::dontSendNotification);
         const auto psg_slots = makeEditLaneSlots(graph_bounds_[0], timbre_.layers[0].source);
         check(psg_slots.timbre.isEmpty() && !psg_slots.mode.isEmpty() && !psg_slots.noise.isEmpty()
@@ -6222,6 +6356,13 @@ public:
 
     void setOpenTimbreCallback(OpenTimbreCallback callback) {
         open_timbre_callback_ = std::move(callback);
+    }
+
+    void setPatchSlideCallback(PatchSlideCallback callback) {
+        patchslide_callback_ = std::move(callback);
+        lane_layout_dirty_ = true;
+        resized();
+        repaint();
     }
 
     void setAssignTimbreCallback(AssignTimbreCallback callback) {
@@ -6751,7 +6892,9 @@ public:
         inspector_view_.setBounds(side);
         inspector_content_.setSize(juce::jmax(1, side.getWidth() - kScrollBarSize),
             count_inspector_ ? UiLayout::compositeInspectorContentH
-                + (UiLayout::fieldH + UiLayout::sm) * 5
+                + (UiLayout::fieldH + UiLayout::sm) * (5 + (selected_layer_ >= 0
+                    && selected_layer_ < static_cast<int>(timbre_.layers.size())
+                    && timbre_.layers[static_cast<std::size_t>(selected_layer_)].source == mgstc::engine::TimbreSource::Psg ? 2 : 0))
                 : panelPad * 2 + (fieldH + sm) * 16 + (libraryTitleH + sm) * 3);
         overview_view_.setVisible(!focus_.getToggleState());
         overview_view_.setBounds(overviewArea());
@@ -9073,6 +9216,9 @@ private:
         const auto& layer =
             timbre_.layers[static_cast<std::size_t>(selected_layer_)];
         const auto& timeline = layer.envelope_timeline;
+        psg_header_mode_.setSelectedId(std::min<int>(layer.volume_envelope.rate.tone_mode, 3) + 1,
+            juce::dontSendNotification);
+        psg_header_noise_.setValue(std::min<int>(layer.volume_envelope.rate.noise, 31), juce::dontSendNotification);
         inspector_selection_.setText(
             juce::String::fromUTF8(layer.name.c_str())
                 + juce::String::fromUTF8(" / ソフトウェアEG"),
@@ -9091,6 +9237,20 @@ private:
             false);
         refreshCommandStack(layer);
         layoutEditToolsDock();
+    }
+
+    void applyPsgEnvelopeMixer(bool commit) {
+        if (selected_layer_ < 0 || selected_layer_ >= static_cast<int>(timbre_.layers.size())) return;
+        auto& layer = timbre_.layers[static_cast<std::size_t>(selected_layer_)];
+        if (layer.source != mgstc::engine::TimbreSource::Psg || !count_inspector_) return;
+        layer.volume_envelope.rate.tone_mode = static_cast<std::uint8_t>(
+            juce::jlimit(0, 3, psg_header_mode_.getSelectedId() - 1));
+        layer.volume_envelope.rate.noise = static_cast<std::uint8_t>(
+            juce::jlimit(0, 31, juce::roundToInt(psg_header_noise_.getValue())));
+        syncRateEditorFromModel();
+        updateEnvelopeMmlPreview();
+        repaint();
+        publishEdit(commit, false);
     }
 
     void applyInspector() {
@@ -10678,7 +10838,8 @@ private:
         const bool has_register = showsRegisterLane(source);
         const int marker_h = UiLayout::editMarkerLaneH;
         if (has_register) {
-            if (source != mgstc::engine::TimbreSource::Psg) slots.timbre = content.removeFromTop(marker_h);
+            if (source != mgstc::engine::TimbreSource::Psg)
+                slots.timbre = content.removeFromTop(marker_h);
             slots.register_write = content.removeFromTop(marker_h);
             if (source == mgstc::engine::TimbreSource::Psg) {
                 slots.mode = content.removeFromTop(marker_h);
@@ -11500,6 +11661,8 @@ private:
             graphics.fillRect(slot);
         }
         auto label = slot.removeFromLeft(UiLayout::compositeOverviewLabelW);
+        if (parameter == Parameter::Timbre && patchslide_.isVisible())
+            label.setRight(patchslide_.getX() - UiLayout::xs);
         graphics.setColour(
             hovered
                 ? uiHoverAccentStrong()
@@ -11842,7 +12005,7 @@ private:
         auto plot = graphStrip(slot);
         juce::Graphics::ScopedSaveState clipped(graphics);
         graphics.reduceClipRegion(plot);
-        std::vector<std::pair<int, int>> points{{0, mgstc::engine::sequenceEnvelopeMixer(layer.volume_envelope.rate).noise}};
+        std::vector<std::pair<int, int>> points{{0, mgstc::engine::psgInitialMixer(layer).noise}};
         for (const auto& event : psgNoiseEvents(layer))
             if (event.kind == mgstc::engine::EnvelopeEventKind::Noise || (event.kind == mgstc::engine::EnvelopeEventKind::RegisterWrite && event.value == 6))
                 points.emplace_back(static_cast<int>(event.count), event.kind == mgstc::engine::EnvelopeEventKind::Noise ? event.value : event.secondary & 31);
@@ -13861,6 +14024,8 @@ private:
             hash *= 1099511628211ull;
         };
         mix(layer.volume);
+        mix(layer.psg_tone_mode ? static_cast<unsigned>(*layer.psg_tone_mode) + 1 : 0);
+        mix(layer.psg_noise ? static_cast<unsigned>(*layer.psg_noise) + 1 : 0);
         mix(static_cast<std::uint64_t>(layer.volume_envelope.kind));
         mix(layer.envelope_timeline.length_counts);
         mix(layer.envelope_timeline.loop_start_count.value_or(~0u));
@@ -14006,8 +14171,26 @@ private:
         lane_layout_dirty_ = false;
     }
 
+    void layoutPatchSlideButton() {
+        patchslide_.setVisible(false);
+        if (!patchslide_callback_ || selected_layer_ < 0
+            || selected_layer_ >= static_cast<int>(timbre_.layers.size())
+            || selected_layer_ >= static_cast<int>(graph_bounds_.size())) return;
+        const auto& layer = timbre_.layers[static_cast<std::size_t>(selected_layer_)];
+        if (layer.source != mgstc::engine::TimbreSource::Opll
+            || layer.volume_envelope.kind != mgstc::engine::EnvelopeKind::Sequence) return;
+        auto label = makeEditLaneSlots(graph_bounds_[static_cast<std::size_t>(selected_layer_)], layer.source)
+            .timbre.removeFromLeft(UiLayout::compositeOverviewLabelW);
+        label.removeFromLeft(UiScale::sx(46));
+        const auto bounds = label.reduced(UiLayout::xs, 0);
+        patchslide_.setBounds(bounds);
+        patchslide_.setVisible(graphArea().contains(bounds));
+        patchslide_.toFront(false);
+    }
+
     void layoutPitchLaneToggle() {
         layoutStepEditToggle();
+        layoutPatchSlideButton();
         if (selected_layer_ < 0
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())
             || selected_layer_ >= static_cast<int>(graph_bounds_.size())) {
@@ -14070,6 +14253,10 @@ private:
                 static_cast<std::size_t>(selected_layer_)]
                     .volume_envelope.kind
                 == mgstc::engine::EnvelopeKind::Rate;
+        const bool show_psg_header = show && count_inspector_
+            && timbre_.layers[static_cast<std::size_t>(selected_layer_)].source == mgstc::engine::TimbreSource::Psg;
+        for (auto* control : std::initializer_list<juce::Component*>{&psg_header_mode_, &psg_header_noise_,
+                &psg_header_mode_label_, &psg_header_noise_label_}) control->setVisible(show_psg_header);
         const bool show_auto = show && !show_rate
             && selectedLayerShowsRegisterAuto()
             && (selectedParameter() == Parameter::OpllTlAuto
@@ -14129,6 +14316,12 @@ private:
         auto split = [&](juce::Component& label, juce::Component& field) {
             auto r = row(); label.setBounds(r.removeFromLeft(UiLayout::compositeInspectorLabelW)); field.setBounds(r);
         };
+        if (show_psg_header) {
+            psg_header_mode_label_.setFont(UiFonts::body());
+            psg_header_noise_label_.setFont(UiFonts::body());
+            split(psg_header_mode_label_, psg_header_mode_);
+            split(psg_header_noise_label_, psg_header_noise_);
+        }
         rate_open_.setBounds(dock.withHeight(fieldH));
         if (!show_rate) {
             auto point = row();
@@ -14219,6 +14412,9 @@ private:
     juce::Label position_;
     juce::Label value_label_;
     juce::TextButton apply_;
+    juce::ComboBox psg_header_mode_;
+    juce::Slider psg_header_noise_;
+    juce::Label psg_header_mode_label_, psg_header_noise_label_;
     SwitchLookAndFeel modulation_switch_look_and_feel_;
     juce::Label modulation_heading_;
     juce::Label modulation_issue_;
@@ -14273,6 +14469,7 @@ private:
     CatalogCallback catalog_callback_;
     OpenTimbreCallback open_timbre_callback_;
     AssignTimbreCallback assign_timbre_callback_;
+    PatchSlideCallback patchslide_callback_;
     TimbreNameCallback timbre_name_callback_;
     TimbreLibraryCallback timbre_library_callback_;
     ManageTagsCallback manage_tags_callback_;
@@ -14297,6 +14494,7 @@ private:
     juce::TextButton mml_toggle_;
     juce::TextButton zoom_in_, zoom_out_;
     juce::ToggleButton pitch_lane_toggle_;
+    juce::TextButton patchslide_;
     std::vector<bool> pitch_lane_expanded_;
     std::vector<bool> envelope_number_active_;
     juce::Label tempo_label_;
@@ -14458,6 +14656,10 @@ void CompositeTimeline::setTimbreCatalogCallback(CatalogCallback callback) {
 
 void CompositeTimeline::setOpenTimbreCallback(OpenTimbreCallback callback) {
     impl_->setOpenTimbreCallback(std::move(callback));
+}
+
+void CompositeTimeline::setPatchSlideCallback(PatchSlideCallback callback) {
+    impl_->setPatchSlideCallback(std::move(callback));
 }
 
 void CompositeTimeline::setAssignTimbreCallback(AssignTimbreCallback callback) {

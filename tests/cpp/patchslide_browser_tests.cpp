@@ -77,6 +77,82 @@ public:
         { Browser absent({}, nullptr, missing); settle(absent);
           require(!absent.db_ && !absent.selectedTimbre(), "Missing database exposes an action");
           require(absent.details_.getText().contains("patchslide.sqlite"), "Missing-file diagnostic lost"); }
+        {
+            Browser loading({}, nullptr, missing);
+            settle(loading);
+            loading.setSize(900, 600);
+            loading.addToDesktop(juce::ComponentPeer::windowIsTemporary);
+            loading.setVisible(true);
+            loading.worker_->load_attempt.fetch_add(1);
+            loading.worker_->loading_database = true;
+            loading.worker_->load_stage = engine::PatchSlideLoadStage::Vectors;
+            loading.worker_->load_fraction = .6;
+            loading.updateDatabaseLoadDialog();
+            require(loading.database_busy_dialog_
+                && loading.database_busy_dialog_->getName().contains(juce::String::fromUTF8("DB読込")),
+                "A visible first DB load must show the existing rotating-parrot progress dialog");
+            if (!screenshots.empty()) {
+                const juce::File folder(screenshots.string());
+                require(folder.createDirectory().wasOk(), "DB progress snapshot directory failed");
+                juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
+                auto* content = loading.database_busy_dialog_->getContentComponent();
+                auto output = folder.getChildFile("patchslide-db-progress.png").createOutputStream();
+                require(content && output && output->setPosition(0) && output->truncate().wasOk()
+                    && juce::PNGImageFormat().writeImageToStream(content->createComponentSnapshot(content->getLocalBounds()), *output),
+                    "DB progress snapshot failed");
+            }
+            loading.database_busy_dialog_->closeButtonPressed();
+            require(loading.worker_->load_cancelled, "The progress cancel action must reach the existing DB worker");
+            loading.worker_->loading_database = false;
+            juce::MessageManager::getInstance()->runDispatchLoopUntil(80);
+            require(!loading.database_busy_dialog_, "Completed or cancelled DB progress must close without a dangling modal window");
+        }
+        {
+            TaskRegistry registry;
+            auto loading = std::unique_ptr<Browser>(new Browser(Browser::Callbacks{}, &registry, missing));
+            settle(*loading);
+            loading->setSize(900, 600);
+            loading->addToDesktop(juce::ComponentPeer::windowIsTemporary);
+            loading->setVisible(true);
+            loading->worker_->load_attempt.fetch_add(1);
+            loading->worker_->loading_database = true;
+            loading->updateDatabaseLoadDialog();
+            auto dialog = loading->database_busy_dialog_;
+            require(dialog != nullptr, "Plugin DB progress setup failed");
+            loading.reset();
+            require(dialog == nullptr, "Destroying a plugin browser must immediately destroy its progress window");
+            registry.tasks.front()->join();
+            require(registry.tasks.front()->completed(), "Plugin closure must leave its DB worker joinable by the host boundary");
+        }
+        {
+            juce::Component owner;
+            Browser loading({}, nullptr, missing);
+            settle(loading);
+            owner.addAndMakeVisible(loading);
+            owner.setSize(900, 600);
+            loading.setBounds(owner.getLocalBounds());
+            owner.addToDesktop(juce::ComponentPeer::windowIsTemporary);
+            owner.setVisible(true);
+            loading.worker_->load_attempt.fetch_add(1);
+            loading.worker_->loading_database = true;
+            loading.updateDatabaseLoadDialog();
+            auto dialog = loading.database_busy_dialog_;
+            require(dialog != nullptr, "Hide-only DB progress setup failed");
+            const auto generation = loading.generation_;
+            // Library manager keeps its content alive when closing the window.
+            loading.prepareToHide();
+            owner.setVisible(false);
+            require(dialog == nullptr && loading.worker_->load_cancelled
+                && !loading.worker_->cancelled && loading.retry_load_when_visible_,
+                "Hiding a retained library browser must close its progress modal and cancel only that load attempt");
+            loading.worker_->loading_database = false;
+            owner.setVisible(true);
+            loading.timerCallback();
+            require(loading.generation_ > generation && !loading.retry_load_when_visible_
+                && !loading.worker_->cancelled,
+                "Reshowing a retained library browser must retry its interrupted load on the same worker");
+            settle(loading);
+        }
         { TaskRegistry registry;
           { Browser temporary({}, &registry, directory); temporary.requestBrowse(); }
           require(registry.tasks.size() == 1, "Worker was not registered before browser lifetime");
@@ -90,15 +166,51 @@ public:
         }
         auto stock = std::make_shared<PatchSlideStock>();
         int previews=0, applies=0, registrations=0, stops=0;
+        int selection_notifications=0;
+        Browser* observed_browser=nullptr;
+        std::optional<engine::CompositeTimbre> keyboardSelection;
         std::optional<engine::CompositeTimbre> last;
         Browser browser({[&](const auto& sound){++previews;last=sound;},
                          [&](const auto& sound){++applies;last=sound;},
-                         [&](const auto& sound){++registrations;last=sound;}, [&]{++stops;}}, nullptr, directory, stock);
+                         [&](const auto& sound){++registrations;last=sound;}, [&]{++stops;}, [&](const auto& sound){
+                             ++selection_notifications;
+                             keyboardSelection = sound;
+                             if (sound.layers.empty() && observed_browser)
+                                 require(!observed_browser->selectedCandidate(), "Empty notification still exposes the old candidate identity");
+                         }}, nullptr, directory, stock);
+        observed_browser=&browser;
+        {
+            juce::LookAndFeel_V4 host_style;
+            browser.setLookAndFeel(&host_style);
+            bool matches = true;
+            for (auto* choices : {&browser.mode_, &browser.match_, &browser.cluster_size_, &browser.audition_mode_})
+                for (int index = 0; index < choices->getNumItems(); ++index)
+                    matches = matches && isSegmentButton(choices->buttonAt(static_cast<std::size_t>(index)))
+                        && dynamic_cast<MgstcLookAndFeel*>(&choices->buttonAt(static_cast<std::size_t>(index)).getLookAndFeel());
+            browser.setLookAndFeel(nullptr);
+            require(matches, "All requested toggle strips keep the existing segment design under a host's default theme");
+        }
         settle(browser);
         if (!browser.db_) throw std::runtime_error("The deployed database is required for UI integration: " + browser.details_.getText().toStdString());
+        {
+            Browser reopened({}, nullptr, directory);
+            reopened.setVisible(true);
+            settle(reopened);
+            require(reopened.db_ == browser.db_ && !reopened.database_busy_dialog_,
+                "A hot shared DB must reopen without another loading dialog");
+        }
         require(!browser.two_changes_.getToggleState() && !browser.rejected_.getToggleState(), "Filter defaults are not OFF");
         require(!browser.selectedTimbre() && !browser.apply_.isEnabled(), "Initial result implicitly became an action target");
-        browser.mode_.setSelectedId(3, juce::sendNotificationSync); settle(browser);
+        require(!browser.audition_mode_.isVisible() && !browser.compare_.isVisible(),
+            "Library browser exposed envelope-only audition controls");
+        require(browser.rejected_.getButtonText() == juce::String::fromUTF8("不安定な音色も表示 (注意)"),
+            "Unstable-sound display label differs from the requested UI");
+        for (auto* choices : {&browser.mode_, &browser.match_, &browser.cluster_size_})
+            for (int index = 0; index < choices->getNumItems(); ++index)
+                require(isSegmentButton(choices->buttonAt(static_cast<std::size_t>(index)))
+                    && choices->buttonAt(static_cast<std::size_t>(index)).getClickingTogglesState(),
+                    "PatchSlide choices do not use the shared segmented toggle style");
+        press(browser.mode_.buttonAt(2)); settle(browser);
         engine::PatchSlideFilter all; all.max_change_count=1;
         require(browser.rows_==browser.db_->filter(all), "Initial one-change filter was not applied");
         for(auto index:browser.rows_) require(browser.db_->candidates()[index].change_count==1,"Two-change result leaked by default");
@@ -106,6 +218,8 @@ public:
         browser.list_.selectRow(0);
         require(browser.selected_index_==one,"Explicit candidate selection failed");
         auto soundOne=browser.selection_;
+        require(keyboardSelection == soundOne && previews == 0,
+            "Keyboard selection must follow explicit selection without starting a timed preview");
         std::unique_ptr<Browser::RowControls> check(static_cast<Browser::RowControls*>(browser.refreshComponentForRow(0,false,nullptr)));
         press(check->check);
         const auto oneId=browser.db_->candidates()[one].candidate_id;
@@ -129,6 +243,7 @@ public:
         browser.stock_list_.selectRow(1);
         const auto twoSound=browser.selection_;
         require(twoSound && browser.selected_index_==two && browser.list_.getSelectedRow()<0,"Stock did not become the exclusive target");
+        require(keyboardSelection == twoSound, "Stock keyboard selection differs from audition/apply");
         require(browser.details_.getText().contains(juce::String(twoId)),"Stock details did not follow selection");
         press(browser.preview_); require(last==twoSound && previews==1,"Stock audition used another sound");
         press(browser.apply_); require(last==twoSound && applies==1,"Stock apply used another sound");
@@ -165,7 +280,7 @@ public:
         if(browser.used_tags_.size()>1)tags.tags.push_back(browser.used_tags_[1].tag);
         require(browser.rows_==browser.db_->filter(tags),"One-change AND tags mismatch");
         checkBrowseRejectToggle(browser,tags);
-        browser.match_.setSelectedId(2,juce::sendNotificationSync);settle(browser);tags.tags_match_all=false;
+        press(browser.match_.buttonAt(1));settle(browser);tags.tags_match_all=false;
         require(browser.rows_==browser.db_->filter(tags),"One-change OR tags mismatch");
         checkBrowseRejectToggle(browser,tags);
         browser.mode_.setSelectedId(2,juce::sendNotificationSync);
@@ -246,15 +361,108 @@ public:
                 require(browser.list_.getBottom()==browser.stock_list_.getBottom() && browser.list_.getBottom()<browser.preview_.getY(),"Lists did not stretch to the bottom controls");
                 require(!browser.list_.getBounds().intersects(browser.stock_list_.getBounds()),"Columns overlap");
                 require(browser.two_changes_.getRight()<browser.stock_list_.getX(),"Toolbar overlaps stock");
+                require(browser.tag_hint_.getY() == browser.match_.getY()
+                    && browser.tag_hint_.getRight() < browser.match_.getX()
+                    && browser.tag_list_.getY() == browser.tag_hint_.getBottom() + UiLayout::xs,
+                    "Tag AND/OR must share the hint row and return the freed row to the list");
+                require(browser.cluster_size_.getY() == browser.group_.getY()
+                    && browser.cluster_size_.getRight() < browser.group_.getX()
+                    && browser.group_.getRight() == browser.details_.getRight(),
+                    "Classification toggles/group selector must share the unchanged left-column width");
+                require(!browser.mode_.getBounds().intersects(browser.rejected_.getBounds())
+                    && browser.mode_.getWidth() > UiLayout::libraryWidth,
+                    "Search modes overlap the unstable-sound toggle or retain the old narrow menu width");
                 if(baseWidth==1100 && baseHeight==700 && !screenshots.empty()) {
                     browser.list_.updateContent();browser.stock_list_.updateContent();
                     auto image=browser.createComponentSnapshot(browser.getLocalBounds());
                     juce::File file(juce::String((screenshots/("patchslide-"+std::to_string(scale)+".png")).wstring().c_str()));
                     auto out=file.createOutputStream();require(out && juce::PNGImageFormat().writeImageToStream(image,*out),"Snapshot failed");
+                    for (const int mode : {1, 2}) {
+                        browser.mode_.setSelectedId(mode, juce::dontSendNotification); browser.updateMode();
+                        auto modeOutput = juce::File(juce::String((screenshots / ("patchslide-mode-" + std::to_string(mode)
+                            + "-" + std::to_string(scale) + ".png")).wstring().c_str())).createOutputStream();
+                        require(modeOutput && juce::PNGImageFormat().writeImageToStream(browser.createComponentSnapshot(browser.getLocalBounds()), *modeOutput),
+                            "Tag/classification browser snapshot failed");
+                    }
+                    browser.mode_.setSelectedId(3, juce::dontSendNotification); browser.updateMode();
                 }
             }
         }
         UiScale::setActivePercent(100);
+        browser.setExternalQuerySource(*soundOne);
+        require(browser.busy_ && !browser.selectedTimbre(), "External query retained an old implicit source");
+        press(browser.stop_);
+        require(!browser.busy_ && !browser.selectedTimbre(), "External query stop did not cancel without selecting a candidate");
+        browser.requestBrowse();
+        settle(browser);
+        require(browser.query_kind_ == Browser::QueryKind::External && !browser.rows_.empty(),
+            "Edited OPLL sound did not produce external similarity results");
+        require(!browser.selectedTimbre() && !browser.variation_.isEnabled(),
+            "External result invented a candidate ID for the query");
+        require(browser.status_.getText().contains(juce::String::fromUTF8("編集中の音色から近似")),
+            "External query was mislabeled as a DB candidate search");
+        browser.list_.selectRow(0);
+        require(browser.selectedCandidate() && browser.variation_.isEnabled(),
+            "External result selection did not enable candidate-origin Variation");
+        int mode_changes{}, compare_changes{};
+        bool requested_whole = true, requested_original = false;
+        browser.setEnvelopeAuditionControls([&](bool whole) { ++mode_changes; requested_whole = whole; },
+            [&](bool original) { ++compare_changes; requested_original = original; });
+        require(browser.auditionWholeComposite() && !browser.auditionOriginal()
+            && browser.audition_mode_.isVisible() && browser.compare_.isVisible(),
+            "Envelope audition must expose its controls with whole-composite/candidate defaults");
+        press(browser.compare_);
+        require(requested_original && browser.auditionOriginal() && compare_changes == 1,
+            "A/B did not route to the original editing sound");
+        press(browser.audition_mode_.buttonAt(0));
+        require(!requested_whole && !browser.auditionWholeComposite() && mode_changes == 1,
+            "Single PatchSlide audition switch did not reach its callback");
+        browser.clearSelection();
+        require(browser.auditionOriginal(), "Result clearing changed the retained audition side");
+        browser.selectCandidate(one);
+        require(!browser.auditionOriginal() && compare_changes == 1,
+            "Explicit new candidate must silently reset A/B before its sole selection notification");
+        browser.setEnvelopeAuditionWholeComposite(true, juce::sendNotificationSync);
+        for (const int scale : {75, 100, 125}) {
+            UiScale::setActivePercent(scale);
+            browser.setSize(UiScale::sx(1100), UiScale::sx(700)); browser.resized();
+            require(browser.audition_mode_.getY() == browser.stop_.getY()
+                && browser.audition_mode_.getX() > browser.stop_.getRight()
+                && browser.audition_mode_.getRight() < browser.apply_.getX(),
+                "Envelope audition toggle does not fit to the right of Stop");
+            require(browser.compare_.getY() == browser.two_changes_.getY()
+                && browser.compare_.getX() > browser.two_changes_.getRight()
+                && browser.compare_.getRight() < browser.stock_list_.getX(),
+                "Envelope A/B does not fit beside the two-change filter");
+            if (!screenshots.empty()) {
+                auto output = juce::File(juce::String((screenshots / ("patchslide-envelope-" + std::to_string(scale) + ".png")).wstring().c_str())).createOutputStream();
+                require(output && juce::PNGImageFormat().writeImageToStream(browser.createComponentSnapshot(browser.getLocalBounds()), *output),
+                    "Envelope browser snapshot failed");
+            }
+        }
+        UiScale::setActivePercent(100);
+        press(browser.variation_); settle(browser);
+        require(browser.query_kind_ == Browser::QueryKind::Variation,
+            "Variation did not transition to the explicitly selected DB candidate");
+        const auto notifications_before_adoption=selection_notifications;
+        {
+            const juce::ScopedValueSetter<bool> adopting(browser.adopting_result_,true);
+            browser.selectCandidate(one);
+            browser.clearSelection();
+        }
+        require(selection_notifications==notifications_before_adoption && !browser.selectedCandidate(),
+            "Late result reconciliation changed the performance program or retained a cleared identity");
+        browser.selectCandidate(one);
+        browser.clearSelection();
+        require(selection_notifications==notifications_before_adoption+2,
+            "Explicit selection/clear must each deliver exactly one performance notification");
+        auto invalid_query=*soundOne;
+        invalid_query.layers.front().relative_semitones=-100;
+        browser.setExternalQuerySource(std::move(invalid_query)); settle(browser);
+        require(browser.db_ && !browser.selectedTimbre() && !browser.apply_.isEnabled()
+            && browser.details_.getText().contains("supported pitch")
+            && !browser.details_.getText().contains(juce::String::fromUTF8("正しい3ファイル")),
+            "A failed acoustic query must preserve authoring and explain its input error without blaming a valid DB");
         require(stops>0,"No selection/preview stop boundary ran");
         std::cout<<"PatchSlide stock/filter/explicit selection/layout and async regressions passed\n";
     }

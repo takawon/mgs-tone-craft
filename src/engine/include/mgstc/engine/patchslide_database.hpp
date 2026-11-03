@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -80,6 +81,22 @@ struct PatchSlideVariationResult {
     std::size_t positive_source_distances = 0;
 };
 
+enum class PatchSlideLoadStage {
+    Waiting, Files, SourceHash, SearchHash, Metadata, Candidates, Vectors, Tags, Clusters, Completed
+};
+
+struct PatchSlideLoadProgress {
+    PatchSlideLoadStage stage{PatchSlideLoadStage::Waiting};
+    std::size_t completed{}, total{};
+    double fraction{};
+};
+
+struct PatchSlideLoadOptions {
+    // Invoked only by the non-audio caller, never by a realtime/render thread.
+    std::function<void(const PatchSlideLoadProgress&)> progress;
+    std::function<bool()> cancelled;
+};
+
 // Loading, filtering and searches belong on a non-audio worker. Immutable metadata
 // accessors are safe on the UI thread. After loading SQLite handles are closed;
 // concurrent queries need no shared mutable state. Never use this API in audio.
@@ -91,11 +108,14 @@ public:
     static constexpr std::size_t vector_dimension = 768;
     [[nodiscard]] static std::filesystem::path defaultDirectory();
     // Instances in one process share an immutable data set by canonical directory.
+    // The most recent verified set stays resident after its last browser closes;
+    // changed file stamps trigger revalidation. At most one inactive set is pinned.
     // Errors include missing filenames and the deployment directory. No dialogs.
     [[nodiscard]] static std::shared_ptr<const PatchSlideDatabase> load(
-        const std::filesystem::path& directory, std::string* error = nullptr);
+        const std::filesystem::path& directory, std::string* error = nullptr,
+        const PatchSlideLoadOptions& options = {});
     [[nodiscard]] static std::shared_ptr<const PatchSlideDatabase> load(
-        std::string* error = nullptr);
+        std::string* error = nullptr, const PatchSlideLoadOptions& options = {});
 
     [[nodiscard]] const std::vector<PatchSlideCandidate>& candidates() const noexcept;
     [[nodiscard]] const std::vector<PatchSlideTag>& tags() const noexcept;
@@ -107,6 +127,10 @@ public:
     [[nodiscard]] std::vector<std::size_t> filter(const PatchSlideFilter& filter) const;
     [[nodiscard]] std::vector<PatchSlideSearchResult> standardB(
         std::size_t source_index, std::size_t top_n) const;
+    // External frozen-B query. Includes every candidate (there is no source ID
+    // to exclude); ties retain candidate_id order. Call only on a worker.
+    [[nodiscard]] std::vector<PatchSlideSearchResult> searchFromVector(
+        std::span<const double> query, std::size_t top_n) const;
     [[nodiscard]] PatchSlideVariationResult variation(std::size_t source_index) const;
     // Restrict sequence lengths before choosing the eligible Standard B pool256.
     // The score expression and tie ordering are identical to the unfiltered mode.
@@ -129,7 +153,7 @@ private:
     std::vector<double> norms_;
     [[nodiscard]] PatchSlideVariationResult variationFromPool(
         std::span<const PatchSlideSearchResult> pool) const;
-    void read(const std::filesystem::path& directory);
+    void read(const std::filesystem::path& directory, const PatchSlideLoadOptions& options);
 };
 
 } // namespace mgstc::engine

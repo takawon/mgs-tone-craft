@@ -80,9 +80,7 @@ bool layerUsesSequenceEnvelope(const CompositeLayer& layer) noexcept {
         return true; // Keep malformed authoring data visible to validation.
     }
     if (layer.source == TimbreSource::Psg) {
-        const auto mixer = sequenceEnvelopeMixer(layer.volume_envelope.rate);
-        if (mixer.tone_mode != kMgscSequenceToneModeDefault
-            || mixer.noise != kMgscSequenceNoiseDefault) {
+        if (hasPsgEnvelopeMixer(layer)) {
             return true;
         }
     }
@@ -335,6 +333,10 @@ CompositeValidation validateCompositeTimbre(
     std::array<std::array<bool, 16>, 3> used{};
     constexpr std::array<std::uint8_t, 3> capacities{3, 5, 9};
     for (const auto& layer : timbre.layers) {
+        if ((layer.psg_tone_mode && *layer.psg_tone_mode > 3)
+            || (layer.psg_noise && *layer.psg_noise > 31)) {
+            result.warnings.emplace_back("PSG track mode or noise is outside its supported range");
+        }
         if (!layer.enabled) {
             continue;
         }

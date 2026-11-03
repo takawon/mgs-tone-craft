@@ -5,6 +5,7 @@
 #include "plugin_editor_context.hpp"
 #include "mgstc_editor_view.hpp"
 #include "ui_layout.hpp"
+#include "mgstc_look_and_feel.hpp"
 #include "tone_library_session.hpp"
 #include <rpc/server.h>
 
@@ -214,6 +215,40 @@ struct LibraryManagerListTabTestAccess {
 namespace mgstc::app {
 
 struct SatelliteEditorParityTestAccess {
+    static PerformanceKeyboard& keyboard(SccEditorComponent& editor) { return editor.performance_keyboard_; }
+    static PerformanceKeyboard& keyboard(OpllEditorComponent& editor) { return editor.performance_keyboard_; }
+    static bool envelopeScopeControlsVisible(const PerformanceKeyboard& keyboard) {
+        return keyboard.single_tone_.isVisible() && keyboard.whole_tone_.isVisible();
+    }
+    static void clickEnvelopeScope(PerformanceKeyboard& keyboard, bool whole) {
+        if (whole) keyboard.whole_tone_.onClick(); else keyboard.single_tone_.onClick();
+    }
+    static juce::Rectangle<int> envelopeSingleBounds(const PerformanceKeyboard& keyboard) { return keyboard.single_tone_.getBounds(); }
+    static juce::Rectangle<int> envelopeWholeBounds(const PerformanceKeyboard& keyboard) { return keyboard.whole_tone_.getBounds(); }
+    static juce::Rectangle<int> polyModeBounds(const PerformanceKeyboard& keyboard) { return keyboard.mode_.getBounds(); }
+    static bool wholeComposite(const PerformanceKeyboard& keyboard) { return keyboard.wholeComposite(); }
+    static bool scopeUsesSegmentStyle(PerformanceKeyboard& keyboard) {
+        juce::LookAndFeel_V4 host_style;
+        keyboard.setLookAndFeel(&host_style);
+        const bool matches = isSegmentButton(keyboard.single_tone_) && isSegmentButton(keyboard.whole_tone_)
+            && dynamic_cast<MgstcLookAndFeel*>(&keyboard.single_tone_.getLookAndFeel())
+            && dynamic_cast<MgstcLookAndFeel*>(&keyboard.whole_tone_.getLookAndFeel());
+        keyboard.setLookAndFeel(nullptr);
+        return matches;
+    }
+    static bool saveKeyboardRow(PerformanceKeyboard& keyboard, MgstcLookAndFeel& look_and_feel,
+        const juce::File& file) {
+        if (file.getParentDirectory().createDirectory().failed()) return false;
+        auto stream = file.createOutputStream();
+        if (!stream || !stream->openedOk()) return false;
+        if (!stream->setPosition(0) || stream->truncate().failed()) return false;
+        keyboard.setLookAndFeel(&look_and_feel);
+        keyboard.sendLookAndFeelChange();
+        const auto image = keyboard.createComponentSnapshot(keyboard.getLocalBounds());
+        keyboard.setLookAndFeel(nullptr);
+        keyboard.sendLookAndFeelChange();
+        return juce::PNGImageFormat().writeImageToStream(image, *stream);
+    }
     static void checkSccWav(SccEditorComponent& editor) {
         const auto check = [](bool value, const char* message) {
             if (!value) throw std::runtime_error(message);
@@ -500,6 +535,67 @@ struct SatelliteEditorParityTestAccess {
 };
 
 struct CompositeEditorComponentTestAccess {
+    static void setOwnedCompositeScope(CompositeEditorComponent& editor, bool whole) { editor.setOwnedEditWholeComposite(whole); }
+    static std::optional<std::size_t> ownedMonoLayer(const CompositeEditorComponent& editor) { return editor.ownedEditAuditionLayer(); }
+    static void auditionOwnedNote(CompositeEditorComponent& editor, std::uint8_t note) { editor.ownedEditNoteOn(note); }
+    static void releaseOwnedNote(CompositeEditorComponent& editor, std::uint8_t note) { editor.ownedEditNoteOff(note); }
+    static std::vector<std::size_t> scheduledAuditionLayers(const CompositeEditorComponent& editor) {
+        const auto plan = mgstc::engine::buildCompositePlaybackPlan(editor.workingTimbre());
+        std::vector<std::size_t> result;
+        for (const auto& scheduled : editor.scheduled_layer_notes_) {
+            for (const auto& binding : plan.audible_layers) {
+                if (plan.physicalTrack(binding, scheduled.voice) == scheduled.track) {
+                    result.push_back(binding.layer_index);
+                    break;
+                }
+            }
+        }
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+    static void bindOwnedScopeTarget(CompositeEditorComponent& editor,
+        const mgstc::engine::SavedTimbreReference& target, std::size_t layer) {
+        editor.owned_edit_layer_ = layer;
+        editor.link_.owned_target = target;
+        editor.link_.owned_published = target;
+    }
+    static void previewEnvelopeOriginal(CompositeEditorComponent& editor, bool whole) {
+        editor.previewEnvelopePatchSlideOriginal(editor.envelope_patchslide_session_, whole, false);
+    }
+    static std::optional<mgstc::engine::CompositeTimbre> envelopeQuerySource(
+        const CompositeEditorComponent& editor, std::size_t index) {
+        return editor.envelopePatchSlideQuerySource(editor.envelope_patchslide_session_->original, index);
+    }
+    static void showEnvelopePatchSlide(CompositeEditorComponent& editor, std::size_t index) {
+        const auto* directory = std::getenv("MGSTC_PATCHSLIDE_TEST_DB_DIR");
+        editor.showEnvelopePatchSlide(index, directory ? std::filesystem::path(directory) : std::filesystem::path{});
+    }
+    static bool hasEnvelopePatchSlideWindow(const CompositeEditorComponent& editor) {
+        return editor.envelope_patchslide_window_ != nullptr;
+    }
+    static bool envelopeLoopConfirmationPending(const CompositeEditorComponent& editor) {
+        return editor.envelope_patchslide_session_ && editor.envelope_patchslide_session_->confirmation_pending;
+    }
+    static void beginEnvelopePatchSlide(CompositeEditorComponent& editor, std::size_t index) {
+        auto state = std::make_shared<CompositeEditorComponent::EnvelopePatchSlideSession>();
+        state->original = editor.workingTimbre(); state->layer_index = index;
+        state->generation = editor.host_restore_generation_;
+        editor.envelope_patchslide_session_ = std::move(state);
+    }
+    static void envelopePatchSlide(CompositeEditorComponent& editor,
+        const mgstc::engine::PatchSlideCandidate& candidate, bool whole, bool one_second = false, bool commit = false) {
+        editor.useEnvelopePatchSlide(editor.envelope_patchslide_session_, candidate, whole, one_second, commit);
+    }
+    static void approveEnvelopeLoop(CompositeEditorComponent& editor,
+        const mgstc::engine::PatchSlideCandidate& candidate) {
+        const auto& state = editor.envelope_patchslide_session_;
+        const auto prepared = mgstc::engine::preparePatchSlideEnvelopeApply(state->original, state->layer_index, candidate);
+        if (!prepared.loop_conflict) throw std::runtime_error("expected a PatchSlide loop conflict");
+        state->approved_candidate = candidate.candidate_id;
+        state->approved_timeline = prepared.loop_conflict->proposed_timeline;
+    }
+    static void finishEnvelopePatchSlide(CompositeEditorComponent& editor) { editor.finishEnvelopePatchSlide(editor.envelope_patchslide_session_); }
+    static bool envelopeCurrent(const CompositeEditorComponent& editor) { return editor.envelopePatchSlideCurrent(editor.envelope_patchslide_session_); }
     static juce::String patchSlideStatus(const CompositeEditorComponent& editor) { return editor.status_.getText(); }
     static const juce::String title(const CompositeEditorComponent& editor) {
         return editor.title_.getText();
@@ -696,6 +792,26 @@ struct CompositeWavConversionTestAccess {
     static void setKeyOff(CompositeWavConversionContent& content, const juce::String& keyoff) { content.key_off_.setText(keyoff, true); }
     static void setConfiguration(CompositeWavConversionContent& content, int id) {
         content.configuration_.setSelectedId(id, juce::sendNotificationSync);
+    }
+    static int configurationCount(const CompositeWavConversionContent& content) { return content.configuration_.getNumItems(); }
+    static juce::String configurationLabel(const CompositeWavConversionContent& content, int id) { return content.configuration_.getItemText(id - 1); }
+    static void setStrategy(CompositeWavConversionContent& content, int id) { content.strategy_.setSelectedId(id, juce::sendNotificationSync); }
+    static int strategy(const CompositeWavConversionContent& content) { return content.strategy_.getSelectedId(); }
+    static bool strategiesEnabled(const CompositeWavConversionContent& content) { return content.strategy_.isEnabled() && content.strategy_.getNumItems() == 5; }
+    static void setPreference(CompositeWavConversionContent& content, int id) { content.preference_.setSelectedId(id, juce::sendNotificationSync); }
+    static bool sccControlsMatch(const CompositeWavConversionContent& content, bool enabled) {
+        return content.budget_.isEnabled() == enabled && content.source_budget_.isEnabled() == enabled
+            && content.wave_method_.isEnabled() == enabled && content.labels_[4].isEnabled() == enabled
+            && content.labels_[5].isEnabled() == enabled && content.labels_[11].isEnabled() == enabled
+            && (enabled || (content.labels_[4].getText().contains(juce::String::fromUTF8("該当なし"))
+                && content.labels_[5].getText().contains(juce::String::fromUTF8("該当なし"))
+                && content.labels_[11].getText().contains(juce::String::fromUTF8("該当なし"))));
+    }
+    static juce::String budgetText(const CompositeWavConversionContent& content) { return content.budget_.getText(); }
+    static bool longConfigurationLayout(CompositeWavConversionContent& content) {
+        return content.getLocalBounds().contains(content.configuration_.getBounds())
+            && content.configuration_.getWidth() >= UiLayout::compositeInspectorLabelW * 3
+            && content.configuration_.getTooltip() == content.configuration_.getText();
     }
     static void setBudget(CompositeWavConversionContent& content, int count) { content.budget_.setText(juce::String(count), false); }
     static void setSourceBudget(CompositeWavConversionContent& content, int count) { content.source_budget_.setSelectedId(count + 1, juce::sendNotificationSync); }
@@ -4282,15 +4398,20 @@ void testSccMorphPluginStateCompatibility() {
     const auto framed = mgstc::plugin::serializePluginState(document);
     // v21 adds only the five global morph bytes.
     // v20 adds four six-byte modulation settings before the embedded count.
-    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3}, std::uint8_t{4}, std::uint8_t{5}, std::uint8_t{6}}) {
+    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3}, std::uint8_t{4}, std::uint8_t{5}, std::uint8_t{6}, std::uint8_t{7}}) {
         auto legacy = original;
         require(legacy.size() >= 64, "legacy sound fixture tail exists");
+        require(legacy[legacy.size() - 11] == 0 && legacy[legacy.size() - 10] == 0,
+            "legacy fixture has unset track PSG settings");
+        legacy.erase(legacy.end() - 11, legacy.end() - 9);
         std::vector<std::uint8_t> unset_noise(19, 0);
         unset_noise[6] = 1;
         unset_noise[7] = 1;
-        require(std::equal(unset_noise.begin(), unset_noise.end(), legacy.end() - 42),
-            "legacy fixture has the unset v25 Noise auto/modulation addition");
-        legacy.erase(legacy.end() - 42, legacy.end() - 23);
+        if (version <= 6) {
+            require(std::equal(unset_noise.begin(), unset_noise.end(), legacy.end() - 42),
+                "legacy fixture has the unset v25 Noise auto/modulation addition");
+            legacy.erase(legacy.end() - 42, legacy.end() - 23);
+        }
         if (version <= 5) legacy.erase(legacy.end() - 21, legacy.end() - 9);
         if (version <= 3) legacy.erase(legacy.end() - 11, legacy.end() - 9);
         if (version <= 2) legacy.resize(legacy.size() - 5);
@@ -4318,7 +4439,7 @@ void testSccMorphPluginStateCompatibility() {
                 static_cast<unsigned>(version), static_cast<unsigned>(parsed.status));
         }
         require(parsed.status == mgstc::plugin::PluginStateStatus::Ok,
-                "legacy v1/v2/v3/v4/v5/v6 plugin sound payload readable");
+                "legacy v1/v2/v3/v4/v5/v6/v7 plugin sound payload readable");
         auto expected_legacy_sound = document.sound;
         if (version <= 2) expected_legacy_sound.scc_morph_algorithm_version = 1;
         require(soundBytes(parsed.document.sound) == soundBytes(expected_legacy_sound),
@@ -4578,6 +4699,7 @@ void testOwnedEditorPendingTargetKeepsSnapshot() {
     using mgstc::engine::SavedTimbreReference;
     using mgstc::engine::TimbreSource;
     MgstcAudioProcessor processor;
+    MgstcLookAndFeel screenshotLookAndFeel;
     processor.prepareToPlay(48'000.0, 512);
     mgstc::plugin::PluginEditorContext context(processor);
     mgstc::app::EditorLink link;
@@ -4588,6 +4710,14 @@ void testOwnedEditorPendingTargetKeepsSnapshot() {
         [](juce::Component*) {}, true, [] {});
     mgstc::app::OpllEditorComponent opll(context, link, open, [] {},
         [](juce::Component*) {}, true, [] {});
+    mgstc::app::SccEditorComponent standalone_scc(context, link, open, [] {},
+        [](std::vector<mgstc::engine::OpllPatchParameters>) {},
+        [](juce::Component*) {}, false, [] {});
+    mgstc::app::OpllEditorComponent standalone_opll(context, link, open, [] {},
+        [](juce::Component*) {}, false, [] {});
+    require(!Access::envelopeScopeControlsVisible(Access::keyboard(standalone_scc))
+        && !Access::envelopeScopeControlsVisible(Access::keyboard(standalone_opll)),
+        "standalone SCC and OPLL editing windows hide the composite-scope controls");
     std::size_t synced = 0;
     link.owned_audition = {
         [&] {
@@ -4657,6 +4787,46 @@ void testOwnedEditorPendingTargetKeepsSnapshot() {
     };
     exercise(scc, TimbreSource::Scc, 1);
     exercise(opll, TimbreSource::Opll, 2);
+    link.owned_audition = {};
+    require(Access::envelopeScopeControlsVisible(Access::keyboard(scc))
+        && Access::envelopeScopeControlsVisible(Access::keyboard(opll)),
+        "composite-owned SCC and OPLL editor windows expose the audition-scope toggle");
+    require(Access::wholeComposite(Access::keyboard(scc))
+        && Access::wholeComposite(Access::keyboard(opll)),
+        "audition scope defaults to the whole composite in both editors");
+    require(Access::scopeUsesSegmentStyle(Access::keyboard(scc))
+        && Access::scopeUsesSegmentStyle(Access::keyboard(opll)),
+        "SCC/OPLL audition toggles reuse the reference segment design even in a default host theme");
+    for (const int percent : {75, 100, 125}) {
+        const int previousScale = UiScale::active_percent;
+        UiScale::setActivePercent(percent);
+        for (auto* editor : {static_cast<juce::Component*>(&scc), static_cast<juce::Component*>(&opll)}) {
+            editor->setSize(UiScale::sx(UiLayout::editorWindowW), UiScale::sx(UiLayout::editorWindowH));
+            editor->resized();
+        }
+        for (auto* keyboard : {&Access::keyboard(scc), &Access::keyboard(opll)}) {
+            const auto single = Access::envelopeSingleBounds(*keyboard);
+            const auto whole = Access::envelopeWholeBounds(*keyboard);
+            const auto poly = Access::polyModeBounds(*keyboard);
+            require(single.getHeight() == poly.getHeight() && whole.getHeight() == poly.getHeight()
+                && single.getRight() <= whole.getX() && whole.getRight() <= poly.getX()
+                && keyboard->getLocalBounds().contains(single) && keyboard->getLocalBounds().contains(whole),
+                "scope toggle sits to the left of Poly/Mono at the same height and fits all three scales");
+        }
+        if (const auto* screenshots = std::getenv("MGSTC_PATCHSLIDE_SCREENSHOTS")) {
+            const juce::File directory(juce::String::fromUTF8(screenshots));
+            require(Access::saveKeyboardRow(Access::keyboard(scc), screenshotLookAndFeel, directory.getChildFile(
+                    "patchslide-envelope-scc-" + juce::String(percent) + ".png"))
+                && Access::saveKeyboardRow(Access::keyboard(opll), screenshotLookAndFeel, directory.getChildFile(
+                    "patchslide-envelope-opll-" + juce::String(percent) + ".png")),
+                "SCC/OPLL composite-scope keyboard row images render at every UI scale");
+        }
+        UiScale::setActivePercent(previousScale);
+    }
+    Access::clickEnvelopeScope(Access::keyboard(scc), false);
+    require(!Access::wholeComposite(Access::keyboard(scc)), "Mono selection reaches the owned-editor callback state");
+    Access::clickEnvelopeScope(Access::keyboard(scc), true);
+    require(Access::wholeComposite(Access::keyboard(scc)), "Poly/whole-composite selection restores the default scope");
 }
 
 void testEditorParityCorrections() {
@@ -6952,7 +7122,57 @@ void testCompositeWavRangeInteractions() {
     require(range.selection().end > range.selection().begin, "range prevents reversed/empty selection");
 }
 
-void testCompositeWavActualUiWorkerAndApply() {
+void testCompositeWavPatchSlideControls() {
+    using Access=mgstc::app::CompositeWavConversionTestAccess;
+    mgstc::app::CompositeWavConversionContent content([](const auto&,auto) {});
+    const std::array<const char*,7> labels{"SCC単音", "SCC × SCC", "SCC × OPLL固定", "SCC × OPLLオリジナル",
+        "SCC × OPLLパッチスライド", "OPLLオリジナル × OPLLパッチスライド", "OPLLパッチスライド × OPLLパッチスライド"};
+    require(Access::configurationCount(content)==7, "WAV configurations retain all four existing choices and add exactly three");
+    Access::setBudget(content,8); Access::setSourceBudget(content,3); Access::setWaveMethod(content,2);
+    for (int id=1;id<=7;++id) {
+        Access::setConfiguration(content,id);
+        require(Access::configurationLabel(content,id)==juce::String::fromUTF8(labels[static_cast<std::size_t>(id-1)]),
+            "WAV configuration labels/order do not match the engine enum");
+        require(Access::sccControlsMatch(content,id<=5), "SCC settings must be marked not applicable only for the two OPLL-only configurations");
+        require(Access::budgetText(content)=="8" && Access::sourceBudget(content)==3 && Access::waveMethod(content)==2,
+            "configuration changes must retain inactive SCC settings for returning to SCC");
+        if (id!=1) for (int strategy=1;strategy<=5;++strategy) {
+            Access::setStrategy(content,strategy);
+            require(Access::strategiesEnabled(content) && Access::strategy(content)==strategy,
+                "every two-channel configuration must expose all five real strategies");
+        }
+    }
+    const auto previous_scale=UiScale::active_percent;
+    const auto* captures=std::getenv("MGSTC_PATCHSLIDE_SCREENSHOTS");
+    for (const int scale:{75,100,125}) {
+        UiScale::setActivePercent(scale);
+        content.setSize(UiScale::sx(1080),UiScale::sx(900)); content.resized();
+        require(Access::buttonsInside(content) && Access::longConfigurationLayout(content),
+            "new long configuration labels and all settings must fit at every supported scale");
+        if (captures) {
+            juce::File directory(juce::String::fromUTF8(captures));
+            require(directory.createDirectory().wasOk(), "cannot create WAV UI screenshot directory");
+            auto output=directory.getChildFile("wav-patchslide-"+juce::String(scale)+".png").createOutputStream();
+            require(output && juce::PNGImageFormat().writeImageToStream(content.createComponentSnapshot(content.getLocalBounds()),*output),
+                "cannot render WAV PatchSlide UI verification image");
+        }
+    }
+    UiScale::setActivePercent(previous_scale);
+}
+
+bool havePatchSlideUiDatabase() {
+    const auto* configured=std::getenv("MGSTC_PATCHSLIDE_TEST_DB_DIR");
+    const auto directory=configured ? std::filesystem::path(configured) : mgstc::engine::PatchSlideDatabase::defaultDirectory();
+    const bool present=std::filesystem::is_regular_file(directory/"patchslide.sqlite")
+        && std::filesystem::is_regular_file(directory/"patchslide_search.sqlite")
+        && std::filesystem::is_regular_file(directory/"manifest.json");
+    require(present || !configured, "explicitly configured PatchSlide UI test DB is missing");
+    if (!present) std::cout << "Actual PatchSlide WAV UI worker skipped (optional DB not installed).\n";
+    return present;
+}
+
+void testCompositeWavActualUiWorkerAndApply(
+    mgstc::engine::CompositeWavConfiguration configuration = mgstc::engine::CompositeWavConfiguration::Scc) {
     using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
     using WavAccess = mgstc::app::CompositeWavConversionTestAccess;
     MgstcAudioProcessor processor;
@@ -6987,11 +7207,19 @@ void testCompositeWavActualUiWorkerAndApply() {
             applied = true;
             EditorAccess::applyWave(editor, converted);
             if (close) close();
-        }, context.pcmPreview(), context.backgroundTasks());
+        }, context.pcmPreview(), context.backgroundTasks(),
+        std::getenv("MGSTC_PATCHSLIDE_TEST_DB_DIR") ? std::filesystem::path(std::getenv("MGSTC_PATCHSLIDE_TEST_DB_DIR")) : std::filesystem::path{});
     EditorAccess::bindWaveAudition(editor, content);
     WavAccess::source(content, pcm);
+    WavAccess::setConfiguration(content, static_cast<int>(configuration) + 1);
+    const bool uses_scc=mgstc::engine::configurationUsesScc(configuration);
+    if (!uses_scc) {
+        WavAccess::setStrategy(content, 5);
+        WavAccess::setPreference(content, 3);
+        WavAccess::setPitch(content, "220");
+    }
     WavAccess::setWaveMethod(content, 2);
-    WavAccess::setBudget(content, 8);
+    WavAccess::setBudget(content, uses_scc ? 8 : 0);
     require(WavAccess::sourceBudget(content) == 0, "source limit defaults to automatic");
     WavAccess::setSourceBudget(content, 1);
     WavAccess::clickAnalyze(content);
@@ -7008,9 +7236,15 @@ void testCompositeWavActualUiWorkerAndApply() {
     // Unoptimized Debug PCM candidate evaluation can exceed 30 seconds.
     // Keep a finite worker-completion wait without imposing a Release-speed
     // requirement on this functional transaction test.
-    for (int wait = 0; wait < 15000 && !WavAccess::hasResult(content); ++wait)
+    for (int wait = 0; wait < 15000 && !WavAccess::hasResult(content); ++wait) {
         juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
-    require(WavAccess::hasResult(content), "Convert button runs actual optimizer and publishes its completed result");
+        if (!WavAccess::loading(content) && !WavAccess::hasResult(content)) {
+            juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+            break;
+        }
+    }
+    const auto conversion_failure=std::string("Convert button failed to publish actual result: ")+WavAccess::status(content).toStdString();
+    require(WavAccess::hasResult(content),conversion_failure.c_str());
     std::set<std::array<std::uint8_t, 32>> source_waves;
     const auto& converted_tone = *WavAccess::result(content)->composite_tone;
     for (const auto& layer : converted_tone.layers) {
@@ -7023,7 +7257,16 @@ void testCompositeWavActualUiWorkerAndApply() {
             source_waves.insert(ref->scc_waveform);
         }
     }
-    require(source_waves.size() == 1, "UI source limit reaches optimizer independently of total Bank limit");
+    if (uses_scc) require(source_waves.size() == 1, "UI source limit reaches optimizer independently of total Bank limit");
+    else {
+        require(source_waves.empty() && WavAccess::result(content)->resource_plan.scc_waveforms == 0
+            && converted_tone.layers.size() == 2
+            && std::all_of(converted_tone.layers.begin(), converted_tone.layers.end(),
+                [](const auto& layer) { return layer.source == mgstc::engine::TimbreSource::Opll; }),
+            "OPLL-only UI conversion ignores disabled zero SCC budget and actually creates two OPLL channels");
+        require(mgstc::engine::buildCompositePlaybackPlan(converted_tone).voice_capacity == 4,
+            "two OPLL channels share the real nine-channel chip instead of independent chips");
+    }
     require(EditorAccess::hasWavePreview(editor) && sameAuthoringSound(EditorAccess::sound(editor), previous)
             && sameAuthoringSound(processor.copyPluginState().sound, previous),
         "actual direct-periodic conversion publishes candidate for performance without committing it");
@@ -7526,6 +7769,161 @@ void testPatchSlideSharedEditorTransactions() {
             "Applying PatchSlide in the second instance leaves the first instance unchanged");
 }
 
+void testEnvelopePatchSlideTransactions() {
+    using namespace mgstc::engine;
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    PatchSlideCandidate candidate;
+    candidate.candidate_id = "envelope_0_5_14_h12";
+    candidate.patch_a = 0; candidate.patch_b = 5; candidate.patch_c = 14;
+    candidate.change_count = 2; candidate.hold_a_steps = 1; candidate.hold_b_steps = 2; candidate.hold_pattern = "h12";
+    auto original = defaultCompositeTimbre();
+    original.name = "Envelope PatchSlide transaction";
+    auto& layer = original.layers[2];
+    SavedTimbreReference owned_original;
+    owned_original.source = TimbreSource::Opll;
+    owned_original.library_id = 0xff00000000000077ULL;
+    owned_original.name = "Owned OPLL source";
+    owned_original.opll_registers = encodeOpllPatch(defaultOpllPatch());
+    layer.base_opll_rom.reset();
+    layer.base_timbre = owned_original;
+    original.embedded_timbres.push_back(owned_original);
+    layer.envelope_timeline.length_counts = 12;
+    layer.envelope_timeline.loop_start_count.reset(); layer.envelope_timeline.loop_end_count.reset();
+    layer.volume_envelope.events = {{.kind=EnvelopeEventKind::Volume,.value=12,.count=0},
+        {.kind=EnvelopeEventKind::Volume,.value=6,.count=6}};
+    layer.pitch_envelope.events = {{.kind=EnvelopeEventKind::Pitch,.value=2,.count=1}};
+    layer.timbre_automation = {{.kind=EnvelopeEventKind::Timbre,.value=3,.count=0,.timbre_pick=TimbrePick::OpllRom},
+        {.kind=EnvelopeEventKind::Timbre,.value=8,.count=10,.timbre_pick=TimbrePick::OpllRom},
+        {.kind=EnvelopeEventKind::RegisterWrite,.value=12,.secondary=3,.count=1}};
+    MgstcAudioProcessor preview_processor, apply_processor;
+    require(preview_processor.replacePluginState(documentFrom(original, 0, {}))
+        && apply_processor.replacePluginState(documentFrom(original, 0, {})), "seed envelope PatchSlide processors");
+    preview_processor.prepareToPlay(48'000.0,512); apply_processor.prepareToPlay(48'000.0,512);
+    processEmpty(preview_processor,512); processEmpty(apply_processor,512);
+    mgstc::plugin::PluginEditorContext preview_context(preview_processor), apply_context(apply_processor);
+    mgstc::app::EditorLink preview_link, apply_link;
+    mgstc::app::CompositeEditorComponent preview(preview_context, preview_link,
+        [](const juce::String&,std::optional<std::uint64_t>){}, []{}, [](std::uint8_t){}, [](juce::Component*){}, []{}, original);
+    mgstc::app::CompositeEditorComponent applied(apply_context, apply_link,
+        [](const juce::String&,std::optional<std::uint64_t>){}, []{}, [](std::uint8_t){}, [](juce::Component*){}, []{}, original);
+    MgstcAudioProcessor scope_processor;
+    require(scope_processor.replacePluginState(documentFrom(original, 0, {})), "seed isolated scope-routing processor");
+    scope_processor.prepareToPlay(48'000.0, 512);
+    processEmpty(scope_processor, 512);
+    mgstc::plugin::PluginEditorContext scope_context(scope_processor);
+    mgstc::app::EditorLink scope_link;
+    mgstc::app::CompositeEditorComponent scope_editor(scope_context, scope_link,
+        [](const juce::String&,std::optional<std::uint64_t>){}, []{}, [](std::uint8_t){}, [](juce::Component*){}, []{}, original);
+    EditorAccess::bindOwnedScopeTarget(scope_editor, owned_original, 2);
+    EditorAccess::setOwnedCompositeScope(scope_editor, false);
+    require(EditorAccess::ownedMonoLayer(scope_editor) == std::optional<std::size_t>(2),
+        "owned Mono scope routes audition to the exact opened layer");
+    const auto scope_authoring = scope_editor.workingTimbre();
+    const auto scope_state = stateBytes(scope_processor);
+    const auto scope_history = EditorAccess::historySize(scope_editor);
+    EditorAccess::auditionOwnedNote(scope_editor, 60);
+    require(EditorAccess::scheduledAuditionLayers(scope_editor) == std::vector<std::size_t>{2},
+        "owned Mono audition schedules only the exact SCC/OPLL editor target layer");
+    EditorAccess::releaseOwnedNote(scope_editor, 60);
+    EditorAccess::setOwnedCompositeScope(scope_editor, true);
+    require(!EditorAccess::ownedMonoLayer(scope_editor), "owned whole-composite scope removes the single-layer filter");
+    EditorAccess::auditionOwnedNote(scope_editor, 60);
+    require(EditorAccess::scheduledAuditionLayers(scope_editor) == std::vector<std::size_t>({0, 1, 2}),
+        "owned Poly/whole-composite audition schedules each audible source layer");
+    EditorAccess::releaseOwnedNote(scope_editor, 60);
+    require(sameAuthoringSound(scope_editor.workingTimbre(), scope_authoring)
+        && EditorAccess::historySize(scope_editor) == scope_history
+        && sameBlock(scope_state, stateBytes(scope_processor)),
+        "switching owned audition scope changes no authoring sound, Plugin State, or Undo history");
+    const auto before = preview.workingTimbre();
+    const auto before_state = stateBytes(preview_processor);
+    const auto history = EditorAccess::historySize(preview);
+    EditorAccess::beginEnvelopePatchSlide(preview,2); EditorAccess::beginEnvelopePatchSlide(applied,2);
+    EditorAccess::envelopePatchSlide(preview,candidate,true);
+    EditorAccess::envelopePatchSlide(applied,candidate,true,false,true);
+    processEmpty(preview_processor,512); processEmpty(apply_processor,512);
+    require(EditorAccess::hasWavePreview(preview)
+        && sameAuthoringSound(EditorAccess::wavePreview(preview), applied.workingTimbre()),
+        "whole preview and commit use the identical partial transformation");
+    require(sameAuthoringSound(preview.workingTimbre(),before) && sameBlock(before_state,stateBytes(preview_processor))
+        && EditorAccess::historySize(preview)==history, "envelope preview preserves authoring, history and Plugin State");
+    const auto preview_pcm=captureHostNotePcm(preview_processor,8192);
+    const auto applied_pcm=captureHostNotePcm(apply_processor,8192);
+    require(peakOf(preview_pcm)>0.001 && hashPcm(preview_pcm)==hashPcm(applied_pcm),
+        "whole preview PCM exactly matches committed PCM under identical host MIDI and engine conditions");
+    const auto committed=applied.workingTimbre();
+    require(committed.layers[0]==before.layers[0] && committed.layers[1]==before.layers[1]
+        && committed.layers[2].volume_envelope==before.layers[2].volume_envelope
+        && committed.layers[2].pitch_envelope==before.layers[2].pitch_envelope,
+        "envelope apply preserves other sources, volume and pitch");
+    require(EditorAccess::historySize(applied)==history+1, "envelope apply creates exactly one undo transaction");
+    EditorAccess::undo(applied); processEmpty(apply_processor,512);
+    require(sameAuthoringSound(applied.workingTimbre(),before), "envelope Undo restores full original events");
+    EditorAccess::redo(applied); processEmpty(apply_processor,512);
+    require(sameAuthoringSound(applied.workingTimbre(),committed), "envelope Redo restores partial replacement");
+    EditorAccess::finishEnvelopePatchSlide(preview); processEmpty(preview_processor,512);
+    require(!EditorAccess::hasWavePreview(preview) && sameAuthoringSound(preview.workingTimbre(),before)
+        && sameBlock(before_state,stateBytes(preview_processor)), "closing envelope preview restores author program and committed state");
+    EditorAccess::beginEnvelopePatchSlide(preview,2);
+    EditorAccess::envelopePatchSlide(preview,candidate,false,true);
+    processEmpty(preview_processor,512);
+    require(EditorAccess::hasWavePreview(preview) && EditorAccess::wavePreview(preview).layers.size()==1,
+        "standalone PatchSlide preview uses only the candidate");
+    const auto before_compare_history = EditorAccess::historySize(preview);
+    const auto before_compare_state = stateBytes(preview_processor);
+    EditorAccess::previewEnvelopeOriginal(preview, false);
+    require(EditorAccess::hasWavePreview(preview)
+        && EditorAccess::wavePreview(preview) == *EditorAccess::envelopeQuerySource(preview, 2)
+        && sameAuthoringSound(preview.workingTimbre(), before)
+        && EditorAccess::historySize(preview) == before_compare_history
+        && sameBlock(before_compare_state, stateBytes(preview_processor)),
+        "A/B original in single mode auditions the resolved selected layer without changing edit state");
+    EditorAccess::previewEnvelopeOriginal(preview, true);
+    require(EditorAccess::hasWavePreview(preview) && EditorAccess::wavePreview(preview) == before
+        && sameAuthoringSound(preview.workingTimbre(), before)
+        && EditorAccess::historySize(preview) == before_compare_history
+        && sameBlock(before_compare_state, stateBytes(preview_processor)),
+        "A/B original in whole mode auditions the original full composite without changing edit state");
+    EditorAccess::finishEnvelopePatchSlide(preview); processEmpty(preview_processor,512);
+    EditorAccess::beginEnvelopePatchSlide(preview,2);
+    EditorAccess::editName(preview,"New authoring while searching");
+    EditorAccess::envelopePatchSlide(preview,candidate,true,false,true);
+    require(preview.workingTimbre().name=="New authoring while searching" && !EditorAccess::envelopeCurrent(preview),
+        "a stale envelope source cannot overwrite subsequent authoring");
+    EditorAccess::finishEnvelopePatchSlide(preview);
+    auto restored=before; restored.name="Host restored during envelope search";
+    EditorAccess::beginEnvelopePatchSlide(preview,2);
+    EditorAccess::restoreHostState(preview,restored);
+    require(!EditorAccess::envelopeCurrent(preview) && !EditorAccess::hasWavePreview(preview)
+        && sameAuthoringSound(preview.workingTimbre(),restored), "host restoration invalidates envelope search and temporary audition");
+    auto looped=before; looped.layers[2].envelope_timeline.loop_start_count=0;
+    looped.layers[2].envelope_timeline.loop_end_count=2;
+    EditorAccess::restoreHostState(preview,looped);
+    EditorAccess::beginEnvelopePatchSlide(preview,2);
+    EditorAccess::envelopePatchSlide(preview,candidate,true);
+    require(!EditorAccess::hasWavePreview(preview) && sameAuthoringSound(preview.workingTimbre(),looped),
+        "unconfirmed loop conflict neither auditions a different loop nor commits");
+    EditorAccess::approveEnvelopeLoop(preview,candidate);
+    EditorAccess::envelopePatchSlide(preview,candidate,true);
+    const auto approved=EditorAccess::wavePreview(preview);
+    EditorAccess::envelopePatchSlide(preview,candidate,true,false,true);
+    require(sameAuthoringSound(preview.workingTimbre(),approved), "approved loop settings are identical for preview and apply");
+    EditorAccess::undo(preview);
+    require(sameAuthoringSound(preview.workingTimbre(),looped), "one Undo restores the original loop together with original @/y");
+    EditorAccess::finishEnvelopePatchSlide(preview);
+    const auto modal_count = juce::Component::getNumCurrentlyModalComponents();
+    EditorAccess::showEnvelopePatchSlide(preview, 2);
+    require(EditorAccess::hasEnvelopePatchSlideWindow(preview), "envelope browser opens an owned modal window");
+    EditorAccess::envelopePatchSlide(preview, candidate, true, true);
+    require(EditorAccess::envelopeLoopConfirmationPending(preview), "trial playback opens explicit loop confirmation");
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    EditorAccess::restoreHostState(preview, restored);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+    require(!EditorAccess::hasEnvelopePatchSlideWindow(preview)
+        && juce::Component::getNumCurrentlyModalComponents() == modal_count,
+        "host restore closes both the envelope browser and its owned loop confirmation");
+}
+
 void testPluginSoundAuthority() {
     MgstcAudioProcessor reference;
     MgstcAudioProcessor shared;
@@ -7696,9 +8094,15 @@ void testToneLibrarySessionFallback() {
 int main() {
     juce::ScopedJuceInitialiser_GUI juce_init;
     try {
+        if (std::getenv("MGSTC_WAV_PATCHSLIDE_UI_ONLY")) {
+            testCompositeWavPatchSlideControls();
+            if (havePatchSlideUiDatabase()) testCompositeWavActualUiWorkerAndApply(mgstc::engine::CompositeWavConfiguration::OpllPatchSlideOpllPatchSlide);
+            return 0;
+        }
         if (std::getenv("MGSTC_PATCHSLIDE_UI_ONLY")) {
             testPatchSlideUiOwnershipAndModal();
             testPatchSlideSharedEditorTransactions();
+            testEnvelopePatchSlideTransactions();
             return 0;
         }
         if (std::getenv("MGSTC_COMMON_HOST_UI_ONLY")) {
@@ -7719,6 +8123,7 @@ int main() {
             testTemporaryCompositePreviewPreservesState();
             testPatchSlideUiOwnershipAndModal();
             testPatchSlideSharedEditorTransactions();
+            testEnvelopePatchSlideTransactions();
             return 0;
         }
         if (std::getenv("MGSTC_WAV_CANDIDATE_UI_ONLY")) {
@@ -7802,6 +8207,7 @@ int main() {
         testTemporaryCompositePreviewPreservesState();
         testPatchSlideUiOwnershipAndModal();
         testPatchSlideSharedEditorTransactions();
+        testEnvelopePatchSlideTransactions();
         testVstPcmPreviewStereoRangeGainAndHostRate();
         testVstPcmPreviewMuteClampAndInvalidRequests();
         testVstPcmPreviewReplaceStopAndLifecycle();
@@ -7820,6 +8226,8 @@ int main() {
         testCompositeWavRetainedSelectionAndPreview();
         testCompositeWavRangeInteractions();
         testCompositeWavActualUiWorkerAndApply();
+        testCompositeWavPatchSlideControls();
+        if (havePatchSlideUiDatabase()) testCompositeWavActualUiWorkerAndApply(mgstc::engine::CompositeWavConfiguration::OpllPatchSlideOpllPatchSlide);
         testWavMorphPlanVstStateAndReediting();
         testToneLibrarySessionFallback();
     } catch (const std::exception& error) {

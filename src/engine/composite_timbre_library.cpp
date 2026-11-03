@@ -281,6 +281,10 @@ public:
                 boolean(placement.after_loop_start);
                 unsignedInteger(placement.command_order, 4);
             }
+            boolean(layer.psg_tone_mode.has_value());
+            if (layer.psg_tone_mode) unsignedInteger(*layer.psg_tone_mode, 1);
+            boolean(layer.psg_noise.has_value());
+            if (layer.psg_noise) unsignedInteger(*layer.psg_noise, 1);
         }
         unsignedInteger(value.embedded_timbres.size(), 4);
         for (const auto& reference_value : value.embedded_timbres) {
@@ -623,12 +627,12 @@ public:
         // Each SQLite payload version names a fixed portable sound layout:
         // v1=v19, v2=v20 modulation, v3=v21 morphing, v4=v22 channel ranges,
         // v5=v23 distribution/plans, v6=v24 modulation/register-auto profiles,
-        // v7=v25 PSG noise authoring.
+        // v7=v25 PSG noise authoring, v8=v26 track-side PSG settings.
         // The DB schema version and the portable file header are separate.
         format_version_ = payload_version == 1 ? 19
             : payload_version == 2 ? 20 : payload_version == 3 ? 21
             : payload_version == 4 ? 22 : payload_version == 5 ? 23
-            : payload_version == 6 ? 24 : 25;
+            : payload_version == 6 ? 24 : payload_version == 7 ? 25 : 26;
         return soundBody(value);
     }
 
@@ -893,6 +897,22 @@ public:
                         || !integer(placement.command_order, 4)) {
                         return false;
                     }
+                }
+            }
+            layer.psg_tone_mode.reset();
+            layer.psg_noise.reset();
+            if (format_version_ >= 26) {
+                bool present{};
+                std::uint8_t setting{};
+                if (!boolean(present)) return false;
+                if (present) {
+                    if (!integer(setting, 1) || setting > 3) return false;
+                    layer.psg_tone_mode = setting;
+                }
+                if (!boolean(present)) return false;
+                if (present) {
+                    if (!integer(setting, 1) || setting > 31) return false;
+                    layer.psg_noise = setting;
                 }
             }
         }

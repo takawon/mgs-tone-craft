@@ -82,6 +82,7 @@ public:
         std::vector<EnvelopeTimbreCatalogItem>(engine::TimbreSource)>;
     using OpenTimbreCallback = std::function<void(
         const juce::String&, std::optional<std::uint64_t>)>;
+    using PatchSlideCallback = std::function<void(std::size_t)>;
     using AssignTimbreCallback = std::function<void(
         std::size_t, LayerBaseTimbreAssign)>;
     using TimbreNameCallback = std::function<juce::String(std::uint64_t)>;
@@ -113,6 +114,7 @@ public:
     void setTimbreCatalogCallback(CatalogCallback callback);
     void setOpenTimbreCallback(OpenTimbreCallback callback);
     void setAssignTimbreCallback(AssignTimbreCallback callback);
+    void setPatchSlideCallback(PatchSlideCallback callback);
     void setTimbreNameCallback(TimbreNameCallback callback);
     void setTimbreLibraryCallback(TimbreLibraryCallback callback);
     void setManageTagsCallback(ManageTagsCallback callback);

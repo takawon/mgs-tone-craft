@@ -174,6 +174,7 @@ else()
 endif()
 
 add_library(mgstc_engine STATIC
+    src/engine/patchslide_features.cpp
     src/engine/patchslide_database.cpp
     src/engine/patchslide_timbre.cpp
     src/engine/chip_rack.cpp
@@ -551,6 +552,14 @@ if(MGSTC_BUILD_TESTS)
     add_executable(mgstc_patchslide_stock_tests tests/cpp/patchslide_stock_tests.cpp)
     target_compile_features(mgstc_patchslide_stock_tests PRIVATE cxx_std_20)
     add_test(NAME mgstc_patchslide_stock_tests COMMAND mgstc_patchslide_stock_tests)
+    add_executable(mgstc_patchslide_features_tests tests/cpp/patchslide_features_tests.cpp)
+    target_link_libraries(mgstc_patchslide_features_tests PRIVATE mgstc_engine)
+    target_compile_features(mgstc_patchslide_features_tests PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(mgstc_patchslide_features_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME mgstc_patchslide_features_tests COMMAND mgstc_patchslide_features_tests)
+    set_tests_properties(mgstc_patchslide_features_tests PROPERTIES TIMEOUT 60)
     add_executable(mgstc_exception_text_tests tests/cpp/exception_text_tests.cpp)
     target_link_libraries(mgstc_exception_text_tests PRIVATE mgstc_engine)
     if(TARGET juce::juce_core)
@@ -655,7 +664,7 @@ if(MGSTC_BUILD_TESTS)
             tests/cpp/patchslide_browser_tests.cpp
             src/app/juce/ui_layout.cpp src/app/juce/ui_paint.cpp)
         target_include_directories(mgstc_patchslide_browser_tests PRIVATE src/app/juce)
-        target_link_libraries(mgstc_patchslide_browser_tests PRIVATE mgstc_engine juce::juce_gui_extra)
+    target_link_libraries(mgstc_patchslide_browser_tests PRIVATE mgstc_engine mgstc_binary_data juce::juce_gui_extra)
         target_compile_features(mgstc_patchslide_browser_tests PRIVATE cxx_std_20)
         target_compile_definitions(mgstc_patchslide_browser_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_MODAL_LOOPS_PERMITTED=1)
         if(MSVC)
@@ -765,7 +774,7 @@ if(MGSTC_BUILD_TESTS)
     endif()
     add_test(NAME mgstc_scc_morph_tests COMMAND mgstc_scc_morph_tests)
 
-    foreach(_wav_component analysis renderer conversion)
+    foreach(_wav_component analysis renderer conversion patchslide)
 
             add_executable(mgstc_composite_wav_${_wav_component}_tests
                 tests/cpp/composite_wav_${_wav_component}_tests.cpp)
@@ -777,6 +786,7 @@ if(MGSTC_BUILD_TESTS)
             add_test(NAME mgstc_composite_wav_${_wav_component}_tests
                 COMMAND mgstc_composite_wav_${_wav_component}_tests)
     endforeach()
+    set_tests_properties(mgstc_composite_wav_patchslide_tests PROPERTIES TIMEOUT 180)
 
     add_executable(
         mgstc_composite_wav_improvement_tests

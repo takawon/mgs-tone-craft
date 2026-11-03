@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "mgstc/engine/patchslide_database.hpp"
+#include "mgstc/engine/patchslide_features.hpp"
+#include "mgstc/engine/patchslide_timbre.hpp"
 
 #include <algorithm>
 #include <array>
@@ -477,6 +479,46 @@ void verifyVariations(const PatchSlideDatabase* db, const fs::path& fixture_dir)
         std::vector<double> pair_squared(pool.size() * pool.size());
         for (double& value : pair_squared) value = readF64(pairs_file);
         const std::span<const double> source_vector(matrix.data(), dimension);
+        if (db) {
+            const auto external = db->searchFromVector(source_vector, db->candidates().size());
+            const auto source_index = db->find(query_id);
+            require(source_index.has_value(), "external golden source exists");
+            const auto original = db->standardB(*source_index, db->candidates().size() - 1);
+            const auto model = makePatchSlideTimbre(db->candidates()[*source_index]);
+            require(model.has_value(), "golden candidate expands into an editable OPLL model");
+            std::string render_error;
+            const auto rendered = makePatchSlideSearchVector(*model, &render_error);
+            require(rendered.has_value(), "golden candidate search rendering failed: " + render_error);
+            double max_difference = 0.0, sum_difference = 0.0;
+            for (std::size_t i = 0; i < dimension; ++i) {
+                const double difference = (*rendered)[i] - source_vector[i];
+                max_difference = std::max(max_difference, std::abs(difference));
+                sum_difference += difference * difference;
+            }
+            const auto nearest = db->searchFromVector(*rendered, 1);
+            std::cout << "192k renderer vs recorded source " << query_id
+                << ": max=" << max_difference << " l2=" << std::sqrt(sum_difference)
+                << " nearest=" << db->candidates()[nearest.front().candidate_index].candidate_id << '\n';
+            std::size_t rank = 0;
+            for (const auto& row : external) {
+                if (row.candidate_index == *source_index) continue;
+                require(row.candidate_index == original[rank].candidate_index
+                            && row.squared_distance == original[rank].squared_distance,
+                        "external query preserves every existing Standard B rank and distance");
+                ++rank;
+            }
+            require(rank == original.size(), "external query retains entire candidate set");
+            for (const double invalid : {std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::infinity(),
+                                         std::numeric_limits<double>::max()}) {
+                auto bad = std::vector<double>(source_vector.begin(), source_vector.end());
+                bad[0] = invalid;
+                bool rejected = false;
+                try { (void)db->searchFromVector(bad, 1); }
+                catch (const std::exception&) { rejected = true; }
+                require(rejected, "external query rejects nonfinite/overflow inputs");
+            }
+        }
         for (std::size_t i = 0; i < pool.size(); ++i) {
             const std::span<const double> target(matrix.data() + (i + 1) * dimension, dimension);
             requireNear(PatchSlideDatabase::squaredDistance(source_vector, target), pool[i].squared_distance,
@@ -633,6 +675,48 @@ void deploymentSkipBoundaries() {
     }
     require(optionalDeploymentAbsent(temp.path, false), "empty optional deployment directory may skip");
 }
+
+std::shared_ptr<const PatchSlideDatabase> retainedCacheBoundaries(const fs::path& directory, std::string& error) {
+    std::vector<PatchSlideLoadStage> stages;
+    double previous{};
+    PatchSlideLoadOptions progress;
+    progress.progress = [&](const PatchSlideLoadProgress& value) {
+        require(value.fraction >= previous && value.fraction <= 1.0, "DB load progress must be monotonic and bounded");
+        previous = value.fraction;
+        stages.push_back(value.stage);
+    };
+    auto first = PatchSlideDatabase::load(directory, &error, progress);
+    require(first != nullptr, "configured DB must load before cache lifetime verification: " + error);
+    require(std::find(stages.begin(), stages.end(), PatchSlideLoadStage::Vectors) != stages.end()
+        && stages.back() == PatchSlideLoadStage::Completed, "cold load must expose actual initialization stages");
+    std::weak_ptr<const PatchSlideDatabase> retained = first;
+    const auto* identity = first.get();
+    first.reset();
+    require(!retained.expired(), "closing the last browser must not discard the verified DB");
+    stages.clear(); previous = 0;
+    auto reopened = PatchSlideDatabase::load(directory, &error, progress);
+    require(reopened.get() == identity && stages == std::vector<PatchSlideLoadStage>{PatchSlideLoadStage::Completed},
+        "reopening must use the same immutable DB without repeating initialization or a loading stage");
+    reopened.reset();
+
+    TempTree other{temporaryDirectory("cache_lifetime")};
+    for (const auto* name : {"patchslide.sqlite", "patchslide_search.sqlite", "manifest.json"})
+        fs::copy_file(directory / name, other.path / name);
+    bool cancel{};
+    PatchSlideLoadOptions interrupted;
+    interrupted.cancelled = [&] { return cancel; };
+    interrupted.progress = [&](const PatchSlideLoadProgress& value) { cancel = value.stage == PatchSlideLoadStage::Vectors; };
+    require(!PatchSlideDatabase::load(other.path, &error, interrupted) && cancel,
+        "a worker cancellation interrupts a cold DB load before publication");
+    require(!retained.expired(), "a cancelled alternative load must retain the last verified DB");
+    auto replacement = PatchSlideDatabase::load(other.path, &error);
+    require(replacement != nullptr, "a cancelled DB load must be retryable");
+    require(retained.expired(), "the process cache must pin only one inactive data set");
+    std::ofstream(other.path / "manifest.json", std::ios::binary | std::ios::app) << '\n';
+    require(!PatchSlideDatabase::load(other.path, &error) && !error.empty(),
+        "changed deployment stamps must revalidate and reject a modified manifest despite a retained DB");
+    return PatchSlideDatabase::load(directory, &error);
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -647,7 +731,7 @@ int main(int argc, char** argv) {
         // Classify before loading: an installed input that disappears during
         // verification must fail rather than become an optional-assets skip.
         const bool may_skip = optionalDeploymentAbsent(directory, explicitly_selected);
-        const auto db = PatchSlideDatabase::load(directory, &error);
+        const auto db = may_skip ? PatchSlideDatabase::load(directory, &error) : retainedCacheBoundaries(directory, error);
         const bool have_full_fixture = fs::is_regular_file(fixture_dir / "standard_b_572_full.bin");
         const auto variation_fixture_dir = db && db->candidates().size() == 12180
             ? fixture_dir / "pruned_v1" : fixture_dir;

@@ -193,10 +193,10 @@ class CompositeWavConversionContent final : public juce::Component, private juce
 public:
     using ApplyCallback = std::function<void(const mgstc::engine::CompositeTimbre&, std::function<void()>)>;
     explicit CompositeWavConversionContent(ApplyCallback apply, PcmPreviewBoundary* pcm_preview = nullptr,
-        BackgroundTaskBoundary* background_tasks = nullptr)
+        BackgroundTaskBoundary* background_tasks = nullptr, std::filesystem::path patchslide_directory = {})
         : apply_callback_(std::move(apply)),
           player_(std::make_unique<CompositeWavPcmPlayer>(pcm_preview)),
-          background_tasks_(background_tasks) {
+          background_tasks_(background_tasks), patchslide_directory_(std::move(patchslide_directory)) {
         auto button = [this](juce::TextButton& control, const char* text, std::function<void()> action) {
             control.setButtonText(juce::String::fromUTF8(text)); control.onClick = std::move(action); addAndMakeVisible(control);
         };
@@ -243,6 +243,9 @@ public:
         configuration_.addItem(juce::String::fromUTF8("SCC × SCC"), 2);
         configuration_.addItem(juce::String::fromUTF8("SCC × OPLL固定"), 3);
         configuration_.addItem(juce::String::fromUTF8("SCC × OPLLオリジナル"), 4);
+        configuration_.addItem(juce::String::fromUTF8("SCC × OPLLパッチスライド"), 5);
+        configuration_.addItem(juce::String::fromUTF8("OPLLオリジナル × OPLLパッチスライド"), 6);
+        configuration_.addItem(juce::String::fromUTF8("OPLLパッチスライド × OPLLパッチスライド"), 7);
         const char* strategies[] = {"自動（標準）", "基音＋残りの倍音", "低次倍音＋高次倍音", "アタック＋持続", "独立最適化"};
         for (int i = 0; i < 5; ++i) strategy_.addItem(juce::String::fromUTF8(strategies[i]), i + 1);
         fixed_tone_.addItem(juce::String::fromUTF8("音色自動選択"), 1);
@@ -336,7 +339,8 @@ public:
             auto left = settings.removeFromLeft((settings.getWidth() - UiLayout::panelGap) / 2);
             settings.removeFromLeft(UiLayout::panelGap);
             auto place = [&](std::size_t index, juce::Rectangle<int> cell) {
-                labels_[index].setBounds(cell.removeFromLeft(cell.getWidth() / 2));
+                labels_[index].setBounds(cell.removeFromLeft(index >= 6
+                    ? UiLayout::compositeInspectorLabelW : cell.getWidth() / 2));
                 cell.removeFromLeft(UiLayout::controlGap);
                 controls[index]->setBounds(cell);
             };
@@ -411,6 +415,14 @@ private:
         stop_.setEnabled(player_ != nullptr); level_match_.setEnabled(player_ != nullptr);
         strategy_.setEnabled(configuration_.getSelectedId() != 1);
         fixed_tone_.setEnabled(configuration_.getSelectedId() == 3);
+        configuration_.setTooltip(configuration_.getText());
+        const auto configuration = static_cast<mgstc::engine::CompositeWavConfiguration>(configuration_.getSelectedId() - 1);
+        const bool uses_scc = mgstc::engine::configurationUsesScc(configuration);
+        budget_.setEnabled(uses_scc); source_budget_.setEnabled(uses_scc); wave_method_.setEnabled(uses_scc);
+        labels_[4].setText(juce::String::fromUTF8(uses_scc ? "最大SCC音色数" : "SCC音色数（該当なし）"), juce::dontSendNotification);
+        labels_[5].setText(juce::String::fromUTF8(uses_scc ? "最大ポイント音色数" : "ポイント数（該当なし）"), juce::dontSendNotification);
+        labels_[11].setText(juce::String::fromUTF8(uses_scc ? "SCC波形生成" : "該当なし"), juce::dontSendNotification);
+        for (const auto index : {4, 5, 11}) labels_[index].setEnabled(uses_scc);
         if (configuration_.getSelectedId() == 1) strategy_.setSelectedId(1, juce::dontSendNotification);
     }
     void report(const juce::String& message) { status_.setText(message, false); }
@@ -696,6 +708,7 @@ private:
     ApplyCallback apply_callback_;
     std::unique_ptr<CompositeWavPcmPlayer> player_;
     BackgroundTaskBoundary* background_tasks_{};
+    std::filesystem::path patchslide_directory_;
     juce::Component::SafePointer<ConversionBusyDialog> busy_dialog_, preview_dialog_;
     CompositeWavRange range_;
     juce::TextButton load_, audacity_, original_, converted_, stop_, zoom_in_, zoom_out_, analyze_, convert_, apply_, cancel_;
@@ -815,12 +828,14 @@ inline void CompositeWavConversionContent::convert() {
     numericRange(true); numericRange(false); stopPcm();
     const auto selection = range_.selection();
     const auto max_waves = budget_.getText().getIntValue();
+    const auto configuration = static_cast<mgstc::engine::CompositeWavConfiguration>(configuration_.getSelectedId() - 1);
+    const bool uses_scc = mgstc::engine::configurationUsesScc(configuration);
     const auto manual_pitch = pitch_.getText().trim();
     const auto manual_keyoff = key_off_.getText().trim();
     const bool pitch_auto = manual_pitch.equalsIgnoreCase("auto");
     const bool keyoff_auto = manual_keyoff.equalsIgnoreCase("auto");
     const auto frequency = manual_pitch.getDoubleValue(), keyoff = manual_keyoff.getDoubleValue();
-    if (max_waves < 1 || max_waves > 32 || (!pitch_auto && (!std::isfinite(frequency) || frequency <= 0))
+    if ((uses_scc && (max_waves < 1 || max_waves > 32)) || (!pitch_auto && (!std::isfinite(frequency) || frequency <= 0))
         || (!keyoff_auto && (!std::isfinite(keyoff) || keyoff < 0
             || keyoff * source_->sample_rate < static_cast<double>(selection.begin)
             || keyoff * source_->sample_rate > static_cast<double>(selection.end)))) {
@@ -829,15 +844,16 @@ inline void CompositeWavConversionContent::convert() {
     if (!analysisMatchesInputs()) { analysis_.reset(); analysis_summary_.clear(); }
     control_ = std::make_shared<mgstc::engine::CompositeWavConversionControl>();
     auto options = mgstc::engine::CompositeWavConversionOptions{};
-    options.configuration = static_cast<mgstc::engine::CompositeWavConfiguration>(configuration_.getSelectedId() - 1);
+    options.configuration = configuration;
     options.strategy = static_cast<mgstc::engine::CompositeWavStrategy>(strategy_.getSelectedId() - 1);
     options.preference = static_cast<mgstc::engine::CompositeWavPreference>(preference_.getSelectedId() - 1);
     options.scc_wave_method = wave_method_.getSelectedId() == 2
         ? mgstc::engine::CompositeWavSccWaveMethod::DirectPeriodic
         : mgstc::engine::CompositeWavSccWaveMethod::Reconstructed;
     options.loop_mode = sustain_.getSelectedId() == 1 ? mgstc::engine::CompositeWavLoopMode::Automatic : mgstc::engine::CompositeWavLoopMode::None;
-    options.max_scc_waveforms = static_cast<std::size_t>(max_waves);
-    if (source_budget_.getSelectedId() > 1)
+    options.max_scc_waveforms = uses_scc ? static_cast<std::size_t>(max_waves) : 0;
+    options.patchslide_database_directory = patchslide_directory_;
+    if (uses_scc && source_budget_.getSelectedId() > 1)
         options.max_scc_source_waveforms = static_cast<std::size_t>(source_budget_.getSelectedId() - 1);
     if (options.configuration == mgstc::engine::CompositeWavConfiguration::SccOpllRom && fixed_tone_.getSelectedId() > 1)
         options.fixed_opll_tone = static_cast<std::uint8_t>(fixed_tone_.getSelectedId() - 2);
@@ -947,11 +963,21 @@ inline void CompositeWavConversionContent::convert() {
             juce::String message = juce::String::fromUTF8("変換完了。PC鍵盤／MIDIで候補を試聴できます。原音と比較してから適用してください。\n")
                 + "SCC: " + juce::String(static_cast<int>(result.resource_plan.scc_waveforms))
                 + juce::String::fromUTF8(" ユニーク波形 / 評価 ") + juce::String(static_cast<int>(result.evaluations))
-                + " / " + juce::String(result.elapsed_seconds, 2) + " s\n"
-                + juce::String::fromUTF8("採用区間: 適応型 ") + juce::String(selected_modes[0])
-                + juce::String::fromUTF8(" / 時間配分型 ") + juce::String(selected_modes[1])
-                + juce::String::fromUTF8(" / 音色配分型 ") + juce::String(selected_modes[2]) + "\n"
-                + "STFT " + juce::String(q.multi_resolution_stft, 4) + " / Harmonic " + juce::String(q.harmonic, 4)
+                + " / " + juce::String(result.elapsed_seconds, 2) + " s\n";
+            if (std::any_of(result.composite_tone->layers.begin(), result.composite_tone->layers.end(),
+                [](const auto& layer) { return layer.source == mgstc::engine::TimbreSource::Scc; })) {
+                message += juce::String::fromUTF8("採用区間: 適応型 ") + juce::String(selected_modes[0])
+                    + juce::String::fromUTF8(" / 時間配分型 ") + juce::String(selected_modes[1])
+                    + juce::String::fromUTF8(" / 音色配分型 ") + juce::String(selected_modes[2]) + "\n";
+            }
+            if (result.patchslide_search.preliminary_renders > 0) {
+                message += juce::String::fromUTF8("パッチスライド: AUTO_SAFE候補 ")
+                    + juce::String(static_cast<int>(result.patchslide_search.prefiltered_candidates))
+                    + " / " + juce::String(static_cast<int>(result.patchslide_search.eligible_candidates))
+                    + juce::String::fromUTF8(" / 予備レンダー ") + juce::String(static_cast<int>(result.patchslide_search.preliminary_renders))
+                    + juce::String::fromUTF8(" / ペア評価 ") + juce::String(static_cast<int>(result.patchslide_search.pair_trials)) + "\n";
+            }
+            message += "STFT " + juce::String(q.multi_resolution_stft, 4) + " / Harmonic " + juce::String(q.harmonic, 4)
                 + " / ERB " + juce::String(q.erb, 4) + " / Attack " + juce::String(q.attack, 4)
                 + " / ENV " + juce::String(q.volume, 4)
                 + juce::String::fromUTF8("\n最大PCM変化 ") + juce::String(q.max_pcm_discontinuity, 4)

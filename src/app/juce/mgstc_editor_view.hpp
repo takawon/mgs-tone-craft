@@ -49,6 +49,8 @@
 #include "ui_paint.hpp"
 #include "ui_focus.hpp"
 #include "ui_modal_dialog.hpp"
+#include "ui_image_io.hpp"
+#include "conversion_busy_dialog.hpp"
 #include "juce_chip_tracks.hpp"
 #include "last_audition_note.hpp"
 #include "pitch_command_labels.hpp"
@@ -298,303 +300,6 @@ inline void configureSettingsButton(
     button.onClick = std::move(action);
 }
 
-struct AnimatedGifSupport final {
-    AnimatedGifSupport() {
-        Gdiplus::GdiplusStartupInput input;
-        Gdiplus::GdiplusStartup(&token_, &input, nullptr);
-    }
-
-    ~AnimatedGifSupport() {
-        if (token_ != 0) {
-            Gdiplus::GdiplusShutdown(token_);
-        }
-    }
-
-    AnimatedGifSupport(const AnimatedGifSupport&) = delete;
-    AnimatedGifSupport& operator=(const AnimatedGifSupport&) = delete;
-
-    ULONG_PTR token_ = 0;
-};
-
-inline [[nodiscard]] AnimatedGifSupport& ensureGdiplusInitialized() {
-    static AnimatedGifSupport runtime;
-    return runtime;
-}
-
-inline [[nodiscard]] juce::Image gdiplusBitmapToImage(
-    Gdiplus::Bitmap& bitmap) {
-    const auto width = static_cast<int>(bitmap.GetWidth());
-    const auto height = static_cast<int>(bitmap.GetHeight());
-    if (width <= 0 || height <= 0) {
-        return {};
-    }
-
-    Gdiplus::BitmapData data{};
-    const Gdiplus::Rect rect(0, 0, width, height);
-    if (bitmap.LockBits(
-            &rect,
-            Gdiplus::ImageLockModeRead,
-            PixelFormat32bppARGB,
-            &data)
-        != Gdiplus::Ok) {
-        return {};
-    }
-
-    juce::Image image(
-        juce::Image::ARGB, width, height, true);
-    {
-        juce::Image::BitmapData dest(
-            image,
-            juce::Image::BitmapData::writeOnly);
-        for (int y = 0; y < height; ++y) {
-            const auto* src = static_cast<const std::uint8_t*>(
-                data.Scan0)
-                + static_cast<std::ptrdiff_t>(y) * data.Stride;
-            auto* out = dest.getLinePointer(y);
-            for (int x = 0; x < width; ++x) {
-                const auto b = src[x * 4 + 0];
-                const auto g = src[x * 4 + 1];
-                const auto r = src[x * 4 + 2];
-                const auto a = src[x * 4 + 3];
-                juce::PixelARGB pixel(a, r, g, b);
-                pixel.premultiply();
-                reinterpret_cast<juce::PixelARGB*>(out)[x] = pixel;
-            }
-        }
-    }
-    bitmap.UnlockBits(&data);
-    return image;
-}
-
-inline [[nodiscard]] juce::Image loadImageMemory(
-    const void* data,
-    std::size_t size) {
-    if (data == nullptr || size == 0) {
-        return {};
-    }
-    if (auto image = juce::ImageFileFormat::loadFrom(data, size);
-        image.isValid()) {
-        return image;
-    }
-    ensureGdiplusInitialized();
-    const auto memory = ::GlobalAlloc(
-        GMEM_MOVEABLE, static_cast<SIZE_T>(size));
-    if (memory == nullptr) {
-        return {};
-    }
-    if (auto* locked = ::GlobalLock(memory)) {
-        std::memcpy(locked, data, size);
-        ::GlobalUnlock(memory);
-    } else {
-        ::GlobalFree(memory);
-        return {};
-    }
-    IStream* stream = nullptr;
-    if (::CreateStreamOnHGlobal(memory, TRUE, &stream) != S_OK
-        || stream == nullptr) {
-        ::GlobalFree(memory);
-        return {};
-    }
-    juce::Image image;
-    {
-        Gdiplus::Bitmap bitmap(stream);
-        if (bitmap.GetLastStatus() == Gdiplus::Ok) {
-            image = gdiplusBitmapToImage(bitmap);
-        }
-    }
-    stream->Release();
-    return image;
-}
-
-inline [[nodiscard]] juce::Image loadImageFileForBackground(
-    const juce::File& file) {
-    if (!file.existsAsFile()) {
-        return {};
-    }
-    if (auto image = juce::ImageFileFormat::loadFrom(file);
-        image.isValid()) {
-        return image;
-    }
-    ensureGdiplusInitialized();
-    Gdiplus::Bitmap bitmap(file.getFullPathName().toWideCharPointer());
-    if (bitmap.GetLastStatus() != Gdiplus::Ok) {
-        return {};
-    }
-    return gdiplusBitmapToImage(bitmap);
-}
-
-inline [[nodiscard]] juce::Image loadImageBytesForBackground(
-    const std::vector<std::uint8_t>& bytes) {
-    return loadImageMemory(bytes.data(), bytes.size());
-}
-
-inline bool loadAnimatedGifFrames(
-    const void* data,
-    int size,
-    std::vector<juce::Image>& frames,
-    std::vector<int>& delays_ms) {
-    ensureGdiplusInitialized();
-    frames.clear();
-    delays_ms.clear();
-    if (data == nullptr || size <= 0) {
-        return false;
-    }
-
-    const auto bytes = static_cast<SIZE_T>(size);
-    const auto memory = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
-    if (memory == nullptr) {
-        return false;
-    }
-    if (auto* locked = ::GlobalLock(memory)) {
-        std::memcpy(locked, data, bytes);
-        ::GlobalUnlock(memory);
-    } else {
-        ::GlobalFree(memory);
-        return false;
-    }
-
-    IStream* stream = nullptr;
-    if (FAILED(::CreateStreamOnHGlobal(memory, TRUE, &stream))
-        || stream == nullptr) {
-        ::GlobalFree(memory);
-        return false;
-    }
-
-    Gdiplus::Bitmap bitmap(stream);
-    stream->Release();
-    if (bitmap.GetLastStatus() != Gdiplus::Ok) {
-        return false;
-    }
-
-    static const GUID dimension = { 0x6aedbd6d, 0x3fb5, 0x418a, { 0x83, 0xa6, 0x7f, 0x45, 0x22, 0x9d, 0xc8, 0x72 } };
-    const UINT frame_count = bitmap.GetFrameCount(&dimension);
-    if (frame_count == 0) {
-        return false;
-    }
-
-    // GIFのフレーム遅延はPropertyTagFrameDelayに1/100秒単位で格納される。
-    // タグがない、値が0、または読込に失敗したフレームだけ50msへフォールバックする。
-    constexpr PROPID frame_delay_property = 0x5100;
-    constexpr int fallback_delay_ms = 50;
-    std::vector<std::uint64_t> delay_storage;
-    const auto delay_property_size =
-        bitmap.GetPropertyItemSize(frame_delay_property);
-    if (delay_property_size > 0) {
-        delay_storage.resize(
-            (static_cast<std::size_t>(delay_property_size)
-             + sizeof(std::uint64_t) - 1)
-            / sizeof(std::uint64_t));
-    }
-    const Gdiplus::PropertyItem* delay_property = nullptr;
-    if (!delay_storage.empty()) {
-        auto* item = reinterpret_cast<Gdiplus::PropertyItem*>(
-            delay_storage.data());
-        if (bitmap.GetPropertyItem(
-                frame_delay_property,
-                delay_property_size,
-                item)
-            == Gdiplus::Ok) {
-            delay_property = item;
-        }
-    }
-    const auto delayForFrame = [delay_property](UINT frame) {
-        if (delay_property == nullptr
-            || delay_property->value == nullptr
-            || delay_property->type
-                != 4) {  // PropertyTagTypeLong
-            return fallback_delay_ms;
-        }
-        const auto delay_count =
-            delay_property->length / sizeof(UINT);
-        if (frame >= delay_count) {
-            return fallback_delay_ms;
-        }
-        const auto hundredths =
-            static_cast<const UINT*>(delay_property->value)[frame];
-        if (hundredths == 0) {
-            return fallback_delay_ms;
-        }
-        constexpr auto maximum_hundredths =
-            static_cast<UINT>(
-                std::numeric_limits<int>::max() / 10);
-        return static_cast<int>(
-            juce::jmin(hundredths, maximum_hundredths) * 10);
-    };
-
-    frames.reserve(frame_count);
-    delays_ms.reserve(frame_count);
-    for (UINT frame = 0; frame < frame_count; ++frame) {
-        if (bitmap.SelectActiveFrame(&dimension, frame)
-            != Gdiplus::Ok) {
-            continue;
-        }
-        auto converted = gdiplusBitmapToImage(bitmap);
-        if (!converted.isValid()) {
-            continue;
-        }
-        frames.push_back(std::move(converted));
-        delays_ms.push_back(delayForFrame(frame));
-    }
-    return !frames.empty();
-}
-
-class AnimatedGifComponent final
-    : public juce::Component,
-      private juce::Timer {
-public:
-    void loadFromMemory(const void* data, int size) {
-        stopTimer();
-        frames_.clear();
-        delays_ms_.clear();
-        frame_index_ = 0;
-        static_cast<void>(
-            loadAnimatedGifFrames(data, size, frames_, delays_ms_));
-        if (!frames_.empty()) {
-            startTimer(delays_ms_.front());
-        }
-        repaint();
-    }
-
-    void setDisplaySize(int width, int height) {
-        display_width_ = juce::jmax(1, width);
-        display_height_ = juce::jmax(1, height);
-        setSize(display_width_, display_height_);
-    }
-
-    void paint(juce::Graphics& g) override {
-        g.fillAll(juce::Colours::transparentBlack);
-        if (frames_.empty()) {
-            return;
-        }
-        g.drawImageWithin(
-            frames_[static_cast<size_t>(frame_index_)],
-            0,
-            0,
-            getWidth(),
-            getHeight(),
-            juce::RectanglePlacement::centred
-                | juce::RectanglePlacement::onlyReduceInSize);
-    }
-
-private:
-    void timerCallback() override {
-        if (frames_.size() <= 1) {
-            return;
-        }
-        frame_index_ =
-            (frame_index_ + 1) % static_cast<int>(frames_.size());
-        repaint();
-        startTimer(
-            delays_ms_[static_cast<size_t>(frame_index_)]);
-    }
-
-    std::vector<juce::Image> frames_;
-    std::vector<int> delays_ms_;
-    int frame_index_{0};
-    int display_width_{256};
-    int display_height_{256};
-};
-
 enum class OpllConversionQuality {
     standard,
     thorough,
@@ -691,41 +396,6 @@ inline juce::Component::SafePointer<ModalDialogWindow> showOpllConversionQuality
     juce::Component* anchor,
     OpllConversionQualityContent::ConvertCallback callback);
 
-struct ConversionProgressState {
-    // Optional worker-specific hooks. Installed before the worker/UI starts.
-    std::function<void()> custom_cancel;
-    std::function<bool()> custom_cancelled;
-    std::function<double()> custom_progress;
-    std::function<juce::String()> custom_stage;
-    std::shared_ptr<mgstc::engine::OpllApproximationControl> control{
-        std::make_shared<
-            mgstc::engine::OpllApproximationControl>()};
-
-    void requestCancellation() const noexcept {
-        control->requestCancel();
-        if (custom_cancel) custom_cancel();
-    }
-
-    [[nodiscard]] bool cancellationRequested() const noexcept {
-        return control->cancelRequested()
-            || (custom_cancelled && custom_cancelled());
-    }
-
-    [[nodiscard]] double progressFraction() const noexcept {
-        if (custom_progress) return custom_progress();
-        const auto current = control->progress();
-        if (current.phase
-            == mgstc::engine::OpllApproximationPhase::Completed) {
-            return 1.0;
-        }
-        if (current.total == 0) {
-            return 0.0;
-        }
-        return static_cast<double>(current.completed)
-            / static_cast<double>(current.total);
-    }
-};
-
 [[nodiscard]] inline mgstc::engine::OpllApproximationOptions
 makeOpllApproximationOptions(
     OpllConversionQuality quality,
@@ -737,160 +407,6 @@ makeOpllApproximationOptions(
     options.control = progress.control;
     return options;
 }
-
-class ConversionBusyContent final
-    : public juce::Component,
-      private juce::Timer {
-public:
-    explicit ConversionBusyContent(
-        std::shared_ptr<ConversionProgressState> state)
-        : state_(std::move(state)),
-          progress_bar_(displayed_progress_) {
-        label_.setText(
-            juce::String::fromUTF8("変換中…"),
-            juce::dontSendNotification);
-        label_.setJustificationType(juce::Justification::centred);
-        label_.setColour(
-            juce::Label::textColourId, juce::Colour(0xFFE6EDF3));
-        addAndMakeVisible(label_);
-
-        addAndMakeVisible(progress_bar_);
-        progress_bar_.setColour(
-            juce::ProgressBar::backgroundColourId,
-            juce::Colour(0xFF26323C));
-        progress_bar_.setColour(
-            juce::ProgressBar::foregroundColourId,
-            juce::Colour(0xFF53E3A6));
-
-        gif_.loadFromMemory(
-            BinaryData::mgstc_spin_gif,
-            BinaryData::mgstc_spin_gifSize);
-        // Source GIF is 512x512; show at about 50%.
-        gif_.setDisplaySize(256, 256);
-        addAndMakeVisible(gif_);
-
-        cancel_.setButtonText(juce::String::fromUTF8("キャンセル"));
-        cancel_.onClick = [this] { requestCancellation(); };
-        addAndMakeVisible(cancel_);
-
-        startTimerHz(30);
-        setSize(UiScale::sx(320), UiScale::sx(402));
-    }
-
-    ~ConversionBusyContent() override {
-        stopTimer();
-    }
-
-    void requestCancellation() {
-        state_->requestCancellation();
-        label_.setText(
-            juce::String::fromUTF8("キャンセル中…"),
-            juce::dontSendNotification);
-        cancel_.setEnabled(false);
-    }
-
-    void resized() override {
-        auto area = getLocalBounds().reduced(16);
-        label_.setBounds(area.removeFromTop(28));
-        area.removeFromTop(8);
-        progress_bar_.setBounds(area.removeFromTop(22));
-        area.removeFromTop(8);
-        auto buttons = area.removeFromBottom(34);
-        cancel_.setBounds(buttons.withSizeKeepingCentre(120, 34));
-        area.removeFromBottom(8);
-        gif_.setBounds(
-            area.withSizeKeepingCentre(256, 256));
-    }
-
-private:
-    void timerCallback() override {
-        displayed_progress_ = juce::jlimit(
-            0.0,
-            1.0,
-            state_->progressFraction());
-        if (state_->custom_stage && !state_->cancellationRequested()) {
-            label_.setText(state_->custom_stage(), juce::dontSendNotification);
-        }
-    }
-
-    std::shared_ptr<ConversionProgressState> state_;
-    double displayed_progress_{0.0};
-    juce::Label label_;
-    juce::ProgressBar progress_bar_;
-    AnimatedGifComponent gif_;
-    juce::TextButton cancel_;
-};
-
-class ConversionBusyDialog final : public juce::DialogWindow, private juce::Timer {
-public:
-    explicit ConversionBusyDialog(
-        std::shared_ptr<ConversionProgressState> state, juce::Component* owner)
-        : juce::DialogWindow(
-              juce::String::fromUTF8("変換中"),
-              juce::Colour(0xFF1B222C),
-              false,
-              true),
-          state_(std::move(state)), owner_(owner), had_owner_(owner != nullptr) {
-        if (had_owner_) startTimerHz(30);
-        setUsingNativeTitleBar(true);
-        setResizable(false, false);
-        auto* content = new ConversionBusyContent(state_);
-        content_ = content;
-        setContentOwned(content, true);
-        centreWithSize(content->getWidth(), content->getHeight() + 32);
-    }
-
-    ~ConversionBusyDialog() override {
-        stopTimer();
-        requestCancellation();
-    }
-
-    void keepTaskAlive(std::shared_ptr<EditorBackgroundTask> task, std::function<void(bool)> completed) {
-        task_ = std::move(task);
-        completed_ = std::move(completed);
-        startTimerHz(30);
-    }
-
-    void closeButtonPressed() override {
-        requestCancellation();
-    }
-
-private:
-    void requestCancellation() {
-        state_->requestCancellation();
-        if (content_ != nullptr) {
-            content_->requestCancellation();
-        }
-    }
-
-    std::shared_ptr<ConversionProgressState> state_;
-    ConversionBusyContent* content_{};
-    void timerCallback() override {
-        if (had_owner_ && owner_ == nullptr) {
-            requestCancellation();
-            setVisible(false);
-            // Standalone keeps the worker alive until completion. Plugin
-            // editors instead destroy this dialog while the registry retains
-            // its task; neither editor-close path joins ongoing work.
-            exitModalState(0);
-            had_owner_ = false;
-        }
-        if (task_ && task_->completed()) {
-            stopTimer();
-            const bool cancelled = state_->cancellationRequested();
-            auto completed = std::move(completed_);
-            exitModalState(1);
-            delete this;
-            if (completed) completed(cancelled);
-            return;
-        }
-    }
-    juce::Component::SafePointer<juce::Component> owner_;
-    bool had_owner_{};
-    std::shared_ptr<EditorBackgroundTask> task_;
-    std::function<void(bool)> completed_;
-};
-
 
 inline juce::Component::SafePointer<ModalDialogWindow> showOpllConversionQualityDialog(
     juce::Component* anchor,
@@ -2205,6 +1721,7 @@ class PerformanceKeyboard final
       private juce::Timer,
       private MidiDrainListener {
 public:
+    friend struct SatelliteEditorParityTestAccess;
     using NoteCallback = std::function<void(std::uint8_t)>;
     using ModeCallback = std::function<void(bool)>;
     using SuppressCallback = std::function<bool()>;
@@ -2287,6 +1804,19 @@ public:
         };
         addAndMakeVisible(mode_);
 
+        single_tone_.setButtonText(juce::String::fromUTF8("単音色"));
+        whole_tone_.setButtonText(juce::String::fromUTF8("複合音色全体"));
+        configureSegmentButton(single_tone_, 0, 2);
+        configureSegmentButton(whole_tone_, 1, 2);
+        single_tone_.setLookAndFeel(&scope_look_and_feel_);
+        whole_tone_.setLookAndFeel(&scope_look_and_feel_);
+        single_tone_.setExplicitFocusOrder(398);
+        whole_tone_.setExplicitFocusOrder(399);
+        single_tone_.onClick = [this] { setWholeComposite(false); };
+        whole_tone_.onClick = [this] { setWholeComposite(true); };
+        addChildComponent(single_tone_);
+        addChildComponent(whole_tone_);
+
         if (session_.snapshot().capabilities.midi_device_settings) {
             syncMidiControls();
             session_.midi().addDrainListener(this);
@@ -2301,6 +1831,8 @@ public:
 
     ~PerformanceKeyboard() override {
         stopTimer();
+        single_tone_.setLookAndFeel(nullptr);
+        whole_tone_.setLookAndFeel(nullptr);
         if (session_.snapshot().capabilities.midi_device_settings) {
             session_.midi().removeDrainListener(this);
         }
@@ -2313,6 +1845,24 @@ public:
     }
 
     // Host editors call this from keyPressed / keyStateChanged.
+    void setCompositeScopeCallback(std::function<void(bool)> callback) {
+        scope_changed_ = std::move(callback);
+        single_tone_.setVisible(bool(scope_changed_) && !headless_);
+        whole_tone_.setVisible(bool(scope_changed_) && !headless_);
+        setWholeComposite(true);
+        resized();
+    }
+
+    void setWholeComposite(bool whole, bool notify = true) {
+        if (notify) allNotesOff();
+        whole_composite_ = whole;
+        single_tone_.setToggleState(!whole, juce::dontSendNotification);
+        whole_tone_.setToggleState(whole, juce::dontSendNotification);
+        if (notify && scope_changed_) scope_changed_(whole);
+    }
+
+    [[nodiscard]] bool wholeComposite() const noexcept { return whole_composite_; }
+
     void pollPerformanceInput() {
         serviceActiveWindowInput(true);
     }
@@ -2424,6 +1974,8 @@ public:
         octave_label_.setVisible(!headless);
         midi_status_.setVisible(!headless);
         mode_.setVisible(!headless);
+        single_tone_.setVisible(!headless && bool(scope_changed_));
+        whole_tone_.setVisible(!headless && bool(scope_changed_));
         setInterceptsMouseClicks(!headless, !headless);
         if (headless) {
             setSize(0, 0);
@@ -2465,6 +2017,11 @@ public:
         }
         auto area = getLocalBounds();
         auto controls = area.removeFromTop(30);
+        if (scope_changed_) {
+            single_tone_.setBounds(controls.removeFromLeft(UiScale::sx(64)));
+            whole_tone_.setBounds(controls.removeFromLeft(UiScale::sx(112)));
+            controls.removeFromLeft(UiLayout::controlGap);
+        }
         mode_.setBounds(controls.removeFromLeft(68));
         controls.removeFromLeft(10);
         octave_down_.setBounds(controls.removeFromLeft(48));
@@ -3446,7 +3003,11 @@ private:
     juce::TextButton octave_up_;
     juce::Label octave_label_;
     juce::Label midi_status_;
+    MgstcLookAndFeel scope_look_and_feel_;
     juce::TextButton mode_;
+    juce::TextButton single_tone_, whole_tone_;
+    std::function<void(bool)> scope_changed_;
+    bool whole_composite_{true};
     std::vector<HeldNote> held_notes_;
     std::array<bool, kPcPerformanceScanCodes.size()>
         pc_key_down_{};
@@ -3776,7 +3337,7 @@ public:
     }
 
     void prepareToHide() {
-        if (patchslide_tab_) patchslide_tab_->stopPreview();
+        if (patchslide_tab_) patchslide_tab_->prepareToHide();
         performance_keyboard_.allNotesOff();
         if (all_notes_off_) {
             all_notes_off_();
@@ -4152,6 +3713,116 @@ public:
 
 private:
     LibraryManagerContent* content_{};
+};
+
+// The browser remains shared with the library. This wrapper only fixes the
+// authoring destination and forwards performance to the editor's bounded
+// temporary program slot; it owns no audio engine or persistent data.
+class EnvelopePatchSlideContent final : public juce::Component,
+                                       private juce::Timer {
+public:
+    struct Callbacks {
+        std::function<void(const engine::PatchSlideCandidate&, bool, bool)> preview;
+        std::function<void(const engine::PatchSlideCandidate&)> apply;
+        std::function<void(const engine::CompositeTimbre&)> registerTimbre;
+        std::function<void(bool)> stop;
+        std::function<bool()> current;
+        std::function<void()> pollKeys;
+        std::function<bool(const juce::KeyPress&)> key;
+        std::function<void(bool, bool)> original;
+    };
+    EnvelopePatchSlideContent(EditorSession& session, engine::CompositeTimbre source,
+        Callbacks callbacks, std::filesystem::path directory = {})
+        : callbacks_(std::move(callbacks)) {
+        setWantsKeyboardFocus(true);
+        notice_.setFont(UiFonts::body());
+        addAndMakeVisible(notice_);
+        browser_ = std::make_unique<PatchSlideBrowserComponent>(PatchSlideBrowserComponent::Callbacks{
+            [this](const auto&) { requestPreview(true); },
+            [this](const auto&) {
+                if (const auto* candidate = browser_->selectedCandidate(); candidate && callbacks_.apply)
+                    callbacks_.apply(*candidate);
+            },
+            [this](const auto& sound) { if (callbacks_.registerTimbre) callbacks_.registerTimbre(sound); },
+            [this] { if (callbacks_.stop) callbacks_.stop(browser_ && browser_->selectedCandidate() != nullptr); },
+            [this](const auto& sound) {
+                if (sound.layers.empty()) { if (callbacks_.stop) callbacks_.stop(false); }
+                else requestPreview(false);
+            }}, session.backgroundTasks(),
+            session.patchSlideStock(), std::move(directory));
+        addAndMakeVisible(*browser_);
+        browser_->setEnvelopeAuditionControls(
+            [this](bool) { if (callbacks_.stop) callbacks_.stop(false); requestPreview(false); },
+            [this](bool) { requestPreview(true); });
+        browser_->setExternalQuerySource(std::move(source));
+        setSize(PatchSlideBrowserComponent::minimumContentWidth(), UiScale::sx(740) - UiLayout::fieldH);
+        const juce::Component::SafePointer<EnvelopePatchSlideContent> safe(this);
+        scale_listener_ = UiScale::addGlobalListener([safe] {
+            if (!safe) return;
+            UiScale::forceGlobalForNonEditorUi();
+            safe->setSize(PatchSlideBrowserComponent::minimumContentWidth(), UiScale::sx(740) - UiLayout::fieldH);
+            safe->sendLookAndFeelChange();
+            safe->resized();
+            if (auto* window = dynamic_cast<juce::DialogWindow*>(safe->getTopLevelComponent())) {
+                window->setResizeLimits(PatchSlideBrowserComponent::minimumContentWidth(), UiScale::sx(600), UiScale::sx(1800), UiScale::sx(1400));
+                window->setSize(safe->getWidth(), safe->getHeight() + UiLayout::fieldH);
+                clampWindowToDisplayWorkArea(*window);
+            }
+        });
+        startTimerHz(30);
+    }
+    ~EnvelopePatchSlideContent() override {
+        stopTimer();
+        UiScale::removeGlobalListener(scale_listener_);
+        // Destroy the browser while the captured wrapper callbacks still exist.
+        browser_.reset();
+        if (callbacks_.stop) callbacks_.stop(false);
+    }
+    void setNotice(const juce::String& text) {
+        notice_.setText(text, juce::dontSendNotification); notice_.setTooltip(text);
+        notice_.setVisible(text.isNotEmpty()); resized();
+    }
+    bool keyPressed(const juce::KeyPress& key) override {
+        return callbacks_.key && callbacks_.key(key);
+    }
+    bool keyStateChanged(bool) override { if (callbacks_.pollKeys) callbacks_.pollKeys(); return false; }
+    void paint(juce::Graphics& g) override { paintPageBackground(g, getLocalBounds()); }
+    void resized() override {
+        using namespace UiLayout;
+        auto area = getLocalBounds();
+        notice_.setBounds(notice_.getText().isNotEmpty()
+            ? area.removeFromTop(fieldH).reduced(panelPad, 0) : juce::Rectangle<int>{});
+        browser_->setBounds(area);
+        notice_.setFont(UiFonts::body());
+    }
+private:
+    void requestPreview(bool one_second) {
+        if (callbacks_.current && !callbacks_.current()) return;
+        if (browser_ && browser_->auditionOriginal()) {
+            if (callbacks_.original) callbacks_.original(browser_->auditionWholeComposite(), one_second);
+            return;
+        }
+        const auto* candidate = browser_ ? browser_->selectedCandidate() : nullptr;
+        if (!candidate) { if (callbacks_.stop) callbacks_.stop(false); return; }
+        if (callbacks_.preview) callbacks_.preview(*candidate, browser_->auditionWholeComposite(), one_second);
+    }
+    void timerCallback() override {
+        if (callbacks_.current && !callbacks_.current()) {
+            if (!stale_) {
+                stale_ = true;
+                browser_->setEnabled(false);
+                if (callbacks_.stop) callbacks_.stop(false);
+                setNotice(juce::String::fromUTF8("編集中の音色が変更されました。閉じて検索し直してください。"));
+            }
+            return;
+        }
+        if (callbacks_.pollKeys) callbacks_.pollKeys();
+    }
+    Callbacks callbacks_;
+    juce::Label notice_;
+    std::unique_ptr<PatchSlideBrowserComponent> browser_;
+    bool stale_{};
+    std::uint64_t scale_listener_{};
 };
 
 class CompositeEditorComponent final
@@ -4657,6 +4328,7 @@ public:
                 std::optional<std::uint64_t> library_id) {
                 openOwnedTimbreEditor(kind, library_id);
             });
+        timeline_.setPatchSlideCallback([this](std::size_t index) { showEnvelopePatchSlide(index); });
         timeline_.setAssignTimbreCallback(
             [this](std::size_t index, LayerBaseTimbreAssign assign) {
                 if (assign.opll_rom) {
@@ -4866,6 +4538,9 @@ public:
         timeline_.cancelPendingDialogs();
         // The comparison adapter belongs to the EditorSession. Destroy this
         // owned modal window before the plugin editor destroys its context.
+        envelope_patchslide_loop_confirmation_.close();
+        delete envelope_patchslide_window_.getComponent();
+        envelope_patchslide_session_.reset();
         delete patchslide_apply_dialog_.getComponent();
         delete wave_converter_window_.getComponent();
         UiScale::removeGlobalListener(ui_scale_listener_);
@@ -4890,6 +4565,9 @@ public:
     void restoreHostState(const mgstc::engine::CompositeTimbre& sound) {
         const juce::ScopedValueSetter<bool> guard(hydrating_, true);
         ++host_restore_generation_;
+        envelope_patchslide_loop_confirmation_.close();
+        if (envelope_patchslide_window_) delete envelope_patchslide_window_.getComponent();
+        envelope_patchslide_session_.reset();
         timeline_preview_pending_ = false;
         if (wave_converter_window_) delete wave_converter_window_.getComponent();
         wave_conversion_preview_.reset();
@@ -4906,6 +4584,8 @@ public:
         selected_composite_id_.reset();
         link_.owned_target.reset();
         link_.owned_published.reset();
+        owned_edit_layer_.reset();
+        owned_edit_whole_composite_ = true;
         applied_owned_revision_ = ++link_.owned_revision;
         timbre_ = sound;
         syncControlsFromModel();
@@ -5290,14 +4970,14 @@ public:
         if (!applyPublishedOwnedSnapshot()) {
             return;
         }
-        startAudition();
+        startCompositeNote(last_audition_note_, true, false, true, ownedEditAuditionLayer());
     }
 
     void ownedEditNoteOn(std::uint8_t note) {
         if (!applyPublishedOwnedSnapshot()) {
             return;
         }
-        startCompositeNote(note, false);
+        startCompositeNote(note, false, false, true, ownedEditAuditionLayer());
     }
 
     void ownedEditNoteOff(std::uint8_t note) {
@@ -5322,8 +5002,29 @@ public:
                 return false;
             }
         }
-        if (note) startCompositeNote(*note, one_second, true);
+        if (note) startCompositeNote(*note, one_second, true, true, ownedEditAuditionLayer());
         return true;
+    }
+
+    void setOwnedEditWholeComposite(bool whole) { owned_edit_whole_composite_ = whole; }
+
+    std::optional<std::size_t> ownedEditAuditionLayer() const {
+        if (owned_edit_whole_composite_) return std::nullopt;
+        const auto& target = link_.owned_published ? link_.owned_published : link_.owned_target;
+        if (!target) return std::nullopt;
+        const auto& sound = workingTimbre();
+        const auto references = [&](std::size_t index) {
+            const auto& layer = sound.layers[index];
+            return (layer.base_timbre && layer.base_timbre->library_id == target->library_id)
+                || std::any_of(layer.timbre_automation.begin(), layer.timbre_automation.end(),
+                    [&](const auto& event) { return event.kind == engine::EnvelopeEventKind::Timbre
+                        && event.target_library_id == target->library_id; });
+        };
+        if (owned_edit_layer_ && *owned_edit_layer_ < sound.layers.size() && references(*owned_edit_layer_))
+            return owned_edit_layer_;
+        for (std::size_t index = 0; index < sound.layers.size(); ++index)
+            if (references(index)) return index;
+        return std::nullopt;
     }
 
     void stopImportedPreview() {
@@ -5746,6 +5447,248 @@ private:
         updateHistoryButtons();
     }
 
+    struct EnvelopePatchSlideSession {
+        engine::CompositeTimbre original;
+        std::size_t layer_index{};
+        std::uint64_t generation{};
+        std::string approved_candidate;
+        std::optional<engine::EnvelopeTimeline> approved_timeline;
+        bool confirmation_pending{};
+    };
+
+    [[nodiscard]] bool envelopePatchSlideCurrent(const std::shared_ptr<EnvelopePatchSlideSession>& state) const {
+        return state && envelope_patchslide_session_ == state
+            && state->generation == host_restore_generation_ && workingTimbre() == state->original;
+    }
+
+    void setEnvelopePatchSlideNotice(const juce::String& text) {
+        if (envelope_patchslide_window_)
+            if (auto* content = dynamic_cast<EnvelopePatchSlideContent*>(envelope_patchslide_window_->getContentComponent()))
+                content->setNotice(text);
+    }
+
+    void stopEnvelopePatchSlidePreview(const std::shared_ptr<EnvelopePatchSlideSession>& state) {
+        if (envelope_patchslide_session_ != state || !wave_conversion_preview_) return;
+        setWaveConversionPreview(nullptr);
+    }
+
+    void finishEnvelopePatchSlide(const std::shared_ptr<EnvelopePatchSlideSession>& state) {
+        if (envelope_patchslide_session_ != state) return;
+        envelope_patchslide_loop_confirmation_.close();
+        stopEnvelopePatchSlidePreview(state);
+        envelope_patchslide_session_.reset();
+    }
+
+    void useEnvelopePatchSlide(const std::shared_ptr<EnvelopePatchSlideSession>& state,
+        const engine::PatchSlideCandidate& candidate, bool whole, bool one_second, bool commit) {
+        if (!envelopePatchSlideCurrent(state)) {
+            setEnvelopePatchSlideNotice(juce::String::fromUTF8("編集中の音色が変更されました。閉じて検索し直してください。"));
+            return;
+        }
+        std::optional<engine::CompositeTimbre> sound;
+        if (whole || commit) {
+            const auto approved = state->approved_candidate == candidate.candidate_id
+                ? state->approved_timeline : std::nullopt;
+            auto prepared = engine::preparePatchSlideEnvelopeApply(state->original, state->layer_index, candidate, approved);
+            if (prepared.loop_conflict) {
+                stopEnvelopePatchSlidePreview(state);
+                setEnvelopePatchSlideNotice(juce::String::fromUTF8("ループ調整の確認前は複合試聴を保留します。試聴または適用で確認できます。"));
+                if ((!one_second && !commit) || state->confirmation_pending) return;
+                state->confirmation_pending = true;
+                const auto conflict = *prepared.loop_conflict;
+                const auto counts = [](const auto& values) {
+                    juce::StringArray text;
+                    for (const auto count : values) text.add(juce::String(static_cast<int>(count)));
+                    return text.joinIntoString(", ");
+                };
+                const auto& before = state->original.layers[state->layer_index].envelope_timeline;
+                const auto& after = conflict.proposed_timeline;
+                const auto position = [](const auto& value) { return value ? juce::String(static_cast<int>(*value)) : juce::String("-"); };
+                auto message = juce::String::fromUTF8("候補の音色変更が既存ループと衝突します。\n");
+                if (!conflict.repeated_counts.empty()) message += juce::String::fromUTF8("繰り返される @ のカウント: ") + counts(conflict.repeated_counts) + "\n";
+                if (!conflict.unreachable_counts.empty()) message += juce::String::fromUTF8("到達できない @ のカウント: ") + counts(conflict.unreachable_counts) + "\n";
+                message += juce::String::fromUTF8("ループ開始 ") + position(before.loop_start_count) + " → " + position(after.loop_start_count)
+                    + juce::String::fromUTF8("、終了 ") + position(before.loop_end_count) + " → " + position(after.loop_end_count)
+                    + juce::String::fromUTF8("、END ") + juce::String(static_cast<int>(before.length_counts)) + " → " + juce::String(static_cast<int>(after.length_counts))
+                    + juce::String::fromUTF8(" に調整しますか？\n承認した調整は試聴と適用で共通です。取消では編集内容を変更しません。");
+                const juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+                const juce::Component::SafePointer<ModalDialogWindow> dialog(envelope_patchslide_window_);
+                envelope_patchslide_loop_confirmation_ = juce::AlertWindow::showScopedAsync(juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::QuestionIcon)
+                    .withTitle(juce::String::fromUTF8("パッチスライドのループ調整"))
+                    .withMessage(message)
+                    .withButton(juce::String::fromUTF8("この調整を承認"))
+                    .withButton(juce::String::fromUTF8("キャンセル"))
+                    .withAssociatedComponent(dialog.getComponent()),
+                    [safe, dialog, state, candidate, conflict, whole, one_second, commit](int result) {
+                        state->confirmation_pending = false;
+                        if (!safe || !dialog || !safe->envelopePatchSlideCurrent(state) || result != 1) return;
+                        state->approved_candidate = candidate.candidate_id;
+                        state->approved_timeline = conflict.proposed_timeline;
+                        safe->useEnvelopePatchSlide(state, candidate, whole, one_second, commit);
+                    });
+                return;
+            }
+            if (!prepared.timbre) {
+                stopEnvelopePatchSlidePreview(state);
+                setEnvelopePatchSlideNotice(juce::String::fromUTF8(prepared.error.c_str()));
+                return;
+            }
+            sound = std::move(prepared.timbre);
+        } else {
+            sound = engine::makePatchSlideTimbre(candidate);
+        }
+        if (!sound) return;
+        setEnvelopePatchSlideNotice({});
+        if (commit) {
+            // Preview and authoring consume the identical validated model.
+            setWaveConversionPreview(nullptr, false);
+            recordHistory();
+            timbre_ = std::move(*sound);
+            composite_program_stale_ = true;
+            recordHistory();
+            refreshTimbreSelectors();
+            syncControlsFromModel();
+            syncTimelineTimbre(true);
+            resized();
+            static_cast<void>(configureEngine());
+            updateStatus(juce::String::fromUTF8("選択OPLLレイヤーの音色変更をパッチスライドへ置換しました（未保存）"));
+            if (envelope_patchslide_window_) envelope_patchslide_window_->exitModalState(1);
+            return;
+        }
+        if (!wave_conversion_preview_ || *wave_conversion_preview_ != *sound)
+            setWaveConversionPreview(&*sound);
+        if (one_second) {
+            wave_preview_audition_pending_ = true;
+            startWaveConversionAuditionIfReady();
+        }
+    }
+
+    void registerEnvelopePatchSlide(const engine::CompositeTimbre& sound) {
+        ScopedLibraryIpcLock lock(library_lock_);
+        if (!lock.isLocked() || !reloadCompositeLibraryFromDisk()) return;
+        auto copy = sound;
+        copy.name = composite_library_.uniqueName(copy.name);
+        composite_library_.add(std::move(copy), unixTimeNow());
+        if (!persistCompositeTimbreLibrary(composite_library_)) {
+            static_cast<void>(reloadCompositeLibraryFromDisk());
+            setEnvelopePatchSlideNotice(juce::String::fromUTF8("音色ライブラリへ保存できませんでした。"));
+            return;
+        }
+        refreshCompositeSelector();
+        if (libraries_changed_) libraries_changed_();
+    }
+
+    void previewEnvelopePatchSlideOriginal(const std::shared_ptr<EnvelopePatchSlideSession>& state,
+        bool whole, bool one_second) {
+        if (!envelopePatchSlideCurrent(state)) return;
+        auto sound = whole ? std::optional<engine::CompositeTimbre>(state->original)
+            : envelopePatchSlideQuerySource(state->original, state->layer_index);
+        if (!sound) return;
+        setEnvelopePatchSlideNotice({});
+        if (!wave_conversion_preview_ || *wave_conversion_preview_ != *sound)
+            setWaveConversionPreview(&*sound);
+        if (one_second) {
+            wave_preview_audition_pending_ = true;
+            startWaveConversionAuditionIfReady();
+        }
+    }
+
+    [[nodiscard]] std::optional<engine::CompositeTimbre> envelopePatchSlideQuerySource(
+        const engine::CompositeTimbre& original, std::size_t index) const {
+        if (index >= original.layers.size()) return std::nullopt;
+        auto source = original;
+        const auto numbers = engine::resolveTimbreNumbers(original);
+        for (const auto& assignment : numbers.assignments) {
+            if (original.layers[assignment.layer_index].source != engine::TimbreSource::Opll) continue;
+            std::optional<engine::SavedTimbreReference> snapshot;
+            if (const auto* saved = engine::findEmbeddedTimbreSnapshot(original, assignment.library_id)) snapshot = *saved;
+            else if (const auto* entry = timbre_library_.find(assignment.library_id);
+                entry && entry->category == engine::TimbreCategory::Opll) snapshot = engine::makeSavedTimbreReference(*entry);
+            if (snapshot && std::none_of(source.embedded_timbres.begin(), source.embedded_timbres.end(),
+                [&](const auto& item) { return item.library_id == assignment.library_id; })) source.embedded_timbres.push_back(*snapshot);
+        }
+        source.layers = {source.layers[index]};
+        auto& layer = source.layers.front();
+        for (auto& event : layer.timbre_automation) {
+            if (event.kind != engine::EnvelopeEventKind::Timbre || event.timbre_pick != engine::TimbrePick::Library) continue;
+            if (!event.target_library_id && event.value >= 16) {
+                for (const auto& assignment : numbers.assignments) {
+                    if (original.layers[assignment.layer_index].source != engine::TimbreSource::Opll) continue;
+                    const auto* snapshot = engine::findEmbeddedTimbreSnapshot(source, assignment.library_id);
+                    if (snapshot && (event.value == assignment.number || snapshot->manual_number == event.value)) {
+                        event.target_library_id = assignment.library_id;
+                        break;
+                    }
+                }
+                if (!event.target_library_id) return std::nullopt;
+            }
+            if (event.target_library_id && !engine::findEmbeddedTimbreSnapshot(source, event.target_library_id)) return std::nullopt;
+        }
+        layer.enabled = true;
+        layer.muted = false;
+        layer.solo = false;
+        return source;
+    }
+
+    void showEnvelopePatchSlide(std::size_t index, std::filesystem::path directory = {}) {
+        if (envelope_patchslide_window_) { envelope_patchslide_window_->toFront(true); return; }
+        if (wave_converter_window_ || index >= workingTimbre().layers.size()
+            || workingTimbre().layers[index].source != engine::TimbreSource::Opll
+            || workingTimbre().layers[index].volume_envelope.kind != engine::EnvelopeKind::Sequence) return;
+        libraryManagerAllNotesOff();
+        stopImportedPreview();
+        stopAudition();
+        auto state = std::make_shared<EnvelopePatchSlideSession>();
+        state->original = workingTimbre();
+        state->layer_index = index;
+        state->generation = host_restore_generation_;
+        auto source = envelopePatchSlideQuerySource(state->original, index);
+        if (!source) {
+            updateStatus(juce::String::fromUTF8("選択OPLLレイヤーの音色参照を解決できません。音色設定を確認してください。"));
+            return;
+        }
+        envelope_patchslide_session_ = state;
+        const juce::Component::SafePointer<CompositeEditorComponent> safe(this);
+        UiScale::forceGlobalForNonEditorUi();
+        auto* dialog = new ModalDialogWindow(juce::String::fromUTF8("パッチスライド — 選択OPLLレイヤー"), juce::Colour(UiLayout::panelFill));
+        envelope_patchslide_window_ = dialog;
+        auto* content = new EnvelopePatchSlideContent(session_, std::move(*source), EnvelopePatchSlideContent::Callbacks{
+            [safe, state](const auto& candidate, bool whole, bool one_second) {
+                if (safe) safe->useEnvelopePatchSlide(state, candidate, whole, one_second, false);
+            },
+            [safe, state](const auto& candidate) { if (safe) safe->useEnvelopePatchSlide(state, candidate, true, false, true); },
+            [safe, state](const auto& sound) { if (safe && safe->envelopePatchSlideCurrent(state)) safe->registerEnvelopePatchSlide(sound); },
+            [safe, state](bool retain_program) {
+                if (!safe || safe->envelope_patchslide_session_ != state) return;
+                if (!retain_program) safe->stopEnvelopePatchSlidePreview(state);
+                else {
+                    safe->wave_preview_audition_pending_ = false;
+                    safe->performance_keyboard_.allNotesOff();
+                    safe->silenceAuditionNotes();
+                }
+            },
+            [safe, state] { return safe && safe->envelopePatchSlideCurrent(state); },
+            [safe, state] { if (safe && safe->envelopePatchSlideCurrent(state) && safe->wave_conversion_preview_) safe->performance_keyboard_.pollPerformanceInput(); },
+            [safe, state](const juce::KeyPress& key) {
+                if (!safe || !safe->envelopePatchSlideCurrent(state) || !safe->wave_conversion_preview_) return false;
+                safe->performance_keyboard_.pollPerformanceInput();
+                return safe->performance_keyboard_.shouldConsumeKeyPress(key);
+            },
+            [safe, state](bool whole, bool one_second) {
+                if (safe) safe->previewEnvelopePatchSlideOriginal(state, whole, one_second);
+            }}, std::move(directory));
+        dialog->setUsingNativeTitleBar(true);
+        dialog->setResizable(true, false);
+        dialog->setContentOwned(content, true);
+        dialog->setResizeLimits(PatchSlideBrowserComponent::minimumContentWidth(), UiScale::sx(600), UiScale::sx(1800), UiScale::sx(1400));
+        dialog->centreAroundComponent(this, content->getWidth(), content->getHeight() + UiLayout::fieldH);
+        clampWindowToDisplayWorkArea(*dialog);
+        dialog->enterModalState(true, juce::ModalCallbackFunction::create([safe, state](int) {
+            if (safe) safe->finishEnvelopePatchSlide(state);
+        }), true);
+    }
+
     void openWaveConverter() {
         const juce::Component::SafePointer<CompositeEditorComponent> safe(this);
         const auto generation = host_restore_generation_;
@@ -5849,6 +5792,7 @@ private:
     }
 
     void showWaveConverter() {
+        if (envelope_patchslide_window_) { envelope_patchslide_window_->toFront(true); return; }
         if (wave_converter_window_) { wave_converter_window_->toFront(true); return; }
         stopAudition();
         const auto generation = host_restore_generation_;
@@ -6878,7 +6822,10 @@ private:
 
     void openOwnedTimbreEditor(
         const juce::String& kind,
-        std::optional<std::uint64_t> library_id) {
+        std::optional<std::uint64_t> library_id,
+        std::optional<std::size_t> layer_index = {}) {
+        owned_edit_layer_ = layer_index;
+        owned_edit_whole_composite_ = true;
         if (library_id) {
             if (*library_id == mgstc::engine::kSccTrianglePresetLibraryId) {
                 for (auto& layer : timbre_.layers) {
@@ -6926,7 +6873,7 @@ private:
             layer.source == mgstc::engine::TimbreSource::Scc
                 ? juce::String("scc-envelope")
                 : juce::String("opll-envelope");
-        openOwnedTimbreEditor(kind, layer.base_timbre->library_id);
+        openOwnedTimbreEditor(kind, layer.base_timbre->library_id, index);
     }
 
     void preserveReferencedBaseSnapshot(std::size_t index,
@@ -7647,7 +7594,8 @@ private:
         std::uint8_t base_note,
         bool stop_after_one_second,
         bool already_configured = false,
-        bool silence_notes_first = true) {
+        bool silence_notes_first = true,
+        std::optional<std::size_t> owned_layer = {}) {
         if (hydrating_) {
             return;
         }
@@ -7701,6 +7649,7 @@ private:
             mgstc::engine::buildCompositePlaybackPlan(note_timbre);
         double maximum_delay_ms = 0.0;
         for (const auto& binding : plan.audible_layers) {
+            if (owned_layer && binding.layer_index != *owned_layer) continue;
             if (audition_layer_filter_ && !wave_conversion_preview_
                 && binding.layer_index != *audition_layer_filter_) {
                 continue;
@@ -8083,6 +8032,9 @@ private:
     juce::TextButton import_wave_;
     juce::Component::SafePointer<ModalDialogWindow> wave_converter_window_;
     juce::Component::SafePointer<ModalDialogWindow> patchslide_apply_dialog_;
+    juce::ScopedMessageBox envelope_patchslide_loop_confirmation_;
+    juce::Component::SafePointer<ModalDialogWindow> envelope_patchslide_window_;
+    std::shared_ptr<EnvelopePatchSlideSession> envelope_patchslide_session_;
     std::vector<mgstc::engine::CompositeTimbre> history_;
     std::size_t history_cursor_{};
     PerformanceKeyboard performance_keyboard_;
@@ -8140,6 +8092,8 @@ private:
     bool satellite_session_{};
     bool spectrogram_input_active_{};
     std::optional<std::size_t> audition_layer_filter_{};
+    std::optional<std::size_t> owned_edit_layer_;
+    bool owned_edit_whole_composite_{true};
 };
 
 class PresetWavePreview final
@@ -9253,6 +9207,16 @@ public:
             [this](bool polyphonic) {
                 voice_allocator_.setPolyphonic(polyphonic);
             });
+        if (envelope_context_) performance_keyboard_.setCompositeScopeCallback([this](bool whole) {
+            const auto preview = owned_preview_snapshot_;
+            silenceAllVoices();
+            if (link_.owned_audition.set_whole_composite) link_.owned_audition.set_whole_composite(whole);
+            if (usesCompositeAudition()) {
+                if (preview && link_.owned_audition.preview)
+                    static_cast<void>(link_.owned_audition.preview(*preview, {}, false));
+                else static_cast<void>(configureEngine(false));
+            }
+        });
         performance_keyboard_.setSuppressPcInputCallback(
             [this] { return textEntryHasFocusWithin(*this); });
         addAndMakeVisible(performance_keyboard_);
@@ -9467,6 +9431,7 @@ public:
         }
         owned_preview_snapshot_.reset();
         owned_edit_snapshot_ = *target;
+        if (envelope_context_) performance_keyboard_.setWholeComposite(true, false);
         selected_library_id_.reset();
         SccWaveform waveform{};
         std::transform(
@@ -9489,6 +9454,8 @@ public:
     }
 
     void publishOwnedSnapshot() {
+        if (link_.owned_audition.set_whole_composite)
+            link_.owned_audition.set_whole_composite(performance_keyboard_.wholeComposite());
         if (!owned_edit_snapshot_) {
             return;
         }
@@ -12249,6 +12216,8 @@ private:
         auto snapshot = *owned_edit_snapshot_;
         for (std::size_t index = 0; index < wave.size(); ++index)
             snapshot.scc_waveform[index] = static_cast<std::uint8_t>(wave[index]);
+        if (link_.owned_audition.set_whole_composite)
+            link_.owned_audition.set_whole_composite(performance_keyboard_.wholeComposite());
         owned_preview_snapshot_ = snapshot;
         return link_.owned_audition.preview(snapshot, note, one_second);
     }
@@ -13328,6 +13297,16 @@ public:
             [this](bool polyphonic) {
                 voice_allocator_.setPolyphonic(polyphonic);
             });
+        if (envelope_context_) performance_keyboard_.setCompositeScopeCallback([this](bool whole) {
+            const auto preview = owned_preview_snapshot_;
+            silenceAllVoices();
+            if (link_.owned_audition.set_whole_composite) link_.owned_audition.set_whole_composite(whole);
+            if (usesCompositeAudition()) {
+                if (preview && link_.owned_audition.preview)
+                    static_cast<void>(link_.owned_audition.preview(*preview, {}, false));
+                else static_cast<void>(configureEngine(false));
+            }
+        });
         performance_keyboard_.setSuppressPcInputCallback(
             [this] { return textEntryHasFocusWithin(*this); });
         addAndMakeVisible(performance_keyboard_);
@@ -13530,6 +13509,7 @@ public:
         }
         owned_preview_snapshot_.reset();
         owned_edit_snapshot_ = *target;
+        if (envelope_context_) performance_keyboard_.setWholeComposite(true, false);
         selected_library_id_.reset();
         name_.setText(
             juce::String::fromUTF8(target->name.c_str()),
@@ -13544,6 +13524,8 @@ public:
     }
 
     void publishOwnedSnapshot() {
+        if (link_.owned_audition.set_whole_composite)
+            link_.owned_audition.set_whole_composite(performance_keyboard_.wholeComposite());
         if (!owned_edit_snapshot_) {
             return;
         }
@@ -15560,6 +15542,8 @@ private:
         if (!owned_edit_snapshot_ || !link_.owned_audition.preview) return false;
         auto snapshot = *owned_edit_snapshot_;
         snapshot.opll_registers = mgstc::engine::encodeOpllPatch(patch);
+        if (link_.owned_audition.set_whole_composite)
+            link_.owned_audition.set_whole_composite(performance_keyboard_.wholeComposite());
         owned_preview_snapshot_ = snapshot;
         return link_.owned_audition.preview(snapshot, note, one_second);
     }

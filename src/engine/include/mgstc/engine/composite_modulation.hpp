@@ -143,7 +143,7 @@ inline void disableCompositeRegisterAuto(
 [[nodiscard]] inline std::uint8_t psgEnvelopeValueAt(
     const CompositeLayer& layer, EnvelopeEventKind kind,
     std::uint32_t count, bool after = true) noexcept {
-    const auto mixer = sequenceEnvelopeMixer(layer.volume_envelope.rate);
+    const auto mixer = psgInitialMixer(layer);
     std::uint8_t value = kind == EnvelopeEventKind::Noise ? mixer.noise : mixer.tone_mode;
     const EnvelopeEvent* selected = nullptr;
     for (const auto& event : layer.timbre_automation) {
@@ -168,7 +168,7 @@ inline void disableCompositeRegisterAuto(
 [[nodiscard]] inline std::uint8_t psgNoiseValueAtCount(
     const CompositeLayer& layer, std::uint32_t count, bool after,
     const std::vector<EnvelopeEvent>& expanded_events) noexcept {
-    auto value = sequenceEnvelopeMixer(layer.volume_envelope.rate).noise;
+    auto value = psgInitialMixer(layer).noise;
     const EnvelopeEvent* selected = nullptr;
     for (const auto& event : expanded_events) {
         if ((event.kind != EnvelopeEventKind::Noise

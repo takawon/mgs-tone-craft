@@ -100,6 +100,7 @@ MgstcAudioProcessorEditor::MgstcAudioProcessorEditor(
                std::optional<std::uint8_t> note, bool one_second) {
             return composite_ && composite_->previewOwnedTimbre(snapshot, note, one_second);
         },
+        [this](bool whole) { if (composite_) composite_->setOwnedEditWholeComposite(whole); },
     };
 
     const auto revision = context_.stateRestoreRevision();

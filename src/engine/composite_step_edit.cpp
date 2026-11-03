@@ -452,7 +452,7 @@ CompositeStepEditResult editCompositeSteps(
         || !moveLane(CompositeStepEditLane::Fb, layer.opll_fb_auto, layer.opll_fb_modulation,
             static_cast<std::uint8_t>(fb_initial))
         || !moveLane(CompositeStepEditLane::Noise, layer.psg_noise_auto, layer.psg_noise_modulation,
-            sequenceEnvelopeMixer(source.volume_envelope.rate).noise)
+            psgInitialMixer(source).noise)
         || (isSelected(lane, CompositeStepEditLane::Volume)
             && !moveModulation(layer.volume_modulation, mapping, content_limit))
         || (isSelected(lane, CompositeStepEditLane::Pitch)
@@ -483,7 +483,7 @@ CompositeStepEditResult editCompositeSteps(
             || !moveAuto(profile.lane, mapping, content_limit,
                 static_cast<std::uint8_t>(target == CompositeModulationTarget::TotalLevel
                     ? tl_initial : target == CompositeModulationTarget::Noise
-                        ? sequenceEnvelopeMixer(source.volume_envelope.rate).noise : fb_initial)))
+                        ? psgInitialMixer(source).noise : fb_initial)))
             return reject("自動設定の移動先が編集範囲に収まりません。");
     }
     for (auto& placement : layer.derived_command_placements) {

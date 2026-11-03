@@ -280,6 +280,7 @@ struct OwnedAuditionHooks {
     // state changes; a missing note only prepares the audition program.
     std::function<bool(const mgstc::engine::SavedTimbreReference&,
         std::optional<std::uint8_t>, bool)> preview;
+    std::function<void(bool)> set_whole_composite;
 
     [[nodiscard]] bool ready() const noexcept {
         return static_cast<bool>(sync_program)

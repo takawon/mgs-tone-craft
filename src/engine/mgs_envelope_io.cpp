@@ -1026,8 +1026,7 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
 
     coalesceAdjacentHolds(tokens);
     collapseTrailingHold(tokens);
-    result.body = formatSequenceEnvelopeHeader(
-                      layer.source, layer.volume_envelope.rate)
+    result.body = formatSequenceEnvelopeHeader(layer)
         + joinTokens(tokens);
     result.compiled_bytes = compiledEnvelopeBytes(tokens);
     if (optimize_loop && looping
@@ -1057,8 +1056,7 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
             return result;
         }
         result.output_cutoff_count = cutoff_count;
-        result.body = formatSequenceEnvelopeHeader(
-                          layer.source, layer.volume_envelope.rate)
+        result.body = formatSequenceEnvelopeHeader(layer)
             + joinTokens(tokens);
         result.compiled_bytes = compiledEnvelopeBytes(tokens);
     }
@@ -1099,6 +1097,10 @@ std::string formatMgsCompositeTrackSetup(
     }
     std::string line = std::to_string(track_number);
     line += " v" + std::to_string(static_cast<unsigned>(layer.volume));
+    if (layer.source == TimbreSource::Psg) {
+        if (layer.psg_tone_mode) line += " /" + std::to_string(*layer.psg_tone_mode);
+        if (layer.psg_noise) line += " n" + std::to_string(*layer.psg_noise);
+    }
     if (layer.source != TimbreSource::Opll && layer.key_off_hang != 0) {
         line += " k" + std::to_string(
             static_cast<unsigned>(layer.key_off_hang));

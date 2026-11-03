@@ -4302,6 +4302,9 @@ void testToneLibrarySqliteV1RoundTripAndPortableFormat() {
 // allocation start, and empty v24 profile vectors. Validate the exact v25
 // addition before removing it; a changed layout must fail here explicitly.
 void removeUnsetNoiseAuthoringFromSingleLayerFixture(std::string& payload) {
+    REQUIRE_EQ(payload.size() >= std::size_t{11}, true);
+    REQUIRE_EQ(payload.substr(payload.size() - 11, 2), std::string(2, '\0'));
+    payload.erase(payload.size() - 11, 2); // v26 optional track mixer fields.
     REQUIRE_EQ(payload.size() >= std::size_t{42}, true);
     std::string expected(19, '\0');
     expected[6] = 1; // Noise auto change speed.
@@ -4573,6 +4576,8 @@ void testSccMorphDistributionPersistence() {
     auto encoded = current_file.substr(blob_at, blob_end - blob_at);
     const auto encoded_at = encoded.find(hex(marker));
     REQUIRE_EQ(encoded_at != std::string::npos, true);
+    REQUIRE_EQ(encoded.substr(encoded.size() - 22, 4), std::string("0000"));
+    encoded.erase(encoded.size() - 22, 4); // v26 absent track mixer fields.
     // Hex payload uses two characters per byte; remove the same validated
     // v25 Noise addition as in the binary fixture before the v24 vectors.
     std::string unset_noise(19, '\0');
@@ -8450,6 +8455,130 @@ void testCompositeModulationAllTargetsRoundTripThroughLibrary() {
     REQUIRE_EQ(entry->timbre.layers[0].psg_noise_auto, psg.psg_noise_auto);
 }
 
+void testPsgTrackAndEnvelopeMixerAreIndependent() {
+    using namespace mgstc::engine;
+    auto tone = defaultCompositeTimbre();
+    tone.layers = {tone.layers.front()};
+    auto& layer = tone.layers.front();
+    layer.volume_envelope.events = {{.kind=EnvelopeEventKind::Volume,.value=15}};
+    layer.pitch_envelope.events.clear();
+    layer.timbre_automation.clear();
+    layer.volume_envelope.rate = {};
+    REQUIRE_EQ(layerUsesSequenceEnvelope(layer), false);
+    layer.psg_tone_mode = 2;
+    layer.psg_noise = 5;
+    const auto fixed = formatMgsComposite(tone);
+    REQUIRE_EQ(fixed.valid(), true);
+    REQUIRE_EQ(fixed.source.find(" /2 n5") != std::string::npos, true);
+    REQUIRE_EQ(fixed.source.find("@e") == std::string::npos, true);
+    REQUIRE_EQ(layerUsesSequenceEnvelope(layer), false);
+    {
+        auto mute = tone;
+        mute.layers.front().psg_tone_mode = 0;
+        mute.layers.front().psg_noise = 0;
+        const auto blob = serializeCompositeSoundPayload(mute);
+        const auto zero = deserializeCompositeSoundPayload(blob, kCompositeSoundPayloadVersion);
+        REQUIRE_EQ(zero.has_value(), true);
+        REQUIRE_EQ(zero->layers.front().psg_tone_mode, std::optional<std::uint8_t>{0});
+        REQUIRE_EQ(zero->layers.front().psg_noise, std::optional<std::uint8_t>{0});
+        EngineCore engine;
+        REQUIRE_EQ(compileCompositeProgram(engine, mute), true);
+        REQUIRE_EQ(engine.session().queueNoteOn(0,60), true);
+        REQUIRE_EQ(engine.session().processTick().ok(), true);
+        REQUIRE_EQ(engine.session().mapper().psgMirror()[7] & 9, 9);
+    }
+    // Cached ADSR values do not turn an unset sequence mixer into a header.
+    layer.volume_envelope.rate.attack_rate = 64;
+    REQUIRE_EQ(layerUsesSequenceEnvelope(layer), false);
+    layer.volume_envelope.events.push_back({.kind=EnvelopeEventKind::Volume,.value=9,.count=4});
+    REQUIRE_EQ(formatMgsCompositeEnvelope(layer, 0).body.starts_with("0,0,"), true);
+    auto output = formatMgsComposite(tone);
+    auto parsed = parseMgsComposite(output.source);
+    REQUIRE_EQ(parsed.valid(), true);
+    REQUIRE_EQ(parsed.timbre.layers.front().psg_tone_mode, layer.psg_tone_mode);
+    REQUIRE_EQ(parsed.timbre.layers.front().psg_noise, layer.psg_noise);
+    REQUIRE_EQ(parsed.timbre.layers.front().volume_envelope.rate.tone_mode, 0);
+    REQUIRE_EQ(psgInitialMixer(parsed.timbre.layers.front()).tone_mode, 2);
+    REQUIRE_EQ(psgInitialMixer(parsed.timbre.layers.front()).noise, 5);
+    layer.volume_envelope.events.resize(1);
+    layer.volume_envelope.rate = {};
+    for (const auto values : {std::pair{1,0}, std::pair{0,7}, std::pair{3,0}}) {
+        layer.volume_envelope.rate.tone_mode = static_cast<std::uint8_t>(values.first);
+        layer.volume_envelope.rate.noise = static_cast<std::uint8_t>(values.second);
+        REQUIRE_EQ(layerUsesSequenceEnvelope(layer), true);
+        output = formatMgsComposite(tone);
+        REQUIRE_EQ(output.valid(), true);
+        parsed = parseMgsComposite(output.source);
+        REQUIRE_EQ(parsed.valid(), true);
+        REQUIRE_EQ(parsed.timbre.layers.front().volume_envelope.rate.tone_mode, values.first);
+        REQUIRE_EQ(parsed.timbre.layers.front().volume_envelope.rate.noise, values.second);
+    }
+    struct Case { int header_mode, header_noise, expected_mode, expected_noise; };
+    for (const auto kind : {EnvelopeKind::Sequence, EnvelopeKind::Rate}) {
+        for (const Case item : {Case{0,0,2,5}, Case{0,11,2,5}, Case{1,19,1,5}, Case{2,0,2,0}, Case{3,31,3,31}}) {
+            layer.volume_envelope.kind = kind;
+            layer.volume_envelope.rate = {};
+            layer.volume_envelope.rate.tone_mode = static_cast<std::uint8_t>(item.header_mode);
+            layer.volume_envelope.rate.noise = static_cast<std::uint8_t>(item.header_noise);
+            EngineCore engine;
+            REQUIRE_EQ(compileCompositeProgram(engine, tone), true);
+            REQUIRE_EQ(engine.session().queueNoteOn(0,60), true);
+            REQUIRE_EQ(engine.session().processTick().ok(), true);
+            const auto& registers = engine.session().mapper().psgMirror();
+            const auto mask = static_cast<unsigned>((item.expected_mode & 1 ? 0 : 1)
+                | (item.expected_mode & 2 ? 0 : 8));
+            REQUIRE_EQ(static_cast<unsigned>(registers[7] & 9), mask);
+            REQUIRE_EQ(registers[6], item.expected_noise);
+        }
+    }
+    layer.volume_envelope.kind = EnvelopeKind::Sequence;
+    layer.volume_envelope.rate = {};
+    layer.timbre_automation = {{.kind=EnvelopeEventKind::ToneNoiseMode,.value=0,.count=0},
+        {.kind=EnvelopeEventKind::Noise,.value=31,.count=0}};
+    EngineCore muted;
+    REQUIRE_EQ(compileCompositeProgram(muted, tone), true);
+    REQUIRE_EQ(muted.session().queueNoteOn(0,60), true);
+    REQUIRE_EQ(muted.session().processTick().ok(), true);
+    REQUIRE_EQ(muted.session().mapper().psgMirror()[7] & 9, 9);
+    REQUIRE_EQ(muted.session().mapper().psgMirror()[6], 31);
+
+    const auto file = CompositeTimbreLibrary::serializeTimbreFile(tone, 1);
+    const auto restored = CompositeTimbreLibrary::deserializeTimbreFile(file);
+    REQUIRE_EQ(restored.has_value(), true);
+    REQUIRE_EQ(restored->layers, tone.layers);
+    const auto payload = serializeCompositeSoundPayload(tone);
+    const auto restored_payload = deserializeCompositeSoundPayload(payload, kCompositeSoundPayloadVersion);
+    REQUIRE_EQ(restored_payload.has_value(), true);
+    REQUIRE_EQ(restored_payload->layers, tone.layers);
+    auto invalid = tone;
+    invalid.layers.front().psg_tone_mode = 4;
+    REQUIRE_EQ(deserializeCompositeSoundPayload(serializeCompositeSoundPayload(invalid), kCompositeSoundPayloadVersion).has_value(), false);
+    invalid = tone;
+    invalid.layers.front().psg_noise = 32;
+    REQUIRE_EQ(deserializeCompositeSoundPayload(serializeCompositeSoundPayload(invalid), kCompositeSoundPayloadVersion).has_value(), false);
+
+    auto old = tone;
+    old.layers.front().psg_tone_mode.reset();
+    old.layers.front().psg_noise.reset();
+    old.embedded_timbres.clear();
+    auto previous_payload = serializeCompositeSoundPayload(old);
+    REQUIRE_EQ(previous_payload.substr(previous_payload.size()-11,2), std::string(2,'\0'));
+    previous_payload.erase(previous_payload.size()-11,2);
+    const auto previous = deserializeCompositeSoundPayload(previous_payload, 7);
+    REQUIRE_EQ(previous.has_value(), true);
+    REQUIRE_EQ(previous->layers, old.layers);
+    auto previous_file = CompositeTimbreLibrary::serializeTimbreFile(old,1);
+    const auto blob_at = previous_file.rfind('\t')+1;
+    const auto blob_end = previous_file.find_first_of("\r\n", blob_at);
+    auto encoded = previous_file.substr(blob_at,blob_end-blob_at);
+    REQUIRE_EQ(encoded.substr(encoded.size()-22,4), std::string("0000"));
+    encoded.erase(encoded.size()-22,4);
+    encoded.replace(0,8,"19000000");
+    previous_file.replace(blob_at,blob_end-blob_at,encoded);
+    const auto previous_portable = CompositeTimbreLibrary::deserializeTimbreFile(previous_file);
+    REQUIRE_EQ(previous_portable.has_value(), true);
+    REQUIRE_EQ(previous_portable->layers, old.layers);
+}
 void testPsgNoiseAutomationUsesNoiseRangeAndMixerInitialValue() {
     using namespace mgstc::engine;
     CompositeLayer layer;
@@ -11297,6 +11426,7 @@ int main(int argc, char** argv) {
         {"PitchLoopOptimizerHonorsBarriers", testPitchLoopOptimizerHonorsBarriers},
         {"OpllModulationLoopBoundaryWriteRepeats", testOpllModulationLoopBoundaryWriteRepeats},
         {"CompositeModulationAllTargetsRoundTripThroughLibrary", testCompositeModulationAllTargetsRoundTripThroughLibrary},
+        {"PsgTrackAndEnvelopeMixerAreIndependent", testPsgTrackAndEnvelopeMixerAreIndependent},
         {"PsgNoiseAutomationUsesNoiseRangeAndMixerInitialValue", testPsgNoiseAutomationUsesNoiseRangeAndMixerInitialValue},
         {"PsgNoiseAutomationCountsAndOffRestore", testPsgNoiseAutomationCountsAndOffRestore},
         {"AuthoredModulationLoopRepeatsFirstBodyAndInheritsState", testAuthoredModulationLoopRepeatsFirstBodyAndInheritsState},

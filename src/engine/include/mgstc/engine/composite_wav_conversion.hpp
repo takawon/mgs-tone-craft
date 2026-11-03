@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <array>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -13,7 +14,20 @@
 
 namespace mgstc::engine {
 
-enum class CompositeWavConfiguration { Scc, SccScc, SccOpllRom, SccOpllOriginal };
+enum class CompositeWavConfiguration {
+    Scc, SccScc, SccOpllRom, SccOpllOriginal,
+    SccOpllPatchSlide, OpllOriginalOpllPatchSlide, OpllPatchSlideOpllPatchSlide
+};
+[[nodiscard]] inline constexpr bool configurationUsesScc(CompositeWavConfiguration configuration) noexcept {
+    return configuration == CompositeWavConfiguration::Scc || configuration == CompositeWavConfiguration::SccScc
+        || configuration == CompositeWavConfiguration::SccOpllRom || configuration == CompositeWavConfiguration::SccOpllOriginal
+        || configuration == CompositeWavConfiguration::SccOpllPatchSlide;
+}
+[[nodiscard]] inline constexpr bool configurationUsesPatchSlide(CompositeWavConfiguration configuration) noexcept {
+    return configuration == CompositeWavConfiguration::SccOpllPatchSlide
+        || configuration == CompositeWavConfiguration::OpllOriginalOpllPatchSlide
+        || configuration == CompositeWavConfiguration::OpllPatchSlideOpllPatchSlide;
+}
 enum class CompositeWavStrategy { Automatic, FundamentalResidual, LowHigh, AttackSustain, Independent };
 enum class CompositeWavPreference { Balanced, Quality, Compact };
 enum class CompositeWavLoopMode { Automatic, None };
@@ -44,6 +58,9 @@ struct CompositeWavConversionOptions {
     double minimum_improvement{1e-5};
     std::size_t stagnation_limit{24};
     std::shared_ptr<CompositeWavConversionControl> control;
+    // Worker-only source override for verified DB deployments/tests; empty uses
+    // the ordinary runtime directory. Never stored in a timbre or Plugin State.
+    std::filesystem::path patchslide_database_directory;
 };
 
 struct CompositeWavResourcePlan {
@@ -161,6 +178,15 @@ struct CompositeWavMorphSearchDiagnostics {
     double wave_generation_seconds{}, direct_extraction_seconds{}, rendering_seconds{}, scoring_seconds{};
 };
 
+struct CompositeWavPatchSlideSearchDiagnostics {
+    std::size_t eligible_candidates{}, prefiltered_candidates{}, preliminary_renders{}, pair_trials{};
+    // Logical local model/PCM estimate, including live held-note probes and a
+    // 128 KiB spectrum scratch allowance. Shared DB/source, allocator overhead,
+    // small source caches and Engine/approximation scratch are excluded.
+    std::size_t max_probe_frames{}, working_set_bytes{};
+    double preliminary_seconds{};
+};
+
 struct CompositeWavConversionResult {
     CompositeWavConversionCompletion completion{CompositeWavConversionCompletion::InvalidInput};
     std::optional<CompositeTimbre> composite_tone;
@@ -175,6 +201,7 @@ struct CompositeWavConversionResult {
     CompositeWavQualityMetrics quality;
     CompositeWavSearchDiagnostics search;
     CompositeWavMorphSearchDiagnostics morph_search;
+    CompositeWavPatchSlideSearchDiagnostics patchslide_search;
     std::vector<CompositeWavMorphCandidateDiagnostic> morph_candidates;
     // At most five distinct valid evaluated tones. First is the unchanged
     // automatic winner; alternatives approximate +5/+10/+15/+20% loss in order.

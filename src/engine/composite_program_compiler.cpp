@@ -321,10 +321,7 @@ bool compileCompositeProgram(
                     track,
                     layer.source == TimbreSource::Opll && layer.opll_sustain);
             if (layer.source == TimbreSource::Psg) {
-                const auto rate = clampRateEnvelope(layer.volume_envelope.rate);
-                const auto mixer = rate_kind
-                    ? rate
-                    : sequenceEnvelopeMixer(layer.volume_envelope.rate);
+                const auto mixer = psgInitialMixer(layer);
                 configured = configured
                     && engine.session().setPsgToneNoise(
                         track, mixer.tone_mode, mixer.noise)

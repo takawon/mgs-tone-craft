@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "mgstc/engine/patchslide_timbre.hpp"
 #include "mgstc/engine/composite_program_compiler.hpp"
+#include "mgstc/engine/composite_envelope_compile.hpp"
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/engine_core.hpp"
 #include "mgstc/engine/mgs_composite_io.hpp"
@@ -170,6 +171,260 @@ void testAllDefinitions() {
     require(count == 13950, "Complete canonical candidate coverage");
 }
 
+void testEnvelopePartialReplacement() {
+    auto original = *makePatchSlideTimbre(candidate(1, 2, 1));
+    original.name = "Authored composite";
+    original.memo = "Preserve metadata";
+    original.playback_tempo = 137;
+    SavedTimbreReference base;
+    base.library_id = 101;
+    base.source = TimbreSource::Opll;
+    base.opll_registers = {1, 2, 3, 4, 5, 6, 7, 8};
+    auto later = base; later.library_id = 102;
+    auto shared = base; shared.library_id = 103;
+    auto unrelated = base; unrelated.library_id = 104;
+    original.embedded_timbres = {base, later, shared, unrelated};
+    auto& layer = original.layers.front();
+    layer.base_timbre = base;
+    layer.base_opll_rom.reset();
+    layer.name = "Keep channel settings";
+    layer.channel = 3;
+    layer.envelope_number = 7;
+    layer.relative_semitones = -3;
+    layer.detune = 4;
+    layer.micro_detune = 9;
+    layer.start_delay_value = 1;
+    layer.volume = 12;
+    layer.opll_sustain = true;
+    layer.envelope_timeline.length_counts = 2;
+    layer.volume_envelope.events = {
+        {.kind=EnvelopeEventKind::Volume, .value=15, .count=0},
+        {.kind=EnvelopeEventKind::Volume, .value=9, .count=1}};
+    layer.pitch_envelope.events = {
+        {.kind=EnvelopeEventKind::Pitch, .value=1, .count=1}};
+    layer.timbre_automation = {
+        {.kind=EnvelopeEventKind::Timbre, .count=0, .target_library_id=101},
+        {.kind=EnvelopeEventKind::Timbre, .count=1, .target_library_id=102},
+        {.kind=EnvelopeEventKind::RegisterWrite, .value=2, .secondary=33, .count=1},
+        {.kind=EnvelopeEventKind::Timbre, .count=51, .target_library_id=103, .after_loop_start=true},
+        {.kind=EnvelopeEventKind::RegisterWrite, .value=56, .secondary=255, .count=65'535}};
+    layer.opll_tl_auto = {.mode=OpllRegisterAutoMode::Rise, .depth=7};
+    layer.opll_fb_auto = {.mode=OpllRegisterAutoMode::FreeCurve, .free_curve={1,2,3}};
+    layer.opll_tl_modulation = {.enabled=true, .depth=3, .speed=1};
+    layer.opll_fb_modulation = {.enabled=true, .depth=2, .speed=1};
+    layer.modulation_profiles = {
+        {.target=CompositeModulationTarget::TotalLevel, .count=0, .parameters={.enabled=true}},
+        {.target=CompositeModulationTarget::Feedback, .count=1, .parameters={.enabled=true}},
+        {.target=CompositeModulationTarget::Pitch, .count=0},
+        {.target=CompositeModulationTarget::Volume, .count=0}};
+    layer.register_auto_profiles = {
+        {.target=OpllRegisterAutoTarget::TotalLevel, .count=0, .lane=layer.opll_tl_auto},
+        {.target=OpllRegisterAutoTarget::Feedback, .count=1, .lane=layer.opll_fb_auto},
+        {.target=OpllRegisterAutoTarget::Noise, .count=0}};
+    layer.derived_command_placements = {
+        {.count=1, .target=CompositeModulationTarget::TotalLevel},
+        {.count=1, .target=CompositeModulationTarget::Feedback},
+        {.count=1, .target=CompositeModulationTarget::Pitch}};
+    auto other = layer;
+    other.base_timbre = shared;
+    other.channel = 4;
+    other.envelope_number = 8;
+    original.layers.push_back(other);
+    CompositeLayer psg;
+    psg.source = TimbreSource::Psg;
+    psg.timbre_automation = {{.kind=EnvelopeEventKind::RegisterWrite, .value=6, .secondary=15}};
+    psg.psg_noise_auto = {.mode=OpllRegisterAutoMode::Rise, .depth=10};
+    original.layers.push_back(psg);
+    const auto before = original;
+    const auto item = candidate(0, 5, 2, 14, 2);
+    const auto result = preparePatchSlideEnvelopeApply(original, 0, item);
+    require(result.timbre.has_value() && result.error.empty() && !result.loop_conflict,
+        "Partial envelope replacement succeeds");
+    require(original == before, "Preparing an apply never mutates caller or Undo snapshot");
+    auto expected = before;
+    auto& dest = expected.layers.front();
+    dest.base_timbre.reset();
+    dest.base_opll_rom = 0;
+    dest.timbre_automation = makePatchSlideTimbre(item)->layers.front().timbre_automation;
+    dest.envelope_timeline.length_counts = 5;
+    dest.opll_tl_auto = {};
+    dest.opll_fb_auto = {};
+    dest.opll_tl_modulation = {};
+    dest.opll_fb_modulation = {};
+    dest.modulation_profiles.erase(dest.modulation_profiles.begin(), dest.modulation_profiles.begin()+2);
+    dest.register_auto_profiles.erase(dest.register_auto_profiles.begin(), dest.register_auto_profiles.begin()+2);
+    dest.derived_command_placements.erase(dest.derived_command_placements.begin(), dest.derived_command_placements.begin()+2);
+    // The other OPLL layer references all old originals; no snapshot is lost.
+    require(*result.timbre == expected,
+        "Only @/TL/FB/y and necessary END change; all metadata, other lanes and layers survive");
+    const auto formatted = formatMgsCompositeEnvelope(result.timbre->layers.front(), 7);
+    require(formatted.valid() && formatted.body.find('y') == std::string::npos,
+        "Deleted manual and generated y never return in MGSC output");
+    auto exclusive = before;
+    exclusive.layers.erase(exclusive.layers.begin()+1);
+    const auto cleaned = preparePatchSlideEnvelopeApply(exclusive, 0, item);
+    require(cleaned.timbre && cleaned.timbre->embedded_timbres == std::vector<SavedTimbreReference>{unrelated},
+        "Only newly unreferenced removed originals are pruned; unrelated snapshots stay");
+    std::string error;
+    const auto bytes = CompositeTimbreLibrary::serializeTimbreFile(*cleaned.timbre, 0);
+    const auto restored = CompositeTimbreLibrary::deserializeTimbreFile(bytes, &error);
+    require(restored && *restored == *cleaned.timbre, "Partial apply portable save retains all authoring and references");
+    const auto preview = preparePatchSlideEnvelopeApply(original, 0, item);
+    require(preview.timbre && *preview.timbre == *result.timbre,
+        "Preview and commit use the identical pure transformation");
+}
+
+void testEnvelopeHeldExtensionAndLimits() {
+    const auto item = candidate(0, 1, 2, 14, 2);
+    for (const auto length : {2U, 5U, 8U, EnvelopeTimeline::kMaximumLengthCounts}) {
+        auto source = *makePatchSlideTimbre(candidate(2, 3, 1));
+        auto& layer = source.layers.front();
+        layer.timbre_automation.clear();
+        layer.envelope_timeline.length_counts = length;
+        layer.volume_envelope.events = {
+            {.kind=EnvelopeEventKind::Volume, .value=13, .count=0},
+            {.kind=EnvelopeEventKind::Volume, .value=0, .count=1}};
+        const auto before_volume = layer.volume_envelope;
+        const auto result = preparePatchSlideEnvelopeApply(source, 0, item);
+        require(result.timbre && result.timbre->layers[0].volume_envelope == before_volume,
+            "Short/equal/long envelopes retain every existing volume event");
+        require(result.timbre->layers[0].envelope_timeline.length_counts == std::max(5U, length),
+            "END extends only to final @ plus one and never truncates");
+        const auto volumes = sampleCompositeVolumeLane(result.timbre->layers[0], 10);
+        require(volumes[0] == 13 && std::all_of(volumes.begin()+1,volumes.end(),[](auto v){return v==0;}),
+            "Extension holds the last zero-volume step without restarting or raising volume");
+    }
+    auto source = *makePatchSlideTimbre(candidate(2, 3, 1));
+    source.layers[0].envelope_timeline.length_counts = 2;
+    source.layers[0].timbre_automation.clear();
+    source.layers[0].volume_envelope.events = {
+        {.kind=EnvelopeEventKind::Volume, .value=15, .count=0},
+        {.kind=EnvelopeEventKind::Volume, .value=9, .count=2, .automatic=true}};
+    const auto before = sampleCompositeVolumeLane(source.layers[0], 10);
+    auto result = preparePatchSlideEnvelopeApply(source, 0, item);
+    require(result.timbre && before == sampleCompositeVolumeLane(result.timbre->layers[0],10),
+        "Ramps ending at original END retain samples and hold their final level");
+    source.layers[0].volume_envelope.events.push_back({.kind=EnvelopeEventKind::Volume,.value=3,.count=4});
+    const auto hidden = source;
+    result = preparePatchSlideEnvelopeApply(source, 0, item);
+    require(!result.timbre && !result.error.empty() && source==hidden,
+        "Extension cannot silently activate a hidden volume target");
+    source.layers[0].volume_envelope.events.pop_back();
+    source.layers[0].envelope_timeline.length_counts = EnvelopeTimeline::kMaximumLengthCounts+1;
+    require(!preparePatchSlideEnvelopeApply(source,0,item).timbre, "Out-of-range END is rejected without clamping");
+    source.layers[0].envelope_timeline.length_counts = 300;
+    source.layers[0].pitch_envelope.events.clear();
+    for (std::uint32_t i=0;i<260;++i)
+        source.layers[0].pitch_envelope.events.push_back({.kind=EnvelopeEventKind::Pitch,.value=1,.count=i});
+    result = preparePatchSlideEnvelopeApply(source,0,item);
+    require(!result.timbre && !result.error.empty(), "Partial MGSC prefix is rejected for PatchSlide apply");
+    source.layers[0].volume_envelope.kind = EnvelopeKind::Rate;
+    require(!preparePatchSlideEnvelopeApply(source,0,item).timbre, "Rate envelopes cannot silently become sequences");
+    source.layers[0].source = TimbreSource::Scc;
+    require(!preparePatchSlideEnvelopeApply(source,0,item).timbre
+        && !preparePatchSlideEnvelopeApply(source,9,item).timbre, "Non-OPLL and stale indices are rejected");
+}
+
+void testEnvelopeInteriorRampPreservation() {
+    auto source = *makePatchSlideTimbre(candidate(2,3,1));
+    auto& layer = source.layers[0];
+    layer.envelope_timeline.length_counts = 8;
+    layer.timbre_automation.clear();
+    layer.volume_envelope.events = {
+        {.kind=EnvelopeEventKind::Volume,.value=15,.count=0},
+        {.kind=EnvelopeEventKind::Volume,.value=0,.count=8,.automatic=true}};
+    const auto original = source;
+    const auto item = candidate(0,5,2,14,2);
+    const auto result = preparePatchSlideEnvelopeApply(source,0,item);
+    require(result.timbre.has_value(), "An ordinary automatic ramp accepts PatchSlide without reauthoring its volume steps");
+    require(source == original && result.timbre->layers[0].volume_envelope == layer.volume_envelope,
+        "PatchSlide leaves the existing volume values, counts, automatic and precise flags unchanged");
+    require(result.error.empty(), "Existing volume-ramp boundary semantics do not cause rejection");
+    require(sampleCompositeVolumeLane(layer,12) == std::vector<std::uint8_t>{15,15,14,12,10,8,6,4,2,0,0,0}
+        && sampleCompositeVolumeLane(result.timbre->layers[0],12) == std::vector<std::uint8_t>{15,15,13,11,10,8,6,4,2,0,0,0},
+        "Ordinary automatic ramps retain the established zero-time boundary rounding semantics");
+    layer.volume_envelope.events.back().precise = true;
+    const auto precise_before = sampleCompositeVolumeLane(layer,12);
+    const auto precise = preparePatchSlideEnvelopeApply(source,0,item);
+    require(precise.timbre.has_value(), "Existing precise ramp applies without changing authoring");
+    require(precise.timbre->layers[0].volume_envelope == layer.volume_envelope,
+        "An already precise authored ramp retains every existing volume step and flag");
+    std::cout << "Existing precise ramp before:";
+    for (const auto value : precise_before) std::cout << ' ' << unsigned(value);
+    std::cout << "\nExisting precise ramp after:";
+    for (const auto value : sampleCompositeVolumeLane(precise.timbre->layers[0],12)) std::cout << ' ' << unsigned(value);
+    std::cout << '\n';
+}
+
+void testEnvelopeLoopApproval() {
+    const auto item = candidate(0, 5, 2, 14, 2);
+    auto source = *makePatchSlideTimbre(candidate(1, 2, 1));
+    auto& layer = source.layers[0];
+    layer.envelope_timeline = {.length_counts=3,.loop_start_count=1,.loop_end_count=3};
+    layer.pitch_envelope.events = {
+        {.kind=EnvelopeEventKind::Pitch,.value=1,.count=1,.after_loop_start=false},
+        {.kind=EnvelopeEventKind::Pitch,.value=-1,.count=1,.after_loop_start=true},
+        {.kind=EnvelopeEventKind::Pitch,.value=1,.count=3,.after_loop_start=true},
+        {.kind=EnvelopeEventKind::Pitch,.value=2,.count=3,.after_loop_start=false},
+        {.kind=EnvelopeEventKind::Pitch,.value=5,.count=4,.after_loop_start=false},
+        {.kind=EnvelopeEventKind::Pitch,.value=6,.count=5,.after_loop_start=false}};
+    layer.modulation_profiles = {
+        {.target=CompositeModulationTarget::Pitch,.count=1,.after_loop_start=false},
+        {.target=CompositeModulationTarget::Volume,.count=1,.after_loop_start=true}};
+    const auto original = source;
+    auto pending = preparePatchSlideEnvelopeApply(source,0,item);
+    require(!pending.timbre && pending.error.empty() && pending.loop_conflict,
+        "Repeated and unreachable candidate commands require approval before preview or apply");
+    require(pending.loop_conflict->repeated_counts==std::vector<std::uint32_t>{2}
+        && pending.loop_conflict->unreachable_counts==std::vector<std::uint32_t>{4},
+        "Conflict identifies exact repeated and unreachable @ counts");
+    require(source==original, "Rejecting or cancelling the pending plan leaves model unchanged");
+    const auto proposed = pending.loop_conflict->proposed_timeline;
+    require(proposed == EnvelopeTimeline{.length_counts=5,.loop_start_count=4,.loop_end_count=5},
+        "Proposed loop adjustment keeps all @ first-pass and preserves a positive wait");
+    auto wrong = proposed;wrong.loop_start_count=3;
+    require(!preparePatchSlideEnvelopeApply(source,0,item,wrong).timbre,
+        "An approval for different loop conditions is not reused");
+    const auto approved = preparePatchSlideEnvelopeApply(source,0,item,proposed);
+    require(approved.timbre && approved.timbre->layers[0].envelope_timeline==proposed,
+        "Only exact approved loop adjustment is applied");
+    const auto& adjusted = approved.timbre->layers[0];
+    const auto& pitch = adjusted.pitch_envelope.events;
+    require(pitch.size()==6 && pitch[0].value==1 && pitch[1].value==-1
+        && !pitch[0].after_loop_start && !pitch[1].after_loop_start
+        && pitch[0].command_order<pitch[1].command_order
+        && pitch[2].value==1 && pitch[3].value==2
+        && !pitch[2].after_loop_start && !pitch[3].after_loop_start
+        && pitch[2].command_order<pitch[3].command_order,
+        "Moved old loop boundaries flatten with first-pass execution order preserved");
+    require(adjusted.modulation_profiles.size()==2
+        && !adjusted.modulation_profiles[0].after_loop_start
+        && !adjusted.modulation_profiles[1].after_loop_start
+        && pitch[0].command_order<adjusted.modulation_profiles[0].command_order
+        && adjusted.modulation_profiles[0].command_order<pitch[1].command_order
+        && pitch[1].command_order<adjusted.modulation_profiles[1].command_order,
+        "Old boundary mixed pitch/profile execution order is preserved across flattening");
+    require(pitch[4].count==4 && pitch[4].after_loop_start
+        && pitch[5].count==5 && pitch[5].after_loop_start
+        && adjusted.timbre_automation.back().count==4
+        && !adjusted.timbre_automation.back().after_loop_start,
+        "Existing commands at new brackets enter body; new final @ stays before start");
+    const auto formatted = formatMgsCompositeEnvelope(approved.timbre->layers[0],0);
+    require(formatted.valid() && formatted.body.find("@14.[")!=std::string::npos,
+        "Final @ at adjusted loop start remains before '[' and is not repeated");
+    layer.envelope_timeline = {.length_counts=8,.loop_start_count=4,.loop_end_count=8};
+    auto boundary = preparePatchSlideEnvelopeApply(source,0,item);
+    require(boundary.timbre && !boundary.loop_conflict
+        && boundary.timbre->layers[0].envelope_timeline == layer.envelope_timeline,
+        "An @ before '[' at the same count is first-pass and needs no loop change");
+    layer.envelope_timeline = {.length_counts=8,.loop_start_count=0,.loop_end_count=4};
+    pending = preparePatchSlideEnvelopeApply(source,0,item);
+    require(pending.loop_conflict && pending.loop_conflict->unreachable_counts==std::vector<std::uint32_t>{4},
+        "An @ after ']' at the same count is unreachable");
+    layer.envelope_timeline.loop_end_count.reset();
+    require(!preparePatchSlideEnvelopeApply(source,0,item).error.empty(), "Incomplete loops are rejected, never repaired silently");
+}
+
 void testRejectMalformed() {
     const auto reject = [](PatchSlideCandidate item) {
         std::string error;
@@ -212,6 +467,10 @@ int main() {
         require(patchEvents(*sound, true) == std::vector<std::pair<Tick, int>>{{0, 0}, {0, 0}, {2, 1}, {4, 14}},
                 "OPLL key-off preserves the existing sequence runtime semantics");
         testRejectMalformed();
+        testEnvelopePartialReplacement();
+        testEnvelopeHeldExtensionAndLimits();
+        testEnvelopeLoopApproval();
+        testEnvelopeInteriorRampPreservation();
         std::cout << "PatchSlide native conversion: 13950 definitions, six hold patterns, runtime, MGSC, persistence passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

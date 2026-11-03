@@ -17,4 +17,28 @@ namespace mgstc::engine {
 [[nodiscard]] std::optional<CompositeTimbre> makePatchSlideTimbre(
     const PatchSlideCandidate& candidate, std::string* error = nullptr);
 
+// A conflict never produces an audition or commit model. The UI must obtain
+// approval for the proposed timeline and retry against the same source snapshot.
+struct PatchSlideEnvelopeLoopConflict {
+    std::vector<std::uint32_t> repeated_counts;
+    std::vector<std::uint32_t> unreachable_counts;
+    EnvelopeTimeline proposed_timeline;
+};
+
+struct PatchSlideEnvelopeApplyResult {
+    std::optional<CompositeTimbre> timbre;
+    std::optional<PatchSlideEnvelopeLoopConflict> loop_conflict;
+    std::string error;
+};
+
+// Pure, bounded UI/worker operation. Replaces only the selected OPLL layer's
+// @ and y/TL/FB authoring; all other authoring and other layers are retained.
+// No history, engine, database or caller-owned model is mutated. Both preview
+// and commit consume the returned model. A caller committing asynchronously
+// must still compare its source snapshot and host-state generation.
+[[nodiscard]] PatchSlideEnvelopeApplyResult preparePatchSlideEnvelopeApply(
+    const CompositeTimbre& original, std::size_t layer_index,
+    const PatchSlideCandidate& candidate,
+    const std::optional<EnvelopeTimeline>& approved_timeline = std::nullopt);
+
 }  // namespace mgstc::engine

@@ -19,7 +19,11 @@
 #include "patchslide_stock.hpp"
 #include "mgstc/engine/patchslide_database.hpp"
 #include "mgstc/engine/patchslide_timbre.hpp"
+#include "mgstc/engine/patchslide_features.hpp"
 #include "switch_look_and_feel.hpp"
+#include "segmented_control.hpp"
+#include "mgstc_look_and_feel.hpp"
+#include "conversion_busy_dialog.hpp"
 #include "ui_chrome_constants.hpp"
 #include "ui_fonts.hpp"
 #include "ui_layout.hpp"
@@ -32,12 +36,66 @@ namespace mgstc::app {
 class PatchSlideBrowserComponent final : public juce::Component,
                                         private juce::ListBoxModel,
                                         private juce::Timer {
+    class ChoiceButtons final : public juce::Component {
+    public:
+        void addItem(const juce::String& text, int id) {
+            auto button = std::make_unique<juce::TextButton>(text);
+            button->setLookAndFeel(&look_and_feel_);
+            button->setClickingTogglesState(true);
+            button->setRadioGroupId(1);
+            button->setTooltip(text);
+            button->onClick = [this, id] { setSelectedId(id, juce::sendNotificationSync); };
+            addAndMakeVisible(*button);
+            ids_.push_back(id);
+            buttons_.push_back(std::move(button));
+            for (std::size_t i = 0; i < buttons_.size(); ++i)
+                configureSegmentButton(*buttons_[i], static_cast<int>(i), static_cast<int>(buttons_.size()));
+            setExplicitFocusOrder(focus_order_);
+            resized();
+        }
+        void setSelectedId(int id, juce::NotificationType notification = juce::sendNotificationAsync) {
+            const bool changed = selected_ != id;
+            selected_ = id;
+            for (std::size_t i = 0; i < buttons_.size(); ++i)
+                buttons_[i]->setToggleState(ids_[i] == id, juce::dontSendNotification);
+            if (changed && notification != juce::dontSendNotification && onChange) onChange();
+        }
+        [[nodiscard]] int getSelectedId() const { return selected_; }
+        [[nodiscard]] int getNumItems() const { return static_cast<int>(buttons_.size()); }
+        [[nodiscard]] juce::String getItemText(int index) const { return buttons_.at(static_cast<std::size_t>(index))->getButtonText(); }
+        juce::TextButton& buttonAt(std::size_t index) { return *buttons_.at(index); }
+        void setExplicitFocusOrder(int order) {
+            focus_order_ = order;
+            juce::Component::setExplicitFocusOrder(order);
+            for (std::size_t i = 0; i < buttons_.size(); ++i)
+                buttons_[i]->setExplicitFocusOrder(order + static_cast<int>(i));
+        }
+        void resized() override {
+            auto area = getLocalBounds();
+            int weight{};
+            for (const auto& button : buttons_) weight += button->getButtonText().length() + 2;
+            for (std::size_t i = 0; i < buttons_.size(); ++i) {
+                const auto current = buttons_[i]->getButtonText().length() + 2;
+                const int width = i + 1 == buttons_.size() ? area.getWidth() : area.getWidth() * current / weight;
+                buttons_[i]->setBounds(area.removeFromLeft(width));
+                weight -= current;
+            }
+        }
+        std::function<void()> onChange;
+    private:
+        MgstcLookAndFeel look_and_feel_;
+        std::vector<std::unique_ptr<juce::TextButton>> buttons_;
+        std::vector<int> ids_;
+        int selected_{}, focus_order_{100};
+    };
 public:
     struct Callbacks {
         std::function<void(const engine::CompositeTimbre&)> preview;
         std::function<void(const engine::CompositeTimbre&)> apply;
         std::function<void(const engine::CompositeTimbre&)> registerTimbre;
         std::function<void()> stop;
+        // Optional notification for keyboard audition; an empty sound clears it.
+        std::function<void(const engine::CompositeTimbre&)> selectionChanged;
     };
 
     explicit PatchSlideBrowserComponent(
@@ -53,25 +111,27 @@ private:
     friend class PatchSlideBrowserTestAccess;
     PatchSlideBrowserComponent(Callbacks callbacks, BackgroundTaskBoundary* background_tasks,
                               std::filesystem::path directory, std::shared_ptr<PatchSlideStock> stock = {})
-        : callbacks_(std::move(callbacks)), tags_model_(*this), stock_model_(*this),
+        : callbacks_(std::move(callbacks)), background_tasks_(background_tasks), tags_model_(*this), stock_model_(*this),
           stock_(stock ? std::move(stock) : std::make_shared<PatchSlideStock>()),
           worker_(std::make_shared<Worker>()) {
         worker_->directory = std::move(directory);
         mode_.addItem(utf8("タグから探す"), 1);
-        mode_.addItem(utf8("分類から探す"), 2);
-        mode_.addItem(utf8("すべての音色"), 3);
+        mode_.addItem(utf8("分類タグから探す"), 2);
+        mode_.addItem(utf8("全ての音色"), 3);
         mode_.setSelectedId(1, juce::dontSendNotification);
-        match_.addItem(utf8("AND（すべて）"), 1);
-        match_.addItem(utf8("OR（いずれか）"), 2);
+        match_.addItem("AND", 1);
+        match_.addItem("OR", 2);
         match_.setSelectedId(1, juce::dontSendNotification);
-        cluster_size_.addItem(utf8("16群（独立分類）"), 16);
-        cluster_size_.addItem(utf8("64群（独立分類）"), 64);
+        match_.buttonAt(0).setTooltip(utf8("選んだタグをすべて含む候補を表示します"));
+        match_.buttonAt(1).setTooltip(utf8("選んだタグのいずれかを含む候補を表示します"));
+        cluster_size_.addItem(utf8("16群"), 16);
+        cluster_size_.addItem(utf8("64群"), 64);
         cluster_size_.setSelectedId(16, juce::dontSendNotification);
         mode_.onChange = [this] { updateMode(); requestBrowse(); };
         match_.onChange = [this] { requestBrowse(); };
         cluster_size_.onChange = [this] { rebuildGroups(); requestBrowse(); };
         group_.onChange = [this] { updateRepresentative(); requestBrowse(); };
-        rejected_.setButtonText(utf8("Rejectも表示（注意）"));
+        rejected_.setButtonText(utf8("不安定な音色も表示 (注意)"));
         rejected_.setLookAndFeel(&switch_style_);
         rejected_.setTooltip(utf8("通常非表示の不安定候補を明示的に表示します。共有DBは変更しません。"));
         rejected_.onClick = [this] {
@@ -82,8 +142,17 @@ private:
         two_changes_.setLookAndFeel(&switch_style_);
         two_changes_.setTooltip(utf8("OFF: 1回変更のみ / ON: 1回変更と2回変更"));
         two_changes_.onClick = rejected_.onClick;
+        audition_mode_.addItem(utf8("パッチスライド単体"), 1);
+        audition_mode_.addItem(utf8("複合音色全体"), 2);
+        audition_mode_.setSelectedId(2, juce::dontSendNotification);
+        audition_mode_.onChange = [this] { if (audition_mode_changed_) audition_mode_changed_(auditionWholeComposite()); };
+        configure(compare_, "A/B", [this] { setEnvelopeAuditionOriginal(!auditionOriginal(), juce::sendNotificationSync); });
+        compare_.setTooltip(utf8("編集中の音色とパッチスライドを切り替えて試聴します"));
         configure(preview_, "試聴", [this] { previewSelection(); });
-        configure(stop_, "停止", [this] { stopPreview(); });
+        configure(stop_, "停止", [this] {
+            stopPreview();
+            if (busy_ && query_kind_ == QueryKind::External) cancelExternalSearch();
+        });
         configure(apply_, "編集へ適用", [this] {
             if (selection_ && callbacks_.apply) callbacks_.apply(*selection_);
         });
@@ -141,7 +210,7 @@ private:
         tag_list_.setModel(&tags_model_);
         tag_list_.setMultipleSelectionEnabled(true);
         tag_list_.setColour(juce::ListBox::backgroundColourId, juce::Colour(UiLayout::panelFill));
-        tag_hint_.setText(utf8("タグを複数選択: Ctrl / Shift"), juce::dontSendNotification);
+        tag_hint_.setText(utf8("タグを複数選択: CTRL/Shift"), juce::dontSendNotification);
         group_info_.setJustificationType(juce::Justification::topLeft);
         details_.setMultiLine(true, false);
         details_.setReadOnly(true);
@@ -151,14 +220,16 @@ private:
         for (auto* component : std::initializer_list<juce::Component*>{
                  &mode_, &match_, &cluster_size_, &group_, &rejected_, &preview_, &stop_,
                  &apply_, &register_, &similar_, &variation_, &random_, &back_, &reload_,
-                 &representative_, &list_, &stock_list_, &stock_header_, &two_changes_, &tag_list_, &tag_hint_, &group_info_, &details_, &status_})
+                 &representative_, &list_, &stock_list_, &stock_header_, &two_changes_, &tag_list_, &tag_hint_, &group_info_, &details_, &status_, &audition_mode_, &compare_})
             addAndMakeVisible(component);
         int focus = 100;
         for (auto* component : std::initializer_list<juce::Component*>{
                  &mode_, &match_, &tag_list_, &cluster_size_, &group_, &representative_,
                  &rejected_, &list_, &stock_list_, &random_, &similar_, &variation_, &two_changes_, &back_, &preview_,
-                 &stop_, &apply_, &register_, &details_, &reload_})
-            component->setExplicitFocusOrder(focus++);
+                 &stop_, &audition_mode_, &compare_, &apply_, &register_, &details_, &reload_})
+            component->setExplicitFocusOrder((focus++) * 10);
+        for (auto* choices : {&mode_, &match_, &cluster_size_, &audition_mode_})
+            choices->setExplicitFocusOrder(choices->getExplicitFocusOrder());
         const bool registered = !background_tasks || background_tasks->registerTask(worker_);
         if (registered && worker_->start()) {
             requestBrowse();
@@ -169,6 +240,8 @@ private:
             status_.setText(utf8("検索ワーカーを開始できません。画面を開き直してください。"), juce::dontSendNotification);
         }
         updateMode();
+        audition_mode_.setVisible(false);
+        compare_.setVisible(false);
         refreshStock();
         updateActions();
     }
@@ -178,6 +251,7 @@ public:
         stopTimer();
         stopPreview();
         worker_->cancel();
+        if (background_tasks_) delete database_busy_dialog_.getComponent();
         list_.setModel(nullptr);
         stock_list_.setModel(nullptr);
         tag_list_.setModel(nullptr);
@@ -191,12 +265,49 @@ public:
         return busy_ && selection_origin_ != SelectionOrigin::Stock ? no_selection_ : selection_;
     }
     [[nodiscard]] const engine::PatchSlideCandidate* selectedCandidate() const noexcept {
-        return db_ && selected_index_ && (!busy_ || selection_origin_ == SelectionOrigin::Stock)
+        return selection_ && db_ && selected_index_ && (!busy_ || selection_origin_ == SelectionOrigin::Stock)
             ? &db_->candidates()[*selected_index_] : nullptr;
     }
+    void setExternalQuerySource(engine::CompositeTimbre isolated_layer) {
+        stopPreview();
+        clearSelection();
+        external_source_ = std::make_shared<const engine::CompositeTimbre>(std::move(isolated_layer));
+        if (mode_.getNumItems() == 3) mode_.addItem(utf8("編集中の音色から近似"), 4);
+        mode_.setSelectedId(4, juce::dontSendNotification);
+        variation_.setTooltip(utf8("候補を選んでから、その候補を起点にVariationを探索します。"));
+        updateMode();
+        requestBrowse();
+    }
     void stopPreview() { if (callbacks_.stop) callbacks_.stop(); }
+    void setEnvelopeAuditionControls(std::function<void(bool)> mode_changed, std::function<void(bool)> compare_changed) {
+        audition_mode_changed_ = std::move(mode_changed);
+        compare_changed_ = std::move(compare_changed);
+        envelope_audition_ = true;
+        audition_mode_.setVisible(true);
+        compare_.setVisible(true);
+        resized();
+        updateActions();
+    }
+    [[nodiscard]] bool auditionWholeComposite() const { return audition_mode_.getSelectedId() == 2; }
+    void setEnvelopeAuditionWholeComposite(bool whole, juce::NotificationType notification = juce::dontSendNotification) {
+        audition_mode_.setSelectedId(whole ? 2 : 1, notification);
+    }
+    [[nodiscard]] bool auditionOriginal() const { return audition_original_; }
+    void setEnvelopeAuditionOriginal(bool original, juce::NotificationType notification = juce::dontSendNotification) {
+        const bool changed = audition_original_ != original;
+        audition_original_ = original;
+        compare_.setButtonText(utf8(original ? "\xE2\x96\xB6" "B" : "\xE2\x96\xB6" "A"));
+        if (changed && notification != juce::dontSendNotification && compare_changed_) compare_changed_(original);
+    }
 
-    void visibilityChanged() override { if (!isShowing()) stopPreview(); }
+    void prepareToHide() {
+        stopPreview();
+        hideDatabaseLoadDialog();
+    }
+    void visibilityChanged() override {
+        if (!isShowing()) prepareToHide();
+        else resumeDatabaseLoadIfNeeded();
+    }
     void paint(juce::Graphics& g) override { paintPageBackground(g, getLocalBounds()); }
     void resized() override {
         using namespace UiLayout;
@@ -208,11 +319,11 @@ public:
         tag_list_.setRowHeight(fieldH);
         auto area = getLocalBounds().reduced(panelPad);
         auto top = area.removeFromTop(fieldH);
-        mode_.setBounds(top.removeFromLeft(libraryWidth));
-        top.removeFromLeft(controlGap);
         reload_.setBounds(top.removeFromRight(libraryManageButtonW));
         top.removeFromRight(controlGap);
-        rejected_.setBounds(top);
+        rejected_.setBounds(top.removeFromRight(UiScale::sx(250)));
+        top.removeFromRight(controlGap);
+        mode_.setBounds(top);
         area.removeFromTop(sm);
         status_.setBounds(area.removeFromTop(fieldH));
         area.removeFromTop(sm);
@@ -221,6 +332,10 @@ public:
         bottom.removeFromLeft(controlGap);
         stop_.setBounds(bottom.removeFromLeft(libraryButtonMinW));
         bottom.removeFromLeft(controlGap);
+        if (envelope_audition_) {
+            audition_mode_.setBounds(bottom.removeFromLeft(UiScale::sx(336)));
+            bottom.removeFromLeft(controlGap);
+        }
         apply_.setBounds(bottom.removeFromLeft(compositeSelectorW));
         bottom.removeFromLeft(controlGap);
         register_.setBounds(bottom.removeFromLeft(outputSwitchW + panelPad * 2));
@@ -229,15 +344,17 @@ public:
         details_.setBounds(left.removeFromBottom(libraryMemoH + fieldH));
         left.removeFromBottom(sm);
         auto tags = left;
-        match_.setBounds(tags.removeFromTop(fieldH));
-        tags.removeFromTop(sm);
-        tag_hint_.setBounds(tags.removeFromTop(fieldH));
+        auto tagHeader = tags.removeFromTop(fieldH);
+        match_.setBounds(tagHeader.removeFromRight(UiScale::sx(100)));
+        tagHeader.removeFromRight(controlGap);
+        tag_hint_.setBounds(tagHeader);
         tags.removeFromTop(xs);
         tag_list_.setBounds(tags);
         auto groups = left;
-        cluster_size_.setBounds(groups.removeFromTop(fieldH));
-        groups.removeFromTop(sm);
-        group_.setBounds(groups.removeFromTop(fieldH));
+        auto groupHeader = groups.removeFromTop(fieldH);
+        cluster_size_.setBounds(groupHeader.removeFromLeft(UiScale::sx(112)));
+        groupHeader.removeFromLeft(controlGap);
+        group_.setBounds(groupHeader);
         groups.removeFromTop(sm);
         representative_.setBounds(groups.removeFromTop(textButtonH));
         groups.removeFromTop(sm);
@@ -254,13 +371,21 @@ public:
         first.removeFromLeft(controlGap);
         variation_.setBounds(first.removeFromLeft(outputSwitchW));
         first.removeFromLeft(controlGap);
-        const bool fits = first.getWidth() >= UiScale::sx(112);
-        if (fits) two_changes_.setBounds(first.removeFromLeft(UiScale::sx(112)));
+        const auto filterWidth = UiScale::sx(112) + (envelope_audition_ ? controlGap + libraryButtonMinW : 0);
+        const bool fits = first.getWidth() >= filterWidth;
+        const auto placeFilters = [&](juce::Rectangle<int>& row) {
+            two_changes_.setBounds(row.removeFromLeft(UiScale::sx(112)));
+            row.removeFromLeft(controlGap);
+            if (envelope_audition_) {
+                compare_.setBounds(row.removeFromLeft(libraryButtonMinW));
+                row.removeFromLeft(controlGap);
+            }
+        };
+        if (fits) placeFilters(first);
         area.removeFromTop(sm);
         auto second = area.removeFromTop(textButtonH);
         if (!fits) {
-            two_changes_.setBounds(second.removeFromLeft(UiScale::sx(112)));
-            second.removeFromLeft(controlGap);
+            placeFilters(second);
         }
         back_.setBounds(second.removeFromLeft(juce::jmin(second.getWidth(), compositeSelectorW)));
         area.removeFromTop(sm);
@@ -268,7 +393,7 @@ public:
     }
 
 private:
-    enum class QueryKind { Browse, StandardB, Variation };
+    enum class QueryKind { Browse, StandardB, Variation, External };
     enum class SelectionOrigin { None, Candidate, Stock };
     struct Query {
         std::uint64_t generation{};
@@ -276,6 +401,7 @@ private:
         engine::PatchSlideFilter filter;
         std::size_t source{};
         std::string source_id;
+        std::shared_ptr<const engine::CompositeTimbre> external_source;
         bool reload{};
     };
     struct Result {
@@ -286,6 +412,7 @@ private:
         std::vector<engine::PatchSlideSearchResult> ranks;
         std::size_t total{}, rejected{}, other_hidden{};
         std::string error;
+        bool load_cancelled{};
     };
 
     struct Worker final : EditorBackgroundTask {
@@ -319,6 +446,8 @@ private:
         void run() noexcept {
             std::shared_ptr<const engine::PatchSlideDatabase> db;
             std::shared_ptr<const std::vector<juce::String>> names;
+            std::shared_ptr<const engine::CompositeTimbre> vector_source;
+            std::optional<std::array<double, engine::PatchSlideDatabase::vector_dimension>> external_vector;
             for (;;) {
                 Query query;
                 {
@@ -332,8 +461,24 @@ private:
                 result.generation = query.generation;
                 try {
                     if (query.reload) { db.reset(); names.reset(); }
-                    if (!db) db = directory.empty() ? engine::PatchSlideDatabase::load(&result.error)
-                        : engine::PatchSlideDatabase::load(directory, &result.error);
+                    if (!db) {
+                        load_cancelled.store(false, std::memory_order_release);
+                        load_attempt.fetch_add(1, std::memory_order_acq_rel);
+                        engine::PatchSlideLoadOptions load;
+                        load.cancelled = [this] {
+                            return cancelled.load(std::memory_order_acquire) || load_cancelled.load(std::memory_order_acquire);
+                        };
+                        load.progress = [this](const engine::PatchSlideLoadProgress& progress) {
+                            load_fraction.store(progress.fraction, std::memory_order_release);
+                            load_stage.store(progress.stage, std::memory_order_release);
+                            if (progress.stage != engine::PatchSlideLoadStage::Completed)
+                                loading_database.store(true, std::memory_order_release);
+                        };
+                        db = directory.empty() ? engine::PatchSlideDatabase::load(&result.error, load)
+                            : engine::PatchSlideDatabase::load(directory, &result.error, load);
+                        result.load_cancelled = load_cancelled.load(std::memory_order_acquire);
+                        loading_database.store(false, std::memory_order_release);
+                    }
                     if (db && !names) {
                         auto formatted = std::make_shared<std::vector<juce::String>>();
                         formatted->reserve(db->candidates().size());
@@ -352,6 +497,30 @@ private:
                             const auto candidates = db->filter(all);
                             result.total = candidates.size();
                             for (const auto index : candidates) appendVisible(result, index, query.filter.show_rejected);
+                        } else if (query.kind == QueryKind::External) {
+                            if (!query.external_source) throw std::runtime_error("The edited OPLL query is unavailable");
+                            if (vector_source != query.external_source || !external_vector) {
+                                external_vector = engine::makePatchSlideSearchVector(*query.external_source, &result.error,
+                                    [this, generation = query.generation] {
+                                        return cancelled.load(std::memory_order_acquire)
+                                            || newest.load(std::memory_order_acquire) != generation;
+                                    });
+                                vector_source = query.external_source;
+                            }
+                            if (!external_vector) {
+                                if (result.error.empty()) result.error = "OPLL query rendering was cancelled";
+                            } else {
+                                result.ranks = db->searchFromVector(*external_vector, db->candidates().size());
+                                auto filter = query.filter;
+                                filter.show_rejected = true;
+                                std::vector<bool> eligible(db->candidates().size(), false);
+                                for (const auto index : db->filter(filter)) eligible[index] = true;
+                                for (const auto& row : result.ranks) {
+                                    if (!eligible[row.candidate_index]) continue;
+                                    ++result.total;
+                                    appendVisible(result, row.candidate_index, query.filter.show_rejected);
+                                }
+                            }
                         } else {
                             const auto source = db->find(query.source_id);
                             if (!source) throw std::runtime_error("The selected PatchSlide candidate is no longer available");
@@ -376,6 +545,7 @@ private:
                     if (query.generation == newest.load(std::memory_order_acquire)) ready = std::move(result);
                 }
             }
+            loading_database.store(false, std::memory_order_release);
             done.store(true, std::memory_order_release);
         }
         static void appendVisible(Result& result, std::size_t index, bool show_rejected) {
@@ -389,6 +559,10 @@ private:
         std::condition_variable wake;
         std::jthread thread;
         std::atomic<bool> cancelled{false}, done{false};
+        std::atomic<bool> loading_database{false}, load_cancelled{false};
+        std::atomic<double> load_fraction{0};
+        std::atomic<engine::PatchSlideLoadStage> load_stage{engine::PatchSlideLoadStage::Waiting};
+        std::atomic<std::uint64_t> load_attempt{0};
         std::atomic<std::uint64_t> newest{0};
         std::optional<Query> pending;
         std::optional<Result> ready;
@@ -511,6 +685,7 @@ private:
         selected_index_.reset();
         active_id_.clear();
         selection_origin_ = SelectionOrigin::None;
+        if (!adopting_result_ && callbacks_.selectionChanged) callbacks_.selectionChanged(engine::CompositeTimbre{});
         details_.clear();
         const juce::ScopedValueSetter<bool> updating(updating_, true);
         list_.deselectAllRows();
@@ -564,7 +739,21 @@ private:
         stock_->remove(id);
         refreshStock();
     }
-    void requestBrowse(bool reload = false) { request(QueryKind::Browse, 0, reload); }
+    void cancelExternalSearch() {
+        {
+            std::lock_guard lock(worker_->mutex);
+            worker_->newest.store(++generation_, std::memory_order_release);
+            worker_->pending.reset();
+            worker_->ready.reset();
+        }
+        busy_ = false;
+        clearSelection();
+        status_.setText(utf8("検索を取り消しました。検索モードを選ぶか再読込で再開できます。"), juce::dontSendNotification);
+        updateActions();
+    }
+    void requestBrowse(bool reload = false) {
+        request(mode_.getSelectedId() == 4 && external_source_ ? QueryKind::External : QueryKind::Browse, 0, reload);
+    }
     void request(QueryKind kind, std::size_t source, bool reload = false) {
         if (worker_->cancelled.load(std::memory_order_acquire)) return;
         stopPreview();
@@ -574,13 +763,14 @@ private:
         Query query;
         query.generation = ++generation_;
         query.kind = kind;
+        query.external_source = external_source_;
         query.source = source;
         if (db_ && source < db_->candidates().size()) query.source_id = db_->candidates()[source].candidate_id;
         query.reload = reload;
         query.filter.show_rejected = rejected_.getToggleState();
         query.filter.max_change_count = two_changes_.getToggleState() ? 2 : 1;
-        if (kind == QueryKind::Browse) {
-            if (mode_.getSelectedId() == 1) {
+        if (kind == QueryKind::Browse || kind == QueryKind::External) {
+            if (mode_.getSelectedId() == 1 || mode_.getSelectedId() == 4) {
                 query.filter.tags_match_all = match_.getSelectedId() == 1;
                 const auto selected = tag_list_.getSelectedRows();
                 for (int i = 0; i < selected.size(); ++i) {
@@ -598,7 +788,71 @@ private:
         updateActions();
         worker_->submit(std::move(query));
     }
+    void hideDatabaseLoadDialog() {
+        if (auto* dialog = database_busy_dialog_.getComponent()) {
+            retry_load_when_visible_ = retry_load_when_visible_
+                || worker_->loading_database.load(std::memory_order_acquire);
+            delete dialog;
+        }
+    }
+    void resumeDatabaseLoadIfNeeded() {
+        if (retry_load_when_visible_ && isShowing()) {
+            retry_load_when_visible_ = false;
+            requestBrowse(true);
+        }
+    }
+    void updateDatabaseLoadDialog() {
+        if (database_busy_dialog_ || !isShowing()
+            || !worker_->loading_database.load(std::memory_order_acquire)
+            || worker_->load_cancelled.load(std::memory_order_acquire)) return;
+        struct LoadObserver final : EditorBackgroundTask {
+            std::shared_ptr<Worker> worker;
+            std::uint64_t attempt{};
+            void cancel() noexcept override {
+                if (worker->load_attempt.load(std::memory_order_acquire) == attempt
+                    && worker->loading_database.load(std::memory_order_acquire))
+                    worker->load_cancelled.store(true, std::memory_order_release);
+            }
+            void join() noexcept override {} // The existing browser worker owns its thread.
+            bool completed() const noexcept override {
+                return worker->load_attempt.load(std::memory_order_acquire) != attempt
+                    || !worker->loading_database.load(std::memory_order_acquire)
+                    || worker->done.load(std::memory_order_acquire);
+            }
+        };
+        auto observer = std::make_shared<LoadObserver>();
+        observer->worker = worker_;
+        observer->attempt = worker_->load_attempt.load(std::memory_order_acquire);
+        auto progress = std::make_shared<ConversionProgressState>();
+        progress->custom_cancel = [observer] { observer->cancel(); };
+        progress->custom_cancelled = [observer] { return observer->worker->load_cancelled.load(std::memory_order_acquire); };
+        progress->custom_progress = [worker = worker_] { return worker->load_fraction.load(std::memory_order_acquire); };
+        progress->custom_stage = [worker = worker_] {
+            using Stage = engine::PatchSlideLoadStage;
+            switch (worker->load_stage.load(std::memory_order_acquire)) {
+            case Stage::Waiting: return utf8("共有DBの読込を待っています…");
+            case Stage::Files: return utf8("DBファイルを確認中…");
+            case Stage::SourceHash: return utf8("音色DBを検証中…");
+            case Stage::SearchHash: return utf8("検索DBを検証中…");
+            case Stage::Metadata: return utf8("DBの整合性を確認中…");
+            case Stage::Candidates: return utf8("音色情報を読込中…");
+            case Stage::Vectors: return utf8("音響特徴量を読込中…");
+            case Stage::Tags: return utf8("タグを読込中…");
+            case Stage::Clusters: return utf8("分類を読込中…");
+            case Stage::Completed: return utf8("DBの読込完了");
+            }
+            return utf8("DBを読込中…");
+        };
+        auto* dialog = new ConversionBusyDialog(std::move(progress), this, utf8("パッチスライドDB読込"));
+        database_busy_dialog_ = dialog;
+        dialog->centreAroundComponent(this, dialog->getWidth(), dialog->getHeight());
+        dialog->keepTaskAlive(std::move(observer), [](bool) {});
+        dialog->enterModalState(true, nullptr, false);
+    }
     void timerCallback() override {
+        if (!isShowing()) hideDatabaseLoadDialog();
+        else resumeDatabaseLoadIfNeeded();
+        updateDatabaseLoadDialog();
         if (stock_revision_ != stock_->revision()) refreshStock();
         std::optional<Result> result;
         {
@@ -632,29 +886,36 @@ private:
             rebuildGroups();
         }
         updating_ = false;
-        if (!result->error.empty()) {
+        if (result->load_cancelled) {
+            clearSelection();
+            status_.setText(utf8("DBの読込を取り消しました。再読込で再開できます。"), juce::dontSendNotification);
+            details_.clear();
+        } else if (!result->error.empty()) {
             clearSelection();
             status_.setText(utf8("パッチスライドを利用できません"), juce::dontSendNotification);
-            details_.setText(utf8(result->error.c_str()) + utf8("\n正しい3ファイルを配置後、再読込またはMGSTCを再起動してください。"), false);
+            details_.setText(utf8(result->error.c_str())
+                + (db_ ? utf8("\n検索条件や音色・音程設定を確認して再検索してください。")
+                       : utf8("\n正しい3ファイルを配置後、再読込またはMGSTCを再起動してください。")), false);
         } else {
             auto text = query_kind_ == QueryKind::Variation ? utf8("Variation（選択順を保持）: ")
-                : query_kind_ == QueryKind::StandardB ? utf8("Standard B（距離順位）: ") : utf8("探索: ");
+                : query_kind_ == QueryKind::StandardB ? utf8("Standard B（距離順位）: ")
+                : query_kind_ == QueryKind::External ? utf8("編集中の音色から近似（Variationは候補選択後）: ") : utf8("探索: ");
             text += utf8("表示 ") + juce::String(static_cast<int>(rows_.size())) + " / " + juce::String(static_cast<int>(result->total));
             text += utf8("　除外 Reject ") + juce::String(static_cast<int>(result->rejected));
             text += utf8(" / 表示不可 ") + juce::String(static_cast<int>(result->other_hidden));
             status_.setText(text, juce::dontSendNotification);
         }
-        if (result->error.empty()) reconcileSelection();
+        if (!result->load_cancelled && result->error.empty()) reconcileSelection();
         refreshStock();
         updateMode();
         updateActions();
     }
     void updateMode() {
         const int mode = mode_.getSelectedId();
-        for (auto* component : std::initializer_list<juce::Component*>{&match_, &tag_list_, &tag_hint_}) component->setVisible(mode == 1);
+        for (auto* component : std::initializer_list<juce::Component*>{&match_, &tag_list_, &tag_hint_}) component->setVisible(mode == 1 || mode == 4);
         for (auto* component : std::initializer_list<juce::Component*>{&cluster_size_, &group_, &representative_, &group_info_}) component->setVisible(mode == 2);
         random_.setVisible(mode == 3 && query_kind_ == QueryKind::Browse);
-        back_.setVisible(query_kind_ != QueryKind::Browse);
+        back_.setVisible(query_kind_ != QueryKind::Browse && query_kind_ != QueryKind::External);
         resized();
     }
     void rebuildGroups() {
@@ -686,6 +947,7 @@ private:
         preview_.setEnabled(selected && static_cast<bool>(callbacks_.preview));
         apply_.setEnabled(selected && static_cast<bool>(callbacks_.apply));
         register_.setEnabled(selected && static_cast<bool>(callbacks_.registerTimbre));
+        compare_.setEnabled(selected && envelope_audition_);
         similar_.setEnabled(selected);
         variation_.setEnabled(selected);
         random_.setEnabled(!busy_ && !rows_.empty());
@@ -710,6 +972,9 @@ private:
             if (from_stock) list_.deselectAllRows(); else stock_list_.deselectAllRows();
         }
         selection_ = engine::makePatchSlideTimbre(candidate, &error);
+        if (!adopting_result_ && envelope_audition_)
+            setEnvelopeAuditionOriginal(false, juce::dontSendNotification);
+        if (!adopting_result_ && callbacks_.selectionChanged) callbacks_.selectionChanged(selection_.value_or(engine::CompositeTimbre{}));
         juce::String text = (*names_)[index];
         text += "\n" + utf8(candidate.candidate_id.c_str());
         text += utf8("　AUTO_SAFE: ") + juce::String(candidate.auto_safe ? "Yes" : "No");
@@ -768,10 +1033,16 @@ private:
     }
 
     Callbacks callbacks_;
+    BackgroundTaskBoundary* background_tasks_{};
+    juce::Component::SafePointer<ConversionBusyDialog> database_busy_dialog_;
+    bool retry_load_when_visible_{};
     SwitchLookAndFeel switch_style_;
-    juce::ComboBox mode_, match_, cluster_size_, group_;
+    ChoiceButtons mode_, match_, cluster_size_, audition_mode_;
+    juce::ComboBox group_;
     juce::ToggleButton rejected_, two_changes_;
-    juce::TextButton preview_, stop_, apply_, register_, similar_, variation_, random_, back_, reload_, representative_;
+    juce::TextButton preview_, stop_, apply_, register_, similar_, variation_, random_, back_, reload_, representative_, compare_;
+    std::function<void(bool)> audition_mode_changed_, compare_changed_;
+    bool envelope_audition_{}, audition_original_{};
     juce::Label status_, tag_hint_, group_info_, stock_header_;
     juce::TextEditor details_;
     KeyboardList list_, stock_list_;
@@ -781,6 +1052,7 @@ private:
     std::shared_ptr<PatchSlideStock> stock_;
     std::vector<std::string> stock_ids_;
     std::uint64_t stock_revision_{};
+    std::shared_ptr<const engine::CompositeTimbre> external_source_;
     std::shared_ptr<Worker> worker_;
     std::shared_ptr<const engine::PatchSlideDatabase> db_;
     std::shared_ptr<const std::vector<juce::String>> names_;

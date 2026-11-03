@@ -259,10 +259,6 @@ inline void assignSequenceEnvelopeMixer(
     std::uint8_t noise) noexcept {
     mode = std::min<std::uint8_t>(mode, 3);
     noise = std::min<std::uint8_t>(noise, 31);
-    if (mode == kMgscSequenceToneModeDefault
-        && noise == kMgscSequenceNoiseDefault) {
-        return;
-    }
     rate.tone_mode = mode;
     rate.noise = noise;
 }
@@ -477,6 +473,9 @@ struct CompositeLayer {
     StartDelayForm start_delay_form{StartDelayForm::AbsoluteTicks};
     std::uint32_t start_delay_value{};
     std::uint8_t volume{15};
+    // Optional track-side MML `/` and `n`; independent of definition headers.
+    std::optional<std::uint8_t> psg_tone_mode;
+    std::optional<std::uint8_t> psg_noise;
     // `@e` / `@r` definition number (0–31). Unused sequence layers do not
     // reserve this stored authoring value.
     std::uint8_t envelope_number{};
@@ -511,6 +510,31 @@ struct CompositeLayer {
         = default;
 };
 
+[[nodiscard]] inline bool hasPsgEnvelopeMixer(const CompositeLayer& layer) noexcept {
+    return layer.volume_envelope.rate.tone_mode != 0 || layer.volume_envelope.rate.noise != 0;
+}
+
+[[nodiscard]] inline RateEnvelope psgInitialMixer(const CompositeLayer& layer) noexcept {
+    RateEnvelope result{};
+    result.tone_mode = std::min<std::uint8_t>(layer.psg_tone_mode.value_or(1), 3);
+    result.noise = std::min<std::uint8_t>(layer.psg_noise.value_or(0), 31);
+    const auto& authored = layer.volume_envelope.rate;
+    const auto header = layer.volume_envelope.kind == EnvelopeKind::Rate
+        || layer.psg_tone_mode || layer.psg_noise ? clampRateEnvelope(authored)
+        : sequenceEnvelopeMixer(authored);
+    // A definition header's Mode=0 preserves the track mixer; Mode=1 changes
+    // only tone/noise selection. Noise is initialized by Mode=2 or 3.
+    if (header.tone_mode != 0) result.tone_mode = header.tone_mode;
+    if (header.tone_mode >= 2) result.noise = header.noise;
+    return result;
+}
+
+[[nodiscard]] inline std::string formatSequenceEnvelopeHeader(const CompositeLayer& layer) {
+    if (layer.source == TimbreSource::Psg && (layer.psg_tone_mode || layer.psg_noise)
+        && !hasPsgEnvelopeMixer(layer)) return "0,0,";
+    return formatSequenceEnvelopeHeader(layer.source, layer.volume_envelope.rate);
+}
+
 // Editor-session output numbering, never part of the authored sound or a save
 // format. Legacy/non-editor callers omit it to retain their existing allocator.
 struct OriginalTimbreAllocationStarts {
@@ -524,7 +548,7 @@ struct OriginalTimbreAllocationStarts {
 struct CompositeTimbre {
     // Portable .mgstc / clipboard layout (name, tags, memo, favorite, then
     // sound body). Independent of SQLite kCompositeSoundPayloadVersion.
-    static constexpr std::uint32_t kFormatVersion = 25;
+    static constexpr std::uint32_t kFormatVersion = 26;
     static constexpr std::uint32_t kMinimumReadableFormatVersion = 5;
 
     std::uint32_t format_version{kFormatVersion};

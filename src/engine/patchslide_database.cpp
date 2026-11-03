@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #ifdef _WIN32
@@ -66,6 +68,17 @@ constexpr std::string_view scales_hash = "888c9fcb86052fb41d1d0e8f845fe17265abf3
 
 void require(bool condition, std::string_view message) {
     if (!condition) throw std::runtime_error(std::string(message));
+}
+
+void checkLoadCancellation(const PatchSlideLoadOptions& options) {
+    if (options.cancelled && options.cancelled())
+        throw std::runtime_error("PatchSlide database loading cancelled");
+}
+
+void reportLoad(const PatchSlideLoadOptions& options, PatchSlideLoadStage stage,
+    std::size_t completed, std::size_t total, double fraction) {
+    checkLoadCancellation(options);
+    if (options.progress) options.progress({stage, completed, total, fraction});
 }
 
 std::string pathText(const std::filesystem::path& path) {
@@ -134,14 +147,21 @@ std::string hashBytes(std::string_view value) {
     return hash.finish();
 }
 
-std::string hashFile(const std::filesystem::path& path) {
+std::string hashFile(const std::filesystem::path& path, const PatchSlideLoadOptions& options,
+    PatchSlideLoadStage stage, double begin, double end) {
     std::ifstream stream(path, std::ios::binary);
     require(stream.good(), "Cannot read PatchSlide database file");
     Sha256 hash;
     std::array<char, 65536> buffer{};
+    std::size_t completed{};
+    const auto total = static_cast<std::size_t>(std::filesystem::file_size(path));
     while (stream) {
+        checkLoadCancellation(options);
         stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         hash.update(buffer.data(), static_cast<std::size_t>(stream.gcount()));
+        completed += static_cast<std::size_t>(stream.gcount());
+        reportLoad(options, stage, completed, total,
+            begin + (end - begin) * (total ? double(completed) / double(total) : 1.0));
     }
     require(stream.eof(), "PatchSlide database read failed");
     return hash.finish();
@@ -365,29 +385,51 @@ std::filesystem::path PatchSlideDatabase::defaultDirectory() {
 #endif
 }
 
-std::shared_ptr<const PatchSlideDatabase> PatchSlideDatabase::load(std::string* error) {
-    return load(defaultDirectory(), error);
+std::shared_ptr<const PatchSlideDatabase> PatchSlideDatabase::load(
+    std::string* error, const PatchSlideLoadOptions& options) {
+    return load(defaultDirectory(), error, options);
 }
 
 std::shared_ptr<const PatchSlideDatabase> PatchSlideDatabase::load(
-    const std::filesystem::path& directory, std::string* error) {
+    const std::filesystem::path& directory, std::string* error, const PatchSlideLoadOptions& options) {
     struct Cached { FileStamps stamps; std::weak_ptr<const PatchSlideDatabase> database; };
     static std::mutex cache_mutex;
     static std::map<std::filesystem::path, Cached> cache;
+    // Keep one verified data set after its last browser closes. Other active
+    // paths may share weak entries, but temporary paths never pin more arrays.
+    static std::shared_ptr<const PatchSlideDatabase> retained;
     if (error) error->clear();
     try {
         const auto canonical = std::filesystem::weakly_canonical(directory);
         // Worker-only lock also prevents concurrent instances loading duplicate 86MB arrays.
-        const std::lock_guard lock(cache_mutex);
+        std::unique_lock lock(cache_mutex, std::defer_lock);
+        bool reported_wait{};
+        while (!lock.try_lock()) {
+            if (!reported_wait) {
+                reportLoad(options, PatchSlideLoadStage::Waiting, 0, 0, 0);
+                reported_wait = true;
+            }
+            checkLoadCancellation(options);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        checkLoadCancellation(options);
+        std::erase_if(cache, [](const auto& entry) { return entry.second.database.expired(); });
         const auto stamps = fileStamps(canonical);
         const auto previous = cache.find(canonical);
         if (previous != cache.end() && previous->second.stamps == stamps) {
-            if (auto existing = previous->second.database.lock()) return existing;
+            if (auto existing = previous->second.database.lock()) {
+                retained = existing;
+                reportLoad(options, PatchSlideLoadStage::Completed, 1, 1, 1.0);
+                return existing;
+            }
         }
         auto database = std::shared_ptr<PatchSlideDatabase>(new PatchSlideDatabase);
-        database->read(canonical);
+        database->read(canonical, options);
         require(fileStamps(canonical) == stamps, "PatchSlide files changed during initialization");
+        checkLoadCancellation(options);
         cache[canonical] = {stamps, database};
+        retained = database;
+        reportLoad(options, PatchSlideLoadStage::Completed, 1, 1, 1.0);
         return database;
     } catch (const std::exception& exception) {
         if (error) *error = std::string(exception.what()) + "\n" + pathText(directory);
@@ -395,7 +437,8 @@ std::shared_ptr<const PatchSlideDatabase> PatchSlideDatabase::load(
     }
 }
 
-void PatchSlideDatabase::read(const std::filesystem::path& directory) {
+void PatchSlideDatabase::read(const std::filesystem::path& directory, const PatchSlideLoadOptions& options) {
+    reportLoad(options, PatchSlideLoadStage::Files, 0, 1, 0.01);
     const auto source_path = directory / "patchslide.sqlite";
     const auto search_path = directory / "patchslide_search.sqlite";
     const auto manifest_path = directory / "manifest.json";
@@ -413,11 +456,21 @@ void PatchSlideDatabase::read(const std::filesystem::path& directory) {
     const auto ids_hash = profile.ids_hash;
     const auto candidate_count = profile.candidate_count;
     const auto candidate_count_text = std::to_string(candidate_count);
-    require(hashFile(source_path) == source_hash, "PatchSlide source database SHA-256 mismatch");
-    require(hashFile(search_path) == search_hash, "PatchSlide search database SHA-256 mismatch");
+    require(hashFile(source_path, options, PatchSlideLoadStage::SourceHash, .02, .10) == source_hash,
+        "PatchSlide source database SHA-256 mismatch");
+    require(hashFile(search_path, options, PatchSlideLoadStage::SearchHash, .10, .30) == search_hash,
+        "PatchSlide search database SHA-256 mismatch");
+    reportLoad(options, PatchSlideLoadStage::Metadata, 0, 1, .30);
     Database source(source_path);
     Database search(search_path);
     auto* db = search.get();
+    const auto interrupt = [](void* context) noexcept {
+        const auto& load = *static_cast<const PatchSlideLoadOptions*>(context);
+        try { return load.cancelled && load.cancelled() ? 1 : 0; }
+        catch (...) { return 1; }
+    };
+    sqlite3_progress_handler(source.get(), 10000, interrupt, const_cast<PatchSlideLoadOptions*>(&options));
+    sqlite3_progress_handler(db, 10000, interrupt, const_cast<PatchSlideLoadOptions*>(&options));
     const auto manifest_value = [&](std::string_view path) { return jsonValue(db, manifest, path); };
     require(scalar(db, "PRAGMA user_version") == "2", "PatchSlide search schema must be version 2");
     require(scalar(source.get(), "PRAGMA user_version") == "1", "PatchSlide source schema must be version 1");
@@ -483,6 +536,7 @@ void PatchSlideDatabase::read(const std::filesystem::path& directory) {
             "PatchSlide frozen search method/layout metadata mismatch");
 
     candidates_.reserve(candidate_count);
+    reportLoad(options, PatchSlideLoadStage::Candidates, 0, candidate_count, .40);
     Statement candidates(source.get(), "SELECT candidate_id,candidate_no,patch_a,patch_b,patch_c,change_count,hold_pattern,hold_a_steps,hold_b_steps,auto_safe,manual_use_allowed,enabled,visibility,predicted_partition,human_pattern,raw_different_count FROM candidates ORDER BY candidate_id COLLATE BINARY");
     std::string canonical_ids = "[";
     while (candidates.row()) {
@@ -510,11 +564,15 @@ void PatchSlideDatabase::read(const std::filesystem::path& directory) {
         if (!candidates_.empty()) canonical_ids += ',';
         canonical_ids += '"' + candidate.candidate_id + '"';
         candidates_.push_back(std::move(candidate));
+        if (candidates_.size() % 64 == 0)
+            reportLoad(options, PatchSlideLoadStage::Candidates, candidates_.size(), candidate_count,
+                .40 + .08 * double(candidates_.size()) / double(candidate_count));
     }
     canonical_ids += ']';
     require(candidates_.size() == candidate_count && hashBytes(canonical_ids) == ids_hash,
             "PatchSlide requires the complete candidate ID set for its delivery");
     vectors_.resize(candidate_count * vector_dimension);
+    reportLoad(options, PatchSlideLoadStage::Vectors, 0, candidate_count, .48);
     norms_.resize(candidate_count);
     Statement vectors(db, "SELECT candidate_id,method_id,dimension,codec,vector_blob,vector_sha256 FROM search_vectors ORDER BY candidate_id COLLATE BINARY");
     std::size_t index = 0;
@@ -535,8 +593,12 @@ void PatchSlideDatabase::read(const std::filesystem::path& directory) {
         }
         norms_[index] = normSquared(values);
         ++index;
+        if (index % 32 == 0)
+            reportLoad(options, PatchSlideLoadStage::Vectors, index, candidate_count,
+                .48 + .34 * double(index) / double(candidate_count));
     }
     require(index == candidate_count, "PatchSlide vector coverage mismatch");
+    reportLoad(options, PatchSlideLoadStage::Tags, 0, profile.tag_records, .82);
     require(scalar(db, "SELECT count(*) FROM tagging_candidates") == candidate_count_text
             && scalar(db, "SELECT count(*) FROM tags") == "94"
             && scalar(db, "SELECT count(*) FROM candidate_tags") == std::to_string(profile.tag_records)
@@ -548,10 +610,14 @@ void PatchSlideDatabase::read(const std::filesystem::path& directory) {
         tags_.push_back({tags.text(0), tags.text(1), static_cast<std::size_t>(tags.integer(2))});
     }
     Statement edges(db, "SELECT ct.candidate_id,t.tag FROM candidate_tags ct JOIN tags t USING(tag) ORDER BY ct.candidate_id COLLATE BINARY,t.ordinal");
+    std::size_t tag_records{};
     while (edges.row()) {
         const auto candidate_index = find(edges.text(0));
         require(candidate_index.has_value(), "PatchSlide tag references an unknown candidate");
         candidates_[*candidate_index].tags.push_back(edges.text(1));
+        if (++tag_records % 128 == 0)
+            reportLoad(options, PatchSlideLoadStage::Tags, tag_records, profile.tag_records,
+                .82 + .08 * double(tag_records) / double(profile.tag_records));
     }
     Statement processed(db, "SELECT candidate_id FROM tagging_candidates ORDER BY candidate_id COLLATE BINARY");
     index = 0;
@@ -561,6 +627,7 @@ void PatchSlideDatabase::read(const std::filesystem::path& directory) {
     }
     require(index == candidate_count, "Incomplete PatchSlide tagging processing records");
 
+    reportLoad(options, PatchSlideLoadStage::Clusters, 0, candidate_count * 2, .90);
     Statement sets(db, "SELECT cluster_set_id,cluster_count,distance_method,provenance_json,provenance_sha256 FROM cluster_sets ORDER BY cluster_count");
     int set_index = 0;
     while (sets.row()) {
@@ -580,6 +647,9 @@ void PatchSlideDatabase::read(const std::filesystem::path& directory) {
                     "PatchSlide cluster candidate ID coverage mismatch");
             (count == 16 ? candidates_[index].cluster16 : candidates_[index].cluster64) = members.integer(1);
             ++index;
+            if (index % 64 == 0)
+                reportLoad(options, PatchSlideLoadStage::Clusters, set_index * candidate_count + index,
+                    candidate_count * 2, .90 + .09 * double(set_index * candidate_count + index) / double(candidate_count * 2));
         }
         require(index == candidate_count, "Incomplete PatchSlide cluster membership");
         Statement clusters(db, "SELECT cluster_id,representative_candidate_id,member_count,statistics_json,statistics_sha256 FROM clusters WHERE cluster_set_id=?1 ORDER BY cluster_id");
@@ -587,6 +657,7 @@ void PatchSlideDatabase::read(const std::filesystem::path& directory) {
         int cluster_rows = 0;
         std::size_t total = 0;
         while (clusters.row()) {
+            checkLoadCancellation(options);
             const int cluster_id = clusters.integer(0);
             const auto representative = find(clusters.text(1));
             const auto member_count = static_cast<std::size_t>(clusters.integer(2));
@@ -678,6 +749,31 @@ std::vector<PatchSlideSearchResult> PatchSlideDatabase::standardB(std::size_t so
         result.push_back({index, 0, index == source_index ? std::numeric_limits<double>::infinity() : distance});
     }
     // Input order is candidate_id COLLATE BINARY, so exact ties retain that order.
+    std::stable_sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+        return left.squared_distance < right.squared_distance;
+    });
+    result.resize(top_n);
+    for (std::size_t index = 0; index < result.size(); ++index) result[index].rank = index + 1;
+    return result;
+}
+
+std::vector<PatchSlideSearchResult> PatchSlideDatabase::searchFromVector(
+    std::span<const double> query, std::size_t top_n) const {
+    require(query.size() == vector_dimension && top_n > 0 && top_n <= candidates_.size(),
+            "Invalid external PatchSlide query dimension/count");
+    require(std::all_of(query.begin(), query.end(), [](double value) { return std::isfinite(value); }),
+            "External PatchSlide query contains nonfinite values");
+    const double norm = normSquared(query);
+    require(std::isfinite(norm), "External PatchSlide query norm overflow");
+    std::vector<PatchSlideSearchResult> result;
+    result.reserve(candidates_.size());
+    for (std::size_t index = 0; index < candidates_.size(); ++index) {
+        const auto target = std::span<const double>(vectors_.data() + index * vector_dimension, vector_dimension);
+        const double distance = distanceWithNorms(query, target, norm, norms_[index],
+                                                  globalDotReduction(index, candidates_.size()));
+        require(std::isfinite(distance), "Nonfinite external PatchSlide search distance");
+        result.push_back({index, 0, distance});
+    }
     std::stable_sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
         return left.squared_distance < right.squared_distance;
     });

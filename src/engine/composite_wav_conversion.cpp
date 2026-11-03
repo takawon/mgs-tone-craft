@@ -5,6 +5,8 @@
 
 #include "mgstc/engine/scc_morph.hpp"
 #include "mgstc/engine/wave_import.hpp"
+#include "mgstc/engine/patchslide_database.hpp"
+#include "mgstc/engine/patchslide_timbre.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1393,7 +1395,7 @@ struct OpllCandidate {
 
 // Candidate acquisition owns source-specific preparation. The optimizer sees
 // only playable snapshots and evaluates all sources through the same Engine.
-// There is deliberately no database adapter until that product scope exists.
+// Database-backed sequences use the same acquisition/evaluation separation.
 class OpllCandidateSource {
 public:
     virtual ~OpllCandidateSource() = default;
@@ -1441,9 +1443,528 @@ public:
 private:
     std::uint32_t frame_;
 };
+
+// PatchSlide acquisition deliberately does not interpret an arbitrary WAV as
+// four repeated DB notes. Classification representatives provide bounded
+// coverage; every acoustic shortlist entry is measured with the ordinary
+// Engine at the source note. This is a separate coarse proposal metric, not B.
+double patchSlideRoleLoss(std::span<const float> reference, std::span<const float> pcm,
+    double frequency, std::size_t attack, CompositeWavStrategy strategy, std::size_t part) {
+    const auto count = std::min(reference.size(), pcm.size());
+    if (!count || rms(pcm) < 1e-8) return std::numeric_limits<double>::infinity();
+    double loss{}, frames{};
+    for (const auto centre : {std::size_t{0}, count / 4, count / 2, count - 1}) {
+        const auto x = spectrum(reference, centre, 2048, 1.0);
+        const auto y = spectrum(pcm, centre, 2048, 1.0);
+        double xpower{}, ypower{};
+        for (std::size_t bin = 1; bin < x.size(); ++bin) {
+            const auto harmonic = static_cast<std::size_t>(std::max(1.0,
+                std::round(double(bin * rate) / (2048.0 * frequency))));
+            const auto weight = harmonicWeight(strategy, part, harmonic,
+                static_cast<std::uint32_t>(centre / 800), static_cast<std::uint32_t>(attack / 800));
+            xpower += std::pow(x[bin] * weight, 2);
+            ypower += y[bin] * y[bin];
+        }
+        if (xpower <= epsilon) continue; // This role is silent at this time.
+        const auto xscale = 1.0 / std::sqrt(xpower + epsilon);
+        const auto yscale = 1.0 / std::sqrt(ypower + epsilon);
+        for (std::size_t bin = 1; bin < x.size(); ++bin) {
+            const auto harmonic = static_cast<std::size_t>(std::max(1.0,
+                std::round(double(bin * rate) / (2048.0 * frequency))));
+            const auto weight = harmonicWeight(strategy, part, harmonic,
+                static_cast<std::uint32_t>(centre / 800), static_cast<std::uint32_t>(attack / 800));
+            loss += std::pow(x[bin] * weight * xscale - y[bin] * yscale, 2);
+        }
+        ++frames;
+    }
+    return frames ? loss / frames : 0.0;
+}
+
+void fitPatchSlideRoleEnvelope(CompositeLayer& layer, const SourceAnalysis& analysis,
+    CompositeWavStrategy strategy, std::size_t part, std::uint32_t keyoff) {
+    layer.volume_envelope.events.clear();
+    double peak{};
+    for (const auto& frame : analysis.amplitude_envelope) peak = std::max(peak, frame.rms);
+    const auto attack = countAt(analysis, analysis.attack_region.selection.end);
+    for (std::uint32_t tick = 0; tick < keyoff; ++tick) {
+        const auto sample = sampleAt(analysis, tick);
+        const auto& amplitude = nearest(analysis.amplitude_envelope, sample);
+        const auto& frame = nearest(analysis.harmonic_trajectory, sample);
+        double power{}, rolePower{};
+        for (const auto& harmonic : frame.harmonics) {
+            const auto weight = harmonicWeight(strategy, part, harmonic.harmonic, tick, attack);
+            power += harmonic.amplitude * harmonic.amplitude;
+            rolePower += std::pow(harmonic.amplitude * weight, 2);
+        }
+        double fraction = power > epsilon ? std::sqrt(rolePower / power) : .5;
+        if (strategy == CompositeWavStrategy::AttackSustain)
+            fraction = harmonicWeight(strategy, part, 1, tick, attack);
+        const double desired = std::clamp(fraction * amplitude.rms / (peak + epsilon), 0.0, 1.0);
+        const int volume = layer.source == TimbreSource::Opll
+            ? (desired > 1e-4 ? 15 + static_cast<int>(std::lround(20 * std::log10(desired) / 3)) : 0)
+            : static_cast<int>(std::lround(15 * desired));
+        addVolume(layer, tick, volume);
+    }
+    simplifyVolume(layer, keyoff);
+}
+
+CompositeWavConversionResult convertPatchSlideWave(std::shared_ptr<const SourceAnalysis> analysis,
+    const CompositeWavConversionOptions& options) {
+    CompositeWavConversionResult result;
+    result.analysis_reference = analysis;
+    const auto started = std::chrono::steady_clock::now();
+    const auto control = options.control;
+    const auto* cancel = control ? &control->cancel_requested : nullptr;
+    const auto stage = [&](CompositeWavStage value) {
+        if (control) control->stage.store(value, std::memory_order_relaxed);
+    };
+    const auto finish = [&]() {
+        result.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        if (cancelled(cancel)) {
+            result.completion = CompositeWavConversionCompletion::Cancelled;
+            result.composite_tone.reset();
+            result.preview = {};
+            result.preview.error = CompositeWavRenderError::Cancelled;
+            result.retained_candidates.clear();
+            stage(CompositeWavStage::Cancelled);
+        } else stage(CompositeWavStage::Completed);
+        return std::move(result);
+    };
+    if (control) control->evaluations.store(0, std::memory_order_relaxed);
+    const bool hasScc = configurationUsesScc(options.configuration);
+    if (!analysis || !validAnalysis(*analysis)
+        || static_cast<unsigned>(options.strategy) > static_cast<unsigned>(CompositeWavStrategy::Independent)
+        || static_cast<unsigned>(options.preference) > static_cast<unsigned>(CompositeWavPreference::Compact)
+        || static_cast<unsigned>(options.loop_mode) > static_cast<unsigned>(CompositeWavLoopMode::None)
+        || !options.max_evaluations || options.max_evaluations > 4096
+        || (options.strategy == CompositeWavStrategy::Automatic && options.max_evaluations < 4)
+        || !std::isfinite(options.minimum_improvement) || options.minimum_improvement < 0
+        || (hasScc && (!options.max_scc_waveforms || options.max_scc_waveforms > 32
+            || static_cast<unsigned>(options.scc_wave_method) > static_cast<unsigned>(CompositeWavSccWaveMethod::DirectPeriodic)
+            || (options.max_scc_source_waveforms && (!*options.max_scc_source_waveforms || *options.max_scc_source_waveforms > 32))
+            || (options.scc_start_number && *options.scc_start_number > 31)))) {
+        result.error = "Invalid PatchSlide conversion settings or insufficient automatic-strategy budget";
+        return finish();
+    }
+    if (cancelled(cancel)) return finish();
+    const int note = static_cast<int>(std::lround(69 + 12 * std::log2(analysis->reference_pitch_hz / 440)));
+    if (note < 24 || note > 119) { result.error = "Reference pitch lies outside the playable note range"; return finish(); }
+    const double frequency = 440 * std::pow(2.0, (note - 69) / 12.0);
+    auto reference = referencePcm(*analysis);
+    if (reference.empty() || reference.size() > CompositeWavRenderOptions::kMaximumFrameCount) {
+        result.error = "Selected audio exceeds the conversion render limit"; return finish();
+    }
+    const auto keyoffSample = options.key_off_position.value_or(analysis->estimated_key_off
+        ? analysis->estimated_key_off->sample_position : analysis->selection.end);
+    if (keyoffSample <= analysis->selection.begin || keyoffSample > analysis->selection.end) {
+        result.error = "Key-off must be inside the selected audio or at its end"; return finish();
+    }
+    const auto keyoff = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(std::ceil(
+        (keyoffSample - analysis->selection.begin) * 60.0 / analysis->source->sample_rate)));
+    const auto total = std::max(keyoff, countAt(*analysis, analysis->selection.end));
+    const auto attackFrame = static_cast<std::size_t>((analysis->attack_region.selection.end
+        - analysis->selection.begin) * double(rate) / analysis->source->sample_rate);
+    CompositeWavRenderOptions rendering;
+    rendering.midi_note = static_cast<std::uint8_t>(note);
+    rendering.frame_count = reference.size();
+    rendering.key_off_frame = static_cast<std::size_t>(std::llround((keyoffSample - analysis->selection.begin)
+        * double(rate) / analysis->source->sample_rate));
+    rendering.cancel = cancel;
+    stage(CompositeWavStage::Candidates);
+    std::string dbError;
+    const auto db = options.patchslide_database_directory.empty() ? PatchSlideDatabase::load(&dbError)
+        : PatchSlideDatabase::load(options.patchslide_database_directory, &dbError);
+    if (!db) {
+        result.completion = CompositeWavConversionCompletion::NoValidCandidate;
+        result.error = std::move(dbError); return finish();
+    }
+    if (cancelled(cancel)) return finish();
+    PatchSlideFilter filter;
+    filter.auto_safe_only = true;
+    auto eligible = db->filter(filter);
+    std::erase_if(eligible, [&](std::size_t index) {
+        const auto& candidate = db->candidates()[index];
+        const auto finalCount = candidate.hold_a_steps + candidate.hold_b_steps.value_or(0);
+        return !candidate.auto_safe || PatchSlideDatabase::isRejected(candidate)
+            || !candidate.enabled || finalCount >= static_cast<int>(keyoff);
+    });
+    result.patchslide_search.eligible_candidates = eligible.size();
+    if (eligible.empty()) {
+        result.completion = CompositeWavConversionCompletion::NoValidCandidate;
+        result.error = "No AUTO_SAFE PatchSlide sequence fits before the selected key-off";
+        return finish();
+    }
+    const std::size_t poolLimit = options.preference == CompositeWavPreference::Quality ? 64
+        : options.preference == CompositeWavPreference::Compact ? 32 : 48;
+    std::vector<std::size_t> pool;
+    const auto add = [&](std::size_t index) {
+        if (pool.size() < poolLimit && std::binary_search(eligible.begin(), eligible.end(), index)
+            && std::find(pool.begin(), pool.end(), index) == pool.end()) pool.push_back(index);
+    };
+    for (const auto* pattern : {"h1", "h2", "h11", "h12", "h21", "h22"}) {
+        const auto found = std::find_if(eligible.begin(), eligible.end(), [&](auto index) {
+            return db->candidates()[index].hold_pattern == pattern;
+        });
+        if (found != eligible.end()) add(*found);
+    }
+    for (const auto& cluster : db->clusters())
+        if (cluster.cluster_count == (options.preference == CompositeWavPreference::Quality ? 64 : 16))
+            add(cluster.representative_index);
+    for (std::size_t i = 0; i < poolLimit; ++i) add(eligible[i * eligible.size() / poolLimit]);
+    for (const auto index : eligible) { if (pool.size() == poolLimit) break; add(index); }
+    result.patchslide_search.prefiltered_candidates = pool.size();
+    std::vector<CompositeWavStrategy> strategies{options.strategy};
+    if (options.strategy == CompositeWavStrategy::Automatic)
+        strategies = {CompositeWavStrategy::FundamentalResidual, CompositeWavStrategy::LowHigh,
+            CompositeWavStrategy::AttackSustain, CompositeWavStrategy::Independent};
+    using Rank = std::pair<double, std::size_t>;
+    std::array<std::array<std::vector<Rank>, 2>, 5> rankings;
+    auto probeOptions = rendering;
+    probeOptions.frame_count = std::min<std::size_t>(reference.size(), 24'000);
+    probeOptions.key_off_frame = std::min(rendering.key_off_frame, probeOptions.frame_count);
+    result.patchslide_search.max_probe_frames = probeOptions.frame_count;
+    const auto coarseReference = std::span<const float>(reference).first(probeOptions.frame_count);
+    const auto preliminaryStarted = std::chrono::steady_clock::now();
+    const auto addRankings = [&](const CompositeWavRenderResult& pcm, std::size_t index,
+        auto& lists) {
+        for (const auto strategy : strategies) for (std::size_t part = 0; part < 2; ++part)
+            if (const auto loss = patchSlideRoleLoss(coarseReference, pcm.mono_pcm, frequency, attackFrame, strategy, part);
+                std::isfinite(loss)) lists[static_cast<std::size_t>(strategy)][part].emplace_back(loss, index);
+    };
+    for (std::size_t index = 0; index < pool.size() && !cancelled(cancel); ++index) {
+        const auto tone = makePatchSlideTimbre(db->candidates()[pool[index]]);
+        if (!tone) continue;
+        const auto pcm = renderCompositeWav(*tone, probeOptions);
+        ++result.patchslide_search.preliminary_renders;
+        result.patchslide_search.working_set_bytes = std::max(result.patchslide_search.working_set_bytes,
+            reference.capacity() * sizeof(float)
+                + (pcm.mono_pcm.capacity() + pcm.stereo_pcm.capacity()) * sizeof(float)
+                + wavToneStorage(*tone) + 128 * 1024);
+        if (pcm.ok() && !pcm.clipped) addRankings(pcm, index, rankings);
+    }
+    const auto initialFrame = std::min(keyoff - 1, countAt(*analysis, analysis->attack_region.selection.end));
+    std::vector<OpllCandidate> originals{{0, std::nullopt}};
+    std::array<std::array<std::vector<Rank>, 2>, 5> originalRankings;
+    if (options.configuration == CompositeWavConfiguration::OpllOriginalOpllPatchSlide && !cancelled(cancel)) {
+        originals = OriginalOpllCandidateSource(initialFrame).acquire(*analysis, note, cancel);
+        for (std::size_t index = 0; index < originals.size() && !cancelled(cancel); ++index) {
+            CompositeTimbre tone;
+            CompositeLayer layer;
+            layer.source = TimbreSource::Opll;
+            SavedTimbreReference snapshot;
+            snapshot.source = TimbreSource::Opll; snapshot.library_id = 1;
+            snapshot.opll_registers = encodeOpllPatch(*originals[index].original);
+            layer.base_timbre = snapshot;
+            tone.layers.push_back(layer);
+            const auto pcm = renderCompositeWav(tone, probeOptions);
+            ++result.patchslide_search.preliminary_renders;
+            result.patchslide_search.working_set_bytes = std::max(result.patchslide_search.working_set_bytes,
+                reference.capacity() * sizeof(float)
+                    + (pcm.mono_pcm.capacity() + pcm.stereo_pcm.capacity()) * sizeof(float)
+                    + wavToneStorage(tone) + 128 * 1024);
+            if (pcm.ok() && !pcm.clipped) addRankings(pcm, index, originalRankings);
+        }
+    }
+    result.patchslide_search.preliminary_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - preliminaryStarted).count();
+    result.patchslide_search.working_set_bytes = std::max(result.patchslide_search.working_set_bytes,
+        reference.capacity() * sizeof(float) + probeOptions.frame_count * 3 * sizeof(float)
+            + pool.capacity() * sizeof(std::size_t));
+    if (cancelled(cancel)) return finish();
+    const auto sortRanks = [](auto& lists) {
+        for (auto& roles : lists) for (auto& list : roles) std::stable_sort(list.begin(), list.end());
+    };
+    sortRanks(rankings); sortRanks(originalRankings);
+    const auto leftRole = [&](CompositeWavStrategy strategy) -> std::size_t {
+        return hasScc && (strategy == CompositeWavStrategy::FundamentalResidual || strategy == CompositeWavStrategy::LowHigh) ? 1 : 0;
+    };
+    std::vector<std::uint32_t> keyframes{0};
+    if (hasScc && options.max_scc_waveforms > 1 && initialFrame > 0) keyframes.push_back(initialFrame);
+    if (hasScc && options.preference == CompositeWavPreference::Quality && options.max_scc_waveforms > 2
+        && keyoff > keyframes.back() + 1) keyframes.push_back(keyoff - 1);
+    WaveShapeCache sourceWaves{{}, &result.morph_search};
+    const auto makeTone = [&](CompositeWavStrategy strategy, std::size_t first, std::size_t second,
+        std::size_t originalIndex) -> CompositeTimbre {
+        CompositeTimbre tone;
+        if (hasScc) {
+            auto legacy = options;
+            legacy.configuration = CompositeWavConfiguration::SccOpllRom;
+            tone = generateCandidate(*analysis, legacy, strategy, keyframes, 0, 1, 0, nullptr, keyoff, false, &sourceWaves);
+            tone.layers.resize(1);
+            tone.layers.front().envelope_timeline.loop_start_count.reset();
+            tone.layers.front().envelope_timeline.loop_end_count.reset();
+            for (std::size_t event = 1; event < tone.layers.front().timbre_automation.size(); ++event) {
+                auto& morph = tone.layers.front().timbre_automation[event].scc_morph;
+                morph.enabled = true;
+                morph.distribution_mode = SccMorphDistributionMode::AdaptiveDistribution;
+            }
+        } else if (options.configuration == CompositeWavConfiguration::OpllOriginalOpllPatchSlide) {
+            CompositeLayer layer;
+            layer.source = TimbreSource::Opll; layer.name = "WAV OPLL original";
+            SavedTimbreReference snapshot;
+            snapshot.source = TimbreSource::Opll; snapshot.library_id = allocateCompositeOwnedTimbreId(tone);
+            snapshot.name = layer.name;
+            snapshot.opll_registers = encodeOpllPatch(*originals[originalIndex].original);
+            layer.base_timbre = snapshot;
+            tone.layers.push_back(std::move(layer));
+        } else {
+            auto slide = makePatchSlideTimbre(db->candidates()[pool[first]]);
+            tone.layers.push_back(slide->layers.front());
+        }
+        auto slide = makePatchSlideTimbre(db->candidates()[pool[second]]);
+        tone.layers.push_back(slide->layers.front());
+        tone.name = "WAV converted";
+        tone.memo = "PatchSlide: ";
+        if (options.configuration == CompositeWavConfiguration::OpllPatchSlideOpllPatchSlide)
+            tone.memo += db->candidates()[pool[first]].candidate_id + " / ";
+        tone.memo += db->candidates()[pool[second]].candidate_id;
+        std::uint8_t opllChannel{};
+        for (std::size_t layerIndex = 0; layerIndex < tone.layers.size(); ++layerIndex) {
+            auto& layer = tone.layers[layerIndex];
+            layer.envelope_number = static_cast<std::uint8_t>(layerIndex);
+            if (layer.source == TimbreSource::Opll) layer.channel = opllChannel++;
+            layer.envelope_timeline.length_counts = total;
+            const auto part = layerIndex == 0 ? leftRole(strategy) : 1 - leftRole(strategy);
+            fitPatchSlideRoleEnvelope(layer, *analysis, strategy, part, keyoff);
+        }
+        discardUnusedSnapshots(tone);
+        return tone;
+    };
+    struct Pair { double score; std::size_t first{}, second{}, original{}; };
+    std::vector<std::vector<Pair>> pairs(strategies.size());
+    const std::size_t shortlist = options.preference == CompositeWavPreference::Quality ? 6 : 4;
+    const std::size_t pairLimit = options.preference == CompositeWavPreference::Quality ? 36
+        : options.preference == CompositeWavPreference::Compact ? 8 : 16;
+    for (std::size_t role = 0; role < strategies.size(); ++role) {
+        const auto strategy = strategies[role];
+        const auto& right = rankings[static_cast<std::size_t>(strategy)][1 - leftRole(strategy)];
+        const auto& left = options.configuration == CompositeWavConfiguration::OpllOriginalOpllPatchSlide
+            ? originalRankings[static_cast<std::size_t>(strategy)][0] : rankings[static_cast<std::size_t>(strategy)][0];
+        if (hasScc) {
+            for (std::size_t j = 0; j < std::min(shortlist, right.size()); ++j)
+                pairs[role].push_back({right[j].first, 0, right[j].second, 0});
+        } else {
+            for (std::size_t i = 0; i < std::min(shortlist, left.size()); ++i)
+                for (std::size_t j = 0; j < std::min(shortlist, right.size()); ++j)
+                    pairs[role].push_back({left[i].first + right[j].first, left[i].second, right[j].second,
+                        options.configuration == CompositeWavConfiguration::OpllOriginalOpllPatchSlide ? left[i].second : 0});
+        }
+        std::stable_sort(pairs[role].begin(), pairs[role].end(), [](const auto& a, const auto& b) {
+            return std::tie(a.score, a.first, a.second, a.original) < std::tie(b.score, b.first, b.second, b.original);
+        });
+        if (pairs[role].size() > pairLimit) pairs[role].resize(pairLimit);
+    }
+    struct Archived { CompositeWavRetainedCandidate candidate; };
+    std::vector<Archived> archive;
+    std::size_t archiveBytes{}, serial{};
+    CompositeWavQualityWeights weights;
+    weights.complexity = 0;
+    const auto pcmBytes = [](const CompositeWavRenderResult& pcm) {
+        return (pcm.mono_pcm.capacity() + pcm.stereo_pcm.capacity()) * sizeof(float);
+    };
+    const auto budget = [&] { return !cancelled(cancel) && result.evaluations < options.max_evaluations; };
+    const auto evaluate = [&](CompositeTimbre tone, CompositeWavSearchFamily family) {
+        if (!budget()) return false;
+        const auto compiled = compileSccMorph(tone);
+        if (!compiled.valid || !formatMgsComposite(tone).valid()) return false;
+        const auto resources = resourcePlan(compiled.timbre);
+        if (hasScc ? (!resources.scc_waveforms || resources.scc_waveforms > options.max_scc_waveforms)
+                   : resources.scc_waveforms != 0) return false;
+        if (hasScc && options.max_scc_source_waveforms && sccSourceWaveformCount(tone) > *options.max_scc_source_waveforms) return false;
+        stage(CompositeWavStage::Evaluation);
+        auto pcm = renderCompositeWav(tone, rendering);
+        ++result.evaluations;
+        if (control) control->evaluations.store(result.evaluations, std::memory_order_relaxed);
+        if (!pcm.ok() || pcm.clipped || rms(pcm.mono_pcm) < 1e-8) return false;
+        auto quality = evaluateCompositeWavePcmImpl(reference, pcm.mono_pcm, frequency, attackFrame,
+            resources.scc_waveforms, weights, cancel, analysis.get(), 128);
+        waveformContinuity(compiled.timbre, quality);
+        double loopLoss = loopStateLoss(compiled.timbre, quality);
+        std::size_t heldFrames{};
+        for (const auto& layer : tone.layers) if (layer.envelope_timeline.loop_start_count) {
+            const auto& timeline = layer.envelope_timeline;
+            heldFrames = std::max(heldFrames, std::size_t(*timeline.loop_end_count
+                + 2 * (*timeline.loop_end_count - *timeline.loop_start_count)) * 800 + 801);
+        }
+        if (heldFrames) {
+            if (heldFrames > CompositeWavRenderOptions::kMaximumFrameCount) return false;
+            auto heldOptions = rendering;
+            heldOptions.frame_count = heldOptions.key_off_frame = heldFrames;
+            const auto held = renderCompositeWav(tone, heldOptions);
+            ++result.loop_probe_renders;
+            if (!held.ok() || held.clipped) return false;
+            result.patchslide_search.working_set_bytes = std::max(result.patchslide_search.working_set_bytes,
+                reference.capacity() * sizeof(float) + pcmBytes(result.preview) + pcmBytes(pcm) + pcmBytes(held)
+                    + archiveBytes + 3 * wavToneStorage(tone) + 128 * 1024);
+            loopLoss += loopJoinLoss(compiled.timbre, reference, held.mono_pcm, frequency, *analysis,
+                held.effective_key_off_frame, cancel, 128, quality);
+        }
+        quality.transition += loopLoss;
+        quality.total += weights.local_discontinuity * loopLoss
+            + weights.waveform_continuity * (quality.max_wave_aligned + quality.max_wave_harmonic
+                + .1 * quality.max_wave_log_spectrum + quality.max_wave_rms);
+        std::size_t commands{}, originalDefinitions{};
+        for (const auto& layer : tone.layers) {
+            commands += layer.timbre_automation.size() + layer.volume_envelope.events.size();
+            originalDefinitions += layer.source == TimbreSource::Opll && layer.base_timbre.has_value();
+        }
+        quality.complexity += double(commands) / 256 + double(originalDefinitions) / 32;
+        if (!std::isfinite(quality.total)) return false;
+        ++result.search.trials[static_cast<std::size_t>(family)];
+        const auto id = ++serial;
+        const auto storage = wavToneStorage(tone);
+        if (archive.size() < 128 && archiveBytes + storage <= 8 * 1024 * 1024
+            && std::none_of(archive.begin(), archive.end(), [&](const auto& item) { return item.candidate.tone == tone; })) {
+            archive.push_back({{tone, resources, quality, id}});
+            archiveBytes += storage;
+        }
+        result.patchslide_search.working_set_bytes = std::max(result.patchslide_search.working_set_bytes,
+            reference.capacity() * sizeof(float) + pcmBytes(result.preview) + pcmBytes(pcm)
+                + archiveBytes + 3 * storage + pool.size() * sizeof(PatchSlideCandidate) + 128 * 1024);
+        if (!result.composite_tone) result.initial_loss = quality.total;
+        const bool compactTie = result.composite_tone && options.preference == CompositeWavPreference::Compact
+            && std::abs(quality.total - result.best_loss) <= 1e-9 && quality.complexity < result.quality.complexity;
+        if (!result.composite_tone || quality.total + options.minimum_improvement < result.best_loss || compactTie) {
+            result.best_loss = quality.total;
+            result.quality = quality;
+            result.composite_tone = std::move(tone);
+            result.resource_plan = resources;
+            result.preview = std::move(pcm);
+            ++result.search.accepted[static_cast<std::size_t>(family)];
+            return true;
+        }
+        return false;
+    };
+    const auto seedBudget = std::max<std::size_t>(strategies.size(), options.max_evaluations * 3 / 4);
+    for (std::size_t pairIndex = 0; budget() && result.evaluations < seedBudget; ++pairIndex) {
+        bool any{};
+        for (std::size_t role = 0; role < strategies.size() && budget() && result.evaluations < seedBudget; ++role) {
+            if (pairIndex >= pairs[role].size()) continue;
+            any = true;
+            const auto& pair = pairs[role][pairIndex];
+            ++result.patchslide_search.pair_trials;
+            evaluate(makeTone(strategies[role], pair.first, pair.second, pair.original), CompositeWavSearchFamily::WaveShape);
+        }
+        if (!any) break;
+    }
+    // Coordinate refinement changes envelopes, gain, placement and original
+    // registers only. It never edits a DB sequence's ROM numbers or counts.
+    const bool tryLoop = options.loop_mode == CompositeWavLoopMode::Automatic
+        && analysis->sustain_region && analysis->sustain_region->confidence >= .5
+        && keyoff > 2 && options.max_evaluations >= 8;
+    const auto coordinateLimit = options.max_evaluations - (tryLoop ? 1 : 0);
+    const auto coordinateBudget = [&] { return budget() && result.evaluations < coordinateLimit; };
+    std::size_t stalled{};
+    stage(CompositeWavStage::Envelope);
+    while (result.composite_tone && coordinateBudget()
+        && (options.stagnation_limit == 0 || stalled < options.stagnation_limit)) {
+        bool improved{}, proposed{};
+        for (std::size_t index = 0; index < 2 && coordinateBudget(); ++index) {
+            for (const int delta : {-1, 1, -3, 3}) {
+                if (!coordinateBudget()) break;
+                auto proposal = *result.composite_tone;
+                const int volume = int(proposal.layers[index].volume) + delta;
+                if (volume < 1 || volume > 15) continue;
+                proposed = true;
+                proposal.layers[index].volume = static_cast<std::uint8_t>(volume);
+                improved |= evaluate(std::move(proposal), CompositeWavSearchFamily::Envelope);
+            }
+            if (coordinateBudget()) {
+                auto proposal = *result.composite_tone;
+                proposal.layers[index].start_delay_form = StartDelayForm::AbsoluteTicks;
+                ++proposal.layers[index].start_delay_value;
+                if (proposal.layers[index].start_delay_value <= 3) {
+                    proposed = true;
+                    improved |= evaluate(std::move(proposal), CompositeWavSearchFamily::KeyTime);
+                }
+            }
+            if (coordinateBudget() && !result.composite_tone->layers[index].volume_envelope.events.empty()) {
+                for (const int delta : {-1, 1}) {
+                    if (!coordinateBudget()) break;
+                    auto proposal = *result.composite_tone;
+                    auto& events = proposal.layers[index].volume_envelope.events;
+                    auto& event = events[(result.evaluations / 2) % events.size()];
+                    const auto volume = event.value + delta;
+                    if (volume < 0 || volume > 15) continue;
+                    event.value = volume;
+                    proposed = true;
+                    improved |= evaluate(std::move(proposal), CompositeWavSearchFamily::Envelope);
+                }
+            }
+            if (coordinateBudget() && index == 0
+                && options.configuration == CompositeWavConfiguration::OpllOriginalOpllPatchSlide) {
+                for (const int delta : {-1, 1}) {
+                    if (!coordinateBudget()) break;
+                    auto proposal = *result.composite_tone;
+                    auto& snapshot = *proposal.layers.front().base_timbre;
+                    auto patch = decodeOpllPatch(snapshot.opll_registers);
+                    const int feedback = int(patch.feedback) + delta;
+                    if (feedback < 0 || feedback > 7) continue;
+                    patch.feedback = static_cast<std::uint8_t>(feedback);
+                    snapshot.opll_registers = encodeOpllPatch(patch);
+                    proposed = true;
+                    improved |= evaluate(std::move(proposal), CompositeWavSearchFamily::WaveShape);
+                }
+            }
+            if (coordinateBudget() && hasScc && index == 0) {
+                const auto& events = result.composite_tone->layers.front().timbre_automation;
+                if (events.size() > 1 && events[1].count > 1 && options.max_scc_waveforms > 2) {
+                    auto proposal = *result.composite_tone;
+                    auto& morph = proposal.layers.front().timbre_automation[1].scc_morph;
+                    if (morph.intermediate_count < 2) {
+                        ++morph.intermediate_count;
+                        proposed = true;
+                        improved |= evaluate(std::move(proposal), CompositeWavSearchFamily::MorphInterval);
+                    }
+                }
+            }
+        }
+        if (!proposed) break;
+        if (improved) stalled = 0; else ++stalled;
+    }
+    if (result.composite_tone && budget() && tryLoop) {
+        auto proposal = *result.composite_tone;
+        bool loop{};
+        for (auto& layer : proposal.layers) {
+            auto begin = countAt(*analysis, analysis->sustain_region->selection.begin);
+            if (layer.source == TimbreSource::Opll && !layer.base_timbre)
+                for (const auto& event : layer.timbre_automation) begin = std::max(begin, event.count);
+            const auto end = std::min(keyoff - 1, countAt(*analysis, analysis->sustain_region->selection.end));
+            if (begin >= end) continue;
+            layer.envelope_timeline.loop_start_count = begin;
+            layer.envelope_timeline.loop_end_count = end;
+            for (auto& event : layer.volume_envelope.events)
+                event.after_loop_start = event.count == begin || event.count == end;
+            loop = true;
+        }
+        if (loop) evaluate(std::move(proposal), CompositeWavSearchFamily::Loop);
+    }
+    if (cancelled(cancel)) return finish();
+    if (!result.composite_tone) {
+        result.completion = CompositeWavConversionCompletion::NoValidCandidate;
+        result.error = "No bounded AUTO_SAFE PatchSlide composite fits the Engine, resource and MGSC limits";
+        return finish();
+    }
+    result.retained_candidates.push_back({*result.composite_tone, result.resource_plan, result.quality, 0, 0});
+    std::vector<detail::WavRetainedScore> scores;
+    for (const auto& item : archive) scores.push_back({item.candidate.quality.total, item.candidate.candidate_id});
+    const auto alternatives = detail::selectDistinctWavScoreSpacedAlternatives(scores, result.best_loss,
+        [&](std::size_t index) { return archive[index].candidate.tone == *result.composite_tone; },
+        [&](std::size_t a, std::size_t b) { return archive[a].candidate.tone == archive[b].candidate.tone; });
+    for (const auto index : alternatives) {
+        auto alternative = std::move(archive[index].candidate);
+        alternative.target_score_increase_percent = static_cast<std::uint8_t>(result.retained_candidates.size() * 5);
+        result.retained_candidates.push_back(std::move(alternative));
+    }
+    if (result.evaluations == options.max_evaluations)
+        result.warnings.push_back("評価予算に達しました。評価済みの最良候補を表示しています。");
+    result.completion = CompositeWavConversionCompletion::Completed;
+    return finish();
+}
 }
 CompositeWavConversionResult convertCompositeWave(
     std::shared_ptr<const SourceAnalysis> analysis, const CompositeWavConversionOptions& options) {
+    if (configurationUsesPatchSlide(options.configuration)) return convertPatchSlideWave(std::move(analysis), options);
     CompositeWavConversionResult result;
     std::optional<SourceAnalysis> residualAnalysis;
     WaveShapeCache sourceWaves{{}, &result.morph_search};

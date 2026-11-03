@@ -921,7 +921,7 @@ CompositeLayer expandCompositeLayerModulations(
         schedule(*active_auto);
         for (const auto& profile : layer.register_auto_profiles)
             if (profile.target == OpllRegisterAutoTarget::Noise) schedule(profile.lane);
-        auto base = static_cast<int>(sequenceEnvelopeMixer(layer.volume_envelope.rate).noise);
+        auto base = static_cast<int>(psgInitialMixer(layer).noise);
         std::optional<int> previous;
         for (std::uint32_t count = 0; count <= end; ++count) {
             struct Change {

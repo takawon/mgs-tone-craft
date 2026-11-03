@@ -906,6 +906,10 @@ std::optional<ParsedTrack> parseTrackLine(
         if (const auto volume_number = integerAfter(token, "v", 0, 15)) {
             result.layer.volume =
                 static_cast<std::uint8_t>(*volume_number);
+        } else if (const auto mode = integerAfter(token, "/", 0, 3); mode && *source == TimbreSource::Psg) {
+            result.layer.psg_tone_mode = static_cast<std::uint8_t>(*mode);
+        } else if (const auto noise = integerAfter(token, "n", 0, 31); noise && *source == TimbreSource::Psg) {
+            result.layer.psg_noise = static_cast<std::uint8_t>(*noise);
         } else if (const auto key_off_hang_number = integerAfter(
                        token, "k", 0, 255)) {
             result.layer.key_off_hang =
@@ -1194,7 +1198,7 @@ MgsCompositeIoResult formatMgsComposite(
                 // state remains per track. Track detune is outside this key.
                 if (layer.source == TimbreSource::Scc) {
                     const SequenceKey key{
-                        formatSequenceEnvelopeHeader(layer.source, layer.volume_envelope.rate),
+                        formatSequenceEnvelopeHeader(layer),
                         formatted.bytecode};
                     const auto [shared, inserted] = shared_scc_envelopes.emplace(key, number);
                     envelope_numbers.back() = shared->second;
