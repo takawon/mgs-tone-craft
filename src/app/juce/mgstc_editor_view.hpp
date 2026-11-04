@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -59,6 +60,7 @@
 #include "opll_patch_ui.hpp"
 #include "editor_session.hpp"
 #include "composite_timeline.hpp"
+#include "scope_waveform.hpp"
 #include "juce_utf8.hpp"
 #include "library_browser_chrome.hpp"
 #include "library_manager.hpp"
@@ -4524,6 +4526,7 @@ public:
         applyHostCapabilities();
         resized();
         startTimer(100);
+        scope_display_timer_.startTimerHz(60);
         ensureCompositeTimerRate();
         updateStatus(
             engine_ready_
@@ -4544,6 +4547,7 @@ public:
         delete patchslide_apply_dialog_.getComponent();
         delete wave_converter_window_.getComponent();
         UiScale::removeGlobalListener(ui_scale_listener_);
+        scope_display_timer_.stopTimer();
         stopTimer();
         stopAudition();
         composite_favorite_only_.setLookAndFeel(nullptr);
@@ -5306,7 +5310,10 @@ public:
         summary.removeFromLeft(sm);
         warning_.setBounds(summary);
         editor.removeFromTop(sm);
-        timeline_.setInspectorFooterExtension(footer_height + sm);
+        // The timeline already supplies its bottom panel inset. Share one
+        // control gap with the audition row instead of stacking both margins.
+        timeline_.setInspectorFooterExtension(juce::jmax(
+            0, footer_height + controlGap - panelPad));
         timeline_.setBounds(editor.withBottom(
             editor.getBottom() + footer_height + sm));
         audition_.toFront(false);
@@ -7456,6 +7463,7 @@ private:
 
     void applyHostCapabilities() {
         const auto caps = session_.snapshot().capabilities;
+        scope_display_enabled_ = caps.composite_playback_waveform;
         if (!caps.spectrum_analyzer && !caps.spectrogram) {
             greyOutHostControl(spectrogram_);
         }
@@ -7637,6 +7645,7 @@ private:
                 && voice_allocator_.activeVoiceCount() == 0
                 && composite_program_stale_
                 && !configureEngine())) {
+            clearScopeSelection();
             return;
         }
         const double now =
@@ -7647,6 +7656,24 @@ private:
         }
         const auto plan =
             mgstc::engine::buildCompositePlaybackPlan(note_timbre);
+        std::array<int, 17> scope_tracks;
+        scope_tracks.fill(-1);
+        std::uint32_t scope_mask = 0;
+        for (const auto& binding : plan.audible_layers) {
+            if (binding.layer_index >= scope_tracks.size()
+                || (owned_layer && binding.layer_index != *owned_layer)
+                || (audition_layer_filter_ && !wave_conversion_preview_
+                    && binding.layer_index != *audition_layer_filter_)
+                || !mgstc::engine::layerMidiNote(note_timbre.layers[binding.layer_index], base_note)) continue;
+            const auto track = plan.physicalTrack(binding, assignment.channel);
+            if (track >= 17) continue;
+            scope_tracks[binding.layer_index] = track;
+            scope_mask |= std::uint32_t{1} << track;
+        }
+        const auto scope_context = requestScopeContext(scope_mask);
+        if (scope_context == 0) {
+            scope_tracks.fill(-1);
+        }
         double maximum_delay_ms = 0.0;
         for (const auto& binding : plan.audible_layers) {
             if (owned_layer && binding.layer_index != *owned_layer) continue;
@@ -7691,6 +7718,7 @@ private:
                 })) {
             static_cast<void>(voice_allocator_.noteOff(base_note));
         }
+        timeline_.setScopeTracks(scope_tracks, scope_context);
         if (stop_after_one_second) {
             audition_stop_time_ms_ =
                 now + maximum_delay_ms + 1000.0;
@@ -7880,17 +7908,6 @@ private:
                 last_audition_note_ = note;
             }
         }
-        mgstc::engine::OpllScopeFrame scope_frame{};
-        bool repaint_scope = false;
-        if (session_.snapshot().capabilities.composite_playback_waveform) {
-            while (session_.pollOpllScope(scope_frame)) {
-                repaint_scope = timeline_.appendScopeFrame(
-                    scope_frame, last_audition_note_) || repaint_scope;
-            }
-        }
-        if (repaint_scope) {
-            timeline_.repaint();
-        }
         if (timeline_preview_pending_
             && now >= timeline_preview_due_ms_) {
             if (configureEngine()) {
@@ -7921,6 +7938,46 @@ private:
         }
         ensureCompositeTimerRate();
     }
+
+    static std::uint64_t nextScopeContext() noexcept {
+        static std::atomic<std::uint64_t> next{1};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::uint64_t requestScopeContext(std::uint32_t mask) {
+        const auto context = nextScopeContext();
+        return scope_display_enabled_ && session_.setScopeSelection(mask, context) ? context : 0;
+    }
+
+    void clearScopeSelection() {
+        std::array<int, 17> tracks;
+        tracks.fill(-1);
+        const auto context = requestScopeContext(0);
+        timeline_.setScopeTracks(tracks, context);
+    }
+
+    // Message-thread display work never dispatches notes or updates the model.
+    void updateScopeDisplay() {
+        if (!isShowing() || !scope_display_enabled_) return;
+        mgstc::engine::OpllScopeFrame frame{};
+        bool changed = false;
+        // Bound catch-up while retaining consecutive low-note history.
+        for (std::size_t count = 0; count < 32; ++count) {
+            if (!session_.pollOpllScope(frame)) break;
+            changed = timeline_.appendScopeFrame(frame, last_audition_note_) || changed;
+        }
+        if (changed) timeline_.repaintScopeOverlay();
+    }
+
+    class ScopeDisplayTimer final : public juce::Timer {
+    public:
+        explicit ScopeDisplayTimer(CompositeEditorComponent& owner) : owner_(owner) {}
+        void timerCallback() override { owner_.updateScopeDisplay(); }
+    private:
+        CompositeEditorComponent& owner_;
+    };
+    ScopeDisplayTimer scope_display_timer_{*this};
+    bool scope_display_enabled_{};
 
     void ensureCompositeTimerRate() {
         const bool needs_fast_timer =
@@ -12603,15 +12660,24 @@ public:
 
     void appendFrame(
         const mgstc::engine::OpllScopeFrame& frame,
-        std::uint8_t midi_note) {
+        std::uint8_t midi_note, bool refresh = true) {
+        midi_note = scopeDisplayNote(frame.selection_context, frame.selection_note, midi_note);
         latest_ = frame.samples;
         latest_available_ = true;
-        if (display_note_ != midi_note) {
+        const bool gap = (frame.sequence != 0 && last_frame_sequence_ != 0
+                && frame.sequence != last_frame_sequence_ + 1)
+            || (frame.sample_end != 0 && last_sample_end_ != 0
+                && frame.sample_end != last_sample_end_ + frame.kSampleCount);
+        if (display_note_ != midi_note || gap
+            || frame.program_generation != last_program_generation_) {
             history_size_ = 0;
             history_write_ = 0;
             synchronized_available_ = false;
             display_note_ = midi_note;
         }
+        last_frame_sequence_ = frame.sequence;
+        last_sample_end_ = frame.sample_end;
+        last_program_generation_ = frame.program_generation;
         for (const float sample : frame.samples) {
             history_[history_write_] = sample;
             history_write_ =
@@ -12619,9 +12685,11 @@ public:
             history_size_ = std::min(
                 history_size_ + 1, history_.size());
         }
-        if (synchronized_) {
-            rebuildSynchronizedDisplay();
-        }
+        if (refresh) refreshDisplay();
+    }
+
+    void refreshDisplay() {
+        if (synchronized_) rebuildSynchronizedDisplay();
         repaint();
     }
 
@@ -12672,32 +12740,14 @@ public:
 
         const auto& samples =
             synchronized_ ? synchronized_display_ : latest_;
-        float peak = 0.0F;
-        for (const float sample : samples) {
-            peak = std::max(peak, std::abs(sample));
-        }
-        const float gain =
-            peak > 0.0001F ? 0.9F / peak : 1.0F;
+        const auto sample_at = [&](std::size_t index) { return samples[index]; };
+        const float peak = scopePeak(samples.size(), sample_at, 0.0F);
+        const float gain = peak > 0.0001F ? 0.9F / peak : 1.0F;
         juce::Path waveform;
-        for (std::size_t index = 0;
-             index < samples.size();
-             ++index) {
-            const float x = juce::jmap(
-                static_cast<float>(index),
-                0.0F,
-                static_cast<float>(samples.size() - 1),
-                graph.getX() + 2.0F,
-                graph.getRight() - 2.0F);
-            const float value = juce::jlimit(
-                -1.0F, 1.0F, samples[index] * gain);
-            const float y = middle
-                - value * (graph.getHeight() - 6.0F) * 0.5F;
-            if (index == 0) {
-                waveform.startNewSubPath(x, y);
-            } else {
-                waveform.lineTo(x, y);
-            }
-        }
+        buildScopePath(waveform,
+            {graph.getX() + 2.0F, graph.getY() + 3.0F,
+             graph.getWidth() - 4.0F, graph.getHeight() - 6.0F},
+            samples.size(), sample_at, gain, true);
         graphics.setColour(juce::Colour(0xFF4DD6B2));
         graphics.strokePath(
             waveform,
@@ -12793,11 +12843,7 @@ private:
     }
 
     void rebuildSynchronizedDisplay() {
-        constexpr double sample_rate = 48000.0;
-        const double frequency = 440.0 * std::pow(
-            2.0,
-            (static_cast<double>(display_note_) - 69.0) / 12.0);
-        const double period = sample_rate / frequency;
+        const double period = scopePeriodSamples(display_note_);
         const double sample_span = period * 2.0;
         if (history_size_
             < static_cast<std::size_t>(
@@ -12890,6 +12936,9 @@ private:
         synchronized_display_{};
     std::size_t history_size_{};
     std::size_t history_write_{};
+    std::uint64_t last_frame_sequence_{};
+    std::uint64_t last_sample_end_{};
+    std::uint64_t last_program_generation_{};
     std::uint8_t display_note_{kPreviewNote};
     bool synchronized_{true};
     bool latest_available_{};
@@ -15682,10 +15731,17 @@ private:
         }
         mgstc::engine::OpllScopeFrame frame{};
         if (session_.snapshot().capabilities.waveform_scope
-            && componentWindowIsActive(*this)
-            && session_.pollLatestOpllScope(frame)) {
-            MGSTC_UI_ACTIVITY("opll: scope latest-frame display");
-            scope_.appendFrame(frame, last_audition_note_);
+            && componentWindowIsActive(*this)) {
+            bool changed = false;
+            for (std::size_t count = 0; count < 32; ++count) {
+                if (!session_.pollOpllScopeHistory(frame)) break;
+                scope_.appendFrame(frame, last_audition_note_, false);
+                changed = true;
+            }
+            if (changed) {
+                MGSTC_UI_ACTIVITY("opll: scope history display");
+                scope_.refreshDisplay();
+            }
         }
         if (audition_stop_time_ms_
             && juce::Time::getMillisecondCounterHiRes()

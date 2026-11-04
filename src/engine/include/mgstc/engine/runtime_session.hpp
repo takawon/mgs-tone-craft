@@ -46,7 +46,8 @@ public:
         std::uint8_t track,
         std::vector<std::uint8_t> volume_bytecode,
         std::vector<std::uint8_t> pitch_bytecode,
-        std::vector<std::uint8_t> timbre_bytecode);
+        std::vector<std::uint8_t> timbre_bytecode,
+        std::vector<std::uint32_t> display_counts = {});
     [[nodiscard]] bool setRateEnvelope(
         std::uint8_t track,
         RateEnvelopeDefinition definition,
@@ -117,6 +118,10 @@ public:
     // Software envelopes, pending keys, and key-off decay. Does not include
     // chip-hardware release tails after the session has already keyed off.
     [[nodiscard]] bool hasRealtimeWork() const noexcept;
+    [[nodiscard]] EnvelopePlaybackPosition playbackPosition(std::uint8_t track) const noexcept;
+    [[nodiscard]] std::uint64_t noteStartGeneration(std::uint8_t track) const noexcept {
+        return track < kTrackCount ? note_start_generations_[track] : 0;
+    }
 
     [[nodiscard]] Tick tick() const noexcept {
         return tick_;
@@ -159,6 +164,7 @@ private:
     std::array<bool, kTrackCount> force_mute_pending_{};
     std::array<bool, kTrackCount> sequence_faulted_{};
     std::array<bool, kTrackCount> sequence_key_off_{};
+    std::array<std::uint64_t, kTrackCount> note_start_generations_{};
     std::array<std::uint8_t, kTrackCount> current_notes_{};
     std::array<std::uint8_t, 3> psg_tone_noise_modes_{};
     std::array<std::uint8_t, 3> psg_noise_periods_{};

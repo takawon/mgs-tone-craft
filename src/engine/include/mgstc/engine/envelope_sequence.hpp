@@ -18,13 +18,19 @@ enum class SequenceError : std::uint8_t {
     UnknownOpcode,
 };
 
+struct EnvelopePlaybackPosition {
+    std::uint32_t count{};
+    bool active{};
+};
+
 class SequenceEnvelopeRuntime {
 public:
     static constexpr std::size_t kDefaultInstructionBudget = 8'192;
 
     explicit SequenceEnvelopeRuntime(
         std::vector<std::uint8_t> bytecode,
-        bool emit_volume_events = true);
+        bool emit_volume_events = true,
+        std::vector<std::uint32_t> display_counts = {});
 
     void resetForKeyOn() noexcept;
 
@@ -46,6 +52,8 @@ public:
         return position_;
     }
 
+    [[nodiscard]] EnvelopePlaybackPosition playbackPosition() const noexcept;
+
 private:
     [[nodiscard]] bool emit(
         EventBuffer& output,
@@ -56,6 +64,14 @@ private:
     [[nodiscard]] bool readByte(std::uint8_t& value) noexcept;
 
     std::vector<std::uint8_t> bytecode_;
+    // Prepared with the compiled program, indexed only by actual runtime
+    // ticks, including a shortened terminal hold through authored END. This
+    // metadata never affects command execution or timing.
+    std::vector<std::uint32_t> display_counts_;
+    std::size_t display_tick_{};
+    std::size_t display_loop_tick_{};
+    bool display_started_{};
+    bool display_finished_{};
     bool emit_volume_events_{true};
     std::size_t position_{};
     std::size_t loop_position_{};

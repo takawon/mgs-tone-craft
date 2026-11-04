@@ -141,6 +141,9 @@ public:
     [[nodiscard]] bool editorProgramReady() const noexcept;
     void editorRetainCompositeScope() noexcept;
     void editorReleaseCompositeScope() noexcept;
+    [[nodiscard]] bool editorSetScopeSelection(std::uint32_t mask,
+        std::uint64_t context,
+        std::optional<std::uint64_t> expected_restore_revision = {});
     [[nodiscard]] bool editorPollCompositeScope(
         mgstc::engine::OpllScopeFrame& frame) noexcept;
     [[nodiscard]] bool editorPollCompositeScope(
@@ -371,6 +374,7 @@ private:
     // Message thread only. One SPSC consumer fans out bounded frame history.
     mgstc::app::ScopeFrameDistributor scope_frames_;
     std::uint64_t scope_legacy_cursor_{};
+    std::uint64_t daw_scope_selection_serial_{};
     std::atomic<int> opll_keyoff_silence_seconds_{20};
     std::array<std::uint64_t, LayerDelayScheduler::kPhysicalTrackCount> opll_silence_due_{};
     std::array<std::uint64_t, LayerDelayScheduler::kPhysicalTrackCount> opll_silence_revision_{};

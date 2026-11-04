@@ -23,7 +23,8 @@ public:
     [[nodiscard]] bool write(
         std::uint8_t address,
         std::uint8_t value) noexcept;
-    [[nodiscard]] float renderSample(std::span<float> channels = {}) noexcept;
+    [[nodiscard]] float renderSample(std::span<float> channels = {},
+        std::uint16_t channel_mask = 0x3FFF) noexcept;
 
 private:
     struct Impl;
@@ -45,7 +46,8 @@ public:
         std::uint8_t port,
         std::uint8_t address,
         std::uint8_t value) noexcept;
-    [[nodiscard]] float renderSample(std::span<float> channels = {}) noexcept;
+    [[nodiscard]] float renderSample(std::span<float> channels = {},
+        std::uint16_t channel_mask = 0x3FFF) noexcept;
 
 private:
     struct Impl;
@@ -66,7 +68,8 @@ public:
     [[nodiscard]] bool write(
         std::uint8_t address,
         std::uint8_t value) noexcept;
-    [[nodiscard]] float renderSample(std::span<float> channels = {}) noexcept;
+    [[nodiscard]] float renderSample(std::span<float> channels = {},
+        std::uint16_t channel_mask = 0x3FFF) noexcept;
 
 private:
     struct Impl;
@@ -89,6 +92,7 @@ public:
     [[nodiscard]] bool apply(
         std::span<const RegisterWrite> writes) noexcept;
     [[nodiscard]] ChipSamples renderSample(bool capture_channels = false) noexcept;
+    [[nodiscard]] ChipSamples renderSampleMask(std::uint32_t channel_mask) noexcept;
 
 private:
     Ym2149Adapter psg_;

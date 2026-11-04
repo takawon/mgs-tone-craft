@@ -108,6 +108,17 @@ public:
     // frame so a live producer cannot keep the message thread in a poll loop.
     [[nodiscard]] bool pollLatestOpllScope(
         OpllScopeFrame& frame) noexcept;
+    // Queue before the corresponding NoteOns. Only subsequent actual note
+    // allocations enter capture, so delayed layers cannot show an old voice.
+    [[nodiscard]] bool setScopeSelection(std::uint32_t track_mask,
+        std::uint64_t context) noexcept;
+    void realtimeSetScopeSelection(std::uint32_t track_mask,
+        std::uint64_t context,
+        const std::array<std::int8_t, RuntimeSession::kTrackCount>& layer_tracks,
+        std::uint8_t note = 60) noexcept;
+    [[nodiscard]] std::uint64_t scopeDroppedFrames() const noexcept {
+        return scope_dropped_frames_.load(std::memory_order_relaxed);
+    }
 
     // UI controls capture; the analysis thread is the queue's sole consumer.
     // The audio thread performs one bounded lock-free copy per completed
@@ -237,6 +248,7 @@ private:
     void allNotesStopped() noexcept;
     SpectrumGuideNote currentGuideNote() const noexcept;
     void annotateGuideNote(OpllScopeFrame& frame) const noexcept;
+    void selectScope(std::uint32_t mask, std::uint64_t context) noexcept;
 
     struct ActiveGuideNote {
         std::uint64_t order{};
@@ -251,6 +263,8 @@ private:
     std::unique_ptr<
         SpscQueue<OpllScopeFrame, kSpectrogramScopeCapacity>>
         spectrogram_scope_frames_;
+    // Allocated during host construction; only the audio consumer uses it.
+    std::unique_ptr<OpllScopeFrame> scope_frame_work_;
     std::unique_ptr<ProgramSlot[]> programs_;
     std::unique_ptr<MAmidiMemoSoundOutput> mamidi_;
     MAmidiOutputSettings mamidi_settings_{};
@@ -272,6 +286,20 @@ private:
     std::uint64_t guide_note_order_{};
     std::uint8_t last_guide_note_{60};
     std::uint8_t last_guide_track_{};
+    std::uint32_t scope_requested_mask_{};
+    std::uint32_t scope_started_mask_{};
+    std::uint64_t scope_selection_context_{};
+    // Ordered display identity across slot reuse and runtime resets. Program
+    // edit handles retain their independent per-slot generation contract.
+    std::uint64_t scope_program_epoch_{1};
+    std::uint64_t scope_ui_context_{};
+    std::uint8_t scope_selection_note_{60};
+    std::atomic<std::uint64_t> scope_dropped_frames_{};
+    std::array<std::int8_t, RuntimeSession::kTrackCount> scope_layer_tracks_ = [] {
+        std::array<std::int8_t, RuntimeSession::kTrackCount> result{};
+        result.fill(-1);
+        return result;
+    }();
     std::unique_ptr<SpectrumCapture> spectrum_capture_;
     std::atomic<bool> spectrum_enabled_{false};
     std::atomic<bool> spectrum_channels_enabled_{true};

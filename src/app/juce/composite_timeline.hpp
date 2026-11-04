@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -149,6 +150,8 @@ public:
     [[nodiscard]] bool appendScopeFrame(
         const engine::OpllScopeFrame& frame,
         std::uint8_t midi_note);
+    void setScopeTracks(const std::array<int, 17>& tracks, std::uint64_t context);
+    void repaintScopeOverlay();
 
     void resized() override;
 

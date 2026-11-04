@@ -1038,6 +1038,19 @@ void MgstcAudioProcessor::stopVoice(std::uint8_t voice, bool hard) noexcept {
 void MgstcAudioProcessor::startVoice(
     std::uint8_t voice,
     std::uint8_t midi_note) noexcept {
+    std::array<std::int8_t, mgstc::engine::RuntimeSession::kTrackCount> scope_tracks{};
+    scope_tracks.fill(-1);
+    std::uint32_t scope_mask{};
+    for (const auto& binding : activePlan().audible_layers) {
+        const auto track = activePlan().physicalTrack(binding, voice);
+        if (binding.layer_index < scope_tracks.size() && validPhysicalTrack(track)
+            && mgstc::engine::transposedMidiNote(midi_note, binding.relative_semitones)) {
+            scope_tracks[binding.layer_index] = static_cast<std::int8_t>(track);
+            scope_mask |= 1U << track;
+        }
+    }
+    engine_.realtimeSetScopeSelection(scope_mask,
+        (std::uint64_t{1} << 63U) | ++daw_scope_selection_serial_, scope_tracks, midi_note);
     for (const auto& binding : activePlan().audible_layers) {
         const auto note = mgstc::engine::transposedMidiNote(
             midi_note, binding.relative_semitones);
@@ -1764,6 +1777,16 @@ void MgstcAudioProcessor::editorReleaseCompositeScope() noexcept {
         }
         scope_frames_.clear();
     }
+}
+
+bool MgstcAudioProcessor::editorSetScopeSelection(std::uint32_t mask,
+    std::uint64_t context,
+    std::optional<std::uint64_t> expected_restore_revision) {
+    mgstc::engine::EngineCommand command{
+        .type = mgstc::engine::EngineCommandType::SetScopeSelection};
+    command.generation = context;
+    command.scope_track_mask = mask;
+    return editorSubmitEngine(command, expected_restore_revision);
 }
 
 bool MgstcAudioProcessor::editorPollCompositeScope(

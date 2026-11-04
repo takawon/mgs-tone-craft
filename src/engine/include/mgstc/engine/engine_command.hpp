@@ -14,6 +14,7 @@ enum class EngineCommandType : std::uint8_t {
     Stop,
     HardReset,
     SetMixerGains,
+    SetScopeSelection,
 };
 
 struct EngineCommand {
@@ -24,6 +25,7 @@ struct EngineCommand {
     std::uint64_t generation{};
     bool retrigger{};
     std::uint8_t program_slot{0xFF};
+    std::uint32_t scope_track_mask{};
 
     [[nodiscard]] static EngineCommand noteOn(
         std::uint8_t track,

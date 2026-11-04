@@ -45,7 +45,7 @@ public:
 private:
     template<class Drain>
     void receive(Drain& drain) noexcept {
-        engine::OpllScopeFrame frame{};
+        auto& frame = *receive_frame_;
         for (std::size_t i = 0; i < kMaxDrainFrames; ++i) {
             if (!drain(frame)) break;
             ++published_;
@@ -57,6 +57,8 @@ private:
 
     std::unique_ptr<std::array<engine::OpllScopeFrame, kHistoryFrames>> history_{
         std::make_unique<std::array<engine::OpllScopeFrame, kHistoryFrames>>()};
+    std::unique_ptr<engine::OpllScopeFrame> receive_frame_{
+        std::make_unique<engine::OpllScopeFrame>()};
     std::uint64_t published_{};
     std::uint64_t oldest_{1};
 };

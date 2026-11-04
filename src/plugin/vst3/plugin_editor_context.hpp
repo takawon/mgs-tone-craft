@@ -98,6 +98,15 @@ public:
         return processor_.editorPollLatestOpllScope(frame, latest_scope_cursor_);
     }
 
+    [[nodiscard]] bool setScopeSelection(std::uint32_t mask, std::uint64_t context) override {
+        return processor_.editorSetScopeSelection(mask, context,
+            restore_tracking_ ? std::optional<std::uint64_t>(acknowledged_restore_revision_)
+                              : std::nullopt);
+    }
+    [[nodiscard]] bool pollOpllScopeHistory(mgstc::engine::OpllScopeFrame& frame) override {
+        return processor_.editorPollCompositeScope(frame, opll_history_cursor_);
+    }
+
 private:
     class BackgroundTasks final : public mgstc::app::BackgroundTaskBoundary {
     public:
@@ -291,6 +300,7 @@ private:
     bool restore_tracking_{};
     std::uint64_t scope_cursor_{};
     std::uint64_t latest_scope_cursor_{};
+    std::uint64_t opll_history_cursor_{};
     Output output_;
     Midi midi_;
     Audition audition_;

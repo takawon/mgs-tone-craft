@@ -14,10 +14,14 @@ public:
     CompositeSequenceRuntime(
         std::vector<std::uint8_t> volume_bytecode,
         std::vector<std::uint8_t> pitch_bytecode,
-        std::vector<std::uint8_t> timbre_bytecode);
+        std::vector<std::uint8_t> timbre_bytecode,
+        std::vector<std::uint32_t> display_counts = {});
 
     void resetForKeyOn() noexcept;
     [[nodiscard]] SequenceError processTick(EventBuffer& output);
+    [[nodiscard]] EnvelopePlaybackPosition playbackPosition() const noexcept {
+        return volume_.playbackPosition();
+    }
 
 private:
     SequenceEnvelopeRuntime timbre_;
@@ -32,7 +36,8 @@ public:
     [[nodiscard]] bool setCompositeSequenceEnvelopes(
         std::vector<std::uint8_t> volume_bytecode,
         std::vector<std::uint8_t> pitch_bytecode,
-        std::vector<std::uint8_t> timbre_bytecode);
+        std::vector<std::uint8_t> timbre_bytecode,
+        std::vector<std::uint32_t> display_counts = {});
     [[nodiscard]] bool setRateEnvelope(
         RateEnvelopeDefinition definition,
         std::uint8_t track_volume = 15);
@@ -43,6 +48,7 @@ public:
     void setTrackVolume(std::uint8_t track_volume) noexcept;
 
     [[nodiscard]] SequenceError processTick(EventBuffer& output);
+    [[nodiscard]] EnvelopePlaybackPosition playbackPosition() const noexcept;
 
     [[nodiscard]] bool active() const noexcept {
         return !std::holds_alternative<std::monostate>(envelope_);

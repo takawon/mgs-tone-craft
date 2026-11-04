@@ -32,6 +32,15 @@ RuntimeSession::RuntimeSession(
     psg_noise_periods_.fill(0);
 }
 
+EnvelopePlaybackPosition RuntimeSession::playbackPosition(std::uint8_t track) const noexcept {
+    if (track >= kTrackCount || sequence_faulted_[track]
+        || (audition_gated_ && !audition_track_running_[track])) return {};
+    // Sequence key-off freezes execution; a k decay may still be sounding,
+    // but it must not animate steps that are no longer being executed.
+    if (sequence_key_off_[track]) return {};
+    return tracks_[track].playbackPosition();
+}
+
 bool RuntimeSession::setSequenceEnvelope(
     std::uint8_t track,
     std::vector<std::uint8_t> bytecode) {
@@ -45,14 +54,16 @@ bool RuntimeSession::setCompositeSequenceEnvelopes(
     std::uint8_t track,
     std::vector<std::uint8_t> volume_bytecode,
     std::vector<std::uint8_t> pitch_bytecode,
-    std::vector<std::uint8_t> timbre_bytecode) {
+    std::vector<std::uint8_t> timbre_bytecode,
+    std::vector<std::uint32_t> display_counts) {
     if (track >= kTrackCount) {
         return false;
     }
     return tracks_[track].setCompositeSequenceEnvelopes(
         std::move(volume_bytecode),
         std::move(pitch_bytecode),
-        std::move(timbre_bytecode));
+        std::move(timbre_bytecode),
+        std::move(display_counts));
 }
 
 bool RuntimeSession::setRateEnvelope(
@@ -580,6 +591,7 @@ TickResult RuntimeSession::processTick() {
                     };
                 }
             }
+            ++note_start_generations_[track];
         } else if (pending_keys_[track] == PendingKey::Off) {
             if (sequenceKeyOffDecayApplies(track)) {
                 sequence_key_off_[track] = true;

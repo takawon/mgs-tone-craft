@@ -14,10 +14,24 @@
 #include <sstream>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 
 namespace mgstc::engine {
 namespace {
+
+// Author coordinates accompany the uncoalesced token stream only. Export
+// formatting and bytecode remain unchanged; the display map is prepared off
+// the audio thread before transformations such as the terminal-hold collapse.
+struct DisplayMappedTokens : std::vector<std::string> {
+    std::vector<std::uint32_t> origins;
+    std::uint32_t source_count{};
+};
+
+void setTokenOrigin(std::vector<std::string>&, std::uint32_t) {}
+void setTokenOrigin(DisplayMappedTokens& tokens, std::uint32_t count) {
+    tokens.source_count = count;
+}
 
 struct CountState {
     struct VolumeSpec {
@@ -90,8 +104,16 @@ void appendToken(std::vector<std::string>& tokens, std::string token) {
     }
 }
 
+void appendToken(DisplayMappedTokens& tokens, std::string token) {
+    if (!token.empty()) {
+        tokens.origins.push_back(tokens.source_count);
+        tokens.push_back(std::move(token));
+    }
+}
+
+template <typename Tokens>
 void appendHold(
-    std::vector<std::string>& tokens,
+    Tokens& tokens,
     std::int32_t volume,
     std::uint32_t count) {
     while (count != 0) {
@@ -101,13 +123,15 @@ void appendHold(
             token += ':' + std::to_string(chunk);
         }
         appendToken(tokens, std::move(token));
+        if constexpr (std::is_same_v<Tokens, DisplayMappedTokens>)
+            tokens.source_count += chunk;
         count -= chunk;
     }
 }
 
-template <typename AppendZeroTime>
+template <typename Tokens, typename AppendZeroTime>
 void emitPreciseAutomaticTokens(
-    std::vector<std::string>& tokens,
+    Tokens& tokens,
     const std::vector<std::uint8_t>& vols,
     std::uint32_t origin_count,
     const std::vector<std::uint32_t>& cuts,
@@ -120,8 +144,10 @@ void emitPreciseAutomaticTokens(
     };
     std::int32_t run_volume = static_cast<std::int32_t>(vols.front());
     std::uint32_t run_length = 0;
+    std::uint32_t run_start = origin_count;
     const auto flush = [&]() {
         if (run_length != 0) {
+            setTokenOrigin(tokens, run_start);
             appendHold(tokens, run_volume, run_length);
             run_length = 0;
         }
@@ -134,12 +160,14 @@ void emitPreciseAutomaticTokens(
         }
         const auto volume = static_cast<std::int32_t>(vols[i]);
         if (run_length == 0) {
+            run_start = count;
             run_volume = volume;
             run_length = 1;
         } else if (volume == run_volume) {
             ++run_length;
         } else {
             flush();
+            run_start = count;
             run_volume = volume;
             run_length = 1;
         }
@@ -751,7 +779,7 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
             static_cast<std::int32_t>(layer.volume), false, false};
     }
 
-    std::vector<std::string> tokens;
+    DisplayMappedTokens tokens;
     std::int32_t current_volume = layer.volume;
     std::uint32_t previous_volume_count = 0;
     std::uint32_t cursor{};
@@ -771,6 +799,7 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
         return std::nullopt;
     };
     const auto append_zero_time = [&](std::uint32_t count, bool inside_only = false) {
+        setTokenOrigin(tokens, count);
         if (std::any_of(states[count].ordered_commands.begin(),
                         states[count].ordered_commands.end(),
                         [inside_only](const auto& command) {
@@ -874,10 +903,12 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
                     } else {
                         std::uint32_t from = cursor;
                         for (const auto to : waypoints) {
+                            setTokenOrigin(tokens, from);
                             if (from < *imported_start) {
                                 const auto hold_end = std::min(to, *imported_start);
                                 appendHold(tokens, origin_value, hold_end - from);
                                 from = hold_end;
+                                setTokenOrigin(tokens, from);
                             }
                             if (to > from) {
                                 const auto duration = to - from;
@@ -944,6 +975,7 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
                 bool first_segment = true;
                 std::int32_t junction_volume = origin_value;
                 for (const auto to : waypoints) {
+                    setTokenOrigin(tokens, from);
                     const auto duration = to - from;
                     if (duration == 0) {
                         from = to;
@@ -972,6 +1004,9 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
                     first_segment = false;
                     std::string token(1, volumeCharacter(segment_volume));
                     if (duration == 1) {
+                        // A direct target letter executes at the destination;
+                        // only an actual ramp repeats the origin count.
+                        setTokenOrigin(tokens, to);
                         appendToken(tokens, std::move(token));
                     } else {
                         token += '=' + std::to_string(duration);
@@ -1024,6 +1059,25 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
         }
     }
 
+    // Timed tokens retain their exact authored origin, including the repeated
+    // origin sample of a compact automatic ramp. Zero-time commands consume
+    // no display entries, just as they consume no execution ticks.
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        if (const auto duration = tokenDuration(tokens[index])) {
+            for (std::uint32_t tick = 0; tick < *duration; ++tick)
+                result.playback_counts.push_back(tokens.origins[index] + tick);
+        }
+    }
+    if (!looping) {
+        // END is a visible author boundary even when its terminal hold is
+        // shortened in the exported program. Keep one final END position.
+        while (result.playback_counts.size() > 1
+            && result.playback_counts.back() == effective_end
+            && result.playback_counts[result.playback_counts.size() - 2] == effective_end)
+            result.playback_counts.pop_back();
+        if (result.playback_counts.empty() || result.playback_counts.back() < effective_end)
+            result.playback_counts.push_back(effective_end);
+    }
     coalesceAdjacentHolds(tokens);
     collapseTrailingHold(tokens);
     result.body = formatSequenceEnvelopeHeader(layer)
@@ -1056,6 +1110,10 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
             return result;
         }
         result.output_cutoff_count = cutoff_count;
+        // A byte-budget prefix cannot display the excluded remainder. This is
+        // an execution-tick cutoff, so retain the corresponding map prefix.
+        result.playback_counts.resize(std::min<std::size_t>(
+            result.playback_counts.size(), cutoff_count));
         result.body = formatSequenceEnvelopeHeader(layer)
             + joinTokens(tokens);
         result.compiled_bytes = compiledEnvelopeBytes(tokens);

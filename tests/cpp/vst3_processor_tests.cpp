@@ -6,6 +6,7 @@
 #include "mgstc_editor_view.hpp"
 #include "ui_layout.hpp"
 #include "mgstc_look_and_feel.hpp"
+#include "mgsc_preview_window.hpp"
 #include "tone_library_session.hpp"
 #include <rpc/server.h>
 
@@ -535,6 +536,33 @@ struct SatelliteEditorParityTestAccess {
 };
 
 struct CompositeEditorComponentTestAccess {
+    static int auditionRowGap(CompositeEditorComponent& editor) {
+        auto* implementation = editor.timeline_.getChildComponent(0);
+        if (implementation == nullptr) return -1;
+        for (auto* child : implementation->getChildren()) {
+            if (auto* scroll = dynamic_cast<juce::ScrollBar*>(child);
+                scroll != nullptr && !scroll->isVertical()) {
+                return editor.audition_.getY()
+                    - editor.getLocalArea(scroll, scroll->getLocalBounds()).getBottom();
+            }
+        }
+        return -1;
+    }
+    static bool dawScopeRecoversAfterRejectedClear(CompositeEditorComponent& editor) {
+        editor.clearScopeSelection();
+        const auto plan = mgstc::engine::buildCompositePlaybackPlan(editor.workingTimbre());
+        if (plan.audible_layers.empty()) return false;
+        const auto& binding = plan.audible_layers.front();
+        const auto track = plan.physicalTrack(binding, 0);
+        auto frame = std::make_unique<mgstc::engine::OpllScopeFrame>();
+        frame->selection_context = (std::uint64_t{1} << 63) | 42;
+        frame->program_generation = 1;
+        frame->layer_tracks[binding.layer_index] = static_cast<std::int8_t>(track);
+        frame->track_note_generation[track] = 1;
+        frame->captured_track_mask = 1U << track;
+        frame->physical_samples[track].fill(0.2F);
+        return editor.timeline_.appendScopeFrame(*frame, 60);
+    }
     static void setOwnedCompositeScope(CompositeEditorComponent& editor, bool whole) { editor.setOwnedEditWholeComposite(whole); }
     static std::optional<std::size_t> ownedMonoLayer(const CompositeEditorComponent& editor) { return editor.ownedEditAuditionLayer(); }
     static void auditionOwnedNote(CompositeEditorComponent& editor, std::uint8_t note) { editor.ownedEditNoteOn(note); }
@@ -718,6 +746,10 @@ struct CompositeEditorComponentTestAccess {
     static std::size_t scheduled(const CompositeEditorComponent& editor) {
         return editor.scheduled_layer_notes_.size();
     }
+    static std::uint8_t latestScheduledVoice(const CompositeEditorComponent& editor) {
+        if (editor.scheduled_layer_notes_.empty()) return 0xff;
+        return editor.scheduled_layer_notes_.back().voice;
+    }
     static std::size_t sounding(const CompositeEditorComponent& editor) {
         return editor.sounding_tracks_.size();
     }
@@ -726,6 +758,15 @@ struct CompositeEditorComponentTestAccess {
     }
     static void stop(CompositeEditorComponent& editor) {
         editor.silenceAuditionNotes();
+    }
+    static int scopeDisplayTimerInterval(const CompositeEditorComponent& editor) {
+        return editor.scope_display_timer_.getTimerInterval();
+    }
+    static bool scopeDisplayTimerRunning(const CompositeEditorComponent& editor) {
+        return editor.scope_display_timer_.isTimerRunning();
+    }
+    static int auditionTimerInterval(const CompositeEditorComponent& editor) {
+        return editor.getTimerInterval();
     }
     static bool rebuild(CompositeEditorComponent& editor) {
         return editor.configureEngine();
@@ -5292,6 +5333,190 @@ void testScopeFrameDistributorReaders() {
         "scope distribution drains at most one bounded queue per poll");
 }
 
+void testOpllScopeRequiresContinuousLowNoteHistory() {
+    mgstc::app::OpllScopeComponent scope;
+    scope.setSynchronized(true);
+    auto frame = std::make_unique<mgstc::engine::OpllScopeFrame>();
+    frame->program_generation = 1;
+    for (std::size_t sample = 0; sample < frame->kSampleCount; ++sample)
+        frame->samples[sample] = std::sin(static_cast<float>(sample) * 0.02F);
+    for (std::uint64_t sequence = 1; sequence <= 4; ++sequence) {
+        frame->sequence = sequence;
+        frame->sample_end = sequence * frame->kSampleCount;
+        scope.appendFrame(*frame, 24);
+    }
+    require(scope.synchronizedDisplayAvailable(), "continuous low-note frames provide a two-cycle window");
+    frame->sequence = 6;
+    frame->sample_end = 6 * frame->kSampleCount;
+    scope.appendFrame(*frame, 24);
+    require(!scope.synchronizedDisplayAvailable(), "a skipped frame starts fresh low-note history");
+    for (std::uint64_t sequence = 7; sequence <= 9; ++sequence) {
+        frame->sequence = sequence;
+        frame->sample_end = sequence * frame->kSampleCount;
+        scope.appendFrame(*frame, 24);
+    }
+    require(scope.synchronizedDisplayAvailable(), "contiguous history recovers after a display gap");
+    frame->sequence = 10;
+    frame->sample_end = 10 * frame->kSampleCount;
+    ++frame->program_generation;
+    scope.appendFrame(*frame, 24);
+    require(!scope.synchronizedDisplayAvailable(), "a new program cannot inherit the old synchronized window");
+    for (std::uint64_t sequence = 11; sequence <= 13; ++sequence) {
+        frame->sequence = sequence;
+        frame->sample_end = sequence * frame->kSampleCount;
+        scope.appendFrame(*frame, 24);
+    }
+    require(scope.synchronizedDisplayAvailable(), "low-note window recovers within the new program");
+    frame->sequence = 14;
+    frame->sample_end = 14 * frame->kSampleCount + 1;
+    scope.appendFrame(*frame, 24);
+    require(!scope.synchronizedDisplayAvailable(), "discarded partial frames cannot masquerade as continuous samples");
+    scope.setSynchronized(false);
+    scope.appendFrame(*frame, 24);
+}
+
+void testOpllLowNoteHistoryWithLargeHostCallbacks() {
+    MgstcAudioProcessor processor;
+    auto sound = mgstc::engine::defaultCompositeTimbre();
+    sound.layers = {sound.layers.back()};
+    mgstc::engine::seedDefaultLayerTimbre(sound.layers.front());
+    require(processor.replacePluginState(documentFrom(sound, 0, {})), "seed low-note OPLL history fixture");
+    processor.prepareToPlay(48'000.0, 2048);
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::OpllScopeComponent scope;
+    scope.setSynchronized(true);
+    auto frame = std::make_unique<mgstc::engine::OpllScopeFrame>();
+    std::uint64_t end = 0;
+    unsigned received = 0;
+    for (int block = 0; block < 2; ++block) {
+        juce::AudioBuffer<float> audio(2, 2048);
+        juce::MidiBuffer midi;
+        if (block == 0) midi.addEvent(juce::MidiMessage::noteOn(1, 24, static_cast<juce::uint8>(100)), 0);
+        processor.processBlock(audio, midi);
+        while (context.pollOpllScopeHistory(*frame)) {
+            require(frame->sample_end == end + frame->kSampleCount, "large host buffers retain every scope window");
+            end = frame->sample_end;
+            ++received;
+            const auto display_note = mgstc::app::scopeDisplayNote(frame->selection_context, frame->selection_note, 60);
+            require(display_note == 24, "DAW low note overrides the editor's cached UI audition note");
+            scope.appendFrame(*frame, 60, false);
+        }
+        scope.refreshDisplay();
+        if (block == 0) require(!scope.synchronizedDisplayAvailable(),
+            "first large callback cannot substitute a short cached-C4 window for C1");
+    }
+    require(received == 5 && scope.synchronizedDisplayAvailable(),
+        "two2048-frame callbacks provide a continuous C1 two-period scope window");
+    require(context.pollLatestOpllScope(*frame) && frame->sample_end == 4000,
+        "latest-frame API remains independent from the OPLL history reader");
+    require(context.pollOpllScope(*frame) && frame->sample_end == 800,
+        "OPLL history does not consume the composite display cursor");
+}
+
+void testDawMidiScopeFollowsLatestVoiceAndRetainsRelease() {
+    MgstcAudioProcessor processor;
+    auto sound = mgstc::engine::defaultCompositeTimbre();
+    for (auto& layer : sound.layers) {
+        mgstc::engine::seedDefaultLayerTimbre(layer);
+        layer.volume_envelope.kind = mgstc::engine::EnvelopeKind::Sequence;
+        layer.volume_envelope.events = {{.kind = mgstc::engine::EnvelopeEventKind::Volume, .value = 15, .count = 0}};
+        layer.envelope_timeline.length_counts = 16;
+        layer.envelope_timeline.loop_start_count = 0;
+        layer.envelope_timeline.loop_end_count = 16;
+    }
+    require(processor.replacePluginState(documentFrom(sound, 0, {})),
+        "seed multilayer DAW scope program");
+    processor.prepareToPlay(48'000.0, 2048);
+    std::unique_ptr<juce::AudioProcessorEditor> editor(processor.createEditor());
+    require(editor != nullptr && Access::scopeEnabled(processor),
+        "DAW scope capture is enabled for the editor lifetime");
+    const auto plan = mgstc::engine::buildCompositePlaybackPlan(sound);
+
+    const auto processAndPoll = [&](const juce::MidiMessage* message) {
+        std::optional<mgstc::engine::OpllScopeFrame> latest;
+        for (int block = 0; block < 5; ++block) {
+            juce::AudioBuffer<float> audio(2, 2048);
+            juce::MidiBuffer midi;
+            if (message != nullptr && block == 0)
+                midi.addEvent(*message, 0);
+            processor.processBlock(audio, midi);
+            mgstc::engine::OpllScopeFrame frame{};
+            while (processor.editorPollCompositeScope(frame)) latest = frame;
+        }
+        return latest;
+    };
+    const auto physicalTrackMap = [&](std::uint8_t voice) {
+        std::array<std::int8_t, mgstc::engine::RuntimeSession::kTrackCount> tracks{};
+        tracks.fill(-1);
+        for (const auto& binding : plan.audible_layers) {
+            const auto track = plan.physicalTrack(binding, voice);
+            if (binding.layer_index < tracks.size() && track < 17)
+                tracks[binding.layer_index] = static_cast<std::int8_t>(track);
+        }
+        return tracks;
+    };
+    const auto physicalTrackMask = [](const auto& tracks) {
+        std::uint32_t mask{};
+        for (const auto track : tracks)
+            if (track >= 0) mask |= std::uint32_t{1} << static_cast<unsigned>(track);
+        return mask;
+    };
+    const auto hasCapturedSignalForEveryLayer = [](const auto& frame) {
+        for (const auto track : frame.layer_tracks) {
+            if (track < 0) continue;
+            const auto& samples = frame.physical_samples[static_cast<std::size_t>(track)];
+            if (std::none_of(samples.begin(), samples.end(), [](float value) {
+                    return std::fabs(value) > 1.0e-7F;
+                })) return false;
+        }
+        return true;
+    };
+
+    const juce::MidiMessage first_on = juce::MidiMessage::noteOn(
+        1, 60, static_cast<juce::uint8>(100));
+    auto first = processAndPoll(&first_on);
+    const auto first_tracks = physicalTrackMap(0);
+    require(first && (first->selection_context & (std::uint64_t{1} << 63U)) != 0
+            && first->layer_tracks == first_tracks
+            && first->captured_track_mask == physicalTrackMask(first_tracks)
+            && hasCapturedSignalForEveryLayer(*first),
+        "DAW NoteOn publishes and captures only its actual physical layer channels");
+    const auto first_context = first->selection_context;
+
+    const juce::MidiMessage second_on = juce::MidiMessage::noteOn(
+        1, 64, static_cast<juce::uint8>(100));
+    auto second = processAndPoll(&second_on);
+    const auto second_tracks = physicalTrackMap(1);
+    require(second && second->selection_context != first_context
+            && second->layer_tracks == second_tracks
+            && second->captured_track_mask == physicalTrackMask(second_tracks)
+            && hasCapturedSignalForEveryLayer(*second),
+        "polyphonic DAW input selects and captures only the most recent voice channels");
+    const auto selected_track = static_cast<std::size_t>(second->layer_tracks[0]);
+    const auto generation = second->track_note_generation[selected_track];
+    editor.reset();
+    require(!Access::scopeEnabled(processor), "closing the editor pauses capture while DAW audio continues");
+    processEmpty(processor, 2048);
+    editor.reset(processor.createEditor());
+    auto reopened = processAndPoll(nullptr);
+    require(reopened && reopened->selection_context == second->selection_context
+            && reopened->layer_tracks == second->layer_tracks
+            && reopened->captured_track_mask == second->captured_track_mask
+            && reopened->track_note_generation[selected_track] == generation
+            && reopened->playback_positions[selected_track].active,
+        "reopened editor resumes the held DAW voice without another NoteOn");
+    const juce::MidiMessage off = juce::MidiMessage::noteOff(1, 64);
+    auto released = processAndPoll(&off);
+    require(released && released->selection_context == second->selection_context
+            && released->layer_tracks == second->layer_tracks
+            && released->track_note_generation[selected_track] == generation,
+        "DAW NoteOff retains the selected voice mapping during release");
+    juce::MidiBuffer all_off;
+    all_off.addEvent(juce::MidiMessage::allNotesOff(1), 0);
+    juce::AudioBuffer<float> audio(2, 2048);
+    processor.processBlock(audio, all_off);
+}
+
 void testProcessorOfflineAndTransport() {
     struct PlayHead final : juce::AudioPlayHead {
         PositionInfo position;
@@ -5523,6 +5748,14 @@ void testOpllKeyoffSilenceDeadline() {
     require(processor.replacePluginState(documentFrom(sound, 0, {})),
         "restore another OPLL snapshot while the old editor still exists");
     processEmpty(processor, 512);
+    require(!stale_context.setScopeSelection(1U << opll_track, 0x1234),
+        "old editor cannot retarget waveform capture after host state restore");
+    {
+        mgstc::app::EditorLink link;
+        mgstc::app::CompositeEditorComponent stale_editor(stale_context, link, {}, {}, {}, {}, {}, sound);
+        require(mgstc::app::CompositeEditorComponentTestAccess::dawScopeRecoversAfterRejectedClear(stale_editor),
+            "rejected display request cannot prevent later DAW scope adoption");
+    }
     stale_context.audition().armOpllKeyOffSilence(opll_track);
     processEmpty(processor, 512);
     require(Access::keyoffDue(processor, opll_track) == 0,
@@ -5599,6 +5832,174 @@ void testCommittedTimelineEditSupersedesPickerPreview() {
     EditorAccess::immediate(editor, old_immediate);
 }
 
+void testCompositeUiScopeFollowsLastVoice() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+#if JUCE_WINDOWS
+    {
+        // Exercise both a standalone peer and a hosted child peer without
+        // attaching a test window to any real host or user-owned window.
+        juce::Component owner;
+        owner.setSize(640, 480);
+        owner.addToDesktop(juce::ComponentPeer::windowHasTitleBar);
+        require(owner.getPeer() != nullptr, "preview owner smoke creates its own native container");
+        const auto owner_handle = static_cast<HWND>(owner.getPeer()->getNativeHandle());
+        juce::Component hosted;
+        hosted.setSize(400, 300);
+        hosted.addToDesktop(0, owner_handle);
+        require(hosted.getPeer() != nullptr
+                && (GetWindowLongPtrW(static_cast<HWND>(hosted.getPeer()->getNativeHandle()), GWL_STYLE) & WS_CHILD) != 0,
+            "preview owner smoke creates a real hosted child peer");
+        const int owner_entry_active = UiScale::active_percent;
+        UiScale::setActivePercent(UiScale::global_percent == 75 ? 125 : 75);
+        const int constructor_active = UiScale::active_percent;
+        const int constructor_pad = UiLayout::panelPad;
+        const int constructor_field = UiLayout::fieldH;
+        int close_count{};
+        mgstc::app::MgscPreviewWindow preview([&] { ++close_count; });
+        require(UiScale::active_percent == constructor_active && UiLayout::panelPad == constructor_pad
+                && UiLayout::fieldH == constructor_field
+                && preview.getWidth() == juce::roundToInt(960.0F * UiScale::factorFromPercent(UiScale::global_percent)),
+            "preview constructor uses global size without changing editor session metrics");
+        require(preview.content().verifyScaleIsolation(),
+            "preview text, resize and splitter use global scale and restore caller metrics");
+        auto sample = mgstc::engine::defaultCompositeTimbre();
+        for (auto& layer : sample.layers) mgstc::engine::seedDefaultLayerTimbre(sample, layer);
+        const auto full_source = mgstc::engine::formatMgsComposite(sample);
+        sample.layers = {sample.layers[1]};
+        const auto selected_source = mgstc::engine::formatMgsComposite(sample);
+        require(full_source.valid() && selected_source.valid(), "preview image fixture produces valid MML");
+        const auto whole_text = juce::String::fromUTF8(full_source.source.c_str());
+        const auto selected_text = juce::String::fromUTF8(selected_source.source.c_str());
+        for (auto* anchor : {&owner, &hosted}) {
+            UiScale::setActivePercent(anchor == &owner ? 75 : 125);
+            const int caller_active = UiScale::active_percent;
+            const int caller_pad = UiLayout::panelPad;
+            const int caller_field = UiLayout::fieldH;
+            preview.content().setTexts(selected_text, whole_text);
+            preview.showFor(*anchor);
+            require(UiScale::active_percent == caller_active && UiLayout::panelPad == caller_pad
+                    && UiLayout::fieldH == caller_field,
+                "showing preview from standalone/hosted peers preserves editor scale");
+            require(preview.isVisible() && preview.getPeer() != nullptr,
+                "MGSC preview opens from standalone and hosted editor peers");
+            const auto handle = static_cast<HWND>(preview.getPeer()->getNativeHandle());
+            require(GetWindow(handle, GW_OWNER) == GetAncestor(owner_handle, GA_ROOT)
+                    && (GetWindowLongPtrW(handle, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0,
+                "MGSC preview uses its editor container as owner without global topmost state");
+            preview.closeButtonPressed();
+            require(!preview.isVisible() && preview.content().compositeText() == whole_text,
+                "closing preview hides it without discarding source text");
+        }
+        require(close_count == 2, "standalone and hosted preview close callbacks are delivered");
+        UiScale::setActivePercent(owner_entry_active);
+        const auto previous_scale = UiScale::active_percent;
+        const auto previous_global = UiScale::global_percent;
+        const auto captures = juce::File::getCurrentWorkingDirectory().getChildFile("composite-ui-captures");
+        require(captures.createDirectory().wasOk(), "preview image output directory is available");
+        for (const auto scale : {75, 100, 125}) {
+            UiScale::global_percent = scale;
+            UiScale::setActivePercent(scale);
+            preview.refreshFonts();
+            preview.setSize(UiScale::sx(960), UiScale::sx(640));
+            auto stream = captures.getChildFile("mgsc-preview-" + juce::String(scale) + ".png").createOutputStream();
+            require(stream != nullptr, "MGSC preview image output opens");
+            stream->setPosition(0); stream->truncate();
+            juce::PNGImageFormat png;
+            require(png.writeImageToStream(preview.content().createComponentSnapshot(preview.content().getLocalBounds()), *stream),
+                "MGSC preview panes render at every UI scale");
+        }
+        UiScale::global_percent = previous_global;
+        UiScale::setActivePercent(previous_scale);
+        preview.refreshFonts();
+    }
+#endif
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    auto sound = mgstc::engine::defaultCompositeTimbre();
+    for (auto& layer : sound.layers) {
+        layer.volume_envelope.kind = mgstc::engine::EnvelopeKind::Sequence;
+        layer.envelope_timeline.length_counts = 64;
+    }
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {},
+        [] {}, [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, sound);
+    const auto original_scale = UiScale::active_percent;
+    for (const auto scale : {75, 100, 125}) {
+        editor.applyEditorUiScale(scale);
+        require(EditorAccess::auditionRowGap(editor) == UiLayout::controlGap,
+            "composite graph and audition row share one control gap at each UI scale");
+    }
+    editor.applyEditorUiScale(original_scale);
+    require(EditorAccess::rebuild(editor), "submit composite scope test program");
+    processEmpty(processor, 512);
+
+    const auto plan = mgstc::engine::buildCompositePlaybackPlan(sound);
+    const auto expectedMask = [&](std::uint8_t voice) {
+        std::uint32_t mask = 0;
+        for (const auto& binding : plan.audible_layers) {
+            const auto track = plan.physicalTrack(binding, voice);
+            if (track < 17) mask |= std::uint32_t{1} << track;
+        }
+        return mask;
+    };
+    const auto newestFrameAfter = [&](std::uint64_t previous_context) {
+        std::optional<mgstc::engine::OpllScopeFrame> latest;
+        for (int block = 0; block < 6; ++block) {
+            processEmpty(processor, 512);
+            mgstc::engine::OpllScopeFrame frame{};
+            while (processor.editorPollCompositeScope(frame)) {
+                if (frame.selection_context != previous_context) latest = frame;
+            }
+            if (latest) return latest;
+        }
+        return latest;
+    };
+    const auto newestFrameWith = [&](std::uint64_t context_value) {
+        std::optional<mgstc::engine::OpllScopeFrame> latest;
+        for (int block = 0; block < 6; ++block) {
+            processEmpty(processor, 512);
+            mgstc::engine::OpllScopeFrame frame{};
+            while (processor.editorPollCompositeScope(frame)) {
+                if (frame.selection_context == context_value) latest = frame;
+            }
+            if (latest) return latest;
+        }
+        return latest;
+    };
+
+    EditorAccess::start(editor, 60);
+    auto first = newestFrameAfter(0);
+    const auto first_voice = EditorAccess::latestScheduledVoice(editor);
+    require(first && first->selection_context != 0
+            && first->captured_track_mask == expectedMask(first_voice),
+        "first UI NoteOn captures its actual physical channels");
+    const auto first_context = first->selection_context;
+
+    EditorAccess::start(editor, 64);
+    auto second = newestFrameAfter(first_context);
+    const auto second_voice = EditorAccess::latestScheduledVoice(editor);
+    require(second && second->selection_context != first_context
+            && second->captured_track_mask == expectedMask(second_voice),
+        "polyphonic UI scope switches to the latest NoteOn voice only");
+    const auto second_context = second->selection_context;
+
+    EditorAccess::release(editor, 64, EditorAccess::onset(editor));
+    auto released = newestFrameWith(second_context);
+    require(released && released->selection_context == second_context
+            && released->captured_track_mask == expectedMask(second_voice),
+        "key release retains the selected voice channels through its release");
+
+    EditorAccess::start(editor, 67);
+    auto retriggered = newestFrameAfter(second_context);
+    const auto third_voice = EditorAccess::latestScheduledVoice(editor);
+    require(retriggered && retriggered->selection_context != second_context
+            && retriggered->captured_track_mask == expectedMask(third_voice),
+        "a later NoteOn replaces the retained selection after release");
+    EditorAccess::stop(editor);
+}
+
 void testCompositeEditorDelayedKeyOff() {
     using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
     MgstcAudioProcessor processor;
@@ -5613,6 +6014,11 @@ void testCompositeEditorDelayedKeyOff() {
     mgstc::app::CompositeEditorComponent editor(context, link,
         [](const juce::String&, std::optional<std::uint64_t>) {},
         [] {}, [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, sound);
+    require(EditorAccess::scopeDisplayTimerRunning(editor)
+            && EditorAccess::scopeDisplayTimerInterval(editor) == 16,
+        "scope presentation timer runs independently at 60 Hz");
+    require(EditorAccess::auditionTimerInterval(editor) == 100,
+        "scope presentation timer does not accelerate audition scheduling");
     require(EditorAccess::rebuild(editor),
         "submit the three-layer test program before checking voice capacity");
     // Let the audio side consume the submitted program, as a running host
@@ -5651,6 +6057,9 @@ void testCompositeEditorDelayedKeyOff() {
         "last delayed release frees the voice");
 
     EditorAccess::start(editor, 60, true);
+    require(EditorAccess::scopeDisplayTimerInterval(editor) == 16
+            && EditorAccess::auditionTimerInterval(editor) == 16,
+        "one-second note scheduling and 60 Hz display use separate timers");
     const auto preview_on = EditorAccess::onset(editor);
     require(EditorAccess::startsAndStopsShiftedEqually(editor, 1000.0),
         "one-second preview holds every layer for one second after its onset");
@@ -8110,6 +8519,10 @@ int main() {
             testPluginProjectRestore();
             testPluginEditor();
             testCompositePlaybackWaveform();
+            testCompositeUiScopeFollowsLastVoice();
+            testOpllScopeRequiresContinuousLowNoteHistory();
+            testOpllLowNoteHistoryWithLargeHostCallbacks();
+            testDawMidiScopeFollowsLatestVoiceAndRetainsRelease();
             testScopeFrameDistributorReaders();
             testProcessorOfflineAndTransport();
             LibraryManagerListTabTestAccess::run();
@@ -8195,6 +8608,10 @@ int main() {
         testOwnedEditorPendingTargetKeepsSnapshot();
         testEditorParityCorrections();
         testCompositePlaybackWaveform();
+        testCompositeUiScopeFollowsLastVoice();
+        testOpllScopeRequiresContinuousLowNoteHistory();
+        testOpllLowNoteHistoryWithLargeHostCallbacks();
+        testDawMidiScopeFollowsLatestVoiceAndRetainsRelease();
         testScopeFrameDistributorReaders();
         testProcessorOfflineAndTransport();
         LibraryManagerListTabTestAccess::run();

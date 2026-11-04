@@ -8,6 +8,8 @@
 constexpr juce::uint32 kUiHoverAccent = 0xFF53E3A6;
 // Toggle-on fill (TextButton / switch pill). Darker so light text stays readable.
 constexpr juce::uint32 kUiToggleOnFill = 0xFF1F8A5C;
+// Runtime position, distinct from editable selection and END markers.
+constexpr juce::uint32 kUiPlaybackPosition = 0xFFFF91C1;
 
 [[nodiscard]] inline juce::Colour uiHoverAccent() {
     return juce::Colour(kUiHoverAccent);

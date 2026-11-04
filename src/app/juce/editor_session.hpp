@@ -263,6 +263,12 @@ public:
         mgstc::engine::OpllScopeFrame& frame) = 0;
     [[nodiscard]] virtual bool pollLatestOpllScope(
         mgstc::engine::OpllScopeFrame& frame) = 0;
+    [[nodiscard]] virtual bool pollOpllScopeHistory(mgstc::engine::OpllScopeFrame& frame) {
+        return pollLatestOpllScope(frame);
+    }
+    // Message thread; queue-ordered before the corresponding NoteOn commands.
+    // Failure suppresses the display selection, never the musical event.
+    [[nodiscard]] virtual bool setScopeSelection(std::uint32_t, std::uint64_t) { return false; }
 private:
     EditorAuditionPreferences audition_preferences_;
     std::shared_ptr<PatchSlideStock> patchslide_stock_;

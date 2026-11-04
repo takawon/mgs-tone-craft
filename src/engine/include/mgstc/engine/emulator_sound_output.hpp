@@ -25,6 +25,7 @@ public:
 
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] ChipSamples renderSample(bool capture_channels = false) noexcept;
+    [[nodiscard]] ChipSamples renderSampleMask(std::uint32_t channel_mask) noexcept;
 
 private:
     ChipRack chips_{};

@@ -48,7 +48,7 @@ SincRateConv::SincRateConv(double input_hz, double output_hz)
 void SincRateConv::reset() noexcept {
     history_.fill(0.0F);
     channel_history_ = {};
-    tracking_channels_ = false;
+    tracked_channel_mask_ = 0;
     history_pos_ = 0;
     time_ = 0.0;
     frac_ = 0.0;

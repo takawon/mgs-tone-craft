@@ -1,7 +1,9 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <span>
 
 namespace mgstc::engine {
@@ -23,29 +25,37 @@ public:
     // Emit one sample at output_hz. `generate` yields the next sample at
     // input_hz whenever the converter needs fresh input.
     template <typename Generate>
-    [[nodiscard]] float next(Generate&& generate, std::span<float> channels = {}) noexcept {
-        if (!channels.empty() && !tracking_channels_) {
-            channel_history_ = {};
+    [[nodiscard]] float next(Generate&& generate, std::span<float> channels = {},
+        std::uint16_t channel_mask = 0x3FFF) noexcept {
+        channel_mask &= static_cast<std::uint16_t>((1U << channels.size()) - 1U);
+        auto added = static_cast<std::uint16_t>(channel_mask & ~tracked_channel_mask_);
+        while (added != 0) {
+            const auto ch = std::countr_zero(added);
+            channel_history_[ch].fill(0.0F);
+            added &= static_cast<std::uint16_t>(added - 1U);
         }
-        tracking_channels_ = !channels.empty();
+        tracked_channel_mask_ = channel_mask;
         while (input_hz_ > time_) {
             time_ += output_hz_;
             const auto slot = history_pos_;
             push(static_cast<float>(generate()));
-            for (std::size_t ch = 0; ch < channels.size(); ++ch)
+            for (auto bits = channel_mask; bits != 0; bits &= static_cast<std::uint16_t>(bits - 1U)) {
+                const auto ch = std::countr_zero(bits);
                 channel_history_[ch][slot] = channels[ch];
+            }
         }
         time_ -= input_hz_;
         const float mixed = interpolate();
         // Read the same native instants with the mono converter's phase.
         // The generator is never called again for individual channels.
-        if (!channels.empty()) {
+        if (channel_mask != 0) {
             constexpr double center = static_cast<double>(kTapCount) / 2.0 - 1.0;
             std::array<float, kTapCount> coefficients{};
             for (std::size_t k = 0; k < kTapCount; ++k)
                 coefficients[k] = lookup(static_cast<double>(k) - center - frac_);
             const auto pos = history_pos_;
-            for (std::size_t ch = 0; ch < channels.size(); ++ch) {
+            for (auto bits = channel_mask; bits != 0; bits &= static_cast<std::uint16_t>(bits - 1U)) {
+                const auto ch = std::countr_zero(bits);
                 double sum = 0.0;
                 const auto& history = channel_history_[ch];
                 for (std::size_t k = 0; k < kTapCount; ++k) {
@@ -71,7 +81,7 @@ private:
     std::size_t history_pos_{};
     std::array<float, kTapCount> history_{};
     std::array<std::array<float, kTapCount>, 14> channel_history_{};
-    bool tracking_channels_{};
+    std::uint16_t tracked_channel_mask_{};
     std::array<float, kTableReso * kTapCount / 2> sinc_table_{};
 };
 

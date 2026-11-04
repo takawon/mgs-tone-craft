@@ -8,10 +8,11 @@ namespace mgstc::engine {
 CompositeSequenceRuntime::CompositeSequenceRuntime(
     std::vector<std::uint8_t> volume_bytecode,
     std::vector<std::uint8_t> pitch_bytecode,
-    std::vector<std::uint8_t> timbre_bytecode)
+    std::vector<std::uint8_t> timbre_bytecode,
+    std::vector<std::uint32_t> display_counts)
     : timbre_(std::move(timbre_bytecode), false),
       pitch_(std::move(pitch_bytecode), false),
-      volume_(std::move(volume_bytecode)) {}
+      volume_(std::move(volume_bytecode), true, std::move(display_counts)) {}
 
 void CompositeSequenceRuntime::resetForKeyOn() noexcept {
     timbre_.resetForKeyOn();
@@ -39,11 +40,13 @@ bool TrackRuntime::setSequenceEnvelope(
 bool TrackRuntime::setCompositeSequenceEnvelopes(
     std::vector<std::uint8_t> volume_bytecode,
     std::vector<std::uint8_t> pitch_bytecode,
-    std::vector<std::uint8_t> timbre_bytecode) {
+    std::vector<std::uint8_t> timbre_bytecode,
+    std::vector<std::uint32_t> display_counts) {
     envelope_.emplace<CompositeSequenceRuntime>(
         std::move(volume_bytecode),
         std::move(pitch_bytecode),
-        std::move(timbre_bytecode));
+        std::move(timbre_bytecode),
+        std::move(display_counts));
     return true;
 }
 
@@ -97,6 +100,19 @@ SequenceError TrackRuntime::processTick(EventBuffer& output) {
         }
     }
     return SequenceError::None;
+}
+
+EnvelopePlaybackPosition TrackRuntime::playbackPosition() const noexcept {
+    if (const auto* sequence = std::get_if<SequenceEnvelopeRuntime>(&envelope_))
+        return sequence->playbackPosition();
+    if (const auto* composite = std::get_if<CompositeSequenceRuntime>(&envelope_))
+        return composite->playbackPosition();
+    if (const auto* rate = std::get_if<RateEnvelopeRuntime>(&envelope_)) {
+        if (rate->tick() == 0 || (rate->phase() == RatePhase::Release && rate->level() == 0))
+            return {};
+        return {static_cast<std::uint32_t>(rate->tick() - 1), true};
+    }
+    return {};
 }
 
 }  // namespace mgstc::engine

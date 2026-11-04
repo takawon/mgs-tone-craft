@@ -2,11 +2,14 @@
 
 #include "composite_timeline.hpp"
 #include "segmented_control.hpp"
+#include "scope_waveform.hpp"
+#include "mgsc_preview_window.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <map>
@@ -4769,32 +4772,11 @@ public:
         });
         addAndMakeVisible(command_stack_);
 
-        envelope_mml_preview_.setMultiLine(true);
-        envelope_mml_preview_.setReadOnly(true);
-        envelope_mml_preview_.setWantsKeyboardFocus(false);
-        envelope_mml_preview_.setScrollbarsShown(true);
-        envelope_mml_preview_.setFont(UiFonts::mono());
-        envelope_mml_preview_.setColour(
-            juce::TextEditor::backgroundColourId,
-            juce::Colour(0xFF151A20));
-        envelope_mml_preview_.setColour(
-            juce::TextEditor::textColourId,
-            juce::Colour(0xFF9BE9C3));
-        envelope_mml_preview_.setColour(
-            juce::TextEditor::outlineColourId,
-            juce::Colour(0xFF40505E));
-        envelope_mml_preview_.setColour(
-            juce::TextEditor::focusedOutlineColourId,
-            juce::Colour(kUiHoverAccent));
-        envelope_mml_preview_.setTooltip(juce::String::fromUTF8(
-            "音色定義=@s/@v、エンベロープ=@e/@r、その下=発音前トラックMML。"
-            "マウスで範囲選択して Ctrl+C でコピーできます"));
-        addAndMakeVisible(envelope_mml_preview_);
-
         mml_toggle_.setButtonText(juce::String::fromUTF8("MGSCプレビュー"));
-        mml_toggle_.setClickingTogglesState(true);
-        mml_toggle_.setTooltip(juce::String::fromUTF8("選択チャンネルの定義と発音前MML。読取専用・範囲コピー可能"));
-        mml_toggle_.onClick = [this] { resized(); repaint(); };
+        mml_toggle_.setClickingTogglesState(false);
+        mml_toggle_.setExplicitFocusOrder(119);
+        mml_toggle_.setTooltip(juce::String::fromUTF8("別ウィンドウで選択レイヤーと複合音色全体のMMLを表示。読取専用・範囲コピー可能"));
+        mml_toggle_.onClick = [this] { showMgscPreview(); };
         addAndMakeVisible(mml_toggle_);
         zoom_in_.setButtonText("+"); zoom_out_.setButtonText("-");
         zoom_in_.setTooltip(juce::String::fromUTF8("ステップ間隔を拡大"));
@@ -4862,7 +4844,6 @@ public:
                  &length_label_, &length_editor_, &loop_start_label_,
                  &loop_start_editor_, &loop_end_label_, &loop_end_editor_,
                  &inspector_apply_, &clear_loop_, &command_stack_,
-                 &envelope_mml_preview_,
                  &auto_mode_, &auto_depth_, &auto_speed_,
                  &auto_coarseness_, &auto_stop_, &auto_depth_label_,
                  &auto_speed_label_, &auto_coarseness_label_,
@@ -4912,7 +4893,6 @@ public:
             if (selected_layer_ >= 0) openRateEditor(static_cast<std::size_t>(selected_layer_));
         };
         inspector_content_.addAndMakeVisible(rate_open_);
-        addChildComponent(envelope_mml_preview_);
         addAndMakeVisible(edit_mode_);
         addAndMakeVisible(parameter_);
         inspector_view_.setViewedComponent(&inspector_content_, false);
@@ -4958,6 +4938,7 @@ public:
     }
 
     ~Impl() override {
+        mgsc_preview_window_.reset();
         cancelPendingDialogs();
         stopTimer();
         cancelMorphGeneration();
@@ -5084,6 +5065,7 @@ public:
             UiScale::setActivePercent(percent);
             setSize(UiScale::sx(1528), UiScale::sx(750));
             refreshUiScaleFonts();
+            failures += verifyScopeDrawing(percent, directory);
             {
                 std::optional<std::size_t> requested;
                 setPatchSlideCallback([&](std::size_t index) { requested = index; });
@@ -5386,14 +5368,31 @@ public:
             check(inspector_view_.getBounds().getIntersection(graphArea()).isEmpty(), "inspector overlaps graph");
             mml_toggle_.setToggleState(true, juce::dontSendNotification);
             mml_toggle_.onClick();
-            check(envelope_mml_preview_.isVisible() && !envelope_mml_preview_.getText().isEmpty(),
-                "MGSC drawer is empty");
-            const auto preview_bounds = envelope_mml_preview_.getBounds();
+            check(mgsc_preview_window_ && mgsc_preview_window_->content().selectedText() == last_envelope_mml_preview_
+                    && last_envelope_mml_preview_.isNotEmpty(), "MGSC selected-layer pane is empty or stale");
+            const auto exported = mgstc::engine::formatMgsComposite(timbre_, timbreLibrary());
+            check(exported.valid() && mgsc_preview_window_->content().compositeText()
+                    == juce::String::fromUTF8(exported.source.data(), static_cast<int>(exported.source.size())),
+                "MGSC whole-composite pane differs from clipboard source");
+            const auto preview_model = timbre_;
+            const auto selected_source = mgsc_preview_window_->content().selectedText();
+            auto other_layer_edited = preview_model;
+            ++other_layer_edited.layers[0].relative_semitones;
+            setTimbre(other_layer_edited);
+            const auto updated_export = mgstc::engine::formatMgsComposite(timbre_, timbreLibrary());
+            check(updated_export.valid() && mgsc_preview_window_->content().selectedText() == selected_source
+                    && mgsc_preview_window_->content().compositeText()
+                        == juce::String::fromUTF8(updated_export.source.data(), static_cast<int>(updated_export.source.size())),
+                "MGSC whole source did not update when an unselected layer changed");
+            setTimbre(preview_model);
+            check(graphArea() == editor, "opening MGSC preview consumed timeline height");
+            check(mgsc_preview_window_->content().verifySplitAndResize(), "MGSC splitter/resize overlaps or loses a pane");
+            const auto preview_bounds = mgsc_preview_window_->getBounds();
             const auto pinned_summary = makeEditLaneSlots(graph_bounds_[1], timbre_.layers[1].source).summary;
             const auto pinned_toggle = step_edit_mode_.getBounds();
             const auto scrolling_volume = makeEditLaneSlots(graph_bounds_[1], timbre_.layers[1].source).volume;
             vertical_scroll_.setCurrentRangeStart(100.0, juce::sendNotificationSync);
-            check(envelope_mml_preview_.getBounds() == preview_bounds, "MGSC drawer moved with graph");
+            check(mgsc_preview_window_->getBounds() == preview_bounds, "MGSC preview window moved with graph");
             check(makeEditLaneSlots(graph_bounds_[1], timbre_.layers[1].source).summary == pinned_summary
                     && step_edit_mode_.getBounds() == pinned_toggle && step_edit_mode_.isVisible()
                     && layerAt(pinned_summary.getCentre()) == 1,
@@ -5403,8 +5402,12 @@ public:
                     "pinning command row prevented envelope body scrolling");
             check(callbacks == 0 && timbre_ == before, "MGSC navigation changed model");
             save("workspace-mml-" + juce::String(percent));
-            mml_toggle_.setToggleState(false, juce::dontSendNotification);
+            auto* preview_window = mgsc_preview_window_.get();
+            mgsc_preview_window_->closeButtonPressed();
+            check(!mml_toggle_.getToggleState(), "closing MGSC preview left button selected");
             mml_toggle_.onClick();
+            check(mgsc_preview_window_.get() == preview_window, "MGSC reopen replaced its session/window");
+            mgsc_preview_window_->closeButtonPressed();
             vertical_scroll_.setCurrentRangeStart(0.0, juce::sendNotificationSync);
             for (const auto& fixture : model.layers) {
                 int changes = 0, previews = 0;
@@ -6054,9 +6057,9 @@ public:
                 && timbre_.layers[1].timbre_automation.back().target_library_id == old_base.library_id
                 && timbre_.layers[1].base_timbre->number_mode == mgstc::engine::TimbreNumberMode::Automatic,
                 "base preset replacement collided with retained manual tone or rebound raw @ incorrectly");
-            mgstc::engine::EngineCore preset_engine;
+            auto preset_engine = std::make_unique<mgstc::engine::EngineCore>();
             check(mgstc::engine::formatMgsComposite(timbre_).valid()
-                && mgstc::engine::compileCompositeProgram(preset_engine, timbre_),
+                && mgstc::engine::compileCompositeProgram(*preset_engine, timbre_),
                 "manual base preset replacement broke export or audition preparation");
             auto shared_base = before;
             shared_base.layers[1].base_timbre = old_base;
@@ -6067,7 +6070,7 @@ public:
             check(timbre_.layers.back().base_timbre == std::optional{old_base}
                 && mgstc::engine::resolveTimbreNumbers(timbre_).warnings.empty()
                 && mgstc::engine::formatMgsComposite(timbre_).valid()
-                && mgstc::engine::compileCompositeProgram(preset_engine, timbre_),
+                && mgstc::engine::compileCompositeProgram(*preset_engine, timbre_),
                 "base preset replacement damaged another channel's shared manual tone");
             setTimbre(before, true); selectOverviewLayer(0);
         }
@@ -6303,8 +6306,12 @@ public:
         selectOverviewLayer(2); setCountInspector(true);
         check(modulation_toggles_[2].isVisible() && modulation_toggles_[3].isVisible()
                 && !modulation_toggles_[4].isVisible(), "OPLL modulation controls regressed");
+        mml_toggle_.onClick();
         model.layers.clear(); setTimbre(model, true);
-        check(selected_layer_ == -1 && !envelope_mml_preview_.isVisible(), "empty model retained editable controls");
+        check(selected_layer_ == -1 && last_envelope_mml_preview_.isEmpty(), "empty model retained a selected-layer preview");
+        check(mgsc_preview_window_ && mgsc_preview_window_->content().selectedText().isEmpty(),
+            "open MGSC window retained a removed layer's MML");
+        if (mgsc_preview_window_) mgsc_preview_window_->closeButtonPressed();
         check(psg_add_.isVisible() && scc_add_.isVisible() && opll_add_.isVisible()
             && !add_channel_.isVisible(), "empty workspace lost explicit add buttons");
         save("workspace-empty");
@@ -6743,6 +6750,18 @@ public:
     void setTimbre(
         const mgstc::engine::CompositeTimbre& timbre,
         bool reset_scroll_extent = false) {
+        const bool same_structure = timbre.layers.size() == timbre_.layers.size()
+            && std::equal(timbre.layers.begin(), timbre.layers.end(), timbre_.layers.begin(), [](const auto& left, const auto& right) {
+                return left.source == right.source && left.channel == right.channel;
+            });
+        if (!same_structure) {
+            scope_tracks_.fill(-1);
+            scope_generations_.fill(0);
+            scope_position_active_.fill(false);
+            for (auto& history : scope_history_) history.fill(0.0F);
+            scope_size_ = scope_write_position_ = 0;
+            scope_visible_sample_count_ = 0;
+        }
         // A host restore / Undo supersedes a provisional mouse gesture.
         if (step_drag_) stopTimer();
         step_drag_.reset();
@@ -6807,7 +6826,7 @@ public:
         tempo_label_.setFont(UiFonts::body());
         UiFonts::styleBodyField(tempo_);
         UiFonts::styleBodyField(value_);
-        UiFonts::refreshMgscPreviewFont(envelope_mml_preview_);
+        if (mgsc_preview_window_) mgsc_preview_window_->refreshFonts();
         morph_bank_label_.setFont(UiFonts::body());
         morph_bank_usage_.setFont(UiFonts::body());
         opll_bank_label_.setFont(UiFonts::body());
@@ -6819,27 +6838,289 @@ public:
         repaint();
     }
 
+    juce::String verifyScopeDrawing(int percent, const juce::File& directory) {
+        juce::String failures;
+        const auto check = [&](bool condition, const char* text) {
+            if (!condition) failures += juce::String(text) + " at " + juce::String(percent) + "%\n";
+        };
+        const auto original = timbre_;
+        const int original_layer = selected_layer_;
+        auto fixture = mgstc::engine::defaultCompositeTimbre();
+        fixture.layers[2].volume_envelope.kind = mgstc::engine::EnvelopeKind::Sequence;
+        fixture.layers[2].volume_envelope.events = {
+            {mgstc::engine::EnvelopeEventKind::Volume, 15, 0, 0},
+            {mgstc::engine::EnvelopeEventKind::Volume, 3, 0, 16}};
+        fixture.layers[2].envelope_timeline.length_counts = 512;
+        setTimbre(fixture, true);
+        selectOverviewLayer(2);
+        setPatchSlideCallback([](std::size_t) {});
+        std::array<int, 17> tracks;
+        tracks.fill(-1); tracks[2] = 8;
+        const auto equal_region = [](const juce::Image& left, const juce::Image& right, juce::Rectangle<int> region) {
+            region = region.getIntersection(left.getBounds()).getIntersection(right.getBounds());
+            for (int y = region.getY(); y < region.getBottom(); ++y)
+                for (int x = region.getX(); x < region.getRight(); ++x)
+                    if (left.getPixelAt(x, y) != right.getPixelAt(x, y)) return false;
+            return true;
+        };
+        // Cached foreground must not inherit a translucent selection brush.
+        const int saved_count = selected_count_;
+        horizontal_scroll_.setCurrentRange(0.0, 24.0, juce::dontSendNotification);
+        selected_count_ = 0; repaint();
+        const auto left_selection = createComponentSnapshot(getLocalBounds());
+        const auto label_region = visibleEditBody(graph_bounds_[2], fixture.layers[2].source)
+            .withRight(timelinePlotBounds(graph_bounds_[2]).getX());
+        selected_count_ = 512; repaint();
+        const auto offscreen_selection = createComponentSnapshot(getLocalBounds());
+        check(equal_region(left_selection, offscreen_selection, label_region),
+            "left selection changed opacity of the entire cached editor foreground");
+        selected_count_ = saved_count;
+        juce::Image opacity_probe(juce::Image::ARGB, 20, 20, true);
+        {
+            juce::Graphics probe(opacity_probe);
+            probe.setColour(juce::Colours::white);
+            drawSelectedCountBand(probe, {0, 0, 10, 10});
+            paintStartDelay(probe, {0, 0, 10, 10}, 2);
+            probe.fillRect(12, 12, 4, 4);
+        }
+        check(opacity_probe.getPixelAt(13, 13) == juce::Colours::white,
+            "selection/delay drawing leaked its colour or opacity to subsequent drawing");
+        overview_scene_dirty_ = true;
+        const auto overview_left = overview_content_.createComponentSnapshot(overview_content_.getLocalBounds());
+        horizontal_scroll_.setCurrentRange(3.5, 24.0, juce::dontSendNotification);
+        overview_scene_dirty_ = true;
+        const auto overview_scrolled = overview_content_.createComponentSnapshot(overview_content_.getLocalBounds());
+        check(equal_region(overview_left, overview_scrolled,
+                overview_content_.getLocalBounds().withWidth(UiLayout::compositeOverviewLabelW)),
+            "overview scrolling primitives entered the fixed button column");
+        unsigned serial = 1;
+        for (const double visible_counts : {24.0, 12.0}) {
+            for (const double horizontal : {0.0, 3.5, 512.0 - visible_counts}) {
+                horizontal_scroll_.setCurrentRange(horizontal, visible_counts, juce::dontSendNotification);
+                for (const double vertical : {0.0, static_cast<double>(UiLayout::editMarkerLaneH / 2),
+                        static_cast<double>(UiLayout::editMarkerLaneH * 3)}) {
+                    vertical_scroll_.setCurrentRangeStart(vertical, juce::dontSendNotification);
+                    scrollBarMoved(&vertical_scroll_, vertical_scroll_.getCurrentRangeStart());
+                    setScopeTracks(tracks, ++serial);
+                    const auto before = createComponentSnapshot(getLocalBounds());
+                    const auto rebuilds = edit_scene_rebuilds_;
+                    auto frame_owner = std::make_unique<mgstc::engine::OpllScopeFrame>();
+                    auto& frame = *frame_owner;
+                    frame.selection_context = serial;
+                    frame.captured_track_mask = 1U << 8;
+                    frame.track_note_generation[8] = serial;
+                    frame.playback_positions[8].active = true;
+                    frame.playback_positions[8].count = static_cast<std::uint32_t>(horizontal + 5);
+                    for (std::size_t sample = 0; sample < frame.kSampleCount; ++sample)
+                        frame.physical_samples[8][sample] = frame.mixed_samples[sample] = std::sin(static_cast<float>(sample) * 0.1F);
+                    check(appendScopeFrame(frame, 60), "scope frame was not accepted");
+                    const auto after = createComponentSnapshot(getLocalBounds());
+                    check(edit_scene_rebuilds_ == rebuilds, "wave update rebuilt static envelope foreground");
+                    const auto content = graph_bounds_[2];
+                    const auto summary = makeEditLaneSlots(content, fixture.layers[2].source).summary;
+                    const auto body = visibleEditBody(content, fixture.layers[2].source);
+                    const auto plot = timelinePlotBounds(content);
+                    const auto selected_parameter = selectedParameter();
+                    check(!commandParameterAt(makeEditLaneSlots(content, fixture.layers[2].source), summary.getCentre()),
+                        "pinned row hit a hidden scrolling parameter");
+                    static_cast<void>(hitEditLane(fixture.layers[2], content, summary.getCentre()));
+                    check(selectedParameter() == selected_parameter && !edit_draw_bounds_,
+                        "pinned row changed the parameter or enabled hidden lane drawing");
+                    check(equal_region(before, after, graphArea().withBottom(summary.getBottom())),
+                        "wave/cursor entered pinned command row");
+                    check(equal_region(before, after, body.withRight(plot.getX())),
+                        "wave/cursor entered fixed label column");
+                    check(!equal_region(before, after, body.getIntersection(plot)), "scope/cursor did not paint in editable plot");
+                    check(!patchslide_.isVisible() || body.contains(patchslide_.getBounds()),
+                        "PatchSlide button paints/intercepts outside visible body");
+                    check(!pitch_lane_toggle_.isVisible() || body.contains(pitch_lane_toggle_.getBounds()),
+                        "pitch button paints/intercepts outside visible body");
+                    edit_scene_dirty_ = true;
+                    const auto uncached = createComponentSnapshot(getLocalBounds());
+                    check(equal_region(after, uncached, graphArea()), "cached foreground changes graph pixels");
+                    const auto generation = scope_generations_[2];
+                    ++frame.track_note_generation[8];
+                    static_cast<void>(appendScopeFrame(frame, 60));
+                    check(scope_generations_[2] == generation && !scope_position_active_[2]
+                            && std::all_of(scope_history_[2].begin(), scope_history_[2].end(), [](float value) { return value == 0; }),
+                        "stolen channel remained visible or followed another note");
+                    if (directory != juce::File{} && horizontal == 3.5) {
+                        auto stream = directory.getChildFile("scope-scroll-" + juce::String(percent) + "-zoom" + juce::String(static_cast<int>(visible_counts)) + "-" + juce::String(static_cast<int>(vertical)) + ".png").createOutputStream();
+                        if (stream) { stream->setPosition(0); stream->truncate(); juce::PNGImageFormat png; png.writeImageToStream(after, *stream); }
+                    }
+                }
+            }
+        }
+        // A deliberately offscreen step must not draw into its fixed label.
+        const auto plot = timelinePlotBounds(graph_bounds_[2]);
+        juce::Image isolated(juce::Image::ARGB, getWidth(), getHeight(), true);
+        {
+            juce::Graphics graphics(isolated);
+            drawSteppedValuePath(graphics, plot, {{0, 15}, {120, 2}}, 0, 15, juce::Colours::white);
+        }
+        juce::Image empty(juce::Image::ARGB, getWidth(), getHeight(), true);
+        check(equal_region(isolated, empty, getLocalBounds().withRight(plot.getX())),
+            "offscreen stepped path/point leaks into fixed label column");
+        const auto measure = [&](bool rebuild) {
+            juce::Image target(juce::Image::ARGB, getWidth(), getHeight(), true);
+            const double start = juce::Time::getMillisecondCounterHiRes();
+            for (int iteration = 0; iteration < 20; ++iteration) {
+                if (rebuild) edit_scene_dirty_ = overview_scene_dirty_ = true;
+                juce::Graphics graphics(target);
+                paint(graphics);
+                paintOverview(graphics);
+            }
+            return (juce::Time::getMillisecondCounterHiRes() - start) / 20.0;
+        };
+        const double uncached_ms = measure(true), cached_ms = measure(false);
+        std::printf("Scope offscreen cache benchmark scale=%d%% forced-rebuild=%.3fms cached=%.3fms (20 draws, not live FPS)\n", percent, uncached_ms, cached_ms);
+        // The latest selected release keeps its base-note period even when the
+        // analyzer's guide switches back to an older, still-held Voice.
+        auto release_frame_owner = std::make_unique<mgstc::engine::OpllScopeFrame>();
+        auto& release_frame = *release_frame_owner;
+        release_frame.selection_context = (std::uint64_t{1} << 63) | 1;
+        release_frame.scope_ui_context = serial;
+        release_frame.selection_note = 64;
+        release_frame.guide_note = 60;
+        release_frame.layer_tracks[2] = 8;
+        release_frame.track_note_generation[8] = 100;
+        release_frame.captured_track_mask = 1U << 8;
+        release_frame.physical_samples[8].fill(0.2F);
+        static_cast<void>(appendScopeFrame(release_frame, 48));
+        check(audition_note_ == 64 && scope_generations_[2] == 100,
+            "DAW release waveform followed an older held or transposed guide note");
+        release_frame.sequence = 1;
+        release_frame.sample_end = 800;
+        static_cast<void>(appendScopeFrame(release_frame, 48));
+        release_frame.sequence = 3;
+        release_frame.sample_end = 2400;
+        release_frame.physical_samples[8].fill(0.0F);
+        release_frame.mixed_samples.fill(0.0F);
+        check(appendScopeFrame(release_frame, 48), "clearing a gap to silence did not request repaint");
+        check(scope_size_ == static_cast<int>(release_frame.kSampleCount)
+                && scope_visible_sample_count_ == 0,
+            "scope history joined samples across a missing frame");
+        release_frame.sequence = 4;
+        release_frame.sample_end = 3200;
+        release_frame.physical_samples[8].fill(0.2F);
+        static_cast<void>(appendScopeFrame(release_frame, 48));
+        release_frame.sequence = 5;
+        release_frame.sample_end = 4001;
+        release_frame.physical_samples[8].fill(0.0F);
+        check(appendScopeFrame(release_frame, 48)
+                && scope_size_ == static_cast<int>(release_frame.kSampleCount)
+                && scope_visible_sample_count_ == 0,
+            "partial capture reset was joined to old samples or not repainted");
+        const auto before_rename_tracks = scope_tracks_;
+        const auto before_rename_context = scope_context_;
+        auto renamed = timbre_;
+        renamed.layers[2].name += " renamed";
+        setTimbre(renamed);
+        check(scope_tracks_ == before_rename_tracks && scope_context_ == before_rename_context,
+            "renaming a layer invalidated its unchanged physical scope target");
+        tracks.fill(-1); setScopeTracks(tracks, 0);
+        setPatchSlideCallback({});
+        selected_layer_ = original_layer;
+        setTimbre(original, true);
+        return failures;
+    }
+
+    void setScopeTracks(const std::array<int, 17>& tracks, std::uint64_t context) {
+        if ((context & (std::uint64_t{1} << 63)) == 0) scope_requested_ui_context_ = context;
+        if (scope_tracks_ == tracks && scope_context_ == context) return;
+        scope_tracks_ = tracks;
+        scope_context_ = context;
+        scope_last_frame_sequence_ = 0;
+        scope_last_sample_end_ = 0;
+        scope_generations_.fill(0);
+        scope_position_active_.fill(false);
+        for (auto& history : scope_history_) history.fill(0.0F);
+        scope_size_ = scope_write_position_ = 0;
+        scope_visible_sample_count_ = 0;
+        repaintScopeOverlay();
+    }
+
+    void repaintScopeOverlay() {
+        overview_content_.repaint();
+        // This deliberately bypasses static scene invalidation.
+        juce::Component::repaint(workspaceArea());
+    }
+
     [[nodiscard]] bool appendScopeFrame(
         const mgstc::engine::OpllScopeFrame& frame,
         std::uint8_t midi_note) {
+        if (frame.program_generation < scope_program_generation_) return false;
+        if (frame.program_generation != scope_program_generation_) {
+            scope_program_generation_ = frame.program_generation;
+            scope_last_frame_sequence_ = 0;
+            scope_last_sample_end_ = 0;
+            scope_generations_.fill(0);
+            scope_position_active_.fill(false);
+            for (auto& history : scope_history_) history.fill(0.0F);
+            scope_size_ = scope_write_position_ = 0;
+            scope_visible_sample_count_ = 0;
+            repaintScopeOverlay();
+        }
+        if ((frame.selection_context & (std::uint64_t{1} << 63)) != 0) {
+            if (frame.scope_ui_context < scope_requested_ui_context_) return false;
+            if (frame.selection_context != scope_context_) {
+                std::array<int, 17> tracks;
+                std::copy(frame.layer_tracks.begin(), frame.layer_tracks.end(), tracks.begin());
+                setScopeTracks(tracks, frame.selection_context);
+            }
+        }
+        if (frame.selection_context != scope_context_) return false;
+        const bool gap = (frame.sequence != 0 && scope_last_frame_sequence_ != 0
+                && frame.sequence != scope_last_frame_sequence_ + 1)
+            || (frame.sample_end != 0 && scope_last_sample_end_ != 0
+                && frame.sample_end != scope_last_sample_end_ + frame.kSampleCount);
+        if (gap) {
+            for (auto& history : scope_history_) history.fill(0.0F);
+            scope_size_ = scope_write_position_ = 0;
+            scope_visible_sample_count_ = 0;
+        }
+        scope_last_frame_sequence_ = frame.sequence;
+        scope_last_sample_end_ = frame.sample_end;
         constexpr float kVisibleAmplitude = 1.0e-5F;
         const bool was_visible = scope_visible_sample_count_ != 0;
-        audition_note_ = midi_note;
+        const bool had_positions = std::any_of(scope_position_active_.begin(), scope_position_active_.end(), [](bool value) { return value; });
+        audition_note_ = scopeDisplayNote(frame.selection_context, frame.selection_note, midi_note);
+        for (std::size_t layer = 0; layer < scope_tracks_.size(); ++layer) {
+            const int track = scope_tracks_[layer];
+            if (track < 0 || track >= 17) { scope_position_active_[layer] = false; continue; }
+            const auto index = static_cast<std::size_t>(track);
+            const auto generation = frame.track_note_generation[index];
+            if (scope_generations_[layer] == 0 && generation != 0
+                && (frame.captured_track_mask & (1U << track)) != 0)
+                scope_generations_[layer] = generation;
+            const bool valid = scope_generations_[layer] != 0 && scope_generations_[layer] == generation;
+            if (!valid && scope_generations_[layer] != 0) {
+                for (float& sample : scope_history_[layer]) {
+                    if (std::abs(sample) >= kVisibleAmplitude) --scope_visible_sample_count_;
+                    sample = 0.0F;
+                }
+            }
+            scope_position_active_[layer] = valid && frame.playback_positions[index].active;
+            scope_positions_[layer] = frame.playback_positions[index].count;
+        }
+        std::array<const float*, 18> sources{};
+        sources.back() = frame.mixed_samples.data();
+        for (std::size_t layer = 0; layer < scope_tracks_.size(); ++layer) {
+            const int track = scope_tracks_[layer];
+            if (track >= 0 && track < 17 && scope_generations_[layer] != 0
+                && scope_generations_[layer] == frame.track_note_generation[static_cast<std::size_t>(track)]
+                && (frame.captured_track_mask & (1U << track)) != 0)
+                sources[layer] = frame.physical_samples[static_cast<std::size_t>(track)].data();
+        }
         for (std::size_t index = 0;
              index < mgstc::engine::OpllScopeFrame::kSampleCount;
              ++index) {
-            const std::array<float, 4> samples{
-                frame.psg_samples[index],
-                frame.scc_samples[index],
-                frame.samples[index],
-                frame.mixed_samples[index],
-            };
-            for (std::size_t channel = 0; channel < samples.size(); ++channel) {
+            for (std::size_t channel = 0; channel < sources.size(); ++channel) {
                 auto& cached = scope_history_[channel][scope_write_position_];
                 if (std::abs(cached) >= kVisibleAmplitude) {
                     --scope_visible_sample_count_;
                 }
-                cached = samples[channel];
+                cached = sources[channel] ? sources[channel][index] : 0.0F;
                 if (std::abs(cached) >= kVisibleAmplitude) {
                     ++scope_visible_sample_count_;
                 }
@@ -6848,11 +7129,14 @@ public:
                 (scope_write_position_ + 1) % kScopeHistorySize;
             scope_size_ = juce::jmin(kScopeHistorySize, scope_size_ + 1);
         }
-        if (was_visible || scope_visible_sample_count_ != 0) overview_content_.repaint();
-        return was_visible || scope_visible_sample_count_ != 0;
+        const bool changed = gap || was_visible || scope_visible_sample_count_ != 0 || had_positions
+            || std::any_of(scope_position_active_.begin(), scope_position_active_.end(), [](bool value) { return value; });
+        if (changed) repaintScopeOverlay();
+        return changed;
     }
 
     void resized() override {
+        edit_scene_dirty_ = overview_scene_dirty_ = true;
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(panelPad);
         auto header = area.removeFromTop(textButtonH);
@@ -6932,10 +7216,6 @@ public:
             edit_header_area.removeFromTop(sm);
             allocation_error_label_.setBounds(edit_header_area.removeFromTop(fieldH));
         }
-        auto preview_area = workspaceArea();
-        preview_area.setTop(graph.getBottom() + kScrollBarSize + sm);
-        preview_area.setHeight(juce::jmin(preview_area.getHeight(), envelopePreviewH));
-        envelope_mml_preview_.setBounds(preview_area);
         vertical_scroll_.setBounds(graph.getRight(), graph.getY(), kScrollBarSize, graph.getHeight());
         horizontal_scroll_.setBounds(graph.getX(), graph.getBottom(), graph.getWidth(), kScrollBarSize);
         updateScrollRanges();
@@ -7522,6 +7802,8 @@ public:
         const auto slots = makeEditLaneSlots(graph, layer.source);
         std::optional<Lane> lane;
         const auto point = event.getPosition();
+        if (!graphStrip(slots.summary).contains(point)
+            && !visibleEditBody(graph, layer.source).contains(point)) return;
         if (graphStrip(slots.summary).contains(point)) lane = Lane::All;
         else if (graphStrip(slots.volume).contains(point)) lane = Lane::Volume;
         else if (graphStrip(slots.pitch).contains(point)) lane = Lane::Pitch;
@@ -7855,7 +8137,8 @@ public:
             return;
         }
         if (!selection_changed && in_graph
-            && selectedEditMode() == EditMode::Draw) {
+            && selectedEditMode() == EditMode::Draw
+            && visibleEditBody(graph, timbre_.layers[static_cast<std::size_t>(layer)].source).contains(event.getPosition())) {
             const auto& selected_layer =
                 timbre_.layers[static_cast<std::size_t>(layer)];
             const auto slots = makeEditLaneSlots(graph, selected_layer.source);
@@ -8020,6 +8303,7 @@ public:
             timbre_.layers[static_cast<std::size_t>(layer)];
         const auto graph = graph_bounds_[static_cast<std::size_t>(layer)];
         const auto slots = makeEditLaneSlots(graph, selected.source);
+        if (!visibleEditBody(graph, selected.source).contains(event.getPosition())) return;
         if (!slots.volume.isEmpty()
             && slots.volume.contains(event.getPosition())) {
             drawing_ = false;
@@ -8162,27 +8446,56 @@ public:
         drawCountGrid(graphics, plot);
         drawSelectedCountBand(graphics, plot);
         paintStartDelay(graphics, plot, index);
+        const auto body = visibleEditBody(lane, layer.source);
         {
             juce::Graphics::ScopedSaveState body_state(graphics);
-            const auto summary = makeEditLaneSlots(lane, layer.source).summary;
-            graphics.reduceClipRegion(graphArea().withTop(summary.getBottom()));
-            paintEditTier(graphics, lane, index, colour);
+            graphics.reduceClipRegion(body);
+            if (layer.volume_envelope.kind == mgstc::engine::EnvelopeKind::Sequence)
+                drawScope(graphics, plot, index, colour.withAlpha(0.32F));
         }
-        if (step_drag_) {
-            graphics.setColour(uiHoverAccent());
-            const int start_x = xForCount(plot, step_drag_->start);
-            const int end_x = xForCount(plot, step_drag_->start + step_drag_->delta);
-            graphics.drawVerticalLine(end_x, static_cast<float>(lane.getY()),
-                static_cast<float>(lane.getBottom()));
-            graphics.setColour(uiHoverAccent().withAlpha(0.12f));
-            graphics.fillRect(juce::Rectangle<int>(juce::jmin(start_x, end_x), lane.getY(),
-                std::abs(end_x - start_x), lane.getHeight()));
+        const auto scene_bounds = graphArea();
+        const auto scene_scale = juce::Component::getApproximateScaleFactorForComponent(this);
+        if (edit_scene_dirty_ || edit_scene_bounds_ != scene_bounds || edit_scene_scale_ != scene_scale) {
+            const int width = juce::jmax(1, juce::roundToInt(std::ceil(scene_bounds.getWidth() * scene_scale)));
+            const int height = juce::jmax(1, juce::roundToInt(std::ceil(scene_bounds.getHeight() * scene_scale)));
+            edit_scene_ = juce::Image(juce::Image::ARGB, width, height, true);
+            juce::Graphics foreground(edit_scene_);
+            foreground.addTransform(juce::AffineTransform::translation(-static_cast<float>(scene_bounds.getX()),
+                -static_cast<float>(scene_bounds.getY())).scaled(scene_scale));
+            {
+                juce::Graphics::ScopedSaveState body_state(foreground);
+                foreground.reduceClipRegion(body);
+                paintEditTier(foreground, lane, index, colour);
+            }
+            if (step_drag_) {
+                juce::Graphics::ScopedSaveState drag_state(foreground);
+                foreground.reduceClipRegion(plot.getIntersection(body));
+                foreground.setColour(uiHoverAccent());
+                const int start_x = xForCount(plot, step_drag_->start);
+                const int end_x = xForCount(plot, step_drag_->start + step_drag_->delta);
+                foreground.drawVerticalLine(end_x, static_cast<float>(lane.getY()), static_cast<float>(lane.getBottom()));
+                foreground.setColour(uiHoverAccent().withAlpha(0.12f));
+                foreground.fillRect(juce::Rectangle<int>(juce::jmin(start_x, end_x), lane.getY(),
+                    std::abs(end_x - start_x), lane.getHeight()));
+            }
+            paintPinnedCommandRow(foreground, lane, layer, colour);
+            edit_scene_bounds_ = scene_bounds;
+            edit_scene_scale_ = scene_scale;
+            edit_scene_dirty_ = false;
+            ++edit_scene_rebuilds_;
         }
-        paintPinnedCommandRow(graphics, lane, layer, colour);
+        graphics.setOpacity(1.0F);
+        graphics.drawImage(edit_scene_, scene_bounds.toFloat());
+        drawPlaybackPosition(graphics, plot, body, index);
         drawHoverValuePopup(graphics);
     }
 
 private:
+    // Every model/selection/layout repaint invalidates the static envelope
+    // foreground; scope-only updates use the base Component entry point.
+    void repaint() { edit_scene_dirty_ = overview_scene_dirty_ = true; juce::Component::repaint(); }
+    void repaint(juce::Rectangle<int> bounds) { edit_scene_dirty_ = overview_scene_dirty_ = true; juce::Component::repaint(bounds); }
+
     void setCountInspector(bool count) {
         count_inspector_ = count;
         setup_tab_.setToggleState(!count, juce::dontSendNotification);
@@ -8524,6 +8837,7 @@ private:
         resized(); repaint();
     }
     void layoutOverview() {
+        overview_scene_dirty_ = true;
         const int count = static_cast<int>(timbre_.layers.size());
         while (overview_select_.size() > count) {
             overview_select_.removeLast();
@@ -8581,6 +8895,8 @@ private:
         overview_content_.repaint();
     }
     void paintStartDelay(juce::Graphics& g, juce::Rectangle<int> plot, std::size_t index) {
+        juce::Graphics::ScopedSaveState state(g);
+        g.reduceClipRegion(plot);
         const auto& layer = timbre_.layers[index];
         const int delay = static_cast<int>(mgstc::engine::startDelayGridCounts(
             layer.start_delay_form, layer.start_delay_value, playback_tempo_));
@@ -8592,13 +8908,48 @@ private:
     }
 
     void paintOverview(juce::Graphics& g) {
-        g.fillAll(juce::Colour(0xFF161B22));
+        const auto bounds = overview_content_.getLocalBounds();
+        if (overview_scene_dirty_ || overview_back_.getWidth() != bounds.getWidth()
+            || overview_back_.getHeight() != bounds.getHeight()) {
+            overview_back_ = juce::Image(juce::Image::ARGB, juce::jmax(1, bounds.getWidth()), juce::jmax(1, bounds.getHeight()), true);
+            overview_front_ = juce::Image(juce::Image::ARGB, juce::jmax(1, bounds.getWidth()), juce::jmax(1, bounds.getHeight()), true);
+            juce::Graphics back(overview_back_), front(overview_front_);
+            paintOverviewStatic(back, false);
+            paintOverviewStatic(front, true);
+            overview_scene_dirty_ = false;
+        }
+        g.setOpacity(1.0F);
+        g.drawImageAt(overview_back_, 0, 0);
+        for (std::size_t i = 0; i < timbre_.layers.size(); ++i) {
+            auto row = juce::Rectangle<int>(0, static_cast<int>(i) * overviewRowHeight(), overview_content_.getWidth(), overviewRowHeight());
+            if (!g.getClipBounds().intersects(row)) continue;
+            auto plot = row.withTrimmedLeft(UiLayout::compositeOverviewLabelW).reduced(UiLayout::sm, UiLayout::xs);
+            drawScope(g, plot, i, sourceColour(timbre_.layers[i].source).withAlpha(0.6F));
+        }
+        g.setOpacity(1.0F);
+        g.drawImageAt(overview_front_, 0, 0);
+        for (std::size_t i = 0; i < timbre_.layers.size(); ++i) {
+            auto row = juce::Rectangle<int>(0, static_cast<int>(i) * overviewRowHeight(), overview_content_.getWidth(), overviewRowHeight());
+            auto plot = row.withTrimmedLeft(UiLayout::compositeOverviewLabelW).reduced(UiLayout::sm, UiLayout::xs);
+            drawPlaybackPosition(g, plot, plot, i);
+        }
+    }
+
+    void paintOverviewStatic(juce::Graphics& g, bool foreground) {
+        if (!foreground) g.fillAll(juce::Colour(0xFF161B22));
         for (std::size_t i = 0; i < timbre_.layers.size(); ++i) {
             auto row = juce::Rectangle<int>(0, static_cast<int>(i) * overviewRowHeight(), overview_content_.getWidth(), overviewRowHeight());
             if (!g.getClipBounds().intersects(row)) continue;
             auto plot = row.withTrimmedLeft(UiLayout::compositeOverviewLabelW).reduced(UiLayout::sm, UiLayout::xs);
             const auto& layer = timbre_.layers[i];
             const auto colour = sourceColour(layer.source);
+            juce::Graphics::ScopedSaveState plot_state(g);
+            g.reduceClipRegion(plot);
+            if (foreground) {
+                drawTimelineMarkers(g, plot, i, colour);
+                drawOutputCutoff(g, plot, i);
+                continue;
+            }
             g.setColour(juce::Colour(i == static_cast<std::size_t>(selected_layer_) ? 0xFF25343A : 0xFF20262E));
             g.fillRect(plot);
             drawCountGrid(g, plot);
@@ -8611,9 +8962,6 @@ private:
                 drawVolumeBars(g, plot, i, colour, 0.12F);
                 drawAutomation(g, plot, i, colour.withAlpha(0.7F), Parameter::Pitch);
             }
-            drawScope(g, plot, i, colour.withAlpha(0.6F));
-            drawTimelineMarkers(g, plot, i, colour);
-            drawOutputCutoff(g, plot, i);
         }
     }
 
@@ -9946,6 +10294,10 @@ private:
                 selected_count_ = countAtX(count_bounds, point.x);
                 return;
             }
+            if (!visibleEditBody(graph, selected.source).contains(point)) {
+                hover_preview_value_.reset();
+                return;
+            }
             const struct LaneHit {
                 Parameter parameter;
                 juce::Rectangle<int> slot;
@@ -10254,8 +10606,7 @@ private:
         auto area = workspaceArea();
         area.setTop(editHeaderArea().getBottom() + UiLayout::sm);
         area.removeFromRight(kScrollBarSize);
-        area.removeFromBottom(kScrollBarSize + UiLayout::sm
-            + (mml_toggle_.getToggleState() ? UiLayout::envelopePreviewH + UiLayout::sm : 0));
+        area.removeFromBottom(kScrollBarSize);
         if (selected_layer_ >= 0
             && selected_layer_ < static_cast<int>(timbre_.layers.size())
             && timbre_.layers[static_cast<std::size_t>(selected_layer_)]
@@ -10377,6 +10728,8 @@ private:
     void drawCountGrid(
         juce::Graphics& graphics,
         juce::Rectangle<int> bounds) const {
+        juce::Graphics::ScopedSaveState clipped(graphics);
+        graphics.reduceClipRegion(bounds);
         const auto visible = visibleCountRange();
         const int begin = juce::jmax(0, static_cast<int>(std::floor(visible.getStart())));
         const int end = juce::jmin(
@@ -10413,6 +10766,8 @@ private:
         std::size_t layer_index,
         juce::Colour colour,
         juce::Rectangle<int> volume_lane = {}) const {
+        juce::Graphics::ScopedSaveState clipped(graphics);
+        graphics.reduceClipRegion(bounds);
         const auto& timeline = selectedTimeline(timbre_.layers[layer_index]);
         const auto draw_marker = [&](std::uint32_t count,
                                      juce::Colour marker_colour,
@@ -10499,6 +10854,8 @@ private:
         std::size_t layer_index,
         juce::Colour colour,
         std::optional<Parameter> forced_parameter = std::nullopt) const {
+        juce::Graphics::ScopedSaveState clipped(graphics);
+        graphics.reduceClipRegion(bounds);
         const auto parameter = forced_parameter.value_or(selectedParameter());
         const auto& layer = timbre_.layers[layer_index];
         if (parameter == Parameter::Pitch) {
@@ -10542,6 +10899,8 @@ private:
         int maximum,
         juce::Colour colour,
         const mgstc::engine::CompositeLayer* noise_layer = nullptr) const {
+        juce::Graphics::ScopedSaveState clipped(graphics);
+        graphics.reduceClipRegion(bounds);
         if (points.empty() || bounds.isEmpty()) {
             return;
         }
@@ -10742,7 +11101,9 @@ private:
         juce::Rectangle<int> bounds,
         std::size_t channel,
         juce::Colour colour) const {
-        const float centre_y = static_cast<float>(bounds.getCentreY());
+        if (bounds.isEmpty()) return;
+        juce::Graphics::ScopedSaveState clipped(graphics);
+        graphics.reduceClipRegion(bounds);
         graphics.setColour(juce::Colour(0xFF52616E).withAlpha(0.65F));
         graphics.drawHorizontalLine(
             bounds.getCentreY(),
@@ -10751,50 +11112,28 @@ private:
         if (scope_size_ < 2 || bounds.getWidth() < 2) {
             return;
         }
-        constexpr double sample_rate = 48000.0;
-        const double frequency = 440.0 * std::pow(
-            2.0,
-            (static_cast<double>(audition_note_) - 69.0) / 12.0);
         const int sample_count = juce::jlimit(
             2,
             scope_size_,
-            juce::roundToInt(2.0 * sample_rate / frequency));
+            juce::roundToInt(2.0 * mgstc::app::scopePeriodSamples(audition_note_)));
         const int oldest =
             (scope_write_position_ + kScopeHistorySize - scope_size_)
             % kScopeHistorySize;
         const int logical_start = scope_size_ - sample_count;
         const std::size_t scope_channel = channel >= timbre_.layers.size()
-            ? 3
-            : static_cast<std::size_t>(timbre_.layers[channel].source);
-        const auto sample_at = [&](int logical_index) {
+            ? 17 : channel;
+        const auto sample_at = [&](std::size_t logical_index) {
             return scope_history_[scope_channel][static_cast<std::size_t>(
                 (oldest + logical_start + logical_index)
                 % kScopeHistorySize)];
         };
-        float peak = 0.0001F;
-        for (int index = 0; index < sample_count; ++index) {
-            peak = juce::jmax(peak, std::abs(sample_at(index)));
-        }
-        const float scale =
-            static_cast<float>(bounds.getHeight()) * 0.43F / peak;
+        const float peak = mgstc::app::scopePeak(static_cast<std::size_t>(sample_count), sample_at);
         juce::Path path;
-        for (int x = 0; x < bounds.getWidth(); ++x) {
-            const int sample_index = juce::jlimit(
-                0,
-                sample_count - 1,
-                juce::roundToInt(
-                    static_cast<double>(x)
-                    * static_cast<double>(sample_count - 1)
-                    / static_cast<double>(bounds.getWidth() - 1)));
-            const float point_x =
-                static_cast<float>(bounds.getX() + x);
-            const float point_y = centre_y - sample_at(sample_index) * scale;
-            if (x == 0) {
-                path.startNewSubPath(point_x, point_y);
-            } else {
-                path.lineTo(point_x, point_y);
-            }
-        }
+        auto path_bounds = bounds.toFloat().withWidth(static_cast<float>(bounds.getWidth() - 1));
+        path_bounds.setCentre(path_bounds.getCentreX(), static_cast<float>(bounds.getCentreY()));
+        mgstc::app::buildScopePath(path, path_bounds, static_cast<std::size_t>(bounds.getWidth()),
+            [&](std::size_t x) { return sample_at(juce::roundToInt(static_cast<double>(x)
+                * static_cast<double>(sample_count - 1) / static_cast<double>(bounds.getWidth() - 1))); }, 0.86F / peak);
         graphics.setColour(colour);
         graphics.strokePath(path, juce::PathStrokeType(1.4F));
     }
@@ -10879,6 +11218,21 @@ private:
         }
         slot.removeFromLeft(UiLayout::compositeOverviewLabelW);
         return slot;
+    }
+
+    [[nodiscard]] juce::Rectangle<int> visibleEditBody(juce::Rectangle<int> content,
+        mgstc::engine::TimbreSource source) const {
+        return graphArea().withTop(makeEditLaneSlots(content, source).summary.getBottom());
+    }
+
+    void drawPlaybackPosition(juce::Graphics& graphics, juce::Rectangle<int> plot,
+        juce::Rectangle<int> visible, std::size_t layer) const {
+        if (layer >= scope_position_active_.size() || !scope_position_active_[layer]) return;
+        juce::Graphics::ScopedSaveState clipped(graphics);
+        graphics.reduceClipRegion(plot.getIntersection(visible));
+        const int x = xForCount(plot, static_cast<int>(scope_positions_[layer]));
+        graphics.setColour(juce::Colour(kUiPlaybackPosition));
+        graphics.fillRect(x, visible.getY(), juce::jmax(2, UiScale::sx(2)), visible.getHeight());
     }
 
     bool isLoopStartCount(const mgstc::engine::CompositeLayer& layer, int count) const {
@@ -11021,6 +11375,8 @@ private:
 
     void drawLaneCommandLabels(juce::Graphics& graphics, juce::Rectangle<int> plot,
         const mgstc::engine::CompositeLayer& layer, Parameter parameter, juce::Colour colour) const {
+        juce::Graphics::ScopedSaveState clipped(graphics);
+        graphics.reduceClipRegion(plot);
         std::map<std::pair<std::uint32_t, bool>, juce::StringArray> labels;
         if (parameter == Parameter::RegisterWrite) {
             std::map<std::pair<std::uint32_t, bool>, std::vector<const mgstc::engine::EnvelopeEvent*>> groups;
@@ -11055,6 +11411,7 @@ private:
 
     std::optional<Parameter> commandParameterAt(const EditLaneSlots& slots, juce::Point<int> point) const {
         if (slots.summary.contains(point)) return std::nullopt;
+        if (point.y < slots.summary.getBottom() || !graphArea().contains(point)) return std::nullopt;
         if (slots.volume.contains(point)) return Parameter::Volume;
         if (slots.pitch.contains(point)) return Parameter::Pitch;
         if (slots.timbre.contains(point)) return Parameter::Timbre;
@@ -11191,6 +11548,7 @@ private:
         if (slots.summary.contains(point) || slots.preview.contains(point)) {
             return true;
         }
+        if (!visibleEditBody(content, layer.source).contains(point)) return false;
         const struct LaneHit {
             Parameter parameter;
             juce::Rectangle<int> slot;
@@ -11316,6 +11674,8 @@ private:
     void drawSelectedCountBand(
         juce::Graphics& graphics,
         juce::Rectangle<int> bounds) const {
+        juce::Graphics::ScopedSaveState state(graphics);
+        graphics.reduceClipRegion(bounds);
         const auto visible = visibleCountRange();
         if (selected_count_ < visible.getStart()
             || selected_count_ > visible.getEnd()) {
@@ -11392,11 +11752,6 @@ private:
             }
             return;
         }
-        drawScope(
-            graphics,
-            timelinePlotBounds(content),
-            layer_index,
-            colour.withAlpha(0.32F));
         paintEditSubLane(
             graphics, slots.volume, layer_index, colour,
             Parameter::Volume, juce::String::fromUTF8("音量"));
@@ -11510,6 +11865,30 @@ private:
         opll_bank_usage_.setTooltip(opll_usage);
     }
 
+    void updateMgscPreviewWindow() {
+        if (!mgsc_preview_window_ || !mml_toggle_.getToggleState()) return;
+        const auto formatted = mgstc::engine::formatMgsComposite(timbre_, timbreLibrary());
+        const auto whole = formatted.valid()
+            ? juce::String::fromUTF8(formatted.source.data(), static_cast<int>(formatted.source.size()))
+            : juce::String::fromUTF8(formatted.issues.empty() ? "MGSCへ書き出せません" : formatted.issues.front().c_str());
+        mgsc_preview_window_->content().setTexts(last_envelope_mml_preview_, whole);
+    }
+
+    void showMgscPreview() {
+        if (!mgsc_preview_window_) {
+            mgsc_preview_window_ = std::make_unique<mgstc::app::MgscPreviewWindow>([this] {
+                mml_toggle_.setToggleState(false, juce::dontSendNotification);
+            });
+        }
+        mml_toggle_.setToggleState(true, juce::dontSendNotification);
+        updateMgscPreviewWindow();
+        mgsc_preview_window_->showFor(*this);
+    }
+
+    void visibilityChanged() override {
+        if (!isShowing() && mgsc_preview_window_ && mgsc_preview_window_->isVisible()) mgsc_preview_window_->closeButtonPressed();
+    }
+
     void updateEnvelopeMmlPreview() {
         pending_plan_invalidation_ = mgstc::app::invalidateEditedSccMorphPlans(last_published_timbre_, timbre_)
             || pending_plan_invalidation_;
@@ -11546,9 +11925,8 @@ private:
             || selected_layer_ >= static_cast<int>(timbre_.layers.size())) {
             if (last_envelope_mml_preview_.isNotEmpty()) {
                 last_envelope_mml_preview_.clear();
-                envelope_mml_preview_.clear();
             }
-            envelope_mml_preview_.setVisible(false);
+            updateMgscPreviewWindow();
             return;
         }
         const auto& preview = morph_preview_.valid ? morph_preview_.timbre : timbre_;
@@ -11633,12 +12011,8 @@ private:
                 + (definition.isNotEmpty() ? definition + "\n" : juce::String{})
                 + track
                 + (output_notice.isNotEmpty() ? "\n; " + output_notice : juce::String{});
-        if (preview_text == last_envelope_mml_preview_) {
-            return;
-        }
         last_envelope_mml_preview_ = preview_text;
-        UiFonts::setMgscPreviewText(
-            envelope_mml_preview_, preview_text);
+        updateMgscPreviewWindow();
     }
 
     [[nodiscard]] bool isEditSubLaneHovered(Parameter parameter) const noexcept {
@@ -11710,6 +12084,8 @@ private:
         const juce::String& title) {
         paintEditSubLaneChrome(graphics, slot, parameter, title);
         slot.removeFromLeft(UiLayout::compositeOverviewLabelW);
+        juce::Graphics::ScopedSaveState clipped(graphics);
+        graphics.reduceClipRegion(slot);
         const auto& auto_lane = parameter == Parameter::OpllTlAuto
             ? layer.opll_tl_auto
             : layer.opll_fb_auto;
@@ -12068,6 +12444,8 @@ private:
         juce::Rectangle<int> bounds,
         const mgstc::engine::CompositeLayer& layer,
         juce::Colour colour) const {
+        juce::Graphics::ScopedSaveState clipped(graphics);
+        graphics.reduceClipRegion(bounds);
         graphics.setColour(juce::Colour(0xFF1B222A));
         graphics.fillRoundedRectangle(bounds.toFloat(), 3.0F);
         const auto visible = visibleCountRange();
@@ -13742,7 +14120,7 @@ private:
         selected_layer_ = layer_index;
         auto& layer = timbre_.layers[static_cast<std::size_t>(layer_index)];
         const auto graph = graph_bounds_[static_cast<std::size_t>(layer_index)];
-        if (!graph.contains(point)) {
+        if (!graph.contains(point) || !visibleEditBody(graph, layer.source).contains(point)) {
             return;
         }
         const auto slots = makeEditLaneSlots(graph, layer.source);
@@ -14184,7 +14562,7 @@ private:
         label.removeFromLeft(UiScale::sx(46));
         const auto bounds = label.reduced(UiLayout::xs, 0);
         patchslide_.setBounds(bounds);
-        patchslide_.setVisible(graphArea().contains(bounds));
+        patchslide_.setVisible(visibleEditBody(graph_bounds_[static_cast<std::size_t>(selected_layer_)], layer.source).contains(bounds));
         patchslide_.toFront(false);
     }
 
@@ -14212,7 +14590,7 @@ private:
             pitchLaneExpanded(), juce::dontSendNotification);
         pitch_lane_toggle_.setEnabled(
             !layer.software_lfo.enabled && !hasModulation(layer, mgstc::engine::CompositeModulationTarget::Pitch));
-        pitch_lane_toggle_.setVisible(graphArea().contains(bounds));
+        pitch_lane_toggle_.setVisible(visibleEditBody(graph_bounds_[static_cast<std::size_t>(selected_layer_)], layer.source).contains(bounds));
         pitch_lane_toggle_.toFront(false);
     }
 
@@ -14290,9 +14668,8 @@ private:
             }
             edit_mode_.setVisible(visible && !show_rate);
             parameter_.setVisible(visible && !show_rate);
-            mml_toggle_.setEnabled(visible);
+            mml_toggle_.setEnabled(true);
             zoom_in_.setEnabled(visible); zoom_out_.setEnabled(visible);
-            envelope_mml_preview_.setVisible(visible && mml_toggle_.getToggleState());
             auto_mode_.setVisible(visible && show_auto && count_inspector_);
             auto_depth_.setVisible(visible && show_auto && count_inspector_);
             auto_speed_.setVisible(visible && show_auto && count_inspector_);
@@ -14304,12 +14681,14 @@ private:
             auto_stop_label_.setVisible(visible && show_auto && count_inspector_);
         };
 
+        // The independent preview must also clear/update when no edit tools
+        // are laid out (for example after removing the final layer).
+        updateEnvelopeMmlPreview();
         if (!show) {
             set_tools_visible(false);
             return;
         }
         set_tools_visible(true);
-        updateEnvelopeMmlPreview();
 
         auto dock = inspector_content_.getLocalBounds().reduced(panelPad);
         auto row = [&dock] { auto r = dock.removeFromTop(fieldH); dock.removeFromTop(sm); return r; };
@@ -14443,7 +14822,7 @@ private:
     juce::Viewport command_view_;
     CountCommandStackView command_stack_;
     juce::TextButton rate_open_;
-    juce::TextEditor envelope_mml_preview_;
+    std::unique_ptr<mgstc::app::MgscPreviewWindow> mgsc_preview_window_;
     juce::String last_envelope_mml_preview_;
     juce::Label morph_bank_label_, morph_bank_usage_, opll_bank_label_, opll_bank_usage_;
     juce::Label allocation_error_label_;
@@ -14553,8 +14932,24 @@ private:
     };
     std::optional<StepDrag> step_drag_;
     static constexpr int kScopeHistorySize = 4096;
-    std::array<std::array<float, kScopeHistorySize>, 4>
+    std::array<std::array<float, kScopeHistorySize>, 18>
         scope_history_{};
+    std::array<int, 17> scope_tracks_ = [] { std::array<int, 17> value; value.fill(-1); return value; }();
+    std::array<std::uint64_t, 17> scope_generations_{};
+    std::array<std::uint32_t, 17> scope_positions_{};
+    std::array<bool, 17> scope_position_active_{};
+    std::uint64_t scope_context_{};
+    std::uint64_t scope_requested_ui_context_{};
+    std::uint64_t scope_program_generation_{};
+    std::uint64_t scope_last_frame_sequence_{};
+    std::uint64_t scope_last_sample_end_{};
+    juce::Image edit_scene_;
+    juce::Rectangle<int> edit_scene_bounds_;
+    float edit_scene_scale_{};
+    bool edit_scene_dirty_{true};
+    bool overview_scene_dirty_{true};
+    juce::Image overview_back_, overview_front_;
+    std::uint64_t edit_scene_rebuilds_{};
     int scope_write_position_{};
     int scope_size_{};
     std::size_t scope_visible_sample_count_{};
@@ -14761,6 +15156,14 @@ bool CompositeTimeline::appendScopeFrame(
     const engine::OpllScopeFrame& frame,
     std::uint8_t midi_note) {
     return impl_->appendScopeFrame(frame, midi_note);
+}
+
+void CompositeTimeline::setScopeTracks(const std::array<int, 17>& tracks, std::uint64_t context) {
+    impl_->setScopeTracks(tracks, context);
+}
+
+void CompositeTimeline::repaintScopeOverlay() {
+    impl_->repaintScopeOverlay();
 }
 
 }  // namespace mgstc::app

@@ -303,7 +303,8 @@ bool compileCompositeProgram(
                         track,
                         std::move(envelopes.volume),
                         std::move(envelopes.pitch),
-                        std::move(envelopes.timbre));
+                        std::move(envelopes.timbre),
+                        std::move(envelopes.playback_counts));
             }
             configured = configured
                 && engine.session().setTrackVolume(track, layer.volume)

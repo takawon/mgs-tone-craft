@@ -1,5 +1,6 @@
 #include "mgstc/engine/chip_rack.hpp"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -93,16 +94,19 @@ bool Ym2149Adapter::write(
     return true;
 }
 
-float Ym2149Adapter::renderSample(std::span<float> channels) noexcept {
+float Ym2149Adapter::renderSample(std::span<float> channels, std::uint16_t channel_mask) noexcept {
     if (!valid()) {
         return 0.0F;
     }
-    return impl_->rate_conv->next([this, channels] {
+    channel_mask &= static_cast<std::uint16_t>((1U << channels.size()) - 1U);
+    return impl_->rate_conv->next([this, channels, channel_mask] {
         const float mixed = static_cast<float>(PSG_calc(impl_->chip)) * kInt16Scale;
-        for (std::size_t ch = 0; ch < channels.size(); ++ch)
+        for (auto bits = channel_mask; bits != 0; bits &= static_cast<std::uint16_t>(bits - 1U)) {
+            const auto ch = std::countr_zero(bits);
             channels[ch] = static_cast<float>(impl_->chip->ch_out[ch]) * kInt16Scale;
+        }
         return mixed;
-    }, channels);
+    }, channels, channel_mask);
 }
 
 struct SccAdapter::Impl {
@@ -181,11 +185,14 @@ bool SccAdapter::write(
     return true;
 }
 
-float SccAdapter::renderSample(std::span<float> channels) noexcept {
+float SccAdapter::renderSample(std::span<float> channels, std::uint16_t channel_mask) noexcept {
     if (!valid()) return 0.0F;
     const float mixed = static_cast<float>(SCC_calc(impl_->chip)) * kInt16Scale;
-    for (std::size_t ch = 0; ch < channels.size(); ++ch)
+    channel_mask &= static_cast<std::uint16_t>((1U << channels.size()) - 1U);
+    for (auto bits = channel_mask; bits != 0; bits &= static_cast<std::uint16_t>(bits - 1U)) {
+        const auto ch = std::countr_zero(bits);
         channels[ch] = static_cast<float>(impl_->chip->ch_out[ch]) * kInt16Scale;
+    }
     return mixed;
 }
 
@@ -247,16 +254,19 @@ bool Ym2413Adapter::write(
     return true;
 }
 
-float Ym2413Adapter::renderSample(std::span<float> channels) noexcept {
+float Ym2413Adapter::renderSample(std::span<float> channels, std::uint16_t channel_mask) noexcept {
     if (!valid()) {
         return 0.0F;
     }
-    return impl_->rate_conv->next([this, channels] {
+    channel_mask &= static_cast<std::uint16_t>((1U << channels.size()) - 1U);
+    return impl_->rate_conv->next([this, channels, channel_mask] {
         const float mixed = static_cast<float>(OPLL_calc(impl_->chip)) * kInt16Scale;
-        for (std::size_t ch = 0; ch < channels.size(); ++ch)
+        for (auto bits = channel_mask; bits != 0; bits &= static_cast<std::uint16_t>(bits - 1U)) {
+            const auto ch = std::countr_zero(bits);
             channels[ch] = static_cast<float>(impl_->chip->ch_out[ch]) * kInt16Scale;
+        }
         return mixed;
-    }, channels);
+    }, channels, channel_mask);
 }
 
 bool ChipRack::valid() const noexcept {
@@ -294,11 +304,15 @@ bool ChipRack::apply(
 }
 
 ChipSamples ChipRack::renderSample(bool capture_channels) noexcept {
+    return renderSampleMask(capture_channels ? 0x3FFFFFU : 0U);
+}
+
+ChipSamples ChipRack::renderSampleMask(std::uint32_t channel_mask) noexcept {
     ChipSamples result{};
     auto channels = std::span<float>(result.channels);
-    result.psg = psg_.renderSample(capture_channels ? channels.first(3) : std::span<float>{});
-    result.scc = scc_.renderSample(capture_channels ? channels.subspan(3, 5) : std::span<float>{});
-    result.opll = opll_.renderSample(capture_channels ? channels.subspan(8, 14) : std::span<float>{});
+    result.psg = psg_.renderSample(channels.first(3), static_cast<std::uint16_t>(channel_mask & 7U));
+    result.scc = scc_.renderSample(channels.subspan(3, 5), static_cast<std::uint16_t>((channel_mask >> 3U) & 31U));
+    result.opll = opll_.renderSample(channels.subspan(8, 14), static_cast<std::uint16_t>((channel_mask >> 8U) & 0x3FFFU));
     return result;
 }
 

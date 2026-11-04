@@ -46,7 +46,22 @@ struct OpllScopeFrame {
     std::array<float, kSampleCount> scc_samples{};
     std::array<float, kSampleCount> samples{};
     std::array<float, kSampleCount> mixed_samples{};
+    std::array<std::array<float, kSampleCount>, RuntimeSession::kTrackCount> physical_samples{};
+    std::array<EnvelopePlaybackPosition, RuntimeSession::kTrackCount> playback_positions{};
+    std::array<std::uint64_t, RuntimeSession::kTrackCount> track_note_generation{};
+    std::array<std::int8_t, RuntimeSession::kTrackCount> layer_tracks = [] {
+        std::array<std::int8_t, RuntimeSession::kTrackCount> result{};
+        result.fill(-1);
+        return result;
+    }();
+    std::uint32_t captured_track_mask{};
+    std::uint64_t selection_context{};
+    std::uint64_t scope_ui_context{};
+    std::uint64_t program_generation{};
+    std::uint8_t selection_note{60};
     std::uint64_t sequence{};
+    // Exclusive end at the internal48kHz clock; resets with the program.
+    std::uint64_t sample_end{};
     // RealtimeEngineHost annotates the chip frame for analysis views.  The
     // last note remains valid after key-off so release tails keep their guide.
     std::uint8_t guide_note{60};
@@ -114,10 +129,21 @@ public:
     void hardReset() noexcept;
     [[nodiscard]] bool takeOpllScopeFrame(
         OpllScopeFrame& frame) noexcept;
+    // Audio consumer only. A selection transition drops an incomplete frame
+    // instead of mixing old/new voices into the same display history.
+    void setScopeSelection(std::uint32_t mask, std::uint64_t context) noexcept;
+    // Queued NoteOn is applied at the next runtime tick. Do not publish its
+    // new display identity over samples from the preceding physical voice.
+    void awaitScopeNoteOn(std::uint8_t track) noexcept;
+    void resetScopeCapture() noexcept {
+        opll_scope_position_ = 0;
+        opll_scope_ready_ = false;
+    }
 
     // Interleaved stereo: L, R, L, R... Audible mix is silent while a
     // remote backend is selected; scope can still track the simulator.
     void setOpllScopeEnabled(bool enabled) noexcept {
+        if (opll_scope_enabled_ != enabled) resetScopeCapture();
         opll_scope_enabled_ = enabled;
     }
 
@@ -136,7 +162,7 @@ private:
     [[nodiscard]] static bool validGain(float value) noexcept;
     [[nodiscard]] bool writeActiveRegisters(
         std::span<const RegisterWrite> writes) noexcept;
-    [[nodiscard]] ChipSamples renderScopeSample(bool capture_channels) noexcept;
+    [[nodiscard]] ChipSamples renderScopeSample(std::uint32_t channel_mask) noexcept;
     [[nodiscard]] static ChipSamples silentSample() noexcept {
         return {};
     }
@@ -156,6 +182,12 @@ private:
     std::array<float, OpllScopeFrame::kSampleCount> scc_scope_work_{};
     std::array<float, OpllScopeFrame::kSampleCount> opll_scope_work_{};
     std::array<float, OpllScopeFrame::kSampleCount> mixed_scope_work_{};
+    std::array<std::array<float, OpllScopeFrame::kSampleCount>, RuntimeSession::kTrackCount> physical_scope_work_{};
+    std::uint32_t scope_track_mask_{};
+    std::uint32_t scope_requested_track_mask_{};
+    std::uint32_t scope_waiting_track_mask_{};
+    std::array<std::uint64_t, RuntimeSession::kTrackCount> scope_waiting_generations_{};
+    std::uint64_t scope_selection_context_{};
     OpllScopeFrame opll_scope_completed_{};
     std::size_t opll_scope_position_{};
     std::uint64_t opll_scope_sequence_{};

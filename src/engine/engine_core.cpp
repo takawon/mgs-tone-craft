@@ -1,6 +1,7 @@
 #include "mgstc/engine/engine_core.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 
 namespace mgstc::engine {
@@ -18,8 +19,30 @@ bool EngineCore::writeActiveRegisters(
         || output_backend_->writeRegisters(writes));
 }
 
-ChipSamples EngineCore::renderScopeSample(bool capture_channels) noexcept {
-    return emulator_.renderSample(capture_channels);
+ChipSamples EngineCore::renderScopeSample(std::uint32_t channel_mask) noexcept {
+    return emulator_.renderSampleMask(channel_mask);
+}
+
+void EngineCore::setScopeSelection(std::uint32_t mask, std::uint64_t context) noexcept {
+    mask &= (1U << RuntimeSession::kTrackCount) - 1U;
+    if (scope_requested_track_mask_ == mask && scope_selection_context_ == context) return;
+    if (scope_selection_context_ != context) scope_waiting_track_mask_ = 0;
+    scope_requested_track_mask_ = mask;
+    scope_waiting_track_mask_ &= mask;
+    scope_track_mask_ = mask & ~scope_waiting_track_mask_;
+    scope_selection_context_ = context;
+    opll_scope_position_ = 0;
+    opll_scope_ready_ = false;
+}
+
+void EngineCore::awaitScopeNoteOn(std::uint8_t track) noexcept {
+    if (track >= RuntimeSession::kTrackCount) return;
+    const auto bit = std::uint32_t{1} << track;
+    if ((scope_requested_track_mask_ & bit) == 0) return;
+    scope_waiting_track_mask_ |= bit;
+    scope_waiting_generations_[track] = session_.noteStartGeneration(track);
+    scope_track_mask_ &= ~bit;
+    resetScopeCapture();
 }
 
 bool EngineCore::setGains(MixerGains gains) noexcept {
@@ -51,6 +74,10 @@ void EngineCore::hardReset() noexcept {
     opll_scope_position_ = 0;
     opll_scope_sequence_ = 0;
     opll_scope_ready_ = false;
+    scope_track_mask_ = 0;
+    scope_requested_track_mask_ = 0;
+    scope_waiting_track_mask_ = 0;
+    scope_selection_context_ = 0;
 }
 
 bool EngineCore::takeOpllScopeFrame(
@@ -75,6 +102,8 @@ RenderResult EngineCore::render(
     const bool remote_output = output_backend_ != nullptr && !offline_rendering_;
     const bool hide_monitor = remote_output && !waveform_monitor_;
     const bool fill_scope = opll_scope_enabled_;
+    const auto channel_mask = (capture != nullptr && capture->channelsEnabled())
+        ? 0x3FFFFFU : (fill_scope && !hide_monitor ? scope_requested_track_mask_ : 0U);
     const auto frame_count = interleaved_stereo.size() / 2;
     for (std::size_t frame = 0; frame < frame_count; ) {
         if (clock_.tickDue()) {
@@ -99,6 +128,15 @@ RenderResult EngineCore::render(
                 result.frames = frame;
                 return result;
             }
+            const auto previous_mask = scope_track_mask_;
+            for (auto bits = scope_waiting_track_mask_; bits != 0; bits &= bits - 1U) {
+                const auto track = std::countr_zero(bits);
+                if (session_.noteStartGeneration(static_cast<std::uint8_t>(track))
+                    != scope_waiting_generations_[track])
+                    scope_waiting_track_mask_ &= ~(1U << track);
+            }
+            scope_track_mask_ = scope_requested_track_mask_ & ~scope_waiting_track_mask_;
+            if (scope_track_mask_ != previous_mask) resetScopeCapture();
             static_cast<void>(clock_.beginTick());
         }
 
@@ -118,8 +156,7 @@ RenderResult EngineCore::render(
             static_cast<std::size_t>(until_tick));
         for (std::size_t index = 0; index < run; ++index) {
             const auto out_frame = frame + index;
-            const auto local_chips = renderScopeSample(
-                capture != nullptr && capture->channelsEnabled());
+            const auto local_chips = renderScopeSample(channel_mask);
             const auto scope_chips = hide_monitor ? silentSample() : local_chips;
             const auto scope_raw = gains_.master * (
                 local_chips.psg * gains_.psg
@@ -160,12 +197,26 @@ RenderResult EngineCore::render(
                 scc_scope_work_[scope_index] = scope_chips.scc;
                 opll_scope_work_[scope_index] = scope_chips.opll;
                 mixed_scope_work_[scope_index] = scope_mixed;
+                for (auto bits = scope_track_mask_; bits != 0; bits &= bits - 1U) {
+                    const auto track = std::countr_zero(bits);
+                    physical_scope_work_[track][scope_index] = scope_chips.channels[track];
+                }
                 if (opll_scope_position_ == opll_scope_work_.size()) {
                     opll_scope_completed_.psg_samples = psg_scope_work_;
                     opll_scope_completed_.scc_samples = scc_scope_work_;
                     opll_scope_completed_.samples = opll_scope_work_;
                     opll_scope_completed_.mixed_samples = mixed_scope_work_;
+                    opll_scope_completed_.captured_track_mask = scope_track_mask_;
+                    opll_scope_completed_.selection_context = scope_selection_context_;
+                    for (auto bits = scope_track_mask_; bits != 0; bits &= bits - 1U) {
+                        const auto track = std::countr_zero(bits);
+                        opll_scope_completed_.physical_samples[track] = physical_scope_work_[track];
+                        opll_scope_completed_.playback_positions[track] = session_.playbackPosition(
+                            static_cast<std::uint8_t>(track));
+                    }
                     opll_scope_completed_.sequence = ++opll_scope_sequence_;
+                    opll_scope_completed_.sample_end = clock_.currentTick() * TickClock::kFramesPerTick
+                        + (TickClock::kFramesPerTick - until_tick) + index + 1;
                     opll_scope_position_ = 0;
                     opll_scope_ready_ = true;
                 }

@@ -127,4 +127,8 @@ ChipSamples EmulatorSoundOutput::renderSample(bool capture_channels) noexcept {
     return chips_.renderSample(capture_channels);
 }
 
+ChipSamples EmulatorSoundOutput::renderSampleMask(std::uint32_t channel_mask) noexcept {
+    return chips_.renderSampleMask(channel_mask);
+}
+
 }  // namespace mgstc::engine

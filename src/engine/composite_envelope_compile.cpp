@@ -807,7 +807,7 @@ void maybeOptimizeModulationLoop(
         return {};
     }
     if (include_original_tone_y) {
-        return {.volume = formatted.bytecode};
+        return {.volume = formatted.bytecode, .playback_counts = formatted.playback_counts};
     }
     auto voice_layer = layer;
     auto& voice_events = voice_layer.timbre_automation;
@@ -850,7 +850,7 @@ void maybeOptimizeModulationLoop(
         }
         at += size;
     }
-    return {.volume = std::move(voice_code)};
+    return {.volume = std::move(voice_code), .playback_counts = formatted.playback_counts};
 }
 
 [[nodiscard]] std::vector<std::uint8_t> sampleCompositeVolumeLane(

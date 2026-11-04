@@ -128,6 +128,7 @@ RealtimeEngineHost::RealtimeEngineHost()
       spectrogram_scope_frames_(
           std::make_unique<SpscQueue<
               OpllScopeFrame, kSpectrogramScopeCapacity>>()),
+      scope_frame_work_(std::make_unique<OpllScopeFrame>()),
       programs_(std::make_unique<ProgramSlot[]>(kProgramSlotCount)),
       mamidi_(std::make_unique<MAmidiMemoSoundOutput>()),
       spectrum_capture_(std::make_unique<SpectrumCapture>()) {
@@ -466,6 +467,33 @@ bool RealtimeEngineHost::pollOpllScope(
     return opll_scope_frames_->tryPop(frame);
 }
 
+bool RealtimeEngineHost::setScopeSelection(std::uint32_t track_mask,
+    std::uint64_t context) noexcept {
+    EngineCommand command{.type = EngineCommandType::SetScopeSelection};
+    command.generation = context;
+    command.scope_track_mask = track_mask;
+    return submit(command);
+}
+
+void RealtimeEngineHost::selectScope(std::uint32_t mask, std::uint64_t context) noexcept {
+    scope_requested_mask_ = mask & ((1U << RuntimeSession::kTrackCount) - 1U);
+    scope_started_mask_ = 0;
+    scope_selection_context_ = context;
+    scope_layer_tracks_.fill(-1);
+    programs_[active_program_].engine.setScopeSelection(0, context);
+}
+
+void RealtimeEngineHost::realtimeSetScopeSelection(std::uint32_t track_mask,
+    std::uint64_t context,
+    const std::array<std::int8_t, RuntimeSession::kTrackCount>& layer_tracks,
+    std::uint8_t note) noexcept {
+    RealtimeAccess access(*this);
+    if (!access) return;
+    selectScope(track_mask, context);
+    scope_layer_tracks_ = layer_tracks;
+    scope_selection_note_ = note;
+}
+
 bool RealtimeEngineHost::pollLatestOpllScope(
     OpllScopeFrame& frame) noexcept {
     bool found = false;
@@ -524,6 +552,13 @@ void RealtimeEngineHost::noteStarted(
     active.order = ++guide_note_order_;
     last_guide_note_ = note;
     last_guide_track_ = track;
+    if ((scope_requested_mask_ & (1U << track)) != 0) {
+        scope_started_mask_ |= 1U << track;
+        programs_[active_program_].engine.resetScopeCapture();
+        programs_[active_program_].engine.setScopeSelection(
+            scope_started_mask_, scope_selection_context_);
+        programs_[active_program_].engine.awaitScopeNoteOn(track);
+    }
 }
 
 void RealtimeEngineHost::noteStopped(std::uint8_t track) noexcept {
@@ -533,9 +568,14 @@ void RealtimeEngineHost::noteStopped(std::uint8_t track) noexcept {
 }
 
 void RealtimeEngineHost::allNotesStopped() noexcept {
+    ++scope_program_epoch_;
     for (auto& note : active_guide_notes_) {
         note.active = false;
     }
+    scope_requested_mask_ = 0;
+    scope_started_mask_ = 0;
+    scope_layer_tracks_.fill(-1);
+    programs_[active_program_].engine.setScopeSelection(0, scope_selection_context_);
 }
 
 SpectrumGuideNote RealtimeEngineHost::currentGuideNote() const noexcept {
@@ -617,6 +657,10 @@ void RealtimeEngineHost::loadProgram(
     incoming.engine.session().gateUntilNoteOn();
     const auto previous = active_program_;
     active_program_ = command.program_slot;
+    scope_requested_mask_ = 0;
+    scope_started_mask_ = 0;
+    scope_layer_tracks_.fill(-1);
+    incoming.engine.setScopeSelection(0, scope_selection_context_);
     allNotesStopped();
     incoming.state.store(ProgramSlotState::Active, std::memory_order_release);
     programs_[previous].state.store(
@@ -712,6 +756,10 @@ void RealtimeEngineHost::applyPendingCommands() noexcept {
     EngineCommand command{};
     while (commands_.tryPop(command)) {
         switch (command.type) {
+        case EngineCommandType::SetScopeSelection:
+            scope_ui_context_ = command.generation;
+            selectScope(command.scope_track_mask, command.generation);
+            break;
         case EngineCommandType::LoadProgram:
             loadProgram(command);
             break;
@@ -833,18 +881,48 @@ RenderResult RealtimeEngineHost::renderAudio(
             spectrum_channels_enabled_.load(std::memory_order_acquire));
         capture = spectrum_capture_.get();
     }
-    const auto result = core.render(interleaved_stereo, capture);
-    spectrum_sample_clock_ += result.frames;
-    if (opll_scope_enabled_) {
-        OpllScopeFrame scope{};
-        if (programs_[active_program_].engine.takeOpllScopeFrame(scope)) {
-            annotateGuideNote(scope);
-            static_cast<void>(opll_scope_frames_->tryPush(scope));
-            if (spectrogram_capture_enabled_.load(std::memory_order_acquire)) {
-                static_cast<void>(spectrogram_scope_frames_->tryPush(scope));
+    RenderResult result{};
+    // Preserve every completed window even when a host callback spans several
+    // ticks. Commands and capture context are serviced once for the whole call.
+    const bool split_scope = opll_scope_enabled_
+        && interleaved_stereo.size() > OpllScopeFrame::kSampleCount * 2
+        && interleaved_stereo.size() % 2 == 0;
+    std::size_t offset = 0;
+    do {
+        const auto remaining = interleaved_stereo.size() - offset;
+        const auto run = split_scope ? std::min(remaining, OpllScopeFrame::kSampleCount * 2) : remaining;
+        const auto tick_before = core.session().tick();
+        const auto part = core.render(interleaved_stereo.subspan(offset, run), capture);
+        result.frames += part.frames;
+        result.clipped = result.clipped || part.clipped;
+        if (!part.ok() || core.session().tick() != tick_before)
+            result.tick_result = part.tick_result;
+        if (!part.ok()) result.error = part.error;
+        offset += run;
+        if (opll_scope_enabled_) {
+            auto& scope = *scope_frame_work_;
+            if (programs_[active_program_].engine.takeOpllScopeFrame(scope)) {
+                annotateGuideNote(scope);
+                scope.scope_ui_context = scope_ui_context_;
+                scope.selection_note = scope_selection_note_;
+                scope.layer_tracks = scope_layer_tracks_;
+                scope.program_generation = scope_program_epoch_;
+                for (std::size_t track = 0; track < active_guide_notes_.size(); ++track)
+                    scope.track_note_generation[track] = active_guide_notes_[track].order;
+                if (!opll_scope_frames_->tryPush(scope))
+                    scope_dropped_frames_.fetch_add(1, std::memory_order_relaxed);
+                if (spectrogram_capture_enabled_.load(std::memory_order_acquire)) {
+                    static_cast<void>(spectrogram_scope_frames_->tryPush(scope));
+                }
             }
         }
-    }
+        if (!part.ok()) {
+            std::fill(interleaved_stereo.begin() + static_cast<std::ptrdiff_t>(offset),
+                interleaved_stereo.end(), 0.0F);
+            break;
+        }
+    } while (offset < interleaved_stereo.size());
+    spectrum_sample_clock_ += result.frames;
     if (!result.ok()) {
         notify({
             .type = EngineNoticeType::RenderFailure,

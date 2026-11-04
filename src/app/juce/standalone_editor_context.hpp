@@ -132,6 +132,13 @@ public:
         return audio_.pollDistributedScope(frame, opll_scope_cursor_, true);
     }
 
+    [[nodiscard]] bool setScopeSelection(std::uint32_t mask, std::uint64_t context) override {
+        return audio_.engine().setScopeSelection(mask, context);
+    }
+    [[nodiscard]] bool pollOpllScopeHistory(mgstc::engine::OpllScopeFrame& frame) override {
+        return audio_.pollDistributedScope(frame, opll_history_cursor_, false);
+    }
+
 private:
     class Output final : public mgstc::app::OutputBoundary {
     public:
@@ -302,6 +309,7 @@ private:
     }
 
     std::uint64_t composite_scope_cursor_{}, opll_scope_cursor_{};
+    std::uint64_t opll_history_cursor_{};
     SharedAudioService& audio_;
     SharedMidiInputService& midi_service_;
     Output output_;

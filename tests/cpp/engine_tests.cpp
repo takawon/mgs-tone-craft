@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <numbers>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -11218,6 +11219,690 @@ CREATE TABLE composite_tags (
     std::filesystem::remove_all(directory);
 }
 
+void testScopePlaybackPositionObservesCommandsAndLoop() {
+    const std::vector<std::uint8_t> code{0x0f, 0x0e, 0x0d, 0x40,
+        0x11, 2, 7, 0x0c, 0x0b, 0x0a, 0x09, 0x60};
+    SequenceEnvelopeRuntime observed(code, true, {0, 1, 2, 3, 4, 5, 6});
+    SequenceEnvelopeRuntime control(code);
+    observed.resetForKeyOn(); control.resetForKeyOn();
+    REQUIRE_EQ(observed.playbackPosition().active, false);
+    EventBuffer a(32), b(32);
+    for (std::uint32_t tick = 0; tick < 103; ++tick) {
+        a.clear(); b.clear();
+        REQUIRE_EQ(observed.processTick(a), SequenceError::None);
+        REQUIRE_EQ(control.processTick(b), SequenceError::None);
+        REQUIRE_EQ(std::equal(a.events().begin(), a.events().end(), b.events().begin(), b.events().end()), true);
+        const auto expected = tick < 3 ? tick : 3 + (tick - 3) % 4;
+        REQUIRE_EQ(observed.playbackPosition().active, true);
+        REQUIRE_EQ(observed.playbackPosition().count, expected);
+    }
+    observed.resetForKeyOn();
+    REQUIRE_EQ(observed.playbackPosition().active, false);
+    a.clear(); REQUIRE_EQ(observed.processTick(a), SequenceError::None);
+    REQUIRE_EQ(observed.playbackPosition().count, 0U);
+    SequenceEnvelopeRuntime finite({0x0f, 0x0e});
+    finite.resetForKeyOn();
+    for (int tick = 0; tick < 3; ++tick) {
+        a.clear(); REQUIRE_EQ(finite.processTick(a), SequenceError::None);
+        REQUIRE_EQ(finite.playbackPosition().active, tick < 2);
+    }
+}
+
+void testScopeAuthoredRampCountMapping() {
+    using namespace mgstc::engine;
+    auto layer = defaultCompositeTimbre().layers.front();
+    layer.volume_envelope.kind = EnvelopeKind::Sequence;
+    layer.volume_envelope.events = {{.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume, .value = 0, .count = 100, .automatic = true}};
+    layer.envelope_timeline.length_counts = 100;
+    layer.envelope_timeline.loop_start_count.reset();
+    layer.envelope_timeline.loop_end_count.reset();
+    const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(formatted.valid(), true);
+    REQUIRE_EQ(formatted.bytecode, (std::vector<std::uint8_t>{0x0f, 0x20, 100, 0x00}));
+    REQUIRE_EQ(formatted.playback_counts.size(), std::size_t{102});
+    SequenceEnvelopeRuntime observed(formatted.bytecode, true, formatted.playback_counts);
+    SequenceEnvelopeRuntime control(formatted.bytecode);
+    observed.resetForKeyOn(); control.resetForKeyOn();
+    EventBuffer a(16), b(16);
+    for (std::uint32_t tick = 0; tick < 103; ++tick) {
+        a.clear(); b.clear();
+        REQUIRE_EQ(observed.processTick(a), SequenceError::None);
+        REQUIRE_EQ(control.processTick(b), SequenceError::None);
+        REQUIRE_EQ(std::equal(a.events().begin(), a.events().end(), b.events().begin(), b.events().end()), true);
+        if (tick < 102) {
+            REQUIRE_EQ(observed.playbackPosition().active, true);
+            REQUIRE_EQ(observed.playbackPosition().count, tick == 0 ? 0U : tick - 1);
+        } else REQUIRE_EQ(observed.playbackPosition().active, false);
+    }
+}
+
+void testScopeTerminalHoldReachesAuthoredEnd() {
+    using namespace mgstc::engine;
+    for (const std::uint32_t end : {0U, 1U, 32U, 128U, 512U}) {
+        auto model = defaultCompositeTimbre();
+        model.layers.resize(1);
+        auto& layer = model.layers.front();
+        layer.volume_envelope.kind = EnvelopeKind::Sequence;
+        layer.volume_envelope.events = {
+            {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0}};
+        layer.envelope_timeline = {.length_counts = end};
+        const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+        REQUIRE_EQ(formatted.valid(), true);
+        // Export and sound still use the original compact terminal hold.
+        REQUIRE_EQ(formatted.bytecode, (std::vector<std::uint8_t>{15}));
+        REQUIRE_EQ(formatted.playback_counts.size(), static_cast<std::size_t>(end + 1));
+        SequenceEnvelopeRuntime observed(formatted.bytecode, true, formatted.playback_counts);
+        SequenceEnvelopeRuntime control(formatted.bytecode);
+        observed.resetForKeyOn(); control.resetForKeyOn();
+        EventBuffer a(16), b(16);
+        for (std::uint32_t tick = 0; tick < end + 3; ++tick) {
+            a.clear(); b.clear();
+            REQUIRE_EQ(observed.processTick(a), SequenceError::None);
+            REQUIRE_EQ(control.processTick(b), SequenceError::None);
+            REQUIRE_EQ(std::equal(a.events().begin(), a.events().end(), b.events().begin(), b.events().end()), true);
+            REQUIRE_EQ(observed.playbackPosition().active, tick <= end);
+            if (tick <= end) REQUIRE_EQ(observed.playbackPosition().count, tick);
+        }
+
+        auto core = std::make_unique<EngineCore>();
+        REQUIRE_EQ(compileCompositeProgram(*core, model, {}), true);
+        REQUIRE_EQ(core->session().queueNoteOn(0, 60), true);
+        std::array<float, 1600> samples{};
+        for (std::uint32_t tick = 0; tick <= end + 1; ++tick) {
+            REQUIRE_EQ(core->render(samples).ok(), true);
+            const auto position = core->session().playbackPosition(0);
+            REQUIRE_EQ(position.active, tick <= end);
+            if (tick <= end) REQUIRE_EQ(position.count, tick);
+        }
+        REQUIRE_EQ(core->session().queueNoteOn(0, 67), true);
+        REQUIRE_EQ(core->render(samples).ok(), true);
+        REQUIRE_EQ(core->session().playbackPosition(0).active, true);
+        REQUIRE_EQ(core->session().playbackPosition(0).count, 0U);
+        REQUIRE_EQ(core->session().queueKeyOff(0), true);
+        REQUIRE_EQ(core->render(samples).ok(), true);
+        REQUIRE_EQ(core->session().playbackPosition(0).active, false);
+    }
+}
+
+void testScopeTerminalHoldStopsAtBudgetPrefix() {
+    using namespace mgstc::engine;
+    auto layer = defaultCompositeTimbre().layers.front();
+    layer.volume_envelope.kind = EnvelopeKind::Sequence;
+    layer.envelope_timeline = {.length_counts = 32};
+    layer.volume_envelope.events.clear();
+    for (std::uint32_t count = 0; count < 32; ++count)
+        layer.volume_envelope.events.push_back({.kind = EnvelopeEventKind::Volume,
+            .value = count % 2 ? 14 : 15, .count = count});
+    const auto formatted = formatMgsCompositeEnvelope(layer, 0, 8);
+    REQUIRE_EQ(formatted.valid(), true);
+    REQUIRE_EQ(formatted.output_cutoff_count.has_value(), true);
+    REQUIRE_EQ(*formatted.output_cutoff_count, 8U);
+    REQUIRE_EQ(formatted.playback_counts.size(), std::size_t{8});
+    SequenceEnvelopeRuntime observed(formatted.bytecode, true, formatted.playback_counts);
+    SequenceEnvelopeRuntime control(formatted.bytecode);
+    observed.resetForKeyOn(); control.resetForKeyOn();
+    EventBuffer a(16), b(16);
+    for (std::uint32_t tick = 0; tick < 35; ++tick) {
+        a.clear(); b.clear();
+        REQUIRE_EQ(observed.processTick(a), SequenceError::None);
+        REQUIRE_EQ(control.processTick(b), SequenceError::None);
+        REQUIRE_EQ(std::equal(a.events().begin(), a.events().end(), b.events().begin(), b.events().end()), true);
+        REQUIRE_EQ(observed.playbackPosition().active, tick < 8);
+        if (tick < 8) REQUIRE_EQ(observed.playbackPosition().count, tick);
+    }
+}
+
+void testScopeShortSplitAndImportedRampPositions() {
+    using namespace mgstc::engine;
+    auto layer = defaultCompositeTimbre().layers.front();
+    layer.volume_envelope.kind = EnvelopeKind::Sequence;
+    layer.envelope_timeline = {.length_counts = 1};
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume, .value = 10, .count = 1, .automatic = true}};
+    const auto direct = formatMgsCompositeEnvelope(layer, 0);
+    REQUIRE_EQ(direct.valid(), true);
+    REQUIRE_EQ(direct.bytecode, (std::vector<std::uint8_t>{15, 10}));
+    std::cout << "scope_short_map";
+    for (const auto count : direct.playback_counts) std::cout << ' ' << count;
+    std::cout << '\n';
+    SequenceEnvelopeRuntime short_runtime(direct.bytecode, true, direct.playback_counts);
+    short_runtime.resetForKeyOn();
+    EventBuffer short_events(16);
+    for (std::uint32_t tick = 0; tick < 3; ++tick) {
+        short_events.clear();
+        REQUIRE_EQ(short_runtime.processTick(short_events), SequenceError::None);
+        REQUIRE_EQ(short_runtime.playbackPosition().active, tick < 2);
+        if (tick < 2) REQUIRE_EQ(short_runtime.playbackPosition().count, tick);
+    }
+
+    const auto check = [](const CompositeLayer& source, std::uint32_t ticks,
+                          bool duplicated_origin, std::uint32_t command_count) {
+        const auto formatted = formatMgsCompositeEnvelope(source, 0);
+        REQUIRE_EQ(formatted.valid(), true);
+        SequenceEnvelopeRuntime observed(formatted.bytecode, true, formatted.playback_counts);
+        SequenceEnvelopeRuntime control(formatted.bytecode);
+        observed.resetForKeyOn(); control.resetForKeyOn();
+        EventBuffer a(32), b(32);
+        bool saw_command = false;
+        for (std::uint32_t tick = 0; tick < ticks; ++tick) {
+            a.clear(); b.clear();
+            REQUIRE_EQ(observed.processTick(a), SequenceError::None);
+            REQUIRE_EQ(control.processTick(b), SequenceError::None);
+            REQUIRE_EQ(std::equal(a.events().begin(), a.events().end(), b.events().begin(), b.events().end()), true);
+            REQUIRE_EQ(observed.playbackPosition().active, true);
+            REQUIRE_EQ(observed.playbackPosition().count,
+                duplicated_origin && tick != 0 ? tick - 1 : tick);
+            for (const auto& event : a.events()) {
+                if (event.kind == MeaningEventKind::FrequencyDelta) {
+                    REQUIRE_EQ(observed.playbackPosition().count, command_count);
+                    saw_command = true;
+                }
+            }
+        }
+        REQUIRE_EQ(saw_command, true);
+    };
+    layer.envelope_timeline.length_counts = 10;
+    layer.volume_envelope.events.back().count = 10;
+    layer.volume_envelope.events.back().value = 0;
+    layer.pitch_envelope.events = {{.kind = EnvelopeEventKind::Pitch, .value = 20, .count = 5}};
+    check(layer, 12, true, 5);
+
+    layer.envelope_timeline.length_counts = 15;
+    layer.volume_envelope.events.back().count = 15;
+    layer.volume_envelope.events.back().secondary = 6; // Imported ramp starts at author count5.
+    layer.volume_envelope.events.back().precise = true;
+    layer.pitch_envelope.events.front().count = 8;
+    check(layer, 16, false, 8);
+}
+
+void testScopeOpllPolyMixAndReleaseMatchesAudibleBus() {
+    using namespace mgstc::engine;
+    auto model = defaultCompositeTimbre();
+    std::erase_if(model.layers, [](const auto& layer) { return layer.source != TimbreSource::Opll; });
+    auto patch = defaultOpllPatch();
+    patch.carrier.release_rate = 1;
+    SavedTimbreReference reference;
+    reference.library_id = 100;
+    reference.revision = 1;
+    reference.source = TimbreSource::Opll;
+    reference.opll_registers = encodeOpllPatch(patch);
+    model.layers.front().base_timbre = reference;
+    model.layers.front().base_opll_rom.reset();
+    auto core = std::make_unique<EngineCore>();
+    CompositePlaybackPlan plan;
+    REQUIRE_EQ(compileCompositeProgram(*core, model, {.polyphonic = true}, &plan), true);
+    REQUIRE_EQ(core->setGains({.master = 1.0F, .psg = 0.0F, .scc = 0.0F, .opll = 1.0F}), true);
+    core->setScopeSelection((1U << 8) | (1U << 9), 1);
+    REQUIRE_EQ(core->session().queueNoteOn(8, 60), true);
+    DcBlocker dc(48'000.0F, 3.4F);
+    std::array<float, 1600> output{};
+    auto frame = std::make_unique<OpllScopeFrame>();
+    bool poly_first = false, poly_second = false, release_tail = false;
+    const auto nonzero = [](const auto& samples) {
+        return std::any_of(samples.begin(), samples.end(), [](float sample) { return std::abs(sample) > 1e-5F; });
+    };
+    for (int tick = 0; tick < 32; ++tick) {
+        if (tick == 8) REQUIRE_EQ(core->session().queueNoteOn(9, 67), true);
+        if (tick == 16) REQUIRE_EQ(core->session().queueKeyOff(9), true);
+        if (tick == 24) REQUIRE_EQ(core->session().queueKeyOff(8), true);
+        REQUIRE_EQ(core->render(output).ok(), true);
+        REQUIRE_EQ(core->takeOpllScopeFrame(*frame), true);
+        for (std::size_t sample = 0; sample < frame->kSampleCount; ++sample) {
+            const auto expected = std::clamp(dc.process(frame->samples[sample]), -1.0F, 1.0F);
+            REQUIRE_EQ(expected, output[sample * 2]);
+            REQUIRE_EQ(expected, frame->mixed_samples[sample]);
+        }
+        if (tick >= 8 && tick < 16) {
+            poly_first |= nonzero(frame->physical_samples[8]);
+            poly_second |= nonzero(frame->physical_samples[9]);
+        }
+        if (tick >= 16 && tick < 24) release_tail |= nonzero(frame->physical_samples[9]);
+    }
+    REQUIRE_EQ(poly_first && poly_second && release_tail, true);
+    core->hardReset();
+    REQUIRE_EQ(core->render(output).ok(), true);
+    REQUIRE_EQ(core->takeOpllScopeFrame(*frame), true);
+    REQUIRE_EQ(nonzero(frame->samples), false);
+}
+
+mgstc::engine::CompositeTimbre scopeCaptureFixture() {
+    using namespace mgstc::engine;
+    auto model = defaultCompositeTimbre();
+    for (auto& layer : model.layers) seedDefaultLayerTimbre(layer);
+    const auto originals = model.layers;
+    for (auto layer : originals) {
+        layer.channel = 1;
+        layer.name += " 2";
+        model.layers.push_back(std::move(layer));
+    }
+    for (auto& layer : model.layers) {
+        layer.volume_envelope.kind = EnvelopeKind::Sequence;
+        layer.volume_envelope.events = {{.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0}};
+        layer.envelope_timeline.length_counts = 32;
+        layer.envelope_timeline.loop_start_count = 0;
+        layer.envelope_timeline.loop_end_count = 32;
+        layer.key_off_hang = 2;
+    }
+    return model;
+}
+
+void testScopeSelectedChannelsPreserveMixAndIndependentOutputs() {
+    using namespace mgstc::engine;
+    const auto model = scopeCaptureFixture();
+    auto selected = std::make_unique<EngineCore>();
+    auto mixed = std::make_unique<EngineCore>();
+    auto full = std::make_unique<EngineCore>();
+    CompositePlaybackPlan plan;
+    for (auto* core : {selected.get(), mixed.get(), full.get()}) {
+        REQUIRE_EQ(compileCompositeProgram(*core, model, {}, &plan), true);
+        for (const auto& binding : plan.audible_layers)
+            REQUIRE_EQ(core->session().queueNoteOn(plan.physicalTrack(binding, 0),
+                static_cast<std::uint8_t>(binding.layer_index < 3 ? 60 : 67)), true);
+    }
+    constexpr std::uint32_t selected_mask = (1U << 0) | (1U << 3) | (1U << 8);
+    selected->setScopeSelection(selected_mask, 7);
+    full->setScopeSelection((1U << 17) - 1, 7);
+    std::array<float, 1600> a{}, b{}, c{};
+    auto first = std::make_unique<OpllScopeFrame>();
+    auto all = std::make_unique<OpllScopeFrame>();
+    std::array<bool, 3> channel_diff{};
+    std::array<bool, 3> channel_nonzero{};
+    for (int tick = 0; tick < 36; ++tick) {
+        if (tick == 24) {
+            for (auto* core : {selected.get(), mixed.get(), full.get()})
+                for (const auto& binding : plan.audible_layers)
+                    REQUIRE_EQ(core->session().queueKeyOff(plan.physicalTrack(binding, 0)), true);
+        }
+        REQUIRE_EQ(selected->render(a).ok(), true);
+        REQUIRE_EQ(mixed->render(b).ok(), true);
+        REQUIRE_EQ(full->render(c).ok(), true);
+        REQUIRE_EQ(a, b); REQUIRE_EQ(a, c);
+        const auto wa = selected->session().writes();
+        const auto wb = mixed->session().writes();
+        REQUIRE_EQ(std::equal(wa.begin(), wa.end(), wb.begin(), wb.end()), true);
+        REQUIRE_EQ(selected->takeOpllScopeFrame(*first), true);
+        REQUIRE_EQ(full->takeOpllScopeFrame(*all), true);
+        REQUIRE_EQ(first->captured_track_mask, selected_mask);
+        REQUIRE_EQ(first->samples, all->samples);
+        REQUIRE_EQ(first->mixed_samples, all->mixed_samples);
+        for (std::size_t chip = 0; chip < 3; ++chip) {
+            const auto track = std::array<std::size_t, 3>{0, 3, 8}[chip];
+            REQUIRE_EQ(first->physical_samples[track], all->physical_samples[track]);
+            channel_diff[chip] = channel_diff[chip]
+                || all->physical_samples[track] != all->physical_samples[track + 1];
+            channel_nonzero[chip] = channel_nonzero[chip]
+                || std::any_of(first->physical_samples[track].begin(), first->physical_samples[track].end(),
+                    [](float value) { return std::abs(value) > 1e-5F; });
+        }
+    }
+    REQUIRE_EQ(std::all_of(channel_diff.begin(), channel_diff.end(), [](bool value) { return value; }), true);
+    REQUIRE_EQ(std::all_of(channel_nonzero.begin(), channel_nonzero.end(), [](bool value) { return value; }), true);
+}
+
+void testScopeSelectionWaitsForActualNoteAndRetainsRelease() {
+    using namespace mgstc::engine;
+    RealtimeEngineHost host;
+    auto edit = host.beginProgramEdit();
+    REQUIRE_EQ(edit.valid(), true);
+    REQUIRE_EQ(edit.engine->session().setSequenceEnvelope(0, {0x40, 0xef, 8, 0x60}), true);
+    REQUIRE_EQ(edit.engine->session().setSequenceEnvelope(3, {0x40, 0xef, 5, 0x60}), true);
+    REQUIRE_EQ(host.submitProgram(edit), true);
+    std::array<float, 1600> output{};
+    REQUIRE_EQ(host.render(output).ok(), true);
+    auto frame = std::make_unique<OpllScopeFrame>();
+    while (host.pollOpllScope(*frame)) {}
+    REQUIRE_EQ(host.setScopeSelection((1U << 0) | (1U << 3), 19), true);
+    REQUIRE_EQ(host.submit(EngineCommand::noteOn(0, 60)), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->selection_context, 19ULL);
+    REQUIRE_EQ(frame->captured_track_mask, 1U);
+    REQUIRE_EQ(frame->playback_positions[0].count, 0U);
+    const auto first_generation = frame->track_note_generation[0];
+    REQUIRE_EQ(first_generation != 0, true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->captured_track_mask, 1U);
+    REQUIRE_EQ(host.submit(EngineCommand::noteOn(3, 67)), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->captured_track_mask, 9U);
+    REQUIRE_EQ(frame->playback_positions[0].count, 2U);
+    REQUIRE_EQ(frame->playback_positions[3].count, 0U);
+    for (unsigned tick = 3; tick < 31; ++tick) {
+        REQUIRE_EQ(host.render(output).ok(), true);
+        REQUIRE_EQ(host.pollOpllScope(*frame), true);
+        REQUIRE_EQ(frame->playback_positions[0].count, tick % 8);
+        REQUIRE_EQ(frame->playback_positions[3].count, (tick - 2) % 5);
+    }
+    REQUIRE_EQ(host.submit(EngineCommand::noteOff(0)), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->captured_track_mask, 9U);
+    REQUIRE_EQ(frame->track_note_generation[0], first_generation);
+    REQUIRE_EQ(frame->playback_positions[0].active, false);
+    REQUIRE_EQ(host.setScopeSelection(1U, 20), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->captured_track_mask, 0U);
+    REQUIRE_EQ(host.submit(EngineCommand::noteOn(0, 72)), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->track_note_generation[0] > first_generation, true);
+    REQUIRE_EQ(frame->playback_positions[0].count, 0U);
+    for (std::size_t tick = 0; tick < RealtimeEngineHost::kOpllScopeCapacity + 2; ++tick)
+        REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.scopeDroppedFrames(), 2ULL);
+}
+
+void testScopeProgramEpochAcrossSlotReuseAndReset() {
+    RealtimeEngineHost host;
+    std::array<float, 1600> output{};
+    auto frame = std::make_unique<OpllScopeFrame>();
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    auto epoch = frame->program_generation;
+    std::array<bool, RealtimeEngineHost::kProgramSlotCount> used{};
+    bool reused = false;
+    for (int program = 0; program < 12; ++program) {
+        auto edit = host.beginProgramEdit();
+        REQUIRE_EQ(edit.valid(), true);
+        reused = reused || used[edit.slot];
+        used[edit.slot] = true;
+        REQUIRE_EQ(edit.engine->session().setSequenceEnvelope(0, {0x40, 0xef, 8, 0x60}), true);
+        REQUIRE_EQ(host.submitProgram(edit), true);
+        REQUIRE_EQ(host.render(output).ok(), true);
+        REQUIRE_EQ(host.pollOpllScope(*frame), true);
+        REQUIRE_EQ(frame->program_generation > epoch, true);
+        epoch = frame->program_generation;
+    }
+    REQUIRE_EQ(reused, true);
+    REQUIRE_EQ(host.submit(EngineCommand::hardReset()), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->program_generation > epoch, true);
+    epoch = frame->program_generation;
+    host.realtimeStop();
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->program_generation > epoch, true);
+}
+
+void testScopeRetriggerMidTickExcludesPreviousPhysicalVoice() {
+    RealtimeEngineHost host;
+    auto edit = host.beginProgramEdit();
+    REQUIRE_EQ(edit.valid(), true);
+    REQUIRE_EQ(edit.engine->session().setSequenceEnvelope(0, {0x40, 0xef, 8, 0x60}), true);
+    REQUIRE_EQ(host.submitProgram(edit), true);
+    std::array<float, 1600> output{};
+    auto frame = std::make_unique<OpllScopeFrame>();
+    REQUIRE_EQ(host.render(output).ok(), true);
+    while (host.pollOpllScope(*frame)) {}
+    REQUIRE_EQ(host.setScopeSelection(1, 1), true);
+    REQUIRE_EQ(host.submit(EngineCommand::noteOn(0, 60)), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    const auto old_generation = frame->track_note_generation[0];
+    std::array<float, 1598> partial{};
+    std::array<float, 2> one_sample{};
+    REQUIRE_EQ(host.render(partial).ok(), true); // 799 samples into the tick.
+    REQUIRE_EQ(host.pollOpllScope(*frame), false);
+    REQUIRE_EQ(host.setScopeSelection(1, 2), true);
+    REQUIRE_EQ(host.submit(EngineCommand::noteOn(0, 72)), true);
+    REQUIRE_EQ(host.render(one_sample).ok(), true); // Runtime NoteOn has not run.
+    REQUIRE_EQ(host.pollOpllScope(*frame), false);
+    REQUIRE_EQ(host.render(partial).ok(), true); // 799 samples of the new voice.
+    REQUIRE_EQ(host.pollOpllScope(*frame), false);
+    REQUIRE_EQ(host.render(one_sample).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->selection_context, 2ULL);
+    REQUIRE_EQ(frame->captured_track_mask, 1U);
+    REQUIRE_EQ(frame->track_note_generation[0] > old_generation, true);
+    REQUIRE_EQ(frame->playback_positions[0].count, 0U);
+    REQUIRE_EQ(frame->sample_end, 3200ULL);
+
+    // An accepted NoteOn superseded by keyoff before execution must never
+    // publish the preceding physical channel as a newly started voice.
+    REQUIRE_EQ(host.setScopeSelection(1, 3), true);
+    REQUIRE_EQ(host.submit(EngineCommand::noteOn(0, 67)), true);
+    REQUIRE_EQ(host.submit(EngineCommand::noteOff(0)), true);
+    REQUIRE_EQ(host.render(output).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->captured_track_mask, 0U);
+}
+
+void testScopeCaptureRestartDiscardsPartialWindow() {
+    RealtimeEngineHost host;
+    auto frame = std::make_unique<OpllScopeFrame>();
+    std::array<float, 512> initial{};
+    std::array<float, 1600> gap{};
+    std::array<float, 1598> partial{};
+    std::array<float, 2> final_sample{};
+    REQUIRE_EQ(host.render(initial).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), false);
+    host.setOpllScopeEnabled(false);
+    REQUIRE_EQ(host.render(gap).ok(), true);
+    host.setOpllScopeEnabled(true);
+    REQUIRE_EQ(host.render(partial).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), false);
+    REQUIRE_EQ(host.render(final_sample).ok(), true);
+    REQUIRE_EQ(host.pollOpllScope(*frame), true);
+    REQUIRE_EQ(frame->sample_end, 1856ULL);
+}
+
+void testScopeLongCallbacksPreservePcmAndEveryWindow() {
+    using namespace mgstc::engine;
+    RealtimeEngineHost observed, control;
+    control.setOpllScopeEnabled(false);
+    const auto configure = [](RealtimeEngineHost& host, bool fault) {
+        auto edit = host.beginProgramEdit();
+        REQUIRE_EQ(edit.valid(), true);
+        if (fault) {
+            REQUIRE_EQ(edit.engine->session().setSequenceEnvelope(0, {0xef, 2, 0x7f}), true);
+        } else {
+            REQUIRE_EQ(compileCompositeProgram(*edit.engine, scopeCaptureFixture(), {}), true);
+        }
+        REQUIRE_EQ(host.submitProgram(edit), true);
+        for (const auto track : fault ? std::vector<std::uint8_t>{0} : std::vector<std::uint8_t>{0, 1, 3, 4, 8, 9})
+            REQUIRE_EQ(host.submit(EngineCommand::noteOn(track, 24)), true);
+    };
+    configure(observed, false); configure(control, false);
+    std::uint64_t previous_end = 0;
+    auto captured = std::make_unique<OpllScopeFrame>();
+    const auto compare = [](const RenderResult& a, const RenderResult& b) {
+        REQUIRE_EQ(a.frames, b.frames); REQUIRE_EQ(a.error, b.error);
+        REQUIRE_EQ(a.clipped, b.clipped); REQUIRE_EQ(a.tick_result.tick, b.tick_result.tick);
+        REQUIRE_EQ(a.tick_result.track, b.tick_result.track);
+        REQUIRE_EQ(a.tick_result.sequence_error, b.tick_result.sequence_error);
+        REQUIRE_EQ(a.tick_result.map_error, b.tick_result.map_error);
+    };
+    for (const auto frames : {256, 2048, 801, 1600, 1, 513, 4096}) {
+        std::vector<float> a(static_cast<std::size_t>(frames) * 2), b(a.size());
+        compare(observed.render(a), control.render(b));
+        REQUIRE_EQ(a, b);
+        while (observed.pollOpllScope(*captured)) {
+            REQUIRE_EQ(captured->sample_end, previous_end + captured->kSampleCount);
+            previous_end = captured->sample_end;
+        }
+    }
+    REQUIRE_EQ(previous_end > 8000, true);
+    std::array<float, 1601> odd_a{}, odd_b{};
+    const auto odd_result = observed.render(odd_a);
+    compare(odd_result, control.render(odd_b));
+    REQUIRE_EQ(odd_result.error, RenderError::InvalidBuffer);
+    REQUIRE_EQ(odd_result.frames, std::size_t{0});
+    REQUIRE_EQ(odd_a, odd_b);
+    compare(observed.render({}), control.render({}));
+    std::array<float, 1600> tail_a{}, tail_b{};
+    compare(observed.render(tail_a), control.render(tail_b));
+    REQUIRE_EQ(tail_a, tail_b);
+    while (observed.pollOpllScope(*captured)) {
+        REQUIRE_EQ(captured->sample_end, previous_end + captured->kSampleCount);
+        previous_end = captured->sample_end;
+    }
+    REQUIRE_EQ(observed.scopeDroppedFrames(), 0ULL);
+    RealtimeEngineHost faulty, faulty_control;
+    faulty_control.setOpllScopeEnabled(false);
+    configure(faulty, true); configure(faulty_control, true);
+    std::array<float, 8192> a{}, b{};
+    a.fill(0.5F); b.fill(0.5F);
+    const auto failed = faulty.render(a);
+    compare(failed, faulty_control.render(b));
+    REQUIRE_EQ(failed.error, RenderError::Runtime);
+    REQUIRE_EQ(failed.frames, std::size_t{1600});
+    REQUIRE_EQ(a, b);
+    REQUIRE_EQ(std::all_of(a.begin() + 3200, a.end(), [](float value) { return value == 0; }), true);
+}
+
+void testScopeCaptureControlledCostBenchmark() {
+    using namespace mgstc::engine;
+    // Time a bounded, already configured callback workload. This measures CPU
+    // cost only, not key-to-speaker latency or real device dropouts.
+    const auto model = scopeCaptureFixture();
+    auto setup_core = std::make_unique<EngineCore>();
+    CompositePlaybackPlan plan;
+    REQUIRE_EQ(compileCompositeProgram(*setup_core, model, {}, &plan), true);
+    for (const auto& binding : plan.audible_layers)
+        REQUIRE_EQ(setup_core->session().queueNoteOn(plan.physicalTrack(binding, 0),
+            static_cast<std::uint8_t>(binding.layer_index < 3 ? 60 : 67)), true);
+    REQUIRE_EQ(setup_core->session().processTick().ok(), true);
+    const auto writes = setup_core->session().writes();
+    constexpr std::array<std::uint32_t, 3> masks{0U, (1U << 0) | (1U << 3) | (1U << 8), 0x3fffffU};
+    for (const auto mask : masks) {
+        ChipRack rack;
+        REQUIRE_EQ(rack.apply(writes), true);
+        for (int sample = 0; sample < 4096; ++sample) static_cast<void>(rack.renderSampleMask(mask));
+        std::vector<double> durations;
+        double checksum{};
+        for (int block = 0; block < 80; ++block) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int sample = 0; sample < 256; ++sample) {
+                const auto value = rack.renderSampleMask(mask);
+                checksum += value.opll + value.scc + value.psg + value.channels[0];
+            }
+            durations.push_back(std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - start).count());
+        }
+        std::sort(durations.begin(), durations.end());
+        const auto total = std::accumulate(durations.begin(), durations.end(), 0.0);
+        std::cout << "scope_capture_benchmark mask=" << mask << " frames=256 mean_us=" << total / durations.size()
+            << " p95_us=" << durations[75] << " p99_us=" << durations[79] << " checksum=" << checksum << '\n';
+    }
+    for (const bool enabled : {false, true}) {
+        auto core = std::make_unique<EngineCore>();
+        REQUIRE_EQ(compileCompositeProgram(*core, model, {}, &plan), true);
+        core->setOpllScopeEnabled(enabled);
+        for (const auto& binding : plan.audible_layers)
+            REQUIRE_EQ(core->session().queueNoteOn(plan.physicalTrack(binding, 0), 60), true);
+        std::array<float, 512> output{};
+        const auto start = std::chrono::steady_clock::now();
+        for (int block = 0; block < 80; ++block) REQUIRE_EQ(core->render(output).ok(), true);
+        const double elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        std::cout << "scope_mix_capture_benchmark enabled=" << enabled << " frames=256 mean_us=" << elapsed / 80 << '\n';
+    }
+
+    for (const unsigned scenario_kind : {0U, 1U, 2U, 3U, 4U}) {
+        for (const bool polyphonic : {false, true}) {
+            auto scenario = defaultCompositeTimbre();
+            if (scenario_kind == 0) {
+                const auto opll = scenario.layers.back();
+                scenario.layers = {opll};
+            }
+            for (auto& layer : scenario.layers) {
+                seedDefaultLayerTimbre(scenario, layer);
+                layer.volume_envelope.kind = EnvelopeKind::Sequence;
+                layer.volume_envelope.events = {{.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0}};
+                layer.envelope_timeline.length_counts = 32;
+                layer.envelope_timeline.loop_start_count = 0;
+                layer.envelope_timeline.loop_end_count = 32;
+            }
+            if (scenario_kind == 2) {
+                auto& layer = scenario.layers.back();
+                layer.timbre_automation = {
+                    {.kind = EnvelopeEventKind::Timbre, .value = 1, .count = 8, .timbre_pick = TimbrePick::OpllRom},
+                    {.kind = EnvelopeEventKind::Timbre, .value = 4, .count = 16, .timbre_pick = TimbrePick::OpllRom}};
+                REQUIRE_EQ(layerEnvelopeHasPatchSlide(layer), true);
+            }
+            if (scenario_kind == 3) {
+                auto& layer = scenario.layers[1];
+                auto destination = *layer.base_timbre;
+                destination.library_id = allocateCompositeOwnedTimbreId(scenario);
+                for (std::size_t i = 0; i < destination.scc_waveform.size(); ++i)
+                    destination.scc_waveform[i] = static_cast<std::uint8_t>(i < 16 ? 100 : -100);
+                scenario.embedded_timbres.push_back(destination);
+                layer.timbre_automation = {{.kind = EnvelopeEventKind::Timbre, .count = 16,
+                    .target_library_id = destination.library_id,
+                    .scc_morph = {.enabled = true, .intermediate_count = 2,
+                        .distribution_mode = SccMorphDistributionMode::TimeDistribution}}};
+            }
+            for (unsigned mode = 0; mode < 3; ++mode) {
+                RealtimeEngineHost host;
+                host.setOpllScopeEnabled(mode != 0);
+                auto edit = host.beginProgramEdit();
+                REQUIRE_EQ(edit.valid(), true);
+                REQUIRE_EQ(compileCompositeProgram(*edit.engine, scenario, {.polyphonic = polyphonic}, &plan), true);
+                REQUIRE_EQ(host.submitProgram(edit), true);
+                std::array<float, 512> output{};
+                REQUIRE_EQ(host.render(output).ok(), true);
+                auto captured = std::make_unique<OpllScopeFrame>();
+                while (host.pollOpllScope(*captured)) {}
+                const auto voices = polyphonic ? 2U : 1U;
+                for (unsigned voice = 0; voice < voices; ++voice) {
+                    if (mode == 2 && voice + 1 == voices) {
+                        std::uint32_t mask{};
+                        for (const auto& binding : plan.audible_layers)
+                            mask |= 1U << plan.physicalTrack(binding, static_cast<std::uint8_t>(voice));
+                        REQUIRE_EQ(host.setScopeSelection(mask, 1), true);
+                    }
+                    for (const auto& binding : plan.audible_layers)
+                        REQUIRE_EQ(host.submit(EngineCommand::noteOn(plan.physicalTrack(binding, static_cast<std::uint8_t>(voice)),
+                            static_cast<std::uint8_t>(voice == 0 ? 60 : 67))), true);
+                }
+                for (int block = 0; block < 8; ++block) {
+                    REQUIRE_EQ(host.render(output).ok(), true);
+                    while (host.pollOpllScope(*captured)) {}
+                }
+                std::vector<double> render_times;
+                std::vector<double> transfer_times;
+                render_times.reserve(128); transfer_times.reserve(128);
+                std::uint32_t transfers{};
+                const int blocks = scenario_kind == 4 ? 200 : 128;
+                render_times.reserve(blocks); transfer_times.reserve(blocks);
+                for (int block = 0; block < blocks; ++block) {
+                    if (scenario_kind == 4 && block == 180) {
+                        for (unsigned voice = 0; voice < voices; ++voice)
+                            for (const auto& binding : plan.audible_layers)
+                                REQUIRE_EQ(host.submit(EngineCommand::noteOff(
+                                    plan.physicalTrack(binding, static_cast<std::uint8_t>(voice)))), true);
+                    }
+                    const auto start = std::chrono::steady_clock::now();
+                    const auto result = host.render(output);
+                    const auto rendered = std::chrono::steady_clock::now();
+                    while (host.pollOpllScope(*captured)) ++transfers;
+                    const auto copied = std::chrono::steady_clock::now();
+                    REQUIRE_EQ(result.ok(), true);
+                    render_times.push_back(std::chrono::duration<double, std::micro>(rendered - start).count());
+                    transfer_times.push_back(std::chrono::duration<double, std::micro>(copied - rendered).count());
+                }
+                const auto transfer_total = std::accumulate(transfer_times.begin(), transfer_times.end(), 0.0);
+                const auto render_total = std::accumulate(render_times.begin(), render_times.end(), 0.0);
+                std::sort(render_times.begin(), render_times.end());
+                const auto scenario_name = std::array{"opll", "composite", "rom_patchslide", "scc_morph", "one_second_preview"}[scenario_kind];
+                std::cout << "scope_host_benchmark scenario=" << scenario_name
+                    << " voices=" << voices << " mode=" << mode << " frames=256 blocks=" << blocks
+                    << " render_mean_us=" << render_total / blocks
+                    << " render_p95_us=" << render_times[(blocks * 95 + 99) / 100 - 1]
+                    << " render_p99_us=" << render_times[(blocks * 99 + 99) / 100 - 1]
+                    << " poll_mean_us=" << transfer_total / blocks << " transferred=" << transfers
+                    << " queue_drops=" << host.scopeDroppedFrames() << '\n';
+                REQUIRE_EQ(host.scopeDroppedFrames(), 0ULL);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -11232,6 +11917,19 @@ int main(int argc, char** argv) {
             ? 0 : 1;
     }
     const std::vector<std::pair<std::string, std::function<void()>>> tests{
+        {"ScopePlaybackPositionObservesCommandsAndLoop", testScopePlaybackPositionObservesCommandsAndLoop},
+        {"ScopeAuthoredRampCountMapping", testScopeAuthoredRampCountMapping},
+        {"ScopeTerminalHoldReachesAuthoredEnd", testScopeTerminalHoldReachesAuthoredEnd},
+        {"ScopeTerminalHoldStopsAtBudgetPrefix", testScopeTerminalHoldStopsAtBudgetPrefix},
+        {"ScopeShortSplitAndImportedRampPositions", testScopeShortSplitAndImportedRampPositions},
+        {"ScopeOpllPolyMixAndReleaseMatchesAudibleBus", testScopeOpllPolyMixAndReleaseMatchesAudibleBus},
+        {"ScopeSelectedChannelsPreserveMixAndIndependentOutputs", testScopeSelectedChannelsPreserveMixAndIndependentOutputs},
+        {"ScopeSelectionWaitsForActualNoteAndRetainsRelease", testScopeSelectionWaitsForActualNoteAndRetainsRelease},
+        {"ScopeProgramEpochAcrossSlotReuseAndReset", testScopeProgramEpochAcrossSlotReuseAndReset},
+        {"ScopeRetriggerMidTickExcludesPreviousPhysicalVoice", testScopeRetriggerMidTickExcludesPreviousPhysicalVoice},
+        {"ScopeCaptureRestartDiscardsPartialWindow", testScopeCaptureRestartDiscardsPartialWindow},
+        {"ScopeLongCallbacksPreservePcmAndEveryWindow", testScopeLongCallbacksPreservePcmAndEveryWindow},
+        {"ScopeCaptureControlledCostBenchmark", testScopeCaptureControlledCostBenchmark},
         {"TickClockSplitsVariableCallbacks", testTickClockSplitsVariableCallbacks},
         {"AdjacentVolumesAreOneTickApart", testAdjacentVolumesAreOneTickApart},
         {"FourCountHoldsCompat", testFourCountHoldsCompat},

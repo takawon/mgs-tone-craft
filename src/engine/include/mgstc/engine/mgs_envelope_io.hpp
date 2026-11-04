@@ -30,6 +30,7 @@ struct MgsEnvelopeFormatResult {
     std::string body;
     std::size_t compiled_bytes{};
     std::vector<std::uint8_t> bytecode;
+    std::vector<std::uint32_t> playback_counts;
     std::vector<MgsEnvelopeIssue> issues;
     // First excluded execution count when the complete stream exceeds the
     // byte budget. The generated definition/bytecode is a valid prefix.

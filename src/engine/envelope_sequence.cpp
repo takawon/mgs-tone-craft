@@ -9,8 +9,10 @@ namespace mgstc::engine {
 
 SequenceEnvelopeRuntime::SequenceEnvelopeRuntime(
     std::vector<std::uint8_t> bytecode,
-    bool emit_volume_events)
+    bool emit_volume_events,
+    std::vector<std::uint32_t> display_counts)
     : bytecode_(std::move(bytecode)),
+      display_counts_(std::move(display_counts)),
       emit_volume_events_(emit_volume_events) {}
 
 void SequenceEnvelopeRuntime::resetForKeyOn() noexcept {
@@ -20,6 +22,18 @@ void SequenceEnvelopeRuntime::resetForKeyOn() noexcept {
     loop_position_ = 0;
     volume_ = 0;
     tick_ = 0;
+    display_tick_ = 0;
+    display_loop_tick_ = 0;
+    display_started_ = false;
+    display_finished_ = false;
+}
+
+EnvelopePlaybackPosition SequenceEnvelopeRuntime::playbackPosition() const noexcept {
+    if (!display_started_ || display_finished_) return {};
+    const auto count = display_counts_.empty()
+        ? static_cast<std::uint32_t>(display_tick_)
+        : display_counts_[std::min(display_tick_, display_counts_.size() - 1)];
+    return {count, true};
 }
 
 void SequenceEnvelopeRuntime::resetForKeyOn(
@@ -90,6 +104,8 @@ bool SequenceEnvelopeRuntime::readByte(std::uint8_t& value) noexcept {
 SequenceError SequenceEnvelopeRuntime::processTick(
     EventBuffer& output,
     std::size_t instruction_budget) {
+    if (display_started_ && !display_finished_) ++display_tick_;
+    display_started_ = true;
     if (wait_ != 0) {
         if (ramp_total_ != 0) {
             const auto numerator = static_cast<std::uint8_t>(
@@ -121,6 +137,11 @@ SequenceError SequenceEnvelopeRuntime::processTick(
         }
 
         if (position_ == bytecode_.size()) {
+            // The final volume may be serialized as one held letter. Keep
+            // observing actual runtime ticks through its authored END without
+            // expanding the audio program or delaying any command.
+            display_finished_ = display_counts_.empty()
+                || display_tick_ >= display_counts_.size();
             if (!emit(output, MeaningEventKind::Volume, volume_)) {
                 return SequenceError::EventBufferOverflow;
             }
@@ -204,11 +225,13 @@ SequenceError SequenceEnvelopeRuntime::processTick(
 
         if (opcode == 0x40) {
             loop_position_ = position_;
+            display_loop_tick_ = display_tick_;
             continue;
         }
 
         if (opcode == 0x60) {
             position_ = loop_position_;
+            display_tick_ = display_loop_tick_;
             continue;
         }
 

@@ -14,6 +14,7 @@ struct CompositeEnvelopePrograms {
     std::vector<std::uint8_t> volume;
     std::vector<std::uint8_t> pitch;
     std::vector<std::uint8_t> timbre;
+    std::vector<std::uint32_t> playback_counts;
 };
 
 enum class CompositeEnvelopeLane : std::uint8_t {
