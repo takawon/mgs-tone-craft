@@ -28,6 +28,7 @@ public:
     ~MgstcAudioProcessorEditor() override;
 
     void resized() override;
+    void childBoundsChanged(juce::Component* child) override;
     void focusGained(juce::Component::FocusChangeType cause) override;
     void focusOfChildComponentChanged(juce::Component::FocusChangeType cause) override;
     [[nodiscard]] mgstc::engine::CompositeTimbre copyWorkingComposite() const;
@@ -65,6 +66,7 @@ private:
     std::uint8_t spectrogram_source_mask_{};
     std::uint8_t spectrogram_input_target_{};
     bool notifying_libraries_{};
+    bool applying_host_bounds_{};
     mgstc::app::LibraryFileFingerprint library_fingerprint_;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MgstcAudioProcessorEditor)

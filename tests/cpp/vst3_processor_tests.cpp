@@ -3854,6 +3854,153 @@ void renderMidiNote(
     processor.processBlock(out, on);
 }
 
+struct ParameterProbeListener final : juce::AudioProcessorParameter::Listener {
+    void parameterValueChanged(int, float value) override {
+        last_value.store(value, std::memory_order_relaxed);
+        value_changes.fetch_add(1, std::memory_order_relaxed);
+    }
+    void parameterGestureChanged(int, bool starting) override {
+        if (starting) starts.fetch_add(1, std::memory_order_relaxed);
+        else ends.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::atomic<float> last_value{0.0F};
+    std::atomic<int> value_changes{0};
+    std::atomic<int> starts{0};
+    std::atomic<int> ends{0};
+};
+
+void testProgramAutomationTechnicalProbes() {
+    // A test-only JUCE parameter attached to a fixture processor, so JUCE
+    // supplies a valid parameter index for gesture notifications. This does
+    // not verify the VST3 wrapper/controller or Cubase behavior.
+    MgstcAudioProcessor parameter_fixture;
+    parameter_fixture.addParameter(new juce::AudioParameterFloat(
+        juce::ParameterID{"mgstc_probe_gain", 1}, "Probe Gain",
+        juce::NormalisableRange<float>{0.0F, 2.0F}, 1.0F));
+    auto* parameter = dynamic_cast<juce::AudioParameterFloat*>(
+        parameter_fixture.getParameters()[0]);
+    require(parameter != nullptr, "JUCE fixture owns the fixed-ID float parameter");
+    ParameterProbeListener listener;
+    parameter->addListener(&listener);
+    require(std::abs(static_cast<juce::AudioProcessorParameter&>(*parameter).getValue()
+                         - 0.5F) < 0.0001F,
+        "JUCE probe default normalized value");
+    parameter->beginChangeGesture();
+    parameter->setValueNotifyingHost(0.25F);
+    parameter->endChangeGesture();
+    require(std::abs(parameter->get() - 0.5F) < 0.0001F,
+        "JUCE probe normalized-to-plain mapping");
+    require(listener.starts.load() == 1 && listener.ends.load() == 1
+        && listener.value_changes.load() == 1,
+        "JUCE probe listener receives gesture and value notifications");
+    require(std::abs(listener.last_value.load() - 0.25F) < 0.0001F,
+        "JUCE probe listener receives normalized value");
+    std::atomic<bool> reading{true};
+    std::atomic<bool> invalid_read{false};
+    std::atomic<bool> reader_ready{false};
+    std::atomic<int> read_count{0};
+    std::thread audio_reader([&] {
+        while (reading.load(std::memory_order_relaxed)) {
+            const auto value = parameter->get();
+            read_count.fetch_add(1, std::memory_order_relaxed);
+            if (!std::isfinite(value) || value < 0.0F || value > 2.0F)
+                invalid_read.store(true, std::memory_order_relaxed);
+            reader_ready.store(true, std::memory_order_release);
+        }
+    });
+    while (!reader_ready.load(std::memory_order_acquire))
+        std::this_thread::yield();
+    for (int i = 0; i < 1000; ++i)
+        parameter->setValueNotifyingHost(static_cast<float>(i % 101) / 100.0F);
+    reading.store(false, std::memory_order_relaxed);
+    audio_reader.join();
+    require(read_count.load() > 0 && !invalid_read.load(),
+        "JUCE parameter plain value remains readable during concurrent updates");
+    parameter->removeListener(&listener);
+
+    MgstcAudioProcessor current_processor;
+    require(current_processor.getNumPrograms() == 1
+        && current_processor.getCurrentProgram() == 0
+        && current_processor.getProgramName(0) == "Default",
+        "current legacy JUCE program API exposes only Default");
+    require(current_processor.getParameters().size() == 0,
+        "current product processor exposes no JUCE parameters");
+
+    using namespace mgstc::engine;
+    auto one_layer = defaultCompositeTimbre();
+    one_layer.layers = {one_layer.layers.front()};
+    auto seventeen_layers = one_layer;
+    seventeen_layers.layers.clear();
+    constexpr std::array<TimbreSource, 3> sources{
+        TimbreSource::Psg, TimbreSource::Scc, TimbreSource::Opll};
+    std::array<int, 3> used{};
+    for (int i = 0; i < 17; ++i) {
+        auto layer = one_layer.layers.front();
+        const auto kind = static_cast<std::size_t>(i < 3 ? 0 : (i < 8 ? 1 : 2));
+        layer.source = sources[kind];
+        layer.channel = static_cast<std::uint8_t>(used[kind]++);
+        layer.name = "Probe layer " + std::to_string(i);
+        seedDefaultLayerTimbre(layer);
+        seventeen_layers.layers.push_back(std::move(layer));
+    }
+    const auto measure_compile = [](const CompositeTimbre& timbre) {
+        auto core = std::make_unique<EngineCore>();
+        CompositePlaybackPlan plan;
+        const auto start = std::chrono::steady_clock::now();
+        const bool ok = compileCompositeProgram(*core, timbre, {}, &plan);
+        const auto elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        return std::pair{ok, elapsed};
+    };
+    const auto one_result = measure_compile(one_layer);
+    const auto seventeen_result = measure_compile(seventeen_layers);
+    std::printf("TECH-PROBE compile layers=1 ok=%d ms=%.3f sizeof(EngineCore)=%zu sizeof(CompositePlaybackPlan)=%zu\n",
+        one_result.first ? 1 : 0, one_result.second,
+        sizeof(EngineCore), sizeof(CompositePlaybackPlan));
+    std::printf("TECH-PROBE compile layers=17 ok=%d ms=%.3f\n",
+        seventeen_result.first ? 1 : 0, seventeen_result.second);
+    require(one_result.first, "one-layer compile timing probe compiles");
+    require(seventeen_result.first, "seventeen-layer compile timing probe compiles");
+
+    auto sound_a = defaultCompositeTimbre();
+    auto sound_b = sound_a;
+    sound_b.layers.front().volume = 7;
+    const auto render_with_message = [](const CompositeTimbre& sound, bool pc) {
+        MgstcAudioProcessor processor;
+        mgstc::plugin::PluginStateDocument document;
+        document.sound = sound;
+        require(processor.replacePluginState(std::move(document)),
+            "load distinct program-change probe composite");
+        constexpr int block_size = 2048;
+        processor.prepareToPlay(48'000.0, block_size);
+        juce::AudioBuffer<float> warm(2, block_size);
+        juce::MidiBuffer empty;
+        processor.processBlock(warm, empty);
+        juce::MidiBuffer midi;
+        if (pc) midi.addEvent(juce::MidiMessage::programChange(1, 1), 0);
+        midi.addEvent(juce::MidiMessage::noteOn(1, 60,
+            static_cast<juce::uint8>(100)), 0);
+        juce::AudioBuffer<float> rendered(2, block_size);
+        processor.processBlock(rendered, midi);
+        return rendered;
+    };
+    for (const auto* sound : {&sound_a, &sound_b}) {
+        const auto control = render_with_message(*sound, false);
+        const auto with_pc = render_with_message(*sound, true);
+        require(bufferAllFinite(control) && bufferAllFinite(with_pc),
+            "raw Program Change probe renders finite PCM");
+        require(std::any_of(control.getReadPointer(0),
+                            control.getReadPointer(0) + control.getNumSamples(),
+                            [](float sample) { return std::abs(sample) > 1.0e-7F; }),
+            "raw Program Change probe Note On produces audible nonzero PCM");
+        require(sameBuffer(control, with_pc),
+            "raw MIDI Program Change is ignored for this current composite");
+    }
+    require(!sameBuffer(render_with_message(sound_a, false),
+                        render_with_message(sound_b, false)),
+        "two probe composites produce distinguishable PCM");
+}
+
 juce::AudioBuffer<float> renderEngineCoreMidiNote(
     const mgstc::engine::CompositeTimbre& timbre,
     int total_frames) {
@@ -8590,6 +8737,7 @@ int main() {
         testAllSoundOffCancelsPending();
         testLifecycleResetDropsPending();
         testProgramResetDropsPending();
+        testProgramAutomationTechnicalProbes();
         testOverdueMappedEventsKeepOrderAndDoNotStick();
         testExactFrameStillConsumedAndFutureStaysQueued();
         testOverdueThenSameFrameKeepsQueueOrder();

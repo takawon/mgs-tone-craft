@@ -41,6 +41,8 @@ constexpr int toolbarH = 44;
 
 constexpr int editorWindowW = 1600;
 constexpr int editorWindowH = 1050;
+constexpr int launcherCardSize = 190;
+constexpr int launcherIconSize = 100;
 constexpr int libraryWidth = 360;
 constexpr int libraryTitleH = 30;
 constexpr int libraryMemoH = 80;
@@ -166,6 +168,8 @@ inline int toolbarH = Base::toolbarH;
 
 inline int editorWindowW = Base::editorWindowW;
 inline int editorWindowH = Base::editorWindowH;
+inline int launcherCardSize = Base::launcherCardSize;
+inline int launcherIconSize = Base::launcherIconSize;
 inline int libraryWidth = Base::libraryWidth;
 inline int libraryTitleH = Base::libraryTitleH;
 inline int libraryMemoH = Base::libraryMemoH;
@@ -346,6 +350,8 @@ inline void applyScale(float factor) {
     toolbarH = s(Base::toolbarH);
     editorWindowW = s(Base::editorWindowW);
     editorWindowH = s(Base::editorWindowH);
+    launcherCardSize = s(Base::launcherCardSize);
+    launcherIconSize = s(Base::launcherIconSize);
     libraryWidth = s(Base::libraryWidth);
     libraryTitleH = s(Base::libraryTitleH);
     libraryMemoH = s(Base::libraryMemoH);

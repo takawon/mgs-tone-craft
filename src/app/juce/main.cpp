@@ -96,6 +96,7 @@
 #include "editor_session.hpp"
 #include "scope_frame_distributor.hpp"
 #include "mgstc_editor_view.hpp"
+#include "launcher_window.hpp"
 
 // Supplied by CMake from the SPECIFICATION.md document version.
 #ifndef MGSTC_DOC_VERSION
@@ -1740,6 +1741,7 @@ public:
                     std::move(libraries_changed)), true);
         }
         setResizable(true, false);
+        updateEditorWindowMinimumWidth(*this);
         centreWithSize(getWidth(), getHeight());
         clampWindowToDisplayWorkArea(*this);
         setWantsKeyboardFocus(true);
@@ -2399,6 +2401,8 @@ public:
             }
         }
         UiScale::loadGlobalFromIni();
+        if (startup_policy_.isolated && arguments.containsOption("--capture-scale"))
+            UiScale::setGlobalPercent(arguments.getValueForOption("--capture-scale").getIntValue(), false);
         juce::LookAndFeel::setDefaultLookAndFeel(&look_and_feel_);
         if (arguments.containsOption("--verify-composite-workspace")) {
             const auto directory = juce::File::getCurrentWorkingDirectory()
@@ -2437,6 +2441,7 @@ public:
         stopTimer();
         hang_watchdog_.stop();
         snapshot_window_ = nullptr;
+        launcher_window_.reset();
         spectrogram_window_.reset();
         library_manager_window_.reset();
         opll_envelope_window_.reset();
@@ -2474,6 +2479,30 @@ private:
         editor_session_ = std::make_unique<StandaloneEditorContext>(
             *audio_service_, *midi_service_);
         wireCompositeOwnedAuditionCallbacks();
+        if (arguments.containsOption("--verify-launcher") || arguments.containsOption("--verify-editor-close")) {
+            launcher_verify_last_editor_close_ = arguments.containsOption("--verify-editor-close");
+            setApplicationReturnValue(1);
+            launcher_verify_index_ = 0;
+            launcher_verify_phase_ = 0;
+            showLauncher();
+            startTimer(100);
+            return;
+        }
+        const bool capture_launcher = snapshot_target == "launcher";
+        if (capture_launcher || (command_line.trim().isEmpty())) {
+            if (capture_launcher && arguments.containsOption("--capture-scale"))
+                UiScale::setGlobalPercent(arguments.getValueForOption("--capture-scale").getIntValue(), false);
+            showLauncher();
+            if (capture_launcher) {
+                const auto path = arguments.getValueForOption("--capture-ui");
+                const auto result = juce::File::isAbsolutePath(path)
+                    ? writeComponentPngSnapshot(*launcher_window_->getContentComponent(), juce::File(path))
+                    : SnapshotResult::InvalidPath;
+                setApplicationReturnValue(static_cast<int>(result));
+                quit();
+            }
+            return;
+        }
         auto requested_editor =
             arguments.getValueForOption("--editor");
         if (requested_editor.isEmpty()) {
@@ -2548,6 +2577,8 @@ private:
                 capture_target = "editor";
             }
             snapshot_target_ = capture_target;
+            if (arguments.containsOption("--capture-width"))
+                snapshot_window_->setSize(arguments.getValueForOption("--capture-width").getIntValue(), snapshot_window_->getHeight());
             if (snapshot_target_ == "spectrogram" || snapshot_target_ == "spectrum") {
                 showSpectrogram();
                 spectrogram_window_->setSpectrumMode(snapshot_target_ == "spectrum");
@@ -2569,6 +2600,216 @@ private:
     }
 
     static constexpr int kMaxActivationPasses = 8;
+
+    void showLauncher() {
+        UiScale::forceGlobalForNonEditorUi();
+        launcher_window_ = std::make_unique<mgstc::app::LauncherWindow>(
+            *editor_session_, [this](const juce::String& target) {
+                // Defer destruction until the Button callback has returned.
+                juce::MessageManager::callAsync([this, target] {
+                    if (launcher_window_ == nullptr) return;
+                    primary_editor_ = target;
+                    snapshot_window_ = showEditor(target);
+                    launcher_window_.reset();
+                });
+            }, [this] {
+                juce::MessageManager::callAsync([this] {
+                    launcher_window_.reset();
+                    if (!anyEditorVisible()) quit();
+                });
+            });
+    }
+
+    void verifyLauncherStep() {
+        const auto fail = [this] {
+            juce::String state = "FAIL phase=" + juce::String(launcher_verify_phase_)
+                + " card=" + juce::String(launcher_verify_index_)
+                + " navigation=" + juce::String(launcher_navigation_index_)
+                + " launcher=" + juce::String(launcher_window_ != nullptr ? 1 : 0) + "\n";
+            for (auto* window : {main_window_.get(), opll_window_.get(), scc_window_.get()})
+                if (window) state += window->getName() + " visible=" + juce::String(window->isVisible() ? 1 : 0)
+                    + " minimised=" + juce::String(window->isMinimised() ? 1 : 0)
+                    + " bounds=" + window->getBounds().toString() + "\n";
+            juce::File::getCurrentWorkingDirectory().getChildFile("launcher-verification.txt")
+                .replaceWithText(state);
+            stopTimer(); setApplicationReturnValue(1); quit();
+        };
+        const std::array<juce::String, 3> targets{"main", "opll", "scc"};
+        const auto awaiting_command = [this] {
+            return juce::Time::getMillisecondCounterHiRes() - launcher_action_started_ms_ < 5000.0;
+        };
+        if (launcher_verify_phase_ == 6) {
+            windowSlot(targets[static_cast<std::size_t>(launcher_close_editor_index_)])->closeButtonPressed();
+            launcher_action_started_ms_ = juce::Time::getMillisecondCounterHiRes();
+            launcher_verify_phase_ = 7;
+            return;
+        }
+        if (launcher_verify_phase_ == 7) {
+            const auto& target = targets[static_cast<std::size_t>(launcher_close_editor_index_)];
+            auto* original = windowSlot(target).get();
+            if (original->isVisible()) {
+                if (!awaiting_command()) fail();
+                return;
+            }
+            for (const auto& other : targets)
+                if (other != target && !windowSlot(other)->isVisible()) { fail(); return; }
+            if (juce::MessageManager::getInstance()->hasStopMessageBeenSent()
+                || showEditor(target) != original) { fail(); return; }
+            if (++launcher_close_editor_index_ < 3) {
+                launcher_verify_phase_ = 6;
+                return;
+            }
+            launcher_verify_phase_ = 8;
+        }
+        if (launcher_verify_phase_ == 3) {
+            for (int i = 0; i < 3; ++i)
+                windowSlot(targets[static_cast<std::size_t>(i)])->setVisible(i == launcher_navigation_index_);
+            int count = 0;
+            std::function<void(juce::Component&)> dispatch = [&](juce::Component& component) {
+                for (auto* child : component.getChildren()) {
+                    if (auto* button = dynamic_cast<mgstc::app::EditorNavigationButton*>(child);
+                        button && button->isVisible() && button->isEnabled()) {
+                        ++count;
+                        button->triggerClick();
+                    } else dispatch(*child);
+                }
+            };
+            dispatch(*windowSlot(targets[static_cast<std::size_t>(launcher_navigation_index_)]));
+            if (count != 2) { fail(); return; }
+            launcher_action_started_ms_ = juce::Time::getMillisecondCounterHiRes();
+            launcher_verify_phase_ = 4;
+            return;
+        }
+        if (launcher_verify_phase_ == 4) {
+            if (!main_window_->isVisible() || !opll_window_->isVisible() || !scc_window_->isVisible()) {
+                if (!awaiting_command()) fail();
+                return;
+            }
+            if (++launcher_navigation_index_ < 3) { launcher_verify_phase_ = 3; return; }
+            primary_editor_ = "main";
+            launcher_verify_phase_ = 6;
+            return;
+        }
+        if (launcher_verify_phase_ == 8) {
+            launcher_verify_phase_ = 5;
+            for (const auto& target : targets) windowSlot(target)->setVisible(false);
+            if (launcher_verify_last_editor_close_) {
+                static_cast<void>(showEditor("main"));
+                main_window_->closeButtonPressed();
+            } else {
+                showLauncher();
+                launcher_window_->closeButtonPressed();
+            }
+            launcher_action_started_ms_ = juce::Time::getMillisecondCounterHiRes();
+            juce::File::getCurrentWorkingDirectory().getChildFile("launcher-verification.txt")
+                .replaceWithText("PASS: settings, key dispatch, cards, scale, minimum width, restore/reuse, six navigation actions, independent editor close, orderly shutdown\n");
+            // closeButtonPressed queues orderly quit; next tick is failure.
+            setApplicationReturnValue(0);
+            return;
+        }
+        if (launcher_verify_phase_ == 5) {
+            // JUCE posts a quit message; timer messages already in the queue
+            // may still run before the dispatch loop consumes that message.
+            if (!launcher_window_ && (launcher_verify_last_editor_close_ || !anyEditorVisible())
+                && juce::MessageManager::getInstance()->hasStopMessageBeenSent()) {
+                stopTimer();
+                return;
+            }
+            if (!awaiting_command()) fail();
+            return;
+        }
+        if (launcher_verify_phase_ == 0) {
+            if (!launcher_window_ || anyEditorVisible()) { fail(); return; }
+            auto* content = dynamic_cast<mgstc::app::LauncherContent*>(launcher_window_->getContentComponent());
+            if (!content) { fail(); return; }
+            if (launcher_verify_index_ == 0 && !launcher_settings_verified_) {
+                content->settingsButton().triggerClick();
+                launcher_action_started_ms_ = juce::Time::getMillisecondCounterHiRes();
+                launcher_verify_phase_ = 2;
+                return;
+            }
+            for (int percent : UiScale::kSteps) {
+                UiScale::setGlobalPercent(percent, false);
+                if (content->card(0).getBounds().intersects(content->card(1).getBounds())
+                    || content->card(2).getRight() > content->getWidth()
+                    || content->card(0).getWidth() != UiLayout::launcherCardSize
+                    || content->card(0).getHeight() != UiLayout::launcherCardSize) { fail(); return; }
+            }
+            // Exercise focus traversal and real key handling before dispatch.
+            launcher_window_->toFront(true);
+            content->card(0).grabKeyboardFocus();
+            for (int i = 0; i < launcher_verify_index_; ++i) {
+                auto* focused = juce::Component::getCurrentlyFocusedComponent();
+                if (!focused) { fail(); return; }
+                focused->moveKeyboardFocusToSibling(true);
+            }
+            auto& card = content->card(launcher_verify_index_);
+            const juce::KeyPress key(launcher_verify_index_ == 1
+                ? juce::KeyPress::returnKey : juce::KeyPress::spaceKey);
+            if (!card.hasKeyboardFocus(false) || !card.keyPressed(key)) { fail(); return; }
+            if (launcher_verify_index_ != 1) static_cast<void>(card.keyPressed(key));
+            launcher_action_started_ms_ = juce::Time::getMillisecondCounterHiRes();
+            launcher_verify_phase_ = 1;
+            return;
+        }
+        if (launcher_verify_phase_ == 2) {
+            auto* modal = juce::Component::getCurrentlyModalComponent();
+            if (!modal) {
+                if (!awaiting_command()) fail();
+                return;
+            }
+            if (!launcher_window_ || anyEditorVisible()) { fail(); return; }
+            juce::ComboBox* scale = nullptr;
+            std::function<void(juce::Component&)> find_scale = [&](juce::Component& component) {
+                for (auto* child : component.getChildren()) {
+                    if (auto* combo = dynamic_cast<juce::ComboBox*>(child);
+                        combo && combo->getNumItems() == 3 && combo->getItemId(0) == 125
+                        && combo->getItemId(2) == 75) scale = combo;
+                    find_scale(*child);
+                }
+            };
+            find_scale(*modal);
+            if (!scale) { fail(); return; }
+            scale->setSelectedId(75, juce::sendNotificationSync);
+            const auto ini = UiScale::settingsIniFile();
+            if (UiScale::global_percent != 75 || !ini.loadFileAsString().contains("UiScalePercent=75")) { fail(); return; }
+            modal->exitModalState(0);
+            launcher_settings_verified_ = true;
+            launcher_verify_phase_ = 0;
+            return;
+        }
+        auto& window = windowSlot(targets[static_cast<std::size_t>(launcher_verify_index_)]);
+        if (launcher_window_) {
+            if (!awaiting_command()) fail();
+            return;
+        }
+        if (launcher_window_ || !window || !window->isVisible()) { fail(); return; }
+        auto* original = window.get();
+        const auto bounds = window->getBounds();
+        window->setBoundsConstrained(bounds.withWidth(1));
+        if (window->getWidth() < mgstc::app::minimumEditorHeaderWidth()) { fail(); return; }
+        window->setBounds(bounds);
+        window->setMinimised(true);
+        if (showEditor(targets[static_cast<std::size_t>(launcher_verify_index_)]) != original
+            || window->isMinimised() || window->getBounds() != bounds) { fail(); return; }
+        window->setVisible(false);
+        if (++launcher_verify_index_ < 3) {
+            launcher_verify_phase_ = 0;
+            showLauncher();
+            return;
+        }
+        for (const auto& target : targets) static_cast<void>(showEditor(target));
+        const bool all_visible = main_window_->isVisible() && scc_window_->isVisible() && opll_window_->isVisible();
+        if (!all_visible) { fail(); return; }
+        launcher_verify_phase_ = 3;
+    }
+
+    bool anyEditorVisible() const {
+        for (auto* window : {main_window_.get(), scc_window_.get(), opll_window_.get(),
+                            scc_envelope_window_.get(), opll_envelope_window_.get()})
+            if (window != nullptr && window->isVisible()) return true;
+        return false;
+    }
 
     [[nodiscard]] static juce::String canonicalEditor(
         const juce::String& editor) {
@@ -2707,7 +2948,7 @@ private:
         }
         // Create or re-show: size from this window's effective scale (global
         // unless it already has its own Ctrl± session override).
-        if (created || bring_to_front) {
+        if (created || !window->isVisible()) {
             window->applyPreferredSizeForEffectiveScale();
         }
         if (created || bring_to_front || active_editor_ != editor) {
@@ -2724,7 +2965,9 @@ private:
         // layout or DPI may have changed while the window was hidden.
         clampWindowToDisplayWorkArea(*window);
         window->setVisible(true);
+        updateEditorWindowMinimumWidth(*window);
         if (bring_to_front) {
+            window->setMinimised(false);
             window->toFront(true);
             window->grabKeyboardFocus();
         }
@@ -3182,11 +3425,16 @@ private:
 
     void closeEditor(const juce::String& requested_editor) {
         const auto editor = canonicalEditor(requested_editor);
-        if (editor == primary_editor_) {
+        auto& window = windowSlot(editor);
+        if (window == nullptr) return;
+        bool other_visible = false;
+        for (auto* other : {main_window_.get(), scc_window_.get(), opll_window_.get(),
+                           scc_envelope_window_.get(), opll_envelope_window_.get()})
+            if (other != nullptr && other != window.get() && other->isVisible()) other_visible = true;
+        if (!other_visible && !launcher_window_) {
             requestApplicationQuit();
             return;
         }
-        auto& window = windowSlot(editor);
         if (window == nullptr || !window->hasUnsavedChanges()
             || editor == "scc-envelope" || editor == "opll-envelope") {
             if (window != nullptr) {
@@ -3259,6 +3507,12 @@ private:
         }
 
         close_confirmation_pending_ = true;
+        juce::Component* confirmation_owner = launcher_window_.get();
+        for (auto* candidate : {main_window_.get(), scc_window_.get(), opll_window_.get(),
+                                scc_envelope_window_.get(), opll_envelope_window_.get()})
+            if (candidate != nullptr && candidate->isVisible()) confirmation_owner = candidate;
+        if (auto& active = windowSlot(active_editor_); active != nullptr && active->isVisible())
+            confirmation_owner = active.get();
         showAlertWhenMouseReleased(
             juce::MessageBoxOptions()
                 .withIconType(
@@ -3275,10 +3529,7 @@ private:
                     juce::String::fromUTF8("保存せず終了"))
                 .withButton(
                     juce::String::fromUTF8("キャンセル"))
-                .withAssociatedComponent(
-                    main_window_ != nullptr
-                        ? main_window_.get()
-                        : snapshot_window_),
+                .withAssociatedComponent(confirmation_owner),
             [this](int result) {
                 close_confirmation_pending_ = false;
                 if (result == 1) {
@@ -3355,6 +3606,10 @@ private:
     }
 
     void timerCallback() override {
+        if (launcher_verify_index_ >= 0) {
+            verifyLauncherStep();
+            return;
+        }
         if (startup_policy_.verify_native_window) {
             const auto elapsed = juce::Time::getMillisecondCounterHiRes() - startup_verify_started_ms_;
             const bool window_painted = snapshot_window_ && snapshot_window_->getPeer()
@@ -3486,6 +3741,14 @@ private:
     }
 
     std::unique_ptr<MainWindow> main_window_;
+    std::unique_ptr<mgstc::app::LauncherWindow> launcher_window_;
+    int launcher_verify_index_{-1};
+    int launcher_verify_phase_{};
+    bool launcher_settings_verified_{};
+    int launcher_navigation_index_{};
+    int launcher_close_editor_index_{};
+    bool launcher_verify_last_editor_close_{};
+    double launcher_action_started_ms_{};
     std::unique_ptr<MainWindow> scc_window_;
     std::unique_ptr<MainWindow> opll_window_;
     std::unique_ptr<MainWindow> scc_envelope_window_;

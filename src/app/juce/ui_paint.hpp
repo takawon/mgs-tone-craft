@@ -7,6 +7,7 @@
 #include "ui_layout.hpp"
 
 void clampWindowToDisplayWorkArea(juce::ResizableWindow& window);
+void updateEditorWindowMinimumWidth(juce::ResizableWindow& window);
 
 void applyScaledContentSize(
     juce::Component& content,

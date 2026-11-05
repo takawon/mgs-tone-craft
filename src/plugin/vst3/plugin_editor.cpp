@@ -166,7 +166,19 @@ MgstcAudioProcessorEditor::~MgstcAudioProcessorEditor() {
 
 void MgstcAudioProcessorEditor::resized() {
     if (composite_ != nullptr) {
+        const juce::ScopedValueSetter<bool> applying_host_bounds(
+            applying_host_bounds_, true);
         composite_->setBounds(getLocalBounds());
+    }
+}
+
+void MgstcAudioProcessorEditor::childBoundsChanged(juce::Component* child) {
+    juce::AudioProcessorEditor::childBoundsChanged(child);
+    if (child == composite_.get() && !applying_host_bounds_) {
+        // View and per-editor zoom resize the shared content. JUCE's VST3
+        // wrapper observes this editor, so forward the preferred size here
+        // to request the corresponding host frame size immediately.
+        setSize(child->getWidth(), child->getHeight());
     }
 }
 

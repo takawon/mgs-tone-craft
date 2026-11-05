@@ -354,6 +354,9 @@ if(WIN32)
             SOURCES
                 assets/MGSTC_logo.png
                 assets/mgstc_spin.gif
+                assets/launcher/composite_transparent_512.png
+                assets/launcher/opll_transparent_512.png
+                assets/launcher/scc_transparent_512.png
         )
 
         target_sources(
@@ -549,6 +552,25 @@ endif()
 
 if(MGSTC_BUILD_TESTS)
     enable_testing()
+    if(TARGET mgstc_vst3)
+        # Reuse the product's shared code and JUCE objects for UI integration tests.
+        function(mgstc_add_shared_ui_test target source)
+            add_executable(${target} ${source})
+            target_link_libraries(${target} PRIVATE mgstc_vst3)
+            target_include_directories(${target} PRIVATE
+                $<TARGET_PROPERTY:mgstc_vst3,INCLUDE_DIRECTORIES>)
+            target_compile_definitions(${target} PRIVATE
+                $<TARGET_PROPERTY:mgstc_vst3,COMPILE_DEFINITIONS>)
+            target_compile_features(${target} PRIVATE cxx_std_20)
+            if(MSVC)
+                target_compile_options(${target} PRIVATE /W4 /permissive- /EHsc /utf-8)
+            endif()
+            add_test(NAME ${target} COMMAND ${target})
+            set_tests_properties(${target} PROPERTIES TIMEOUT 120)
+        endfunction()
+        mgstc_add_shared_ui_test(mgstc_ui_header_tests tests/cpp/editor_header_layout_tests.cpp)
+        mgstc_add_shared_ui_test(mgstc_ui_vst3_scale_tests tests/cpp/vst3_editor_scale_tests.cpp)
+    endif()
     add_executable(mgstc_patchslide_stock_tests tests/cpp/patchslide_stock_tests.cpp)
     target_compile_features(mgstc_patchslide_stock_tests PRIVATE cxx_std_20)
     add_test(NAME mgstc_patchslide_stock_tests COMMAND mgstc_patchslide_stock_tests)
@@ -575,6 +597,30 @@ if(MGSTC_BUILD_TESTS)
     set_tests_properties(mgstc_startup_output_connection_tests PROPERTIES TIMEOUT 15)
 
     if(TARGET mgstc)
+        add_test(NAME mgstc_launcher_tests COMMAND mgstc --verify-launcher)
+        set_tests_properties(mgstc_launcher_tests PROPERTIES TIMEOUT 60)
+        add_test(NAME mgstc_launcher_editor_close_tests COMMAND mgstc --verify-editor-close)
+        set_tests_properties(mgstc_launcher_editor_close_tests PROPERTIES TIMEOUT 60)
+        foreach(_launcher_scale 75 100 125)
+            add_test(NAME mgstc_launcher_${_launcher_scale}_capture_tests COMMAND mgstc
+                "--capture-ui=${CMAKE_CURRENT_BINARY_DIR}/launcher-${_launcher_scale}.png"
+                --capture-target=launcher "--capture-scale=${_launcher_scale}")
+            set_tests_properties(mgstc_launcher_${_launcher_scale}_capture_tests PROPERTIES TIMEOUT 30)
+        endforeach()
+        foreach(_navigation_editor main opll scc)
+            foreach(_navigation_scale 75 100 125)
+                add_test(NAME mgstc_navigation_${_navigation_editor}_${_navigation_scale}_capture_tests COMMAND mgstc
+                    "--capture-ui=${CMAKE_CURRENT_BINARY_DIR}/navigation-${_navigation_editor}-${_navigation_scale}.png"
+                    "--editor=${_navigation_editor}" "--capture-scale=${_navigation_scale}")
+                set_tests_properties(mgstc_navigation_${_navigation_editor}_${_navigation_scale}_capture_tests PROPERTIES TIMEOUT 30)
+            endforeach()
+            foreach(_navigation_scale 100 125)
+                add_test(NAME mgstc_navigation_${_navigation_editor}_narrow_${_navigation_scale}_capture_tests COMMAND mgstc
+                    "--capture-ui=${CMAKE_CURRENT_BINARY_DIR}/navigation-${_navigation_editor}-narrow-${_navigation_scale}.png"
+                    "--editor=${_navigation_editor}" "--capture-scale=${_navigation_scale}" --capture-width=700)
+                set_tests_properties(mgstc_navigation_${_navigation_editor}_narrow_${_navigation_scale}_capture_tests PROPERTIES TIMEOUT 30)
+            endforeach()
+        endforeach()
         add_test(NAME mgstc_startup_smoke_tests COMMAND mgstc --verify-startup)
         set_tests_properties(mgstc_startup_smoke_tests PROPERTIES TIMEOUT 30)
         foreach(_settings_tab view midi output about)

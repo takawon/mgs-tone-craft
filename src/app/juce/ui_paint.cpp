@@ -3,6 +3,7 @@
 #include "ui_paint.hpp"
 
 #include "ui_fonts.hpp"
+#include "editor_header_layout.hpp"
 
 // Fit a top-level editor window entirely inside the target monitor work
 // area (taskbar excluded). Size/position are never written to settings INI.
@@ -100,6 +101,17 @@ void clampWindowToDisplayWorkArea(juce::ResizableWindow& window) {
     }
 }
 
+void updateEditorWindowMinimumWidth(juce::ResizableWindow& window) {
+    int frame_width = 0;
+    if (auto* peer = window.getPeer())
+        if (const auto frame = peer->getFrameSizeIfPresent())
+            frame_width = frame->getLeftAndRight();
+    const int content_border = window.getContentComponentBorder().getLeftAndRight();
+    if (auto* constraints = window.getConstrainer())
+        constraints->setMinimumWidth(mgstc::app::minimumEditorHeaderWidth()
+            + content_border + frame_width);
+}
+
 void applyScaledContentSize(
     juce::Component& content,
     int preferred_w,
@@ -114,6 +126,7 @@ void applyScaledContentSize(
     }
     if (auto* top = content.getTopLevelComponent()) {
         if (auto* window = dynamic_cast<juce::ResizableWindow*>(top)) {
+            updateEditorWindowMinimumWidth(*window);
             // Preferred size may exceed the work area; clamp keeps chrome visible.
             window->setSize(
                 juce::jmax(preferred_w, window->getWidth()),

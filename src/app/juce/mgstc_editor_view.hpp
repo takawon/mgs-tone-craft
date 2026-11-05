@@ -59,6 +59,8 @@
 #include "tag_ui.hpp"
 #include "opll_patch_ui.hpp"
 #include "editor_session.hpp"
+#include "editor_navigation_button.hpp"
+#include "editor_header_layout.hpp"
 #include "composite_timeline.hpp"
 #include "scope_waveform.hpp"
 #include "juce_utf8.hpp"
@@ -101,6 +103,36 @@
 #include "mgstc/engine/wave_import.hpp"
 
 namespace mgstc::app {
+
+inline EditorHeaderLayout layoutEditorHeader(
+    int host_width, juce::Label& title, juce::Label& description,
+    EditorNavigationButton& navigation_a, EditorNavigationButton& navigation_b,
+    juce::TextButton& graph, juce::Component& output,
+    juce::DrawableButton& immediate, juce::Slider& volume,
+    juce::Label& volume_label, juce::DrawableButton& settings) {
+    const int title_width = juce::GlyphArrangement::getStringWidthInt(
+        title.getFont(), title.getText());
+    const int description_width = juce::GlyphArrangement::getStringWidthInt(
+        description.getFont(), description.getText());
+    const int text_width = juce::jmax(title_width, description_width)
+        + UiLayout::sm * 2;
+    const int graph_width = editorGraphButtonWidth();
+    const auto layout = calculateEditorHeaderLayout(host_width, text_width,
+        navigation_a.isVisible() ? navigation_a.preferredWidth() : 0,
+        navigation_b.isVisible() ? navigation_b.preferredWidth() : 0,
+        graph_width);
+    title.setBounds(layout.title);
+    description.setBounds(layout.description);
+    navigation_a.setBounds(layout.navigation[0]);
+    navigation_b.setBounds(layout.navigation[1]);
+    graph.setBounds(layout.graph);
+    output.setBounds(layout.output);
+    immediate.setBounds(layout.immediate);
+    volume.setBounds(layout.volume);
+    volume_label.setBounds(layout.volume_label);
+    settings.setBounds(layout.settings);
+    return layout;
+}
 
 constexpr int kPcOctaveDownVirtualKey = VK_NEXT;
 constexpr int kPcOctaveUpVirtualKey = VK_PRIOR;
@@ -1717,6 +1749,620 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
         : SnapshotResult::PngFailure;
 }
 
+[[nodiscard]] inline SnapshotResult showAppSettings(
+    EditorSession& session_ref,
+    juce::Component& owner,
+    int initial_tab = 0,
+    const juce::File* capture_file = nullptr,
+    std::function<void(int)> apply_midi = {},
+    std::function<void()> midi_changed = {}) {
+    UiScale::forceGlobalForNonEditorUi();
+    auto* session = &session_ref;
+
+    class SettingsContent final : public juce::Component {
+    public:
+        SettingsContent(
+            EditorSession& session,
+            int selected_midi_id,
+            int initial_tab)
+            : session_(session) {
+            tabs_.setOutline(0);
+            addAndMakeVisible(tabs_);
+
+            auto* view_page = new juce::Component();
+            ui_scale_label_.setText(
+                juce::String::fromUTF8("画面の大きさ"),
+                juce::dontSendNotification);
+            ui_scale_label_.setColour(
+                juce::Label::textColourId,
+                juce::Colour(0xFFE6EDF3));
+            ui_scale_label_.setTooltip(
+                juce::String::fromUTF8(
+                    "編集画面・ダイアログなどアプリ全体の表示倍率。"
+                    "ウィンドウの位置とサイズは保存しません。"));
+            view_page->addAndMakeVisible(ui_scale_label_);
+            ui_scale_.addItem("125%", 125);
+            ui_scale_.addItem("100%", 100);
+            ui_scale_.addItem("75%", 75);
+            ui_scale_.setSelectedId(
+                UiScale::global_percent, juce::dontSendNotification);
+            ui_scale_.setTooltip(ui_scale_label_.getTooltip());
+            view_page->addAndMakeVisible(ui_scale_);
+
+            auto* midi_page = new juce::Component();
+            midi_help_.setText(
+                juce::String::fromUTF8(
+                    "使用するMIDI入力機器を選択してください。\n"
+                    "接続状態は鍵盤上部のオクターブ操作（PgUp）の右側へ常時表示されます。"),
+                juce::dontSendNotification);
+            midi_help_.setJustificationType(
+                juce::Justification::topLeft);
+            midi_help_.setColour(
+                juce::Label::textColourId,
+                juce::Colour(0xFFE6EDF3));
+            midi_page->addAndMakeVisible(midi_help_);
+
+            juce::StringArray devices;
+            devices.add(juce::String::fromUTF8("MIDI入力なし"));
+            for (const auto& device : session_.snapshot().midi_devices) {
+                devices.add(device.name);
+            }
+            midi_input_.addItemList(devices, 1);
+            midi_input_.setSelectedId(
+                selected_midi_id, juce::dontSendNotification);
+            midi_page->addAndMakeVisible(midi_input_);
+
+            apply_midi_.setButtonText(
+                juce::String::fromUTF8("適用"));
+            refresh_.setButtonText(
+                juce::String::fromUTF8("一覧更新"));
+            midi_page->addAndMakeVisible(apply_midi_);
+            midi_page->addAndMakeVisible(refresh_);
+
+            auto* output_page = new juce::Component();
+            pc_audio_help_.setText(
+                juce::String::fromUTF8(
+                    "PC音声出力を選びます。既定はWASAPI共有モードです。\n"
+                    "ASIOはドライバー選択後に適用し、必要ならASIO設定を開きます。"),
+                juce::dontSendNotification);
+            pc_audio_help_.setJustificationType(
+                juce::Justification::topLeft);
+            pc_audio_help_.setColour(
+                juce::Label::textColourId,
+                juce::Colour(0xFFE6EDF3));
+            output_page->addAndMakeVisible(pc_audio_help_);
+
+            pc_audio_kind_.addItem(
+                juce::String::fromUTF8(
+                    "既定出力 (WASAPI共有モード)"),
+                1);
+            pc_audio_kind_.addItem("ASIO", 2);
+            pc_audio_kind_.setSelectedId(
+                session_.snapshot().pc_audio_backend
+                        == PcAudioBackend::Asio
+                    ? 2
+                    : 1,
+                juce::dontSendNotification);
+            output_page->addAndMakeVisible(pc_audio_kind_);
+
+            const auto saved_driver =
+                session_.snapshot().asio_driver_name;
+            int saved_driver_id{};
+            int driver_id = 1;
+            if (session_.snapshot().capabilities.audio_device_settings) {
+                for (const auto& driver :
+                     session_.output().availableAsioDrivers()) {
+                    asio_driver_.addItem(
+                        juce::String::fromUTF8(driver.c_str()),
+                        driver_id);
+                    if (driver == saved_driver) {
+                        saved_driver_id = driver_id;
+                    }
+                    ++driver_id;
+                }
+            }
+            if (saved_driver_id != 0) {
+                asio_driver_.setSelectedId(
+                    saved_driver_id, juce::dontSendNotification);
+            } else if (asio_driver_.getNumItems() > 0) {
+                asio_driver_.setSelectedItemIndex(
+                    0, juce::dontSendNotification);
+            }
+            output_page->addAndMakeVisible(asio_driver_);
+
+            asio_settings_.setButtonText(
+                juce::String::fromUTF8("ASIO設定"));
+            output_page->addAndMakeVisible(asio_settings_);
+            pc_audio_status_.setColour(
+                juce::Label::textColourId,
+                juce::Colour(0xFF9AA8B5));
+            pc_audio_status_.setJustificationType(
+                juce::Justification::topLeft);
+            output_page->addAndMakeVisible(pc_audio_status_);
+            pc_audio_kind_.onChange = [this] {
+                const auto asio = pc_audio_kind_.getSelectedId() == 2;
+                asio_driver_.setEnabled(asio);
+            };
+            asio_driver_.setEnabled(
+                pc_audio_kind_.getSelectedId() == 2);
+            refreshPcAudioStatus();
+            applyCapabilityGrey();
+
+            mamidi_help_.setText(
+                juce::String::fromUTF8(
+                    "実機出力の接続先を設定します。MAmidiMEmo は "
+                    "MAmidiMEmo.exe -chip_server 起動後に接続します。\n"
+                    "切断時はエミュレータへ自動切替しません。"),
+                juce::dontSendNotification);
+            mamidi_help_.setFont(UiFonts::body());
+            mamidi_help_.setJustificationType(
+                juce::Justification::topLeft);
+            mamidi_help_.setColour(
+                juce::Label::textColourId,
+                juce::Colour(0xFFE6EDF3));
+            output_page->addAndMakeVisible(mamidi_help_);
+
+            const auto mamidi =
+                session_.snapshot().hardware_settings;
+            host_.setText(mamidi.host, false);
+            UiFonts::styleBodyField(host_);
+            port_.setInputRestrictions(5, "0123456789");
+            port_.setText(juce::String(mamidi.port), false);
+            UiFonts::styleBodyField(port_);
+            unit_.setInputRestrictions(3, "0123456789");
+            unit_.setText(juce::String(mamidi.unit_no), false);
+            UiFonts::styleBodyField(unit_);
+            scc_plus_.setButtonText("SCC+");
+            scc_plus_.setToggleState(
+                mamidi.scc_plus, juce::dontSendNotification);
+            waveform_monitor_.setButtonText(
+                juce::String::fromUTF8("波形モニタ"));
+            waveform_monitor_.setTooltip(
+                juce::String::fromUTF8(
+                    "MAmidiMEmo 経由で実機へ出力しているときも、"
+                    "画面の波形表示用に内蔵の音源シミュレーションで"
+                    "波形を生成します。"
+                    "パソコンのスピーカーからは鳴りません。"));
+            waveform_monitor_.setToggleState(
+                mamidi.waveform_monitor,
+                juce::dontSendNotification);
+            output_page->addAndMakeVisible(host_);
+            output_page->addAndMakeVisible(port_);
+            output_page->addAndMakeVisible(unit_);
+            output_page->addAndMakeVisible(scc_plus_);
+            output_page->addAndMakeVisible(waveform_monitor_);
+
+            opll_silence_label_.setText(
+                juce::String::fromUTF8(
+                    "OPLLキーオフ後の強制消音（秒）"),
+                juce::dontSendNotification);
+            opll_silence_label_.setColour(
+                juce::Label::textColourId,
+                juce::Colour(0xFFE6EDF3));
+            output_page->addAndMakeVisible(opll_silence_label_);
+            opll_silence_seconds_.setInputRestrictions(
+                4, "0123456789");
+            opll_silence_seconds_.setText(
+                juce::String(
+                    session_.snapshot().opll_keyoff_silence_seconds),
+                false);
+            UiFonts::styleBodyField(opll_silence_seconds_);
+            opll_silence_seconds_.setTooltip(
+                juce::String::fromUTF8(
+                    "OPLLでキーオフ後も鳴り続ける音色（RR=0など）を、"
+                    "指定秒数後に強制消音します。0で無効。"
+                    "鍵盤演奏と1秒プレビューの両方に適用します。"));
+            output_page->addAndMakeVisible(opll_silence_seconds_);
+
+            apply_output_.setButtonText(
+                juce::String::fromUTF8("適用"));
+            reconnect_.setButtonText(
+                juce::String::fromUTF8("再接続"));
+            output_page->addAndMakeVisible(apply_output_);
+            output_page->addAndMakeVisible(reconnect_);
+
+            output_status_.setColour(
+                juce::Label::textColourId,
+                juce::Colour(0xFF9AA8B5));
+            const auto output_caps = session_.snapshot().capabilities;
+            output_status_.setText(
+                (output_caps.hardware_output || output_caps.mamidi)
+                    ? statusTextFromUtf8(
+                          session_.output().hardwareStatus())
+                    : juce::String{},
+                juce::dontSendNotification);
+            output_page->addAndMakeVisible(output_status_);
+
+            tabs_.addTab(
+                "View",
+                juce::Colour(0xFF243040),
+                view_page,
+                true);
+            tabs_.addTab(
+                "MIDI",
+                juce::Colour(0xFF243040),
+                midi_page,
+                true);
+            tabs_.addTab(
+                "Output",
+                juce::Colour(0xFF243040),
+                output_page,
+                true);
+            tabs_.addTab(
+                "About",
+                juce::Colour(0xFF243040),
+                new AboutPanel(),
+                true);
+            tabs_.setCurrentTabIndex(
+                juce::jlimit(0, 3, initial_tab),
+                juce::dontSendNotification);
+
+            close_.setButtonText(
+                juce::String::fromUTF8("閉じる"));
+            addAndMakeVisible(close_);
+            setSize(
+                UiLayout::settingsDialogW,
+                UiLayout::settingsDialogH);
+        }
+
+        void paint(juce::Graphics& graphics) override {
+            UiScale::forceGlobalForNonEditorUi();
+            juce::Component::paint(graphics);
+        }
+
+        void resized() override {
+            UiScale::forceGlobalForNonEditorUi();
+            auto area = getLocalBounds().reduced(UiLayout::panelPad);
+            auto bottom = area.removeFromBottom(UiLayout::fieldH);
+            close_.setBounds(bottom.removeFromRight(UiScale::sx(96)));
+            area.removeFromBottom(UiLayout::sm);
+            tabs_.setBounds(area);
+            tabs_.setTabBarDepth(UiLayout::fieldH);
+
+            if (auto* view_page = tabs_.getTabContentComponent(0)) {
+                auto page = view_page->getLocalBounds().reduced(UiLayout::md);
+                ui_scale_label_.setBounds(
+                    page.removeFromTop(UiLayout::fieldH));
+                page.removeFromTop(UiLayout::sm);
+                ui_scale_.setBounds(
+                    page.removeFromTop(UiLayout::fieldH).removeFromLeft(
+                        UiScale::sx(160)));
+            }
+            if (auto* midi_page = tabs_.getTabContentComponent(1)) {
+                auto page = midi_page->getLocalBounds().reduced(UiLayout::md);
+                midi_help_.setBounds(page.removeFromTop(UiScale::sx(56)));
+                page.removeFromTop(UiLayout::sm);
+                midi_input_.setBounds(
+                    page.removeFromTop(UiScale::sx(28)));
+                page.removeFromTop(UiLayout::md);
+                auto row = page.removeFromTop(UiScale::sx(30));
+                apply_midi_.setBounds(row.removeFromLeft(UiScale::sx(96)));
+                row.removeFromLeft(UiLayout::sm);
+                refresh_.setBounds(row.removeFromLeft(UiScale::sx(96)));
+            }
+            if (auto* output_page =
+                    tabs_.getTabContentComponent(2)) {
+                auto page =
+                    output_page->getLocalBounds().reduced(12);
+                if (session_.snapshot().capabilities.audio_device_settings) {
+                pc_audio_help_.setBounds(page.removeFromTop(48));
+                page.removeFromTop(8);
+                pc_audio_kind_.setBounds(page.removeFromTop(28));
+                page.removeFromTop(8);
+                asio_driver_.setBounds(page.removeFromTop(28));
+                page.removeFromTop(8);
+                asio_settings_.setBounds(
+                    page.removeFromTop(30).removeFromLeft(112));
+                page.removeFromTop(8);
+                pc_audio_status_.setBounds(page.removeFromTop(48));
+                page.removeFromTop(12);
+                }
+                mamidi_help_.setBounds(page.removeFromTop(72));
+                page.removeFromTop(10);
+                auto row = page.removeFromTop(UiLayout::fieldH);
+                host_.setBounds(row.removeFromLeft(180));
+                row.removeFromLeft(8);
+                port_.setBounds(row.removeFromLeft(72));
+                row.removeFromLeft(8);
+                unit_.setBounds(row.removeFromLeft(54));
+                row.removeFromLeft(8);
+                scc_plus_.setBounds(row.removeFromLeft(72));
+                page.removeFromTop(10);
+                waveform_monitor_.setBounds(
+                    page.removeFromTop(UiLayout::fieldH));
+                page.removeFromTop(10);
+                opll_silence_label_.setBounds(
+                    page.removeFromTop(22));
+                page.removeFromTop(4);
+                opll_silence_seconds_.setBounds(
+                    page.removeFromTop(28).removeFromLeft(96));
+                page.removeFromTop(12);
+                auto buttons = page.removeFromTop(30);
+                apply_output_.setBounds(buttons.removeFromLeft(96));
+                buttons.removeFromLeft(8);
+                reconnect_.setBounds(buttons.removeFromLeft(96));
+                page.removeFromTop(12);
+                output_status_.setBounds(page.removeFromTop(48));
+            }
+        }
+
+        void refreshOutputStatus() {
+            const auto caps = session_.snapshot().capabilities;
+            output_status_.setText(
+                (caps.hardware_output || caps.mamidi)
+                    ? statusTextFromUtf8(
+                          session_.output().hardwareStatus())
+                    : juce::String{},
+                juce::dontSendNotification);
+        }
+
+        void refreshPcAudioStatus() {
+            pc_audio_status_.setText(
+                statusTextFromUtf8(
+                    session_.snapshot().pc_audio_status),
+                juce::dontSendNotification);
+            if (!session_.snapshot().capabilities.audio_device_settings) {
+                asio_settings_.setEnabled(false);
+                return;
+            }
+            asio_settings_.setEnabled(
+                session_.snapshot().asio_control_panel_available);
+        }
+
+        void applyCapabilityGrey() {
+            const auto caps = session_.snapshot().capabilities;
+            if (!caps.midi_device_settings) {
+                midi_help_.setText("Audio / MIDI: DAW", juce::dontSendNotification);
+                midi_input_.setVisible(false);
+                apply_midi_.setVisible(false);
+                refresh_.setVisible(false);
+            }
+            if (!caps.audio_device_settings) {
+                pc_audio_help_.setVisible(false);
+                pc_audio_kind_.setVisible(false);
+                asio_driver_.setVisible(false);
+                asio_settings_.setVisible(false);
+                pc_audio_status_.setVisible(false);
+            }
+            if (!caps.hardware_output && !caps.mamidi && !caps.vsif) {
+                greyOutHostControl(host_);
+                greyOutHostControl(port_);
+                greyOutHostControl(unit_);
+                greyOutHostControl(scc_plus_);
+                greyOutHostControl(waveform_monitor_);
+                greyOutHostControl(opll_silence_seconds_);
+                greyOutHostControl(apply_output_);
+                greyOutHostControl(reconnect_);
+            }
+        }
+
+        juce::TabbedComponent tabs_{
+            juce::TabbedButtonBar::TabsAtTop};
+        juce::Label ui_scale_label_;
+        juce::ComboBox ui_scale_;
+        juce::Label midi_help_;
+        juce::ComboBox midi_input_;
+        juce::TextButton apply_midi_;
+        juce::TextButton refresh_;
+        juce::Label pc_audio_help_;
+        juce::ComboBox pc_audio_kind_;
+        juce::ComboBox asio_driver_;
+        juce::TextButton asio_settings_;
+        juce::Label pc_audio_status_;
+        juce::Label mamidi_help_;
+        juce::TextEditor host_;
+        juce::TextEditor port_;
+        juce::TextEditor unit_;
+        juce::ToggleButton scc_plus_;
+        juce::ToggleButton waveform_monitor_;
+        juce::Label opll_silence_label_;
+        juce::TextEditor opll_silence_seconds_;
+        juce::TextButton apply_output_;
+        juce::TextButton reconnect_;
+        juce::Label output_status_;
+        juce::TextButton close_;
+        EditorSession& session_;
+    };
+
+    auto* content = new SettingsContent(
+        session_ref,
+        session_ref.snapshot().midi_selected_combo_id,
+        initial_tab);
+    auto* dialog = new ModalDialogWindow(
+        juce::String::fromUTF8("アプリ設定"),
+        juce::Colour(0xFF1B222C));
+    dialog->setUsingNativeTitleBar(true);
+    dialog->setResizable(false, false);
+    dialog->setContentOwned(content, true);
+    dialog->centreWithSize(
+        content->getWidth(), content->getHeight() + 32);
+
+    if (capture_file != nullptr) {
+        // Give fixed-width device controls enough room in documentation.
+        // The ordinary settings dialog keeps its existing dimensions.
+        content->setSize(UiScale::sx(640), content->getHeight());
+        // Public documentation captures must not disclose the installed
+        // device list. These widgets have no commit callbacks attached yet.
+        content->midi_input_.clear(juce::dontSendNotification);
+        content->midi_input_.addItem(
+            juce::String::fromUTF8("MIDI入力なし"), 1);
+        content->midi_input_.setSelectedId(1, juce::dontSendNotification);
+        content->asio_driver_.clear(juce::dontSendNotification);
+        content->asio_driver_.addItem("ASIO driver (example)", 1);
+        content->asio_driver_.setSelectedId(1, juce::dontSendNotification);
+        const auto result =
+            writeComponentPngSnapshot(*content, *capture_file);
+        delete dialog;
+        return result;
+    }
+
+    juce::Component::SafePointer<juce::Component> safe(&owner);
+    juce::Component::SafePointer<juce::DialogWindow> safe_dialog(
+        dialog);
+    juce::Component::SafePointer<SettingsContent> safe_content(
+        content);
+
+    content->ui_scale_.onChange = [safe, safe_content, safe_dialog, session] {
+        if (safe == nullptr || safe_content == nullptr) {
+            return;
+        }
+        const int percent = safe_content->ui_scale_.getSelectedId();
+        if (!UiScale::isStep(percent)
+            || percent == UiScale::global_percent) {
+            return;
+        }
+        // Clears editor session overrides via listeners; scales all roots.
+        UiScale::setGlobalPercent(
+            percent,
+            standaloneHostPreferences(
+                session->snapshot().capabilities));
+        safe_content->setSize(
+            UiLayout::settingsDialogW,
+            UiLayout::settingsDialogH);
+        safe_content->sendLookAndFeelChange();
+        safe_content->resized();
+        if (safe_dialog != nullptr) {
+            safe_dialog->setSize(
+                safe_content->getWidth(),
+                safe_content->getHeight() + 32);
+            safe_dialog->centreWithSize(
+                safe_dialog->getWidth(),
+                safe_dialog->getHeight());
+            clampWindowToDisplayWorkArea(*safe_dialog);
+        }
+    };
+    content->apply_midi_.onClick = [safe, safe_content, session, apply_midi] {
+        if (safe == nullptr || safe_content == nullptr) {
+            return;
+        }
+        const int selected = safe_content->midi_input_.getSelectedId();
+        if (selected == session->snapshot().midi_selected_combo_id) {
+            return;
+        }
+        if (apply_midi) {
+            apply_midi(selected);
+        } else if (session->snapshot().capabilities.midi_device_settings) {
+            session->midi().selectDevice(selected, true);
+        }
+    };
+    content->refresh_.onClick =
+        [safe, safe_dialog, session, apply_midi, midi_changed] {
+            if (safe == nullptr
+                || !session->snapshot()
+                        .capabilities.midi_device_settings) {
+                return;
+            }
+            session->midi().refreshDevices(false);
+            if (midi_changed) midi_changed();
+            if (safe_dialog != nullptr) {
+                safe_dialog->exitModalState(0);
+            }
+            juce::MessageManager::callAsync([safe, session, apply_midi, midi_changed] {
+                if (safe != nullptr) {
+                    static_cast<void>(
+                        showAppSettings(*session, *safe, 1, nullptr,
+                            apply_midi, midi_changed));
+                }
+            });
+        };
+    content->apply_output_.onClick = [safe, safe_content, session, midi_changed] {
+        if (safe == nullptr || safe_content == nullptr) {
+            return;
+        }
+        const auto caps = session->snapshot().capabilities;
+        if (!caps.audio_device_settings
+            && !caps.hardware_output
+            && !caps.mamidi
+            && !caps.vsif) {
+            return;
+        }
+        const auto pc_backend =
+            safe_content->pc_audio_kind_.getSelectedId() == 2
+            ? PcAudioBackend::Asio
+            : PcAudioBackend::Wasapi;
+        const auto driver_name = utf8String(
+            safe_content->asio_driver_.getText());
+        if (caps.audio_device_settings
+            && !session->output().applyPcAudio(
+                pc_backend,
+                driver_name)) {
+            safe_content->pc_audio_kind_.setSelectedId(
+                1, juce::sendNotificationSync);
+        }
+        safe_content->refreshPcAudioStatus();
+
+        HardwareOutputSettings settings{};
+        settings.host = utf8String(
+            safe_content->host_.getText().trim());
+        if (settings.host.empty()) {
+            settings.host = "localhost";
+        }
+        settings.port = static_cast<std::uint16_t>(juce::jlimit(
+            1,
+            65535,
+            safe_content->port_.getText().getIntValue()));
+        settings.unit_no = static_cast<std::uint8_t>(juce::jlimit(
+            0,
+            255,
+            safe_content->unit_.getText().getIntValue()));
+        settings.scc_plus =
+            safe_content->scc_plus_.getToggleState();
+        settings.waveform_monitor =
+            safe_content->waveform_monitor_.getToggleState();
+        const int silence_seconds = juce::jlimit(
+            0,
+            9999,
+            safe_content->opll_silence_seconds_.getText()
+                .getIntValue());
+        static_cast<void>(session->output().applyHardwareSettings(
+            std::move(settings), silence_seconds));
+        safe_content->opll_silence_seconds_.setText(
+            juce::String(
+                session->snapshot()
+                    .opll_keyoff_silence_seconds),
+            false);
+        safe_content->refreshOutputStatus();
+        if (midi_changed) midi_changed();
+    };
+    content->asio_settings_.onClick = [safe, safe_content, session] {
+        if (safe == nullptr || safe_content == nullptr) {
+            return;
+        }
+        static_cast<void>(
+            session->output().showAsioControlPanel());
+        if (session->snapshot().pc_audio_backend
+            != PcAudioBackend::Asio) {
+            safe_content->pc_audio_kind_.setSelectedId(
+                1, juce::sendNotificationSync);
+        }
+        safe_content->refreshPcAudioStatus();
+    };
+    content->reconnect_.onClick = [safe, safe_content, session, midi_changed] {
+        if (safe == nullptr || safe_content == nullptr) {
+            return;
+        }
+        const auto caps = session->snapshot().capabilities;
+        if (!caps.hardware_output && !caps.mamidi && !caps.vsif) {
+            return;
+        }
+        MGSTC_UI_ACTIVITY(
+            "settings: MAmidiMEmo reconnect (blocking)");
+        static_cast<void>(
+            session->output().reconnectHardware());
+        safe_content->refreshOutputStatus();
+        if (midi_changed) midi_changed();
+    };
+    content->close_.onClick = [safe_dialog] {
+        if (safe_dialog != nullptr) {
+            safe_dialog->exitModalState(0);
+        }
+    };
+
+    dialog->enterModalState(true, nullptr, true);
+    return SnapshotResult::Success;
+}
+
+
 class PerformanceKeyboard final
     : public juce::Component,
       private juce::MidiKeyboardState::Listener,
@@ -2048,604 +2694,19 @@ private:
     [[nodiscard]] SnapshotResult showAppSettings(
         int initial_tab,
         const juce::File* capture_file) {
-        UiScale::forceGlobalForNonEditorUi();
         syncMidiControls();
-
-        class SettingsContent final : public juce::Component {
-        public:
-            SettingsContent(
-                EditorSession& session,
-                int selected_midi_id,
-                int initial_tab)
-                : session_(session) {
-                tabs_.setOutline(0);
-                addAndMakeVisible(tabs_);
-
-                auto* view_page = new juce::Component();
-                ui_scale_label_.setText(
-                    juce::String::fromUTF8("画面の大きさ"),
-                    juce::dontSendNotification);
-                ui_scale_label_.setColour(
-                    juce::Label::textColourId,
-                    juce::Colour(0xFFE6EDF3));
-                ui_scale_label_.setTooltip(
-                    juce::String::fromUTF8(
-                        "編集画面・ダイアログなどアプリ全体の表示倍率。"
-                        "ウィンドウの位置とサイズは保存しません。"));
-                view_page->addAndMakeVisible(ui_scale_label_);
-                ui_scale_.addItem("125%", 125);
-                ui_scale_.addItem("100%", 100);
-                ui_scale_.addItem("75%", 75);
-                ui_scale_.setSelectedId(
-                    UiScale::global_percent, juce::dontSendNotification);
-                ui_scale_.setTooltip(ui_scale_label_.getTooltip());
-                view_page->addAndMakeVisible(ui_scale_);
-
-                auto* midi_page = new juce::Component();
-                midi_help_.setText(
-                    juce::String::fromUTF8(
-                        "使用するMIDI入力機器を選択してください。\n"
-                        "接続状態は鍵盤上部のオクターブ操作（PgUp）の右側へ常時表示されます。"),
-                    juce::dontSendNotification);
-                midi_help_.setJustificationType(
-                    juce::Justification::topLeft);
-                midi_help_.setColour(
-                    juce::Label::textColourId,
-                    juce::Colour(0xFFE6EDF3));
-                midi_page->addAndMakeVisible(midi_help_);
-
-                juce::StringArray devices;
-                devices.add(juce::String::fromUTF8("MIDI入力なし"));
-                for (const auto& device : session_.snapshot().midi_devices) {
-                    devices.add(device.name);
-                }
-                midi_input_.addItemList(devices, 1);
-                midi_input_.setSelectedId(
-                    selected_midi_id, juce::dontSendNotification);
-                midi_page->addAndMakeVisible(midi_input_);
-
-                apply_midi_.setButtonText(
-                    juce::String::fromUTF8("適用"));
-                refresh_.setButtonText(
-                    juce::String::fromUTF8("一覧更新"));
-                midi_page->addAndMakeVisible(apply_midi_);
-                midi_page->addAndMakeVisible(refresh_);
-
-                auto* output_page = new juce::Component();
-                pc_audio_help_.setText(
-                    juce::String::fromUTF8(
-                        "PC音声出力を選びます。既定はWASAPI共有モードです。\n"
-                        "ASIOはドライバー選択後に適用し、必要ならASIO設定を開きます。"),
-                    juce::dontSendNotification);
-                pc_audio_help_.setJustificationType(
-                    juce::Justification::topLeft);
-                pc_audio_help_.setColour(
-                    juce::Label::textColourId,
-                    juce::Colour(0xFFE6EDF3));
-                output_page->addAndMakeVisible(pc_audio_help_);
-
-                pc_audio_kind_.addItem(
-                    juce::String::fromUTF8(
-                        "既定出力 (WASAPI共有モード)"),
-                    1);
-                pc_audio_kind_.addItem("ASIO", 2);
-                pc_audio_kind_.setSelectedId(
-                    session_.snapshot().pc_audio_backend
-                            == PcAudioBackend::Asio
-                        ? 2
-                        : 1,
-                    juce::dontSendNotification);
-                output_page->addAndMakeVisible(pc_audio_kind_);
-
-                const auto saved_driver =
-                    session_.snapshot().asio_driver_name;
-                int saved_driver_id{};
-                int driver_id = 1;
-                if (session_.snapshot().capabilities.audio_device_settings) {
-                    for (const auto& driver :
-                         session_.output().availableAsioDrivers()) {
-                        asio_driver_.addItem(
-                            juce::String::fromUTF8(driver.c_str()),
-                            driver_id);
-                        if (driver == saved_driver) {
-                            saved_driver_id = driver_id;
-                        }
-                        ++driver_id;
-                    }
-                }
-                if (saved_driver_id != 0) {
-                    asio_driver_.setSelectedId(
-                        saved_driver_id, juce::dontSendNotification);
-                } else if (asio_driver_.getNumItems() > 0) {
-                    asio_driver_.setSelectedItemIndex(
-                        0, juce::dontSendNotification);
-                }
-                output_page->addAndMakeVisible(asio_driver_);
-
-                asio_settings_.setButtonText(
-                    juce::String::fromUTF8("ASIO設定"));
-                output_page->addAndMakeVisible(asio_settings_);
-                pc_audio_status_.setColour(
-                    juce::Label::textColourId,
-                    juce::Colour(0xFF9AA8B5));
-                pc_audio_status_.setJustificationType(
-                    juce::Justification::topLeft);
-                output_page->addAndMakeVisible(pc_audio_status_);
-                pc_audio_kind_.onChange = [this] {
-                    const auto asio = pc_audio_kind_.getSelectedId() == 2;
-                    asio_driver_.setEnabled(asio);
-                };
-                asio_driver_.setEnabled(
-                    pc_audio_kind_.getSelectedId() == 2);
-                refreshPcAudioStatus();
-                applyCapabilityGrey();
-
-                mamidi_help_.setText(
-                    juce::String::fromUTF8(
-                        "実機出力の接続先を設定します。MAmidiMEmo は "
-                        "MAmidiMEmo.exe -chip_server 起動後に接続します。\n"
-                        "切断時はエミュレータへ自動切替しません。"),
-                    juce::dontSendNotification);
-                mamidi_help_.setFont(UiFonts::body());
-                mamidi_help_.setJustificationType(
-                    juce::Justification::topLeft);
-                mamidi_help_.setColour(
-                    juce::Label::textColourId,
-                    juce::Colour(0xFFE6EDF3));
-                output_page->addAndMakeVisible(mamidi_help_);
-
-                const auto mamidi =
-                    session_.snapshot().hardware_settings;
-                host_.setText(mamidi.host, false);
-                UiFonts::styleBodyField(host_);
-                port_.setInputRestrictions(5, "0123456789");
-                port_.setText(juce::String(mamidi.port), false);
-                UiFonts::styleBodyField(port_);
-                unit_.setInputRestrictions(3, "0123456789");
-                unit_.setText(juce::String(mamidi.unit_no), false);
-                UiFonts::styleBodyField(unit_);
-                scc_plus_.setButtonText("SCC+");
-                scc_plus_.setToggleState(
-                    mamidi.scc_plus, juce::dontSendNotification);
-                waveform_monitor_.setButtonText(
-                    juce::String::fromUTF8("波形モニタ"));
-                waveform_monitor_.setTooltip(
-                    juce::String::fromUTF8(
-                        "MAmidiMEmo 経由で実機へ出力しているときも、"
-                        "画面の波形表示用に内蔵の音源シミュレーションで"
-                        "波形を生成します。"
-                        "パソコンのスピーカーからは鳴りません。"));
-                waveform_monitor_.setToggleState(
-                    mamidi.waveform_monitor,
-                    juce::dontSendNotification);
-                output_page->addAndMakeVisible(host_);
-                output_page->addAndMakeVisible(port_);
-                output_page->addAndMakeVisible(unit_);
-                output_page->addAndMakeVisible(scc_plus_);
-                output_page->addAndMakeVisible(waveform_monitor_);
-
-                opll_silence_label_.setText(
-                    juce::String::fromUTF8(
-                        "OPLLキーオフ後の強制消音（秒）"),
-                    juce::dontSendNotification);
-                opll_silence_label_.setColour(
-                    juce::Label::textColourId,
-                    juce::Colour(0xFFE6EDF3));
-                output_page->addAndMakeVisible(opll_silence_label_);
-                opll_silence_seconds_.setInputRestrictions(
-                    4, "0123456789");
-                opll_silence_seconds_.setText(
-                    juce::String(
-                        session_.snapshot().opll_keyoff_silence_seconds),
-                    false);
-                UiFonts::styleBodyField(opll_silence_seconds_);
-                opll_silence_seconds_.setTooltip(
-                    juce::String::fromUTF8(
-                        "OPLLでキーオフ後も鳴り続ける音色（RR=0など）を、"
-                        "指定秒数後に強制消音します。0で無効。"
-                        "鍵盤演奏と1秒プレビューの両方に適用します。"));
-                output_page->addAndMakeVisible(opll_silence_seconds_);
-
-                apply_output_.setButtonText(
-                    juce::String::fromUTF8("適用"));
-                reconnect_.setButtonText(
-                    juce::String::fromUTF8("再接続"));
-                output_page->addAndMakeVisible(apply_output_);
-                output_page->addAndMakeVisible(reconnect_);
-
-                output_status_.setColour(
-                    juce::Label::textColourId,
-                    juce::Colour(0xFF9AA8B5));
-                const auto output_caps = session_.snapshot().capabilities;
-                output_status_.setText(
-                    (output_caps.hardware_output || output_caps.mamidi)
-                        ? statusTextFromUtf8(
-                              session_.output().hardwareStatus())
-                        : juce::String{},
-                    juce::dontSendNotification);
-                output_page->addAndMakeVisible(output_status_);
-
-                tabs_.addTab(
-                    "View",
-                    juce::Colour(0xFF243040),
-                    view_page,
-                    true);
-                tabs_.addTab(
-                    "MIDI",
-                    juce::Colour(0xFF243040),
-                    midi_page,
-                    true);
-                tabs_.addTab(
-                    "Output",
-                    juce::Colour(0xFF243040),
-                    output_page,
-                    true);
-                tabs_.addTab(
-                    "About",
-                    juce::Colour(0xFF243040),
-                    new AboutPanel(),
-                    true);
-                tabs_.setCurrentTabIndex(
-                    juce::jlimit(0, 3, initial_tab),
-                    juce::dontSendNotification);
-
-                close_.setButtonText(
-                    juce::String::fromUTF8("閉じる"));
-                addAndMakeVisible(close_);
-                setSize(
-                    UiLayout::settingsDialogW,
-                    UiLayout::settingsDialogH);
-            }
-
-            void paint(juce::Graphics& graphics) override {
-                UiScale::forceGlobalForNonEditorUi();
-                juce::Component::paint(graphics);
-            }
-
-            void resized() override {
-                UiScale::forceGlobalForNonEditorUi();
-                auto area = getLocalBounds().reduced(UiLayout::panelPad);
-                auto bottom = area.removeFromBottom(UiLayout::fieldH);
-                close_.setBounds(bottom.removeFromRight(UiScale::sx(96)));
-                area.removeFromBottom(UiLayout::sm);
-                tabs_.setBounds(area);
-                tabs_.setTabBarDepth(UiLayout::fieldH);
-
-                if (auto* view_page = tabs_.getTabContentComponent(0)) {
-                    auto page = view_page->getLocalBounds().reduced(UiLayout::md);
-                    ui_scale_label_.setBounds(
-                        page.removeFromTop(UiLayout::fieldH));
-                    page.removeFromTop(UiLayout::sm);
-                    ui_scale_.setBounds(
-                        page.removeFromTop(UiLayout::fieldH).removeFromLeft(
-                            UiScale::sx(160)));
-                }
-                if (auto* midi_page = tabs_.getTabContentComponent(1)) {
-                    auto page = midi_page->getLocalBounds().reduced(UiLayout::md);
-                    midi_help_.setBounds(page.removeFromTop(UiScale::sx(56)));
-                    page.removeFromTop(UiLayout::sm);
-                    midi_input_.setBounds(
-                        page.removeFromTop(UiScale::sx(28)));
-                    page.removeFromTop(UiLayout::md);
-                    auto row = page.removeFromTop(UiScale::sx(30));
-                    apply_midi_.setBounds(row.removeFromLeft(UiScale::sx(96)));
-                    row.removeFromLeft(UiLayout::sm);
-                    refresh_.setBounds(row.removeFromLeft(UiScale::sx(96)));
-                }
-                if (auto* output_page =
-                        tabs_.getTabContentComponent(2)) {
-                    auto page =
-                        output_page->getLocalBounds().reduced(12);
-                    if (session_.snapshot().capabilities.audio_device_settings) {
-                    pc_audio_help_.setBounds(page.removeFromTop(48));
-                    page.removeFromTop(8);
-                    pc_audio_kind_.setBounds(page.removeFromTop(28));
-                    page.removeFromTop(8);
-                    asio_driver_.setBounds(page.removeFromTop(28));
-                    page.removeFromTop(8);
-                    asio_settings_.setBounds(
-                        page.removeFromTop(30).removeFromLeft(112));
-                    page.removeFromTop(8);
-                    pc_audio_status_.setBounds(page.removeFromTop(48));
-                    page.removeFromTop(12);
-                    }
-                    mamidi_help_.setBounds(page.removeFromTop(72));
-                    page.removeFromTop(10);
-                    auto row = page.removeFromTop(UiLayout::fieldH);
-                    host_.setBounds(row.removeFromLeft(180));
-                    row.removeFromLeft(8);
-                    port_.setBounds(row.removeFromLeft(72));
-                    row.removeFromLeft(8);
-                    unit_.setBounds(row.removeFromLeft(54));
-                    row.removeFromLeft(8);
-                    scc_plus_.setBounds(row.removeFromLeft(72));
-                    page.removeFromTop(10);
-                    waveform_monitor_.setBounds(
-                        page.removeFromTop(UiLayout::fieldH));
-                    page.removeFromTop(10);
-                    opll_silence_label_.setBounds(
-                        page.removeFromTop(22));
-                    page.removeFromTop(4);
-                    opll_silence_seconds_.setBounds(
-                        page.removeFromTop(28).removeFromLeft(96));
-                    page.removeFromTop(12);
-                    auto buttons = page.removeFromTop(30);
-                    apply_output_.setBounds(buttons.removeFromLeft(96));
-                    buttons.removeFromLeft(8);
-                    reconnect_.setBounds(buttons.removeFromLeft(96));
-                    page.removeFromTop(12);
-                    output_status_.setBounds(page.removeFromTop(48));
-                }
-            }
-
-            void refreshOutputStatus() {
-                const auto caps = session_.snapshot().capabilities;
-                output_status_.setText(
-                    (caps.hardware_output || caps.mamidi)
-                        ? statusTextFromUtf8(
-                              session_.output().hardwareStatus())
-                        : juce::String{},
-                    juce::dontSendNotification);
-            }
-
-            void refreshPcAudioStatus() {
-                pc_audio_status_.setText(
-                    statusTextFromUtf8(
-                        session_.snapshot().pc_audio_status),
-                    juce::dontSendNotification);
-                if (!session_.snapshot().capabilities.audio_device_settings) {
-                    asio_settings_.setEnabled(false);
-                    return;
-                }
-                asio_settings_.setEnabled(
-                    session_.snapshot().asio_control_panel_available);
-            }
-
-            void applyCapabilityGrey() {
-                const auto caps = session_.snapshot().capabilities;
-                if (!caps.midi_device_settings) {
-                    midi_help_.setText("Audio / MIDI: DAW", juce::dontSendNotification);
-                    midi_input_.setVisible(false);
-                    apply_midi_.setVisible(false);
-                    refresh_.setVisible(false);
-                }
-                if (!caps.audio_device_settings) {
-                    pc_audio_help_.setVisible(false);
-                    pc_audio_kind_.setVisible(false);
-                    asio_driver_.setVisible(false);
-                    asio_settings_.setVisible(false);
-                    pc_audio_status_.setVisible(false);
-                }
-                if (!caps.hardware_output && !caps.mamidi && !caps.vsif) {
-                    greyOutHostControl(host_);
-                    greyOutHostControl(port_);
-                    greyOutHostControl(unit_);
-                    greyOutHostControl(scc_plus_);
-                    greyOutHostControl(waveform_monitor_);
-                    greyOutHostControl(opll_silence_seconds_);
-                    greyOutHostControl(apply_output_);
-                    greyOutHostControl(reconnect_);
-                }
-            }
-
-            juce::TabbedComponent tabs_{
-                juce::TabbedButtonBar::TabsAtTop};
-            juce::Label ui_scale_label_;
-            juce::ComboBox ui_scale_;
-            juce::Label midi_help_;
-            juce::ComboBox midi_input_;
-            juce::TextButton apply_midi_;
-            juce::TextButton refresh_;
-            juce::Label pc_audio_help_;
-            juce::ComboBox pc_audio_kind_;
-            juce::ComboBox asio_driver_;
-            juce::TextButton asio_settings_;
-            juce::Label pc_audio_status_;
-            juce::Label mamidi_help_;
-            juce::TextEditor host_;
-            juce::TextEditor port_;
-            juce::TextEditor unit_;
-            juce::ToggleButton scc_plus_;
-            juce::ToggleButton waveform_monitor_;
-            juce::Label opll_silence_label_;
-            juce::TextEditor opll_silence_seconds_;
-            juce::TextButton apply_output_;
-            juce::TextButton reconnect_;
-            juce::Label output_status_;
-            juce::TextButton close_;
-            EditorSession& session_;
-        };
-
-        auto* content = new SettingsContent(
-            session_,
-            midi_input_.getSelectedId(),
-            initial_tab);
-        auto* dialog = new ModalDialogWindow(
-            juce::String::fromUTF8("アプリ設定"),
-            juce::Colour(0xFF1B222C));
-        dialog->setUsingNativeTitleBar(true);
-        dialog->setResizable(false, false);
-        dialog->setContentOwned(content, true);
-        dialog->centreWithSize(
-            content->getWidth(), content->getHeight() + 32);
-
-        if (capture_file != nullptr) {
-            // Give fixed-width device controls enough room in documentation.
-            // The ordinary settings dialog keeps its existing dimensions.
-            content->setSize(UiScale::sx(640), content->getHeight());
-            // Public documentation captures must not disclose the installed
-            // device list. These widgets have no commit callbacks attached yet.
-            content->midi_input_.clear(juce::dontSendNotification);
-            content->midi_input_.addItem(
-                juce::String::fromUTF8("MIDI入力なし"), 1);
-            content->midi_input_.setSelectedId(1, juce::dontSendNotification);
-            content->asio_driver_.clear(juce::dontSendNotification);
-            content->asio_driver_.addItem("ASIO driver (example)", 1);
-            content->asio_driver_.setSelectedId(1, juce::dontSendNotification);
-            const auto result =
-                writeComponentPngSnapshot(*content, *capture_file);
-            delete dialog;
-            return result;
-        }
-
         juce::Component::SafePointer<PerformanceKeyboard> safe(this);
-        juce::Component::SafePointer<juce::DialogWindow> safe_dialog(
-            dialog);
-        juce::Component::SafePointer<SettingsContent> safe_content(
-            content);
-
-        content->ui_scale_.onChange = [safe, safe_content, safe_dialog] {
-            if (safe == nullptr || safe_content == nullptr) {
-                return;
-            }
-            const int percent = safe_content->ui_scale_.getSelectedId();
-            if (!UiScale::isStep(percent)
-                || percent == UiScale::global_percent) {
-                return;
-            }
-            // Clears editor session overrides via listeners; scales all roots.
-            UiScale::setGlobalPercent(
-                percent,
-                standaloneHostPreferences(
-                    safe->session_.snapshot().capabilities));
-            safe_content->setSize(
-                UiLayout::settingsDialogW,
-                UiLayout::settingsDialogH);
-            safe_content->sendLookAndFeelChange();
-            safe_content->resized();
-            if (safe_dialog != nullptr) {
-                safe_dialog->setSize(
-                    safe_content->getWidth(),
-                    safe_content->getHeight() + 32);
-                safe_dialog->centreWithSize(
-                    safe_dialog->getWidth(),
-                    safe_dialog->getHeight());
-                clampWindowToDisplayWorkArea(*safe_dialog);
-            }
-        };
-        content->apply_midi_.onClick = [safe, safe_content] {
-            if (safe == nullptr || safe_content == nullptr) {
-                return;
-            }
-            safe->midi_input_.setSelectedId(
-                safe_content->midi_input_.getSelectedId(),
-                juce::sendNotificationSync);
-            safe->syncMidiControls();
-        };
-        content->refresh_.onClick =
-            [safe, safe_dialog] {
-                if (safe == nullptr
-                    || !safe->session_.snapshot()
-                            .capabilities.midi_device_settings) {
-                    return;
-                }
-                safe->session_.midi().refreshDevices(false);
+        return mgstc::app::showAppSettings(
+            session_, *this, initial_tab, capture_file,
+            [safe](int selected) {
+                if (safe == nullptr) return;
+                safe->allNotesOff();
+                safe->session_.midi().selectDevice(selected, true);
                 safe->syncMidiControls();
-                if (safe_dialog != nullptr) {
-                    safe_dialog->exitModalState(0);
-                }
-                juce::MessageManager::callAsync([safe] {
-                    if (safe != nullptr) {
-                        static_cast<void>(
-                            safe->showAppSettings(1, nullptr));
-                    }
-                });
-            };
-        content->apply_output_.onClick = [safe, safe_content] {
-            if (safe == nullptr || safe_content == nullptr) {
-                return;
-            }
-            const auto caps = safe->session_.snapshot().capabilities;
-            if (!caps.audio_device_settings
-                && !caps.hardware_output
-                && !caps.mamidi
-                && !caps.vsif) {
-                return;
-            }
-            const auto pc_backend =
-                safe_content->pc_audio_kind_.getSelectedId() == 2
-                ? PcAudioBackend::Asio
-                : PcAudioBackend::Wasapi;
-            const auto driver_name = utf8String(
-                safe_content->asio_driver_.getText());
-            if (caps.audio_device_settings
-                && !safe->session_.output().applyPcAudio(
-                    pc_backend,
-                    driver_name)) {
-                safe_content->pc_audio_kind_.setSelectedId(
-                    1, juce::sendNotificationSync);
-            }
-            safe_content->refreshPcAudioStatus();
-
-            HardwareOutputSettings settings{};
-            settings.host = utf8String(
-                safe_content->host_.getText().trim());
-            if (settings.host.empty()) {
-                settings.host = "localhost";
-            }
-            settings.port = static_cast<std::uint16_t>(juce::jlimit(
-                1,
-                65535,
-                safe_content->port_.getText().getIntValue()));
-            settings.unit_no = static_cast<std::uint8_t>(juce::jlimit(
-                0,
-                255,
-                safe_content->unit_.getText().getIntValue()));
-            settings.scc_plus =
-                safe_content->scc_plus_.getToggleState();
-            settings.waveform_monitor =
-                safe_content->waveform_monitor_.getToggleState();
-            const int silence_seconds = juce::jlimit(
-                0,
-                9999,
-                safe_content->opll_silence_seconds_.getText()
-                    .getIntValue());
-            static_cast<void>(safe->session_.output().applyHardwareSettings(
-                std::move(settings), silence_seconds));
-            safe_content->opll_silence_seconds_.setText(
-                juce::String(
-                    safe->session_.snapshot()
-                        .opll_keyoff_silence_seconds),
-                false);
-            safe_content->refreshOutputStatus();
-            safe->syncMidiControls();
-        };
-        content->asio_settings_.onClick = [safe, safe_content] {
-            if (safe == nullptr || safe_content == nullptr) {
-                return;
-            }
-            static_cast<void>(
-                safe->session_.output().showAsioControlPanel());
-            if (safe->session_.snapshot().pc_audio_backend
-                != PcAudioBackend::Asio) {
-                safe_content->pc_audio_kind_.setSelectedId(
-                    1, juce::sendNotificationSync);
-            }
-            safe_content->refreshPcAudioStatus();
-        };
-        content->reconnect_.onClick = [safe, safe_content] {
-            if (safe == nullptr || safe_content == nullptr) {
-                return;
-            }
-            const auto caps = safe->session_.snapshot().capabilities;
-            if (!caps.hardware_output && !caps.mamidi && !caps.vsif) {
-                return;
-            }
-            MGSTC_UI_ACTIVITY(
-                "settings: MAmidiMEmo reconnect (blocking)");
-            static_cast<void>(
-                safe->session_.output().reconnectHardware());
-            safe_content->refreshOutputStatus();
-            safe->syncMidiControls();
-        };
-        content->close_.onClick = [safe_dialog] {
-            if (safe_dialog != nullptr) {
-                safe_dialog->exitModalState(0);
-            }
-        };
-
-        dialog->enterModalState(true, nullptr, true);
-        return SnapshotResult::Success;
+            },
+            [safe] {
+                if (safe != nullptr) safe->syncMidiControls();
+            });
     }
 
     struct HeldNote {
@@ -3895,7 +3956,7 @@ public:
         };
         addAndMakeVisible(open_opll_);
         spectrogram_.setButtonText(
-            juce::String::fromUTF8("スペアナ"));
+            juce::String::fromUTF8("\xE3\x82\xB0\xE3\x83\xA9\xE3\x83\x95"));
         spectrogram_.setTooltip(juce::String::fromUTF8(
             "共通スペクトログラムウィンドウを開きます"));
         spectrogram_.onClick = [this] {
@@ -5191,49 +5252,10 @@ public:
             *this, effectiveUiScalePercent());
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(pageMargin);
-        layoutEditorTopRightChrome(
-            getWidth(),
-            settings_,
-            master_volume_,
-            &master_volume_label_,
-            &immediate_audition_);
-        int chrome_right = immediate_audition_.getX() - controlGap;
-        const int output_width = UiLayout::outputSwitchW;
-        output_switch_.setBounds(chrome_right - output_width, pageMargin,
-            output_width, textButtonH + juce::roundToInt(UiFonts::body().getHeight()));
-        chrome_right -= output_width + controlGap;
-        if (open_opll_.isVisible()) {
-            open_opll_.setBounds(
-                chrome_right - compositeOpenOpllW,
-                pageMargin,
-                compositeOpenOpllW,
-                textButtonH);
-            chrome_right -= compositeOpenOpllW + controlGap;
-        }
-        if (open_scc_.isVisible()) {
-            open_scc_.setBounds(
-                chrome_right - compositeOpenSccW,
-                pageMargin,
-                compositeOpenSccW,
-                textButtonH);
-            chrome_right -= compositeOpenSccW + controlGap;
-        }
-        spectrogram_.setBounds(
-            chrome_right - UiScale::sx(88),
-            pageMargin,
-            UiScale::sx(88),
-            textButtonH);
-        const int title_w = juce::jmax(
-            120,
-            chrome_right - UiScale::sx(88) - area.getX() - sm);
-        title_.setBounds(area.getX(), area.getY(), title_w, titleH);
-        description_.setBounds(
-            area.getX(),
-            area.getY() + titleH,
-            title_w,
-            descriptionH);
-        area.removeFromTop(titleH + descriptionH);
-        area.removeFromTop(sm);
+        const auto header = layoutEditorHeader(getWidth(), title_, description_,
+            open_scc_, open_opll_, spectrogram_, output_switch_,
+            immediate_audition_, master_volume_, master_volume_label_, settings_);
+        area.removeFromTop(header.bottom - area.getY() + sm);
         auto file_row = area.removeFromTop(toolbarH);
         for (auto* button : {&mgsc_open_, &mgsc_save_, &clipboard_paste_, &clipboard_copy_}) {
             button->setBounds(file_row.removeFromLeft(iconButton));
@@ -5435,6 +5457,10 @@ private:
             component->setExplicitFocusOrder(editor_order++);
         }
         performance_keyboard_.setExplicitFocusOrder(400);
+        open_scc_.setExplicitFocusOrder(60);
+        open_opll_.setExplicitFocusOrder(61);
+        spectrogram_.setExplicitFocusOrder(62);
+        settings_.setExplicitFocusOrder(63);
         mgsc_open_.setExplicitFocusOrder(70);
         mgsc_save_.setExplicitFocusOrder(71);
         clipboard_paste_.setExplicitFocusOrder(72);
@@ -8067,8 +8093,8 @@ private:
     CompositeTimeline timeline_;
     juce::Rectangle<int> editor_panel_bounds_;
     juce::Rectangle<int> composite_library_bounds_;
-    juce::TextButton open_scc_;
-    juce::TextButton open_opll_;
+    EditorNavigationButton open_scc_{2};
+    EditorNavigationButton open_opll_{1};
     juce::TextButton spectrogram_;
     juce::DrawableButton immediate_audition_{
         "immediate audition",
@@ -8523,8 +8549,7 @@ public:
 
         description_.setText(
             juce::String::fromUTF8(
-                "32サンプルの波形を直接編集できます。"
-                "グラフ両端は周期的につながっています。"),
+                "32サンプルの波形を直接編集できます。"),
             juce::dontSendNotification);
         addAndMakeVisible(description_);
 
@@ -8564,6 +8589,13 @@ public:
                 "Audacityを操作できるため、信頼できる環境で"
                 "使用してください"),
             [this] { importAudacitySelection(); });
+        open_composite_.setButtonText(juce::String::fromUTF8("\xE8\xA4\x87\xE5\x90\x88\xE9\x9F\xB3\xE8\x89\xB2"));
+        open_composite_.setTooltip(juce::String::fromUTF8(
+            "\xE8\xA4\x87\xE5\x90\x88\xE9\x9F\xB3\xE8\x89\xB2\xE3\x82\xA8\xE3\x83\x87\xE3\x82\xA3\xE3\x82\xBF\xE3\x82\x92\xE5\x88\xA5\xE3\x82\xA6\xE3\x82\xA3\xE3\x83\xB3\xE3\x83\x89\xE3\x82\xA6\xE3\x81\xA7\xE9\x96\x8B\xE3\x81\x8D\xE3\x81\xBE\xE3\x81\x99"));
+        open_composite_.onClick = [this] {
+            if (open_editor_) open_editor_("main", std::nullopt);
+        };
+        addAndMakeVisible(open_composite_);
         configureButton(
             open_opll_,
             juce::String::fromUTF8("OPLL音色"),
@@ -8572,7 +8604,7 @@ public:
             [this] { open_editor_("opll", std::nullopt); });
         configureButton(
             spectrogram_,
-            juce::String::fromUTF8("スペアナ"),
+            juce::String::fromUTF8("\xE3\x82\xB0\xE3\x83\xA9\xE3\x83\x95"),
             juce::String::fromUTF8(
                 "共通スペクトログラムウィンドウを開きます"),
             [this] {
@@ -9315,6 +9347,7 @@ public:
         assignExplicitFocusOrders(
             {
                 &spectrogram_,
+                &open_composite_,
                 &open_opll_,
                 &immediate_audition_,
                 &master_volume_,
@@ -9378,6 +9411,12 @@ public:
         };
         while (getNumChildComponents() > 0)
             editor_canvas_.addChildComponent(getChildComponent(0));
+        for (auto* component : std::initializer_list<juce::Component*>{
+                 &title_, &description_, &open_composite_, &open_opll_,
+                 &spectrogram_, &output_switch_, &immediate_audition_,
+                 &master_volume_, &master_volume_label_, &settings_}) {
+            addChildComponent(component);
+        }
         editor_viewport_.setViewedComponent(&editor_canvas_, false);
         editor_viewport_.setScrollBarsShown(true, true);
         addAndMakeVisible(editor_viewport_);
@@ -9846,51 +9885,30 @@ public:
         UiScale::syncEditorDrivenActivePercent(
             *this, effectiveUiScalePercent());
         paintPageBackground(graphics, getLocalBounds());
-        paintRoundedPanelFrame(graphics, editor_panel_bounds_);
-        paintRoundedPanelFrame(graphics, library_panel_bounds_);
     }
 
     void resized() override {
         UiScale::syncEditorDrivenActivePercent(
             *this, effectiveUiScalePercent());
         using namespace UiLayout;
-        editor_viewport_.setBounds(getLocalBounds());
-        const int chrome_height = pageMargin * 2 + titleH + descriptionH + md
+        const auto header = layoutEditorHeader(getWidth(), title_, description_,
+            open_composite_, open_opll_, spectrogram_, output_switch_,
+            immediate_audition_, master_volume_, master_volume_label_, settings_);
+        // The canvas owns only the body; the fixed header must stay outside
+        // its clipping/background region, including when the body is scrolled.
+        const int viewport_top = header.bottom + md;
+        editor_viewport_.setBounds(getLocalBounds().withTrimmedTop(viewport_top));
+        const int chrome_height = pageMargin
             + keyboardH + keyboardGap + statusH + sm + fieldH * 3 + xs * 2 + sm
             + toolbarH + sm + textButtonH + sm + textButtonH + md + panelPad * 2;
         const int minimum_height = chrome_height + 256 + 26 + 52 + fieldH + xs;
-        editor_canvas_.setSize(juce::jmax(getWidth(), UiLayout::editorWindowW),
-            juce::jmax(getHeight(), minimum_height));
+        editor_canvas_.setSize(juce::jmax(editor_viewport_.getWidth(), UiLayout::editorWindowW),
+            juce::jmax(editor_viewport_.getHeight(), minimum_height));
         editor_canvas_.setSize(juce::jmax(editor_viewport_.getMaximumVisibleWidth(), UiLayout::editorWindowW),
             juce::jmax(editor_viewport_.getMaximumVisibleHeight(), minimum_height));
-        auto area = editor_canvas_.getLocalBounds().reduced(pageMargin);
-        title_.setBounds(area.removeFromTop(titleH));
-        description_.setBounds(area.removeFromTop(descriptionH));
-        layoutEditorTopRightChrome(
-            editor_canvas_.getWidth(),
-            settings_,
-            master_volume_,
-            &master_volume_label_,
-            &immediate_audition_);
-        int chrome_right = immediate_audition_.getX() - controlGap;
-        const int output_width = UiLayout::outputSwitchW;
-        output_switch_.setBounds(chrome_right - output_width, pageMargin,
-            output_width, textButtonH + juce::roundToInt(UiFonts::body().getHeight()));
-        chrome_right -= output_width + controlGap;
-        if (open_opll_.isVisible()) {
-            open_opll_.setBounds(
-                chrome_right - compositeOpenOpllW,
-                pageMargin,
-                compositeOpenOpllW,
-                textButtonH);
-            chrome_right -= compositeOpenOpllW + controlGap;
-        }
-        spectrogram_.setBounds(
-            chrome_right - UiScale::sx(88),
-            pageMargin,
-            UiScale::sx(88),
-            textButtonH);
-        area.removeFromTop(md);
+        auto area = editor_canvas_.getLocalBounds()
+            .withTrimmedLeft(pageMargin).withTrimmedRight(pageMargin)
+            .withTrimmedBottom(pageMargin);
 
         auto keyboard_area = area.removeFromBottom(keyboardH);
         area.removeFromBottom(keyboardGap);
@@ -12250,6 +12268,7 @@ private:
             greyOutHostControl(spectrogram_);
         }
         if (!caps.independent_scc_opll_workbench) {
+            open_composite_.setVisible(false);
             open_opll_.setVisible(false);
         }
         if (!caps.tone_library) {
@@ -12515,7 +12534,8 @@ private:
         "copy", juce::DrawableButton::ImageOnButtonBackground};
     juce::TextButton import_wave_;
     juce::TextButton import_audacity_;
-    juce::TextButton open_opll_;
+    EditorNavigationButton open_opll_{1};
+    EditorNavigationButton open_composite_{0};
     juce::TextButton spectrogram_;
     juce::DrawableButton convert_to_opll_{
         "convert-to-opll",
@@ -13011,8 +13031,7 @@ public:
         addAndMakeVisible(immediate_audition_);
         description_.setText(
             juce::String::fromUTF8(
-                "YM2413オリジナル音色のパラメーターを編集します。"
-                "値の変更ごとに1秒試聴します。"),
+                "YM2413オリジナル音色のパラメーターを編集します。"),
             juce::dontSendNotification);
         addAndMakeVisible(description_);
 
@@ -13139,6 +13158,13 @@ public:
         addAndMakeVisible(rom_load_);
 
         updateAuditionNoteLabels();
+        open_composite_.setButtonText(juce::String::fromUTF8("\xE8\xA4\x87\xE5\x90\x88\xE9\x9F\xB3\xE8\x89\xB2"));
+        open_composite_.setTooltip(juce::String::fromUTF8(
+            "\xE8\xA4\x87\xE5\x90\x88\xE9\x9F\xB3\xE8\x89\xB2\xE3\x82\xA8\xE3\x83\x87\xE3\x82\xA3\xE3\x82\xBF\xE3\x82\x92\xE5\x88\xA5\xE3\x82\xA6\xE3\x82\xA3\xE3\x83\xB3\xE3\x83\x89\xE3\x82\xA6\xE3\x81\xA7\xE9\x96\x8B\xE3\x81\x8D\xE3\x81\xBE\xE3\x81\x99"));
+        open_composite_.onClick = [this] {
+            if (open_editor_) open_editor_("main", std::nullopt);
+        };
+        addAndMakeVisible(open_composite_);
         open_scc_.setButtonText(
             juce::String::fromUTF8("SCC音色"));
         open_scc_.setTooltip(
@@ -13150,7 +13176,7 @@ public:
         addAndMakeVisible(open_scc_);
         configureButton(
             spectrogram_,
-            juce::String::fromUTF8("スペアナ"),
+            juce::String::fromUTF8("\xE3\x82\xB0\xE3\x83\xA9\xE3\x83\x95"),
             juce::String::fromUTF8(
                 "共通スペクトログラムウィンドウを開きます"),
             [this] {
@@ -13394,6 +13420,7 @@ public:
         assignExplicitFocusOrders(
             {
                 &spectrogram_,
+                &open_composite_,
                 &open_scc_,
                 &immediate_audition_,
                 &master_volume_,
@@ -13855,33 +13882,10 @@ public:
             *this, effectiveUiScalePercent());
         using namespace UiLayout;
         auto area = getLocalBounds().reduced(pageMargin);
-        title_.setBounds(area.removeFromTop(titleH));
-        description_.setBounds(area.removeFromTop(descriptionH));
-        layoutEditorTopRightChrome(
-            getWidth(),
-            settings_,
-            master_volume_,
-            &master_volume_label_,
-            &immediate_audition_);
-        int chrome_right = immediate_audition_.getX() - controlGap;
-        const int output_width = UiLayout::outputSwitchW;
-        output_switch_.setBounds(chrome_right - output_width, pageMargin,
-            output_width, textButtonH + juce::roundToInt(UiFonts::body().getHeight()));
-        chrome_right -= output_width + controlGap;
-        if (open_scc_.isVisible()) {
-            open_scc_.setBounds(
-                chrome_right - compositeOpenSccW,
-                pageMargin,
-                compositeOpenSccW,
-                textButtonH);
-            chrome_right -= compositeOpenSccW + controlGap;
-        }
-        spectrogram_.setBounds(
-            chrome_right - UiScale::sx(88),
-            pageMargin,
-            UiScale::sx(88),
-            textButtonH);
-        area.removeFromTop(sm);
+        const auto header = layoutEditorHeader(getWidth(), title_, description_,
+            open_composite_, open_scc_, spectrogram_, output_switch_,
+            immediate_audition_, master_volume_, master_volume_label_, settings_);
+        area.removeFromTop(header.bottom - area.getY() + sm);
 
         auto keyboard_area = area.removeFromBottom(keyboardH);
         area.removeFromBottom(keyboardGap);
@@ -15558,6 +15562,7 @@ private:
             greyOutHostControl(spectrogram_);
         }
         if (!caps.independent_scc_opll_workbench) {
+            open_composite_.setVisible(false);
             open_scc_.setVisible(false);
         }
         if (!caps.waveform_scope) {
@@ -15804,7 +15809,8 @@ private:
     juce::DrawableButton immediate_audition_{
         "immediate audition",
         juce::DrawableButton::ImageOnButtonBackground};
-    juce::TextButton open_scc_;
+    EditorNavigationButton open_scc_{2};
+    EditorNavigationButton open_composite_{0};
     juce::TextButton spectrogram_;
     juce::DrawableButton convert_to_scc_{
         "convert-to-scc",

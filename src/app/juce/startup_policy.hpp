@@ -15,6 +15,8 @@ struct StartupPolicy {
         const bool verify = arguments.containsOption("--verify-startup");
         return {verify || arguments.containsOption("--verify-composite-workspace")
             || arguments.containsOption("--verify-window-routing")
+            || arguments.containsOption("--verify-launcher")
+            || arguments.containsOption("--verify-editor-close")
             || arguments.getValueForOption("--capture-ui").isNotEmpty(), verify};
     }
 };
