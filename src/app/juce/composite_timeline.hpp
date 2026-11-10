@@ -154,6 +154,8 @@ public:
     void repaintScopeOverlay();
     // Once per display tick, after appending all available frames.
     void refreshScopeDisplay();
+    // Timer-only cadence; new note/context changes bypass skipped ticks.
+    bool refreshScopeDisplayIfDue(double update_started_ms);
     void setScopeOutputGain(float gain);
 
     void resized() override;

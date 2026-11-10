@@ -109,6 +109,35 @@ void eachSignal(F&& test) {
     test(step, 7);
 }
 
+void testDisplayCadenceLoadRecoveryAndNotePriority() {
+    ScopeDisplayCadence cadence;
+    require(cadence.shouldRefresh(), "normal scope tick was skipped");
+    cadence.recordRefresh(4.0);
+    require(!cadence.shouldRefresh() && cadence.shouldRefresh(),
+        "scope overload did not reduce updates from 60 to 30 Hz");
+    cadence.recordRefresh(5.0);
+    for (int i = 0; i < 3; ++i)
+        require(!cadence.shouldRefresh(), "sustained overload did not reduce updates to 15 Hz");
+    require(cadence.shouldRefresh(), "scope cadence stalled after skipped frames");
+    cadence.recordRefresh(5.0);
+    require(cadence.shouldRefresh(true), "new note waited behind an overloaded display tick");
+    cadence.recordRefresh(5.0);
+    for (int i = 0; i < 16; ++i) {
+        int skipped = 0;
+        while (!cadence.shouldRefresh()) {
+            require(++skipped <= 3, "scope cadence grew an unbounded backlog");
+        }
+        cadence.recordRefresh(0.5);
+    }
+    require(cadence.shouldRefresh(), "scope did not recover to 60 Hz after healthy updates");
+    cadence.recordRefresh(0.5);
+    require(cadence.shouldRefresh(), "recovered scope still skipped healthy frames");
+    cadence.recordRefresh(std::numeric_limits<double>::infinity());
+    require(!cadence.shouldRefresh(), "non-finite cost did not degrade display safely");
+    cadence.reset();
+    require(cadence.shouldRefresh(), "reset scope retained an old skipped frame");
+}
+
 void testWindowSelectionBoundariesAndFiniteOutput() {
     eachSignal([](const std::vector<float>& pcm, int) {
         ScopeSynchronizer synchronizer;
@@ -888,6 +917,7 @@ std::size_t firstPcmAfterQueuedNoteOn(bool capture_scope) {
 
 int main(int argc, char** argv) {
     try {
+        testDisplayCadenceLoadRecoveryAndNotePriority();
         testWindowSelectionBoundariesAndFiniteOutput();
         testUnipolarPeriodicAndConstantDcSignals();
         testRollingColoredNoiseStaysRecentAndReadBounded();

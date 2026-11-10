@@ -7125,6 +7125,55 @@ public:
         refreshScopeDisplay();
         check(std::abs(normalized_height(2) - 0.43F) < 0.006F,
             "quiet auto-scale waveform lost the legacy peak floor or jumped to unity gain");
+        for (auto& channel : comparison_frame->physical_samples)
+            for (auto& sample : channel) sample *= 0.18F;
+        for (int i = 0; i < 6; ++i) static_cast<void>(appendScopeFrame(*comparison_frame, 60));
+        refreshScopeDisplay();
+        check(std::abs(normalized_height(2) - 0.0774F) < 0.003F,
+            "sub-threshold nonzero tail was treated as silent");
+        static_cast<void>(refreshScopeDisplayIfDue(juce::Time::getMillisecondCounterHiRes()));
+        scope_cadence_.reset();
+        scope_cadence_.recordRefresh(4.0);
+        const auto displayed_revision = scope_display_[2].overview_revision;
+        for (auto& channel : comparison_frame->physical_samples)
+            for (auto& sample : channel) sample *= 0.5F;
+        for (int i = 0; i < 6; ++i) static_cast<void>(appendScopeFrame(*comparison_frame, 60));
+        check(!refreshScopeDisplayIfDue(juce::Time::getMillisecondCounterHiRes())
+                && scope_display_[2].overview_revision == displayed_revision,
+            "overloaded scope did not skip waveform generation");
+        check(refreshScopeDisplayIfDue(juce::Time::getMillisecondCounterHiRes())
+                && scope_display_[2].overview_revision == scope_revision_
+                && std::abs(normalized_height(2) - 0.0387F) < 0.003F,
+            "resumed scope did not display the newest accumulated PCM");
+        scope_cadence_.recordRefresh(4.0);
+        static_cast<void>(appendScopeFrame(*comparison_frame, 61));
+        check(refreshScopeDisplayIfDue(juce::Time::getMillisecondCounterHiRes()),
+            "new note display waited for the overloaded cadence");
+        comparison_frame->sequence = 1;
+        comparison_frame->sample_end = 800;
+        static_cast<void>(appendScopeFrame(*comparison_frame, 61));
+        scope_cadence_.reset();
+        scope_cadence_.recordRefresh(4.0);
+        comparison_frame->sequence = 3;
+        comparison_frame->sample_end = 2400;
+        static_cast<void>(appendScopeFrame(*comparison_frame, 61));
+        check(!refreshScopeDisplayIfDue(juce::Time::getMillisecondCounterHiRes()),
+            "frame loss bypassed overloaded cadence without a new note");
+        comparison_frame->sequence = 5;
+        comparison_frame->sample_end = 4000;
+        static_cast<void>(appendScopeFrame(*comparison_frame, 61));
+        check(refreshScopeDisplayIfDue(juce::Time::getMillisecondCounterHiRes()),
+            "scope did not resume on latest PCM during continuing frame loss");
+        comparison_frame->sequence = comparison_frame->sample_end = 0;
+        for (auto& channel : comparison_frame->physical_samples) channel.fill(0.0F);
+        for (int i = 0; i < 6; ++i) static_cast<void>(appendScopeFrame(*comparison_frame, 61));
+        refreshScopeDisplay();
+        check(normalized_height(2) == 0.0F,
+            "sub-threshold tail remained cached after silent PCM replaced history");
+        const auto silent_revision = scope_revision_;
+        check(!appendScopeFrame(*comparison_frame, 61) && scope_revision_ == silent_revision,
+            "exact-zero idle PCM invalidated the cleared waveform cache");
+        scope_cadence_.reset();
         check(scope_auto_.getWidth() >= UiLayout::textButtonH && scope_common_.getWidth() >= UiLayout::textButtonH,
             "scope scale controls have insufficient toolbar space");
         tracks.fill(-1); setScopeTracks(tracks, 0);
@@ -7150,8 +7199,9 @@ public:
         repaintScopeOverlay();
     }
 
-    void resetScopeSynchronization() {
+    void resetScopeSynchronization(bool urgent = true) {
         ++scope_revision_;
+        if (urgent) scope_display_urgent_ = true;
         for (auto& display : scope_display_) {
             display.sync.reset();
             display.revision = 0;
@@ -7254,6 +7304,15 @@ public:
         if (changed) repaintScopeOverlay();
     }
 
+    bool refreshScopeDisplayIfDue(double update_started_ms) {
+        if (!scope_cadence_.shouldRefresh(scope_display_urgent_)) return false;
+        refreshScopeDisplay();
+        scope_display_urgent_ = false;
+        // Includes queue drain/history work performed before this call.
+        scope_cadence_.recordRefresh(juce::Time::getMillisecondCounterHiRes() - update_started_ms);
+        return true;
+    }
+
     void repaintScopeOverlay() {
         overview_content_.repaint();
         // This deliberately bypasses static scene invalidation.
@@ -7290,14 +7349,13 @@ public:
             || (frame.sample_end != 0 && scope_last_sample_end_ != 0
                 && frame.sample_end != scope_last_sample_end_ + frame.kSampleCount);
         if (gap) {
-            resetScopeSynchronization();
+            resetScopeSynchronization(false);
             for (auto& history : scope_history_) history.fill(0.0F);
             scope_size_ = scope_write_position_ = 0;
             scope_visible_sample_count_ = 0;
         }
         scope_last_frame_sequence_ = frame.sequence;
         scope_last_sample_end_ = frame.sample_end;
-        constexpr float kVisibleAmplitude = 1.0e-5F;
         const bool was_visible = scope_visible_sample_count_ != 0;
         const bool had_positions = std::any_of(scope_position_active_.begin(), scope_position_active_.end(), [](bool value) { return value; });
         const auto note = scopeDisplayNote(frame.selection_context, frame.selection_note, midi_note);
@@ -7309,12 +7367,14 @@ public:
             const auto index = static_cast<std::size_t>(track);
             const auto generation = frame.track_note_generation[index];
             if (scope_generations_[layer] == 0 && generation != 0
-                && (frame.captured_track_mask & (1U << track)) != 0)
+                && (frame.captured_track_mask & (1U << track)) != 0) {
                 scope_generations_[layer] = generation;
+                scope_display_urgent_ = true;
+            }
             const bool valid = scope_generations_[layer] != 0 && scope_generations_[layer] == generation;
             if (!valid && scope_generations_[layer] != 0) {
                 for (float& sample : scope_history_[layer]) {
-                    if (std::abs(sample) >= kVisibleAmplitude) --scope_visible_sample_count_;
+                    if (sample != 0.0F) --scope_visible_sample_count_;
                     sample = 0.0F;
                 }
                 scope_output_history_[layer].fill(0.0F);
@@ -7337,16 +7397,16 @@ public:
              ++index) {
             for (std::size_t channel = 0; channel < sources.size(); ++channel) {
                 auto& cached = scope_history_[channel][scope_write_position_];
-                if (std::abs(cached) >= kVisibleAmplitude) {
+                if (cached != 0.0F) {
                     --scope_visible_sample_count_;
                 }
-                cached = sources[channel] ? sources[channel][index] : 0.0F;
+                cached = sources[channel] ? finiteScopeSample(sources[channel][index]) : 0.0F;
                 const int track = channel < 17 ? scope_tracks_[channel] : -1;
                 const auto gains = frame.mixer_gains[index];
                 const float source_gain = track < 3 ? gains.psg : track < 8 ? gains.scc : gains.opll;
                 scope_output_history_[channel][scope_write_position_] = channel == 17
                     ? cached : cached * gains.master * source_gain;
-                if (std::abs(cached) >= kVisibleAmplitude) {
+                if (cached != 0.0F) {
                     ++scope_visible_sample_count_;
                 }
             }
@@ -15183,6 +15243,8 @@ private:
         std::uint64_t revision{}, overview_revision{}, detail_revision{}, sample_end{};
     };
     std::array<ScopeDisplayCache, 18> scope_display_;
+    ScopeDisplayCadence scope_cadence_;
+    bool scope_display_urgent_{true};
     std::uint64_t scope_revision_{1};
     float scope_output_gain_{1.0F};
     std::uint64_t scope_analysis_count_{}, scope_path_rebuilds_{};
@@ -15421,6 +15483,10 @@ void CompositeTimeline::repaintScopeOverlay() {
 
 void CompositeTimeline::refreshScopeDisplay() {
     impl_->refreshScopeDisplay();
+}
+
+bool CompositeTimeline::refreshScopeDisplayIfDue(double update_started_ms) {
+    return impl_->refreshScopeDisplayIfDue(update_started_ms);
 }
 
 void CompositeTimeline::setScopeOutputGain(float gain) {

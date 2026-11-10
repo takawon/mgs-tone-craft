@@ -5591,6 +5591,33 @@ void testOpllScopeRequiresContinuousLowNoteHistory() {
     require(!scope.synchronizedDisplayAvailable(), "discarded partial frames cannot masquerade as continuous samples");
     scope.setSynchronized(false);
     scope.appendFrame(*frame, 24);
+    ++frame->sequence;
+    frame->sample_end += frame->kSampleCount;
+    scope.appendFrame(*frame, 24, false);
+    require(scope.refreshDisplayIfDue(juce::Time::getMillisecondCounterHiRes() - 4.0),
+        "OPLL scope did not render its pending frame before measuring overload");
+    ++frame->sequence;
+    frame->sample_end += frame->kSampleCount;
+    scope.appendFrame(*frame, 24, false);
+    require(!scope.refreshDisplayIfDue(juce::Time::getMillisecondCounterHiRes()),
+        "OPLL scope did not skip waveform generation after overload");
+    require(scope.refreshDisplayIfDue(juce::Time::getMillisecondCounterHiRes()),
+        "OPLL scope lost the final pending frame when no new PCM arrived");
+    scope.appendFrame(*frame, 25, false);
+    require(scope.refreshDisplayIfDue(juce::Time::getMillisecondCounterHiRes()),
+        "OPLL note change waited behind a skipped scope update");
+    ++frame->sequence;
+    frame->sample_end += frame->kSampleCount;
+    scope.appendFrame(*frame, 25, false);
+    bool rendered = false;
+    for (int tick = 0; tick < 4 && !rendered; ++tick)
+        rendered = scope.refreshDisplayIfDue(juce::Time::getMillisecondCounterHiRes() - 4.0);
+    require(rendered, "OPLL cadence never consumed its pending frame");
+    frame->sequence += 2;
+    frame->sample_end += 2 * frame->kSampleCount;
+    scope.appendFrame(*frame, 25, false);
+    require(!scope.refreshDisplayIfDue(juce::Time::getMillisecondCounterHiRes()),
+        "OPLL frame loss bypassed overloaded cadence without a new note");
 }
 
 void testOpllLowNoteHistoryWithLargeHostCallbacks() {

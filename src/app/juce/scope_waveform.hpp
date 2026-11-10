@@ -37,6 +37,33 @@ struct ScopeWindow {
     bool synchronized{};
 };
 
+// Message-thread waveform cadence; the host timer and performance control stay
+// at their existing rate. Call once per tick, including ticks with no new PCM.
+class ScopeDisplayCadence final {
+public:
+    void reset() noexcept { interval_ = 1; remaining_ = healthy_ = 0; }
+    [[nodiscard]] bool shouldRefresh(bool urgent = false) noexcept {
+        if (urgent) { remaining_ = 0; return true; }
+        if (remaining_ == 0) return true;
+        --remaining_;
+        return false;
+    }
+    void recordRefresh(double elapsed_ms) noexcept {
+        if (!std::isfinite(elapsed_ms) || elapsed_ms > 3.0) {
+            interval_ = std::min(interval_ * 2U, 4U);
+            healthy_ = 0;
+        } else if (elapsed_ms < 1.5) {
+            if (++healthy_ >= 8) {
+                interval_ = std::max(1U, interval_ / 2U);
+                healthy_ = 0;
+            }
+        } else healthy_ = 0;
+        remaining_ = interval_ - 1;
+    }
+private:
+    unsigned interval_{1}, remaining_{}, healthy_{};
+};
+
 template <typename SampleAt>
 [[nodiscard]] float scopeSampleLinear(std::size_t count, SampleAt sample_at, double position) {
     if (count == 0 || !std::isfinite(position)) return 0.0F;

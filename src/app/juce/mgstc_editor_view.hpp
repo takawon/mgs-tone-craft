@@ -7985,6 +7985,7 @@ private:
     // Message-thread display work never dispatches notes or updates the model.
     void updateScopeDisplay() {
         if (!isShowing() || !scope_display_enabled_) return;
+        const double update_started = juce::Time::getMillisecondCounterHiRes();
         mgstc::engine::OpllScopeFrame frame{};
         // Bound catch-up while retaining consecutive low-note history.
         for (std::size_t count = 0; count < 32; ++count) {
@@ -7992,7 +7993,7 @@ private:
             static_cast<void>(timeline_.appendScopeFrame(frame, last_audition_note_));
         }
         timeline_.setScopeOutputGain(static_cast<float>(master_volume_.getValue()) / 100.0F);
-        timeline_.refreshScopeDisplay();
+        static_cast<void>(timeline_.refreshScopeDisplayIfDue(update_started));
     }
 
     class ScopeDisplayTimer final : public juce::Timer {
@@ -12695,6 +12696,11 @@ public:
             || frame.program_generation != last_program_generation_
             || frame.selection_context != last_selection_context_
             || note_generation != last_note_generation_) {
+            if (display_note_ != midi_note
+                || frame.program_generation != last_program_generation_
+                || frame.selection_context != last_selection_context_
+                || note_generation != last_note_generation_)
+                display_urgent_ = true;
             history_size_ = 0;
             history_write_ = 0;
             synchronized_available_ = false;
@@ -12713,10 +12719,20 @@ public:
             history_size_ = std::min(
                 history_size_ + 1, history_.size());
         }
+        display_pending_ = true;
         if (refresh) refreshDisplay();
     }
 
+    bool refreshDisplayIfDue(double update_started_ms) {
+        const bool due = cadence_.shouldRefresh(display_urgent_);
+        if (!display_pending_ || !due) return false;
+        refreshDisplay();
+        cadence_.recordRefresh(juce::Time::getMillisecondCounterHiRes() - update_started_ms);
+        return true;
+    }
+
     void refreshDisplay() {
+        display_pending_ = display_urgent_ = false;
         if (synchronized_) rebuildSynchronizedDisplay();
         rebuildWaveformPath();
         repaint();
@@ -12832,6 +12848,8 @@ private:
         float,
         mgstc::engine::OpllScopeFrame::kSampleCount>
         latest_{};
+    ScopeDisplayCadence cadence_;
+    bool display_pending_{}, display_urgent_{true};
     ScopeSynchronizer synchronizer_;
     ScopeWindow synchronized_window_;
     juce::Path waveform_path_;
@@ -15617,6 +15635,7 @@ private:
                 pending_envelope_trace_refresh_ = true;
             }
         }
+        const double scope_started = juce::Time::getMillisecondCounterHiRes();
         mgstc::engine::OpllScopeFrame frame{};
         if (session_.snapshot().capabilities.waveform_scope
             && componentWindowIsActive(*this)) {
@@ -15628,8 +15647,8 @@ private:
             }
             if (changed) {
                 MGSTC_UI_ACTIVITY("opll: scope history display");
-                scope_.refreshDisplay();
             }
+            scope_.refreshDisplayIfDue(scope_started);
         }
         if (audition_stop_time_ms_
             && juce::Time::getMillisecondCounterHiRes()
