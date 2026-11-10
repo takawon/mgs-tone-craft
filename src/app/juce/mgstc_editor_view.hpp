@@ -7986,13 +7986,13 @@ private:
     void updateScopeDisplay() {
         if (!isShowing() || !scope_display_enabled_) return;
         mgstc::engine::OpllScopeFrame frame{};
-        bool changed = false;
         // Bound catch-up while retaining consecutive low-note history.
         for (std::size_t count = 0; count < 32; ++count) {
             if (!session_.pollOpllScope(frame)) break;
-            changed = timeline_.appendScopeFrame(frame, last_audition_note_) || changed;
+            static_cast<void>(timeline_.appendScopeFrame(frame, last_audition_note_));
         }
-        if (changed) timeline_.repaintScopeOverlay();
+        timeline_.setScopeOutputGain(static_cast<float>(master_volume_.getValue()) / 100.0F);
+        timeline_.refreshScopeDisplay();
     }
 
     class ScopeDisplayTimer final : public juce::Timer {
@@ -12668,13 +12668,14 @@ private:
 class OpllScopeComponent final : public juce::Component {
 public:
     static constexpr std::size_t kHistorySampleCount = 4096;
-    static constexpr std::size_t kMaxSynchronizationCandidates = 64;
+    static constexpr std::size_t kMaxSynchronizationCandidates = ScopeSynchronizer::kMaxCandidates;
 
     void setSynchronized(bool synchronized) {
         synchronized_ = synchronized;
         if (synchronized_) {
             rebuildSynchronizedDisplay();
-        }
+        } else synchronizer_.reset();
+        rebuildWaveformPath();
         repaint();
     }
 
@@ -12688,16 +12689,23 @@ public:
                 && frame.sequence != last_frame_sequence_ + 1)
             || (frame.sample_end != 0 && last_sample_end_ != 0
                 && frame.sample_end != last_sample_end_ + frame.kSampleCount);
+        const auto note_generation = frame.guide_track < frame.track_note_generation.size()
+            ? frame.track_note_generation[frame.guide_track] : 0;
         if (display_note_ != midi_note || gap
-            || frame.program_generation != last_program_generation_) {
+            || frame.program_generation != last_program_generation_
+            || frame.selection_context != last_selection_context_
+            || note_generation != last_note_generation_) {
             history_size_ = 0;
             history_write_ = 0;
             synchronized_available_ = false;
+            synchronizer_.reset();
             display_note_ = midi_note;
         }
         last_frame_sequence_ = frame.sequence;
         last_sample_end_ = frame.sample_end;
         last_program_generation_ = frame.program_generation;
+        last_selection_context_ = frame.selection_context;
+        last_note_generation_ = note_generation;
         for (const float sample : frame.samples) {
             history_[history_write_] = sample;
             history_write_ =
@@ -12710,8 +12718,11 @@ public:
 
     void refreshDisplay() {
         if (synchronized_) rebuildSynchronizedDisplay();
+        rebuildWaveformPath();
         repaint();
     }
+
+    void resized() override { rebuildWaveformPath(); }
 
     [[nodiscard]] bool synchronizedDisplayAvailable() const {
         return synchronized_available_;
@@ -12758,19 +12769,9 @@ public:
             return;
         }
 
-        const auto& samples =
-            synchronized_ ? synchronized_display_ : latest_;
-        const auto sample_at = [&](std::size_t index) { return samples[index]; };
-        const float peak = scopePeak(samples.size(), sample_at, 0.0F);
-        const float gain = peak > 0.0001F ? 0.9F / peak : 1.0F;
-        juce::Path waveform;
-        buildScopePath(waveform,
-            {graph.getX() + 2.0F, graph.getY() + 3.0F,
-             graph.getWidth() - 4.0F, graph.getHeight() - 6.0F},
-            samples.size(), sample_at, gain, true);
         graphics.setColour(juce::Colour(0xFF4DD6B2));
         graphics.strokePath(
-            waveform,
+            waveform_path_,
             juce::PathStrokeType(
                 1.6F,
                 juce::PathStrokeType::curved,
@@ -12785,164 +12786,45 @@ public:
     }
 
 private:
-    [[nodiscard]] float sampleHistory(double position) const {
-        if (history_size_ == 0) {
-            return 0.0F;
-        }
-        position = std::clamp(
-            position,
-            0.0,
-            static_cast<double>(history_size_ - 1));
-        const auto left = static_cast<std::size_t>(position);
-        const auto right =
-            std::min(left + 1, history_size_ - 1);
-        const std::size_t oldest =
-            (history_write_ + history_.size() - history_size_)
-            % history_.size();
-        const auto sample = [&](std::size_t index) {
-            return history_[
-                (oldest + index) % history_.size()];
-        };
-        const float fraction = static_cast<float>(
-            position - static_cast<double>(left));
-        return sample(left)
-            + (sample(right) - sample(left)) * fraction;
-    }
-
-    void sampleWindow(
-        double start,
-        double sample_span,
-        std::array<
-            float,
-            mgstc::engine::OpllScopeFrame::kSampleCount>& output)
-        const {
-        const double step = sample_span
-            / static_cast<double>(output.size() - 1);
-        for (std::size_t index = 0;
-             index < output.size();
-             ++index) {
-            output[index] = sampleHistory(
-                start + static_cast<double>(index) * step);
-        }
-    }
-
-    [[nodiscard]] static double correlation(
-        const std::array<
-            float,
-            mgstc::engine::OpllScopeFrame::kSampleCount>& left,
-        const std::array<
-            float,
-            mgstc::engine::OpllScopeFrame::kSampleCount>& right) {
-        double left_mean = 0.0;
-        double right_mean = 0.0;
-        for (std::size_t index = 0;
-             index < left.size();
-             ++index) {
-            left_mean += left[index];
-            right_mean += right[index];
-        }
-        left_mean /= static_cast<double>(left.size());
-        right_mean /= static_cast<double>(right.size());
-        double dot = 0.0;
-        double left_energy = 0.0;
-        double right_energy = 0.0;
-        for (std::size_t index = 0;
-             index < left.size();
-             ++index) {
-            const double a =
-                static_cast<double>(left[index]) - left_mean;
-            const double b =
-                static_cast<double>(right[index]) - right_mean;
-            dot += a * b;
-            left_energy += a * a;
-            right_energy += b * b;
-        }
-        const double scale =
-            std::sqrt(left_energy * right_energy);
-        return scale > 1.0e-12 ? dot / scale : -1.0;
+    [[nodiscard]] float historySample(std::size_t index) const {
+        const auto oldest = (history_write_ + history_.size() - history_size_) % history_.size();
+        return history_[(oldest + index) % history_.size()];
     }
 
     void rebuildSynchronizedDisplay() {
         const double period = scopePeriodSamples(display_note_);
-        const double sample_span = period * 2.0;
-        if (history_size_
-            < static_cast<std::size_t>(
-                  std::ceil(sample_span))
-                + 2) {
+        if (history_size_ < static_cast<std::size_t>(std::ceil(period * 2.0)) + 2) {
             synchronized_available_ = false;
+            synchronizer_.reset();
             return;
         }
-
-        const double maximum_start =
-            static_cast<double>(history_size_ - 1)
-            - sample_span;
-        const std::size_t search_first =
-            static_cast<std::size_t>(
-                std::max(1.0, maximum_start - period * 2.5));
-        const std::size_t search_last =
-            static_cast<std::size_t>(
-                std::floor(maximum_start));
-        std::vector<double> candidates;
-        for (std::size_t index = search_first;
-             index <= search_last;
-             ++index) {
-            const float previous = sampleHistory(
-                static_cast<double>(index - 1));
-            const float current = sampleHistory(
-                static_cast<double>(index));
-            if (previous <= 0.0F && current > 0.0F) {
-                const double denominator =
-                    static_cast<double>(current - previous);
-                const double fraction =
-                    denominator > 1.0e-12
-                    ? -static_cast<double>(previous)
-                        / denominator
-                    : 0.0;
-                candidates.push_back(
-                    static_cast<double>(index - 1)
-                    + fraction);
-            }
-        }
-        if (candidates.empty()) {
-            candidates.push_back(maximum_start);
-        }
-
-        const bool compare_previous = synchronized_available_;
-        double best_start = candidates.back();
-        double best_score =
-            -std::numeric_limits<double>::infinity();
-        std::array<
-            float,
-            mgstc::engine::OpllScopeFrame::kSampleCount>
-            candidate{};
-        const std::size_t evaluation_count = std::min(
-            candidates.size(), kMaxSynchronizationCandidates);
-        for (std::size_t evaluation = 0;
-             compare_previous && evaluation < evaluation_count;
-             ++evaluation) {
-            const std::size_t candidate_index = evaluation_count > 1
-                ? evaluation * (candidates.size() - 1)
-                    / (evaluation_count - 1)
-                : candidates.size() - 1;
-            const double start = candidates[candidate_index];
-            sampleWindow(start, sample_span, candidate);
-            const double similarity = correlation(
-                candidate, synchronized_display_);
-            const double recency = maximum_start > 0.0
-                ? start / maximum_start
-                : 0.0;
-            const double score =
-                similarity + recency * 1.0e-4;
-            if (score > best_score) {
-                best_score = score;
-                best_start = start;
-            }
-        }
-        sampleWindow(
-            best_start,
-            sample_span,
-            synchronized_display_);
+        synchronized_window_ = synchronizer_.select(history_size_,
+            [this](std::size_t index) { return historySample(index); }, period, true, last_sample_end_);
         synchronized_available_ = true;
+    }
+
+    void rebuildWaveformPath() {
+        const auto graph = getLocalBounds().toFloat().reduced(0.5F);
+        const juce::Rectangle<float> bounds{graph.getX() + 2.0F, graph.getY() + 3.0F,
+            graph.getWidth() - 4.0F, graph.getHeight() - 6.0F};
+        if (synchronized_) {
+            waveform_path_.clear();
+            if (!synchronized_available_) return;
+            const auto sample_at = [this](std::size_t index) { return historySample(index); };
+            float peak = std::max(std::abs(scopeSampleLinear(history_size_, sample_at, synchronized_window_.start)),
+                std::abs(scopeSampleLinear(history_size_, sample_at, synchronized_window_.start + synchronized_window_.span)));
+            for (auto i = static_cast<std::size_t>(std::ceil(synchronized_window_.start));
+                static_cast<double>(i) <= synchronized_window_.start + synchronized_window_.span; ++i)
+                peak = std::max(peak, std::abs(finiteScopeSample(sample_at(i))));
+            const float gain = peak > 0.0001F ? 0.9F / peak : 1.0F;
+            buildScopeWindowPath(waveform_path_, bounds, history_size_, sample_at,
+                synchronized_window_, gain, true);
+        } else {
+            const auto sample_at = [this](std::size_t index) { return latest_[index]; };
+            const auto peak = scopePeak(latest_.size(), sample_at, 0.0F);
+            buildScopePath(waveform_path_, bounds, latest_.size(), sample_at,
+                peak > 0.0001F ? 0.9F / peak : 1.0F, true);
+        }
     }
 
     std::array<float, kHistorySampleCount> history_{};
@@ -12950,15 +12832,16 @@ private:
         float,
         mgstc::engine::OpllScopeFrame::kSampleCount>
         latest_{};
-    std::array<
-        float,
-        mgstc::engine::OpllScopeFrame::kSampleCount>
-        synchronized_display_{};
+    ScopeSynchronizer synchronizer_;
+    ScopeWindow synchronized_window_;
+    juce::Path waveform_path_;
     std::size_t history_size_{};
     std::size_t history_write_{};
     std::uint64_t last_frame_sequence_{};
     std::uint64_t last_sample_end_{};
     std::uint64_t last_program_generation_{};
+    std::uint64_t last_selection_context_{};
+    std::uint64_t last_note_generation_{};
     std::uint8_t display_note_{kPreviewNote};
     bool synchronized_{true};
     bool latest_available_{};

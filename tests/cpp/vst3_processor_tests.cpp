@@ -536,6 +536,37 @@ struct SatelliteEditorParityTestAccess {
 };
 
 struct CompositeEditorComponentTestAccess {
+    static juce::ToggleButton* scopeScaleButton(CompositeEditorComponent& editor, bool common) {
+        const auto wanted = juce::String::fromUTF8(common ? "\xE5\x85\xB1\xE9\x80\x9A" : "\xE8\x87\xAA\xE5\x8B\x95");
+        const auto find = [&](const auto& self, juce::Component& parent) -> juce::ToggleButton* {
+            for (int index = 0; index < parent.getNumChildComponents(); ++index) {
+                auto* child = parent.getChildComponent(index);
+                auto* button = dynamic_cast<juce::ToggleButton*>(child);
+                if (button != nullptr && button->getRadioGroupId() == 0x5343
+                    && button->getButtonText() == wanted) return button;
+                if (auto* found = self(self, *child)) return found;
+            }
+            return nullptr;
+        };
+        return find(find, editor.timeline_);
+    }
+    static juce::Image scopeTimelineSnapshot(CompositeEditorComponent& editor) {
+        return editor.timeline_.createComponentSnapshot(editor.timeline_.getLocalBounds());
+    }
+    static int scopeControlsBottomInTimeline(CompositeEditorComponent& editor) {
+        auto* automatic = scopeScaleButton(editor, false);
+        auto* common = scopeScaleButton(editor, true);
+        if (automatic == nullptr || common == nullptr) return -1;
+        const auto automatic_bounds = editor.timeline_.getLocalArea(automatic, automatic->getLocalBounds());
+        const auto common_bounds = editor.timeline_.getLocalArea(common, common->getLocalBounds());
+        return juce::jmax(automatic_bounds.getBottom(), common_bounds.getBottom());
+    }
+    static void updateScopeDisplay(CompositeEditorComponent& editor) {
+        editor.updateScopeDisplay();
+    }
+    static void setMasterVolume(CompositeEditorComponent& editor, int percent) {
+        editor.master_volume_.setValue(percent, juce::sendNotificationSync);
+    }
     static int auditionRowGap(CompositeEditorComponent& editor) {
         auto* implementation = editor.timeline_.getChildComponent(0);
         if (implementation == nullptr) return -1;
@@ -4214,12 +4245,15 @@ void requireRejected(
 }
 
 void testPluginStateFoundation() {
-    require(MgstcAudioProcessor{}.hasEditor(), "plugin exposes the shared editor");
+    // Hosts heap-own processors; keep this multi-instance fixture off the bounded test stack.
+    require(std::make_unique<MgstcAudioProcessor>()->hasEditor(), "plugin exposes the shared editor");
 
-    MgstcAudioProcessor original;
+    auto original_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& original = *original_owner;
     const auto original_bytes = stateBytes(original);
     require(!original_bytes.isEmpty(), "default state is not empty");
-    MgstcAudioProcessor restored;
+    auto restored_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& restored = *restored_owner;
     restored.setStateInformation(
         original_bytes.getData(),
         static_cast<int>(original_bytes.getSize()));
@@ -4289,10 +4323,12 @@ void testPluginStateFoundation() {
         psg.sound.layers[0].pitch_envelope.events.back().value == -3,
         "pitch envelope value");
 
-    MgstcAudioProcessor player_a;
+    auto player_a_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& player_a = *player_a_owner;
     require(player_a.replacePluginState(composite), "commit composite");
     const auto committed = stateBytes(player_a);
-    MgstcAudioProcessor player_b;
+    auto player_b_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& player_b = *player_b_owner;
     player_b.setStateInformation(
         committed.getData(), static_cast<int>(committed.getSize()));
     juce::AudioBuffer<float> pcm_a;
@@ -4309,8 +4345,10 @@ void testPluginStateFoundation() {
     require(
         soundBytes(library_a.sound) == soundBytes(library_b.sound),
         "library id is not part of the sound payload");
-    MgstcAudioProcessor lib_left;
-    MgstcAudioProcessor lib_right;
+    auto lib_left_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& lib_left = *lib_left_owner;
+    auto lib_right_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& lib_right = *lib_right_owner;
     require(lib_left.replacePluginState(library_a), "library 0");
     require(lib_right.replacePluginState(library_b), "library 382");
     require(lib_right.copyPluginState().library_id == 382, "library metadata");
@@ -4320,8 +4358,10 @@ void testPluginStateFoundation() {
     renderMidiNote(lib_right, lib_pcm_b);
     require(sameBuffer(lib_pcm_a, lib_pcm_b), "library id does not change PCM");
 
-    MgstcAudioProcessor instance_a;
-    MgstcAudioProcessor instance_b;
+    auto instance_a_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& instance_a = *instance_a_owner;
+    auto instance_b_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& instance_b = *instance_b_owner;
     require(instance_a.replacePluginState(psg), "instance A");
     require(instance_b.replacePluginState(opll), "instance B");
     const auto instance_b_bytes = stateBytes(instance_b);
@@ -4378,7 +4418,8 @@ void testPluginStateFoundation() {
     auto short_wave = payload;
     short_wave.resize(short_wave.size() - 8);
 
-    MgstcAudioProcessor guard;
+    auto guard_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& guard = *guard_owner;
     requireRejected(guard, {});
     requireRejected(guard, std::vector<std::uint8_t>(valid.begin(), valid.begin() + 12));
     requireRejected(guard, bad_magic);
@@ -4397,7 +4438,8 @@ void testPluginStateFoundation() {
     require(Access::stateCompileCount(guard) == compiles, "invalid channel does not compile");
     require(sameBlock(before_direct, stateBytes(guard)), "direct reject keeps state");
 
-    MgstcAudioProcessor audio_guard;
+    auto audio_guard_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& audio_guard = *audio_guard_owner;
     const auto audio_before = stateBytes(audio_guard);
     const auto audio_compiles = Access::stateCompileCount(audio_guard);
     Access::poseAsAudioThread(audio_guard);
@@ -4411,7 +4453,8 @@ void testPluginStateFoundation() {
     Access::clearAudioThread(audio_guard);
     require(sameBlock(audio_before, stateBytes(audio_guard)), "audio-thread reject keeps state");
 
-    MgstcAudioProcessor timed;
+    auto timed_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& timed = *timed_owner;
     loadDelayedThreeLayerProgram(timed);
     timed.prepareToPlay(44'100.0, 128);
     juce::AudioBuffer<float> attack(2, 128);
@@ -4429,7 +4472,8 @@ void testPluginStateFoundation() {
     require(layerOf(Access::plan(timed), mgstc::engine::TimbreSource::Opll) == nullptr, "old OPLL delay is gone");
     require(Access::scheduler(timed).pendingCount() == 0, "old pending layers are dropped");
 
-    MgstcAudioProcessor rates;
+    auto rates_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& rates = *rates_owner;
     require(rates.replacePluginState(psg), "program before rate changes");
     rates.prepareToPlay(44'100.0, 512);
     const auto latency_calls = Access::latencyCalls(rates);
@@ -4449,7 +4493,8 @@ void testPluginStateFoundation() {
     require(sameBlock(at_441, stateBytes(rates)), "88.2 kHz keeps the sound snapshot");
     require(rates.getLatencySamples() == 15, "88.2 kHz latency is unchanged by state");
 
-    MgstcAudioProcessor audible;
+    auto audible_owner = std::make_unique<MgstcAudioProcessor>();
+    auto& audible = *audible_owner;
     audible.setStateInformation(valid.data(), static_cast<int>(valid.size()));
     audible.prepareToPlay(48'000.0, 512);
     juce::AudioBuffer<float> heard(2, 512);
@@ -5176,19 +5221,22 @@ void testPluginEditor() {
     juce::Button* file_menu = nullptr;
     std::array<juce::Button*, 4> source_buttons{};
     bool layer_library_present = false;
-    bool spectrum_enabled = false;
-    juce::Button* spectrum_button = nullptr;
+    bool graph_entry_enabled = false;
+    juce::Button* graph_entry = nullptr;
     mgstc::app::SoundOutputSwitch* output_switch = nullptr;
     bool library_enabled = false;
     juce::Button* library_manage = nullptr;
-    bool scc_hidden = false;
-    bool opll_hidden = false;
+    int editor_navigation_buttons{}, visible_editor_navigation_buttons{};
     int emu_buttons{}, hardware_buttons{};
     const auto walk = [&](auto&& self, juce::Component* component) -> void {
         if (auto* control = dynamic_cast<mgstc::app::SoundOutputSwitch*>(component))
             output_switch = control;
         if (auto* button = dynamic_cast<juce::Button*>(component)) {
             const auto text = button->getButtonText();
+            if (dynamic_cast<mgstc::app::EditorNavigationButton*>(button)) {
+                ++editor_navigation_buttons;
+                if (button->isVisible()) ++visible_editor_navigation_buttons;
+            }
             if (text == juce::String::fromUTF8("保存 / ライブラリ")) library_toggle = button;
             if (text == juce::String::fromUTF8("カウント編集")) count_tab = button;
             if (text == juce::String::fromUTF8("試聴 1秒")) audition_footer = button;
@@ -5203,23 +5251,19 @@ void testPluginEditor() {
             if (tip == juce::String::fromUTF8("コピー (Ctrl+C)")) source_buttons[3] = button;
             if (text == juce::String::fromUTF8("エミュ") && button->isVisible()) ++emu_buttons;
             if (text == juce::String::fromUTF8("実機") && button->isVisible()) ++hardware_buttons;
-            if (text == juce::String::fromUTF8("スペアナ")) {
-                require(button->isEnabled() && button->isVisible(), "shared spectrum control is available");
-                spectrum_enabled = true;
-                spectrum_button = button;
+            if (button->getTooltip()
+                == juce::String::fromUTF8("共通スペクトログラムウィンドウを開きます")) {
+                require(text == juce::String::fromUTF8("グラフ")
+                        && button->isEnabled() && button->isVisible()
+                        && button->onClick,
+                    "shared graph entry is available and connected");
+                graph_entry_enabled = true;
+                graph_entry = button;
             }
             if (text == juce::String::fromUTF8("ライブラリ管理")) {
                 require(button->isEnabled(), "shared tone library manager is available");
                 library_manage = button;
                 library_enabled = true;
-            }
-            if (text == juce::String::fromUTF8("SCC音色")) {
-                require(!button->isVisible(), "independent SCC workbench button is hidden");
-                scc_hidden = true;
-            }
-            if (text == juce::String::fromUTF8("OPLL音色")) {
-                require(!button->isVisible(), "independent OPLL workbench button is hidden");
-                opll_hidden = true;
             }
         }
         if (auto* label = dynamic_cast<juce::Label*>(component))
@@ -5229,13 +5273,40 @@ void testPluginEditor() {
         }
     };
     walk(walk, editor);
-    require(spectrum_enabled, "spectrum button is present");
-    require(spectrum_button && output_switch
-            && spectrum_button->getRight() + UiLayout::controlGap == output_switch->getX(),
-        "hidden independent workbench controls leave no gap in plugin chrome");
+    require(graph_entry_enabled, "shared graph entry is present");
+    require(graph_entry && output_switch
+            && graph_entry->getRight() + UiLayout::controlGap == output_switch->getX(),
+        "graph entry is adjacent to the output switch in plugin chrome");
+    require(editor_navigation_buttons == 2 && visible_editor_navigation_buttons == 0,
+        "VST3 preserves its specified hidden independent-workbench navigation");
+    graph_entry->onClick();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+    juce::TopLevelWindow* graph_window = nullptr;
+    for (int index = 0; index < juce::TopLevelWindow::getNumTopLevelWindows(); ++index) {
+        auto* window = juce::TopLevelWindow::getTopLevelWindow(index);
+        if (window != nullptr
+            && window->getName()
+                == juce::String::fromUTF8("MGS Tone Craft - スペクトログラム")) {
+            graph_window = window;
+            break;
+        }
+    }
+    require(graph_window != nullptr && graph_window->isVisible(),
+        "graph entry opens the shared spectrum and spectrogram window");
+    const auto find_graph_button = [](auto&& self, juce::Component& root,
+                                      const juce::String& text) -> juce::Button* {
+        if (auto* button = dynamic_cast<juce::Button*>(&root);
+            button != nullptr && button->getButtonText() == text) return button;
+        for (auto* child : root.getChildren())
+            if (auto* found = self(self, *child, text)) return found;
+        return nullptr;
+    };
+    require(find_graph_button(find_graph_button, *graph_window,
+                juce::String::fromUTF8("スペクトラム")) != nullptr
+            && find_graph_button(find_graph_button, *graph_window,
+                juce::String::fromUTF8("スペクトログラム")) != nullptr,
+        "shared graph window exposes both spectrum display modes");
     require(library_enabled, "library button is present");
-    require(scc_hidden, "SCC workbench button is retained but hidden");
-    require(opll_hidden, "OPLL workbench button is retained but hidden");
     require(emu_buttons == 1 && hardware_buttons == 1,
         "composite view has one visible shared emulator/hardware switch");
     require(library_toggle && count_tab && focus_button, "main workspace navigation is present");
@@ -6144,6 +6215,96 @@ void testCompositeUiScopeFollowsLastVoice() {
     require(retriggered && retriggered->selection_context != second_context
             && retriggered->captured_track_mask == expectedMask(third_voice),
         "a later NoteOn replaces the retained selection after release");
+    EditorAccess::stop(editor);
+}
+
+void testVst3CompositeScopeScaleUsesDeliveredPcm() {
+    using EditorAccess = mgstc::app::CompositeEditorComponentTestAccess;
+    MgstcAudioProcessor processor;
+    processor.prepareToPlay(48'000.0, 512);
+    auto sound = mgstc::engine::defaultCompositeTimbre();
+    for (auto& layer : sound.layers) mgstc::engine::seedDefaultLayerTimbre(sound, layer);
+    mgstc::plugin::PluginEditorContext context(processor);
+    mgstc::app::EditorLink link;
+    mgstc::app::CompositeEditorComponent editor(context, link,
+        [](const juce::String&, std::optional<std::uint64_t>) {},
+        [] {}, [](std::uint8_t) {}, [](juce::Component*) {}, [] {}, sound);
+    editor.setSize(1280, 900);
+    editor.addToDesktop(0);
+    editor.setVisible(true);
+    require(editor.isShowing(), "private VST3 editor peer makes the display timer eligible");
+    EditorAccess::setMasterVolume(editor, 50);
+    require(processor.editorMasterVolumePercent() == 50, "scope fixture uses the post-engine plugin master volume");
+    require(EditorAccess::rebuild(editor), "VST3 scope fixture program submits");
+    processEmpty(processor, 512);
+    EditorAccess::start(editor, 60);
+
+    bool received_pcm = false;
+    for (int block = 0; block < 8; ++block) {
+        processEmpty(processor, 512);
+        EditorAccess::updateScopeDisplay(editor);
+        // Scope frames contain 800 samples. Drain several complete host blocks
+        // before treating the cached image as evidence of delivered PCM.
+        if (block < 3) continue;
+        auto* common = EditorAccess::scopeScaleButton(editor, true);
+        require(common != nullptr && common->getToggleState() == false,
+            "VST3 timeline exposes common scope scale in its default auto state");
+        // Compare below the toolbar, where scale-button chrome cannot explain
+        // a pixel difference. The preceding blocks exceed one scope frame.
+        const auto auto_image = EditorAccess::scopeTimelineSnapshot(editor);
+        if (!auto_image.isNull()) {
+            const int first_wave_y = juce::jmin(auto_image.getHeight(),
+                EditorAccess::scopeControlsBottomInTimeline(editor) + UiLayout::controlGap);
+            if (first_wave_y < auto_image.getHeight()) {
+                const auto before = stateBytes(processor);
+                const auto model_before = EditorAccess::sound(editor);
+                const auto audition_interval = EditorAccess::auditionTimerInterval(editor);
+                const auto display_interval = EditorAccess::scopeDisplayTimerInterval(editor);
+                auto* auto_button = EditorAccess::scopeScaleButton(editor, false);
+                require(auto_button != nullptr && auto_button->getToggleState(),
+                    "VST3 scope auto scale button is selected before switching");
+                common->triggerClick();
+                juce::MessageManager::getInstance()->runDispatchLoopUntil(30);
+                require(common->getToggleState() && !auto_button->getToggleState(),
+                    "VST3 scope switch dispatch selects the common radio button");
+                require(EditorAccess::sound(editor) == model_before
+                        && sameBlock(before, stateBytes(processor)),
+                    "scope scale change leaves VST3 timbre and Plugin State unchanged");
+                require(EditorAccess::scopeDisplayTimerInterval(editor) == display_interval
+                        && EditorAccess::auditionTimerInterval(editor) == audition_interval,
+                    "scope scale change preserves display and audition timer rates");
+                const auto common_image = EditorAccess::scopeTimelineSnapshot(editor);
+                require(!common_image.isNull()
+                        && common_image.getWidth() == auto_image.getWidth()
+                        && common_image.getHeight() == auto_image.getHeight(),
+                    "common-scale VST3 timeline renders at the same size");
+                bool waveform_region_changed = false;
+                for (int y = first_wave_y; y < auto_image.getHeight() && !waveform_region_changed; ++y)
+                    for (int x = 0; x < auto_image.getWidth(); ++x)
+                        if (auto_image.getPixelAt(x, y) != common_image.getPixelAt(x, y)) {
+                            waveform_region_changed = true;
+                            break;
+                        }
+                require(waveform_region_changed,
+                    "VST3 delivered PCM changes its rendered waveform under common scale");
+                EditorAccess::setMasterVolume(editor, 0);
+                EditorAccess::updateScopeDisplay(editor);
+                const auto muted_image = EditorAccess::scopeTimelineSnapshot(editor);
+                bool master_changed_waveform = false;
+                for (int y = first_wave_y; y < common_image.getHeight() && !master_changed_waveform; ++y)
+                    for (int x = 0; x < common_image.getWidth(); ++x)
+                        if (common_image.getPixelAt(x, y) != muted_image.getPixelAt(x, y)) {
+                            master_changed_waveform = true;
+                            break;
+                        }
+                require(processor.editorMasterVolumePercent() == 0 && master_changed_waveform,
+                    "post-engine master volume updates the VST3 common-scale waveform");
+                received_pcm = true;
+                break;
+            }
+        }
+    }
+    require(received_pcm, "VST3 editor drained captured PCM into its visible waveform cache");
     EditorAccess::stop(editor);
 }
 
@@ -8667,6 +8828,7 @@ int main() {
             testPluginEditor();
             testCompositePlaybackWaveform();
             testCompositeUiScopeFollowsLastVoice();
+            testVst3CompositeScopeScaleUsesDeliveredPcm();
             testOpllScopeRequiresContinuousLowNoteHistory();
             testOpllLowNoteHistoryWithLargeHostCallbacks();
             testDawMidiScopeFollowsLatestVoiceAndRetainsRelease();
@@ -8757,6 +8919,7 @@ int main() {
         testEditorParityCorrections();
         testCompositePlaybackWaveform();
         testCompositeUiScopeFollowsLastVoice();
+        testVst3CompositeScopeScaleUsesDeliveredPcm();
         testOpllScopeRequiresContinuousLowNoteHistory();
         testOpllLowNoteHistoryWithLargeHostCallbacks();
         testDawMidiScopeFollowsLatestVoiceAndRetainsRelease();

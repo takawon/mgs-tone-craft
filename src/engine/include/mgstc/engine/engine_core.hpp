@@ -41,6 +41,8 @@ struct RenderResult {
 
 struct OpllScopeFrame {
     static constexpr std::size_t kSampleCount = 800;
+    // Display metadata; physical PCM remains in its native chip units.
+    std::array<MixerGains, kSampleCount> mixer_gains{};
 
     std::array<float, kSampleCount> psg_samples{};
     std::array<float, kSampleCount> scc_samples{};
@@ -182,6 +184,7 @@ private:
     std::array<float, OpllScopeFrame::kSampleCount> scc_scope_work_{};
     std::array<float, OpllScopeFrame::kSampleCount> opll_scope_work_{};
     std::array<float, OpllScopeFrame::kSampleCount> mixed_scope_work_{};
+    std::array<MixerGains, OpllScopeFrame::kSampleCount> scope_gain_work_{};
     std::array<std::array<float, OpllScopeFrame::kSampleCount>, RuntimeSession::kTrackCount> physical_scope_work_{};
     std::uint32_t scope_track_mask_{};
     std::uint32_t scope_requested_track_mask_{};

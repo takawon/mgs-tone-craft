@@ -193,6 +193,7 @@ RenderResult EngineCore::render(
             }
             if (fill_scope) {
                 const auto scope_index = opll_scope_position_++;
+                scope_gain_work_[scope_index] = gains_;
                 psg_scope_work_[scope_index] = scope_chips.psg;
                 scc_scope_work_[scope_index] = scope_chips.scc;
                 opll_scope_work_[scope_index] = scope_chips.opll;
@@ -206,6 +207,7 @@ RenderResult EngineCore::render(
                     opll_scope_completed_.scc_samples = scc_scope_work_;
                     opll_scope_completed_.samples = opll_scope_work_;
                     opll_scope_completed_.mixed_samples = mixed_scope_work_;
+                    opll_scope_completed_.mixer_gains = scope_gain_work_;
                     opll_scope_completed_.captured_track_mask = scope_track_mask_;
                     opll_scope_completed_.selection_context = scope_selection_context_;
                     for (auto bits = scope_track_mask_; bits != 0; bits &= bits - 1U) {

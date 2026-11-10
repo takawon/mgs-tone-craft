@@ -11510,6 +11510,10 @@ void testScopeSelectedChannelsPreserveMixAndIndependentOutputs() {
     std::array<bool, 3> channel_diff{};
     std::array<bool, 3> channel_nonzero{};
     for (int tick = 0; tick < 36; ++tick) {
+        if (tick == 12) {
+            for (auto* core : {selected.get(), mixed.get(), full.get()})
+                REQUIRE_EQ(core->setGains({0.7F, 0.5F, 1.2F, 0.8F}), true);
+        }
         if (tick == 24) {
             for (auto* core : {selected.get(), mixed.get(), full.get()})
                 for (const auto& binding : plan.audible_layers)
@@ -11527,6 +11531,12 @@ void testScopeSelectedChannelsPreserveMixAndIndependentOutputs() {
         REQUIRE_EQ(first->captured_track_mask, selected_mask);
         REQUIRE_EQ(first->samples, all->samples);
         REQUIRE_EQ(first->mixed_samples, all->mixed_samples);
+        for (const auto gain : first->mixer_gains) {
+            REQUIRE_EQ(gain.master, tick < 12 ? 3.0F : 0.7F);
+            REQUIRE_EQ(gain.psg, tick < 12 ? 1.0F : 0.5F);
+            REQUIRE_EQ(gain.scc, tick < 12 ? 1.0F : 1.2F);
+            REQUIRE_EQ(gain.opll, tick < 12 ? 1.0F : 0.8F);
+        }
         for (std::size_t chip = 0; chip < 3; ++chip) {
             const auto track = std::array<std::size_t, 3>{0, 3, 8}[chip];
             REQUIRE_EQ(first->physical_samples[track], all->physical_samples[track]);

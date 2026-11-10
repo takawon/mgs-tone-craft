@@ -4611,6 +4611,29 @@ public:
             repaint();
         };
         addAndMakeVisible(compact_overview_);
+        scope_scale_label_.setText(juce::String::fromUTF8("\xE6\xB3\xA2\xE5\xBD\xA2"), juce::dontSendNotification);
+        scope_scale_label_.setFont(UiFonts::body());
+        scope_scale_label_.setBorderSize(juce::BorderSize<int>(0));
+        scope_scale_label_.setJustificationType(juce::Justification::centredLeft);
+        addAndMakeVisible(scope_scale_label_);
+        scope_auto_.setButtonText(juce::String::fromUTF8("\xE8\x87\xAA\xE5\x8B\x95"));
+        scope_common_.setButtonText(juce::String::fromUTF8("\xE5\x85\xB1\xE9\x80\x9A"));
+        int scope_segment = 0;
+        for (auto* button : {&scope_auto_, &scope_common_}) {
+            configureSegmentButton(*button, scope_segment++, 2);
+            button->setClickingTogglesState(true);
+            button->setRadioGroupId(0x5343);
+            button->setTooltip(juce::String::fromUTF8(
+                "\xE6\xB3\xA2\xE5\xBD\xA2\xE3\x81\xAE\xE8\xA1\xA8\xE7\xA4\xBA\xE5\x80\x8D\xE7\x8E\x87: "
+                "\xE8\x87\xAA\xE5\x8B\x95 / \xE5\x85\xB1\xE9\x80\x9A (\xE5\x87\xBA\xE5\x8A\x9B\xE6\x8C\xAF\xE5\xB9\x85)"));
+            button->onClick = [this] { ++scope_revision_; refreshScopeDisplay(); repaintScopeOverlay(); };
+            addAndMakeVisible(*button);
+        }
+        scope_auto_.setToggleState(true, juce::dontSendNotification);
+        scope_common_.setTooltip(juce::String::fromUTF8(
+            "\xE5\x85\xB1\xE9\x80\x9A\xE3\x82\xB9\xE3\x82\xB1\xE3\x83\xBC\xE3\x83\xAB: "
+            "\xE3\x83\x9F\xE3\x82\xAD\xE3\x82\xB5\xE3\x83\xBC\xE3\x82\xB2\xE3\x82\xA4\xE3\x83\xB3\xE9\x81\xA9\xE7\x94\xA8\xE5\xBE\x8C\xE3\x81\xAE\xE6\x8C\xAF\xE5\xB9\x85\xE3\x82\x92\xE6\xAF\x94\xE8\xBC\x83\xE3\x80\x82"
+            "MIX\xE3\x81\xAF" "DC\xE9\x99\xA4\xE5\x8E\xBB\xE3\x83\xBB\xE3\x82\xAF\xE3\x83\xAA\xE3\x83\x83\xE3\x83\x97\xE5\xBE\x8C\xE3\x80\x82"));
 
         step_edit_mode_.setButtonText(juce::String::fromUTF8("削除/挿入"));
         step_edit_mode_.setClickingTogglesState(true);
@@ -6823,6 +6846,7 @@ public:
     }
 
     void refreshUiScaleFonts() {
+        scope_scale_label_.setFont(UiFonts::body());
         tempo_label_.setFont(UiFonts::body());
         UiFonts::styleBodyField(tempo_);
         UiFonts::styleBodyField(value_);
@@ -6914,6 +6938,7 @@ public:
                     for (std::size_t sample = 0; sample < frame.kSampleCount; ++sample)
                         frame.physical_samples[8][sample] = frame.mixed_samples[sample] = std::sin(static_cast<float>(sample) * 0.1F);
                     check(appendScopeFrame(frame, 60), "scope frame was not accepted");
+                    refreshScopeDisplay();
                     const auto after = createComponentSnapshot(getLocalBounds());
                     check(edit_scene_rebuilds_ == rebuilds, "wave update rebuilt static envelope foreground");
                     const auto content = graph_bounds_[2];
@@ -7011,6 +7036,11 @@ public:
                 && scope_size_ == static_cast<int>(release_frame.kSampleCount)
                 && scope_visible_sample_count_ == 0,
             "partial capture reset was joined to old samples or not repainted");
+        release_frame.sequence = 6;
+        release_frame.sample_end += release_frame.kSampleCount;
+        const auto idle_revision = scope_revision_;
+        check(!appendScopeFrame(release_frame, 48) && scope_revision_ == idle_revision,
+            "unchanged silent idle PCM invalidated the waveform cache");
         const auto before_rename_tracks = scope_tracks_;
         const auto before_rename_context = scope_context_;
         auto renamed = timbre_;
@@ -7018,6 +7048,85 @@ public:
         setTimbre(renamed);
         check(scope_tracks_ == before_rename_tracks && scope_context_ == before_rename_context,
             "renaming a layer invalidated its unchanged physical scope target");
+        // Exercise the actual keyboard-to-button-to-display connection.
+        fixture.layers[2].relative_semitones = 7;
+        setTimbre(fixture, true);
+        tracks[0] = 0; tracks[1] = 3; tracks[2] = 8;
+        setScopeTracks(tracks, ++serial);
+        auto comparison_frame = std::make_unique<mgstc::engine::OpllScopeFrame>();
+        comparison_frame->selection_context = serial;
+        comparison_frame->captured_track_mask = (1U << 0) | (1U << 3) | (1U << 8);
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            const auto track = static_cast<std::size_t>(tracks[channel]);
+            comparison_frame->track_note_generation[track] = serial;
+            const auto note = mgstc::engine::layerMidiNote(fixture.layers[channel], 60).value_or(60);
+            for (std::size_t i = 0; i < comparison_frame->kSampleCount; ++i) {
+                comparison_frame->mixer_gains[i] = {2.0F, 0.5F, 1.0F, 2.0F};
+                comparison_frame->physical_samples[track][i] = 0.02F * static_cast<float>(channel + 1)
+                    * std::sin(static_cast<float>(i * juce::MathConstants<double>::twoPi
+                        / mgstc::app::scopePeriodSamples(note)));
+            }
+        }
+        static_cast<void>(appendScopeFrame(*comparison_frame, 60));
+        refreshScopeDisplay();
+        const auto before_scale_model = timbre_;
+        const auto revision_before_click = scope_revision_;
+        check(static_cast<juce::Component&>(scope_common_).keyPressed(juce::KeyPress(juce::KeyPress::returnKey)),
+            "common scope scale is not keyboard accessible");
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+        check(scope_common_.getToggleState() && !scope_auto_.getToggleState()
+                && scope_revision_ > revision_before_click && timbre_ == before_scale_model,
+            "scope scale keyboard dispatch did not update display exclusively");
+        check(scope_display_[2].window.synchronized,
+            "transposed periodic layer failed to synchronize to its own pitch");
+        const auto normalized_height = [&](std::size_t channel) {
+            return scope_display_[channel].overview.getBounds().getHeight()
+                / juce::jmax(1, scope_display_[channel].overview_size.y);
+        };
+        check(std::abs(normalized_height(0) - 0.02F) < 0.003F
+                && std::abs(normalized_height(1) - 0.08F) < 0.003F
+                && std::abs(normalized_height(2) - 0.24F) < 0.003F,
+            "common scope scale does not reflect source/master output balance");
+        setScopeOutputGain(0.5F);
+        refreshScopeDisplay();
+        check(std::abs(normalized_height(0) - 0.01F) < 0.002F
+                && std::abs(normalized_height(1) - 0.04F) < 0.002F
+                && std::abs(normalized_height(2) - 0.12F) < 0.002F,
+            "common scope scale ignored post-mixer output volume");
+        setScopeOutputGain(0.0F);
+        refreshScopeDisplay();
+        check(normalized_height(0) == 0.0F && normalized_height(1) == 0.0F
+                && normalized_height(2) == 0.0F,
+            "zero post-mixer output volume left nonzero common-scale waveforms");
+        setScopeOutputGain(1.0F);
+        refreshScopeDisplay();
+        const auto cached_path = scope_display_[2].overview;
+        const auto analyses = scope_analysis_count_, rebuilds = scope_path_rebuilds_;
+        const int foreign_scale = percent == 75 ? 125 : 75;
+        UiScale::setActivePercent(foreign_scale);
+        refreshScopeDisplay();
+        check(UiScale::active_percent == foreign_scale,
+            "scope display tick leaked editor metrics into another window");
+        UiScale::setActivePercent(percent);
+        static_cast<void>(createComponentSnapshot(getLocalBounds()));
+        check(scope_display_[2].overview == cached_path && scope_analysis_count_ == analyses
+                && scope_path_rebuilds_ == rebuilds,
+            "unchanged display tick or repaint reanalysed cached waveform geometry");
+        static_cast<juce::Component&>(scope_auto_).keyPressed(juce::KeyPress(juce::KeyPress::returnKey));
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+        check(scope_auto_.getToggleState() && !scope_common_.getToggleState(),
+            "auto scope scale radio selection was not restored");
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            const auto track = static_cast<std::size_t>(tracks[channel]);
+            const float reduction = 0.00005F / (0.02F * static_cast<float>(channel + 1));
+            for (auto& sample : comparison_frame->physical_samples[track]) sample *= reduction;
+        }
+        for (int i = 0; i < 6; ++i) static_cast<void>(appendScopeFrame(*comparison_frame, 60));
+        refreshScopeDisplay();
+        check(std::abs(normalized_height(2) - 0.43F) < 0.006F,
+            "quiet auto-scale waveform lost the legacy peak floor or jumped to unity gain");
+        check(scope_auto_.getWidth() >= UiLayout::textButtonH && scope_common_.getWidth() >= UiLayout::textButtonH,
+            "scope scale controls have insufficient toolbar space");
         tracks.fill(-1); setScopeTracks(tracks, 0);
         setPatchSlideCallback({});
         selected_layer_ = original_layer;
@@ -7037,7 +7146,112 @@ public:
         for (auto& history : scope_history_) history.fill(0.0F);
         scope_size_ = scope_write_position_ = 0;
         scope_visible_sample_count_ = 0;
+        resetScopeSynchronization();
         repaintScopeOverlay();
+    }
+
+    void resetScopeSynchronization() {
+        ++scope_revision_;
+        for (auto& display : scope_display_) {
+            display.sync.reset();
+            display.revision = 0;
+            display.overview.clear();
+            display.detail.clear();
+        }
+    }
+
+    void setScopeOutputGain(float gain) {
+        gain = std::isfinite(gain) ? std::clamp(gain, 0.0F, 1.0F) : 1.0F;
+        if (scope_output_gain_ == gain) return;
+        scope_output_gain_ = gain;
+        if (scope_common_.getToggleState()) ++scope_revision_;
+    }
+
+    // Message thread only; bounded to the visible rows plus detail and MIX.
+    // Repaints consume these paths and never run correlation or PCM analysis.
+    void refreshScopeDisplay() {
+        // A different editor or floating preview may currently own process
+        // metrics. Use this timeline's laid-out geometry without leaking scale.
+        struct ScopedLayoutScale {
+            int previous{UiScale::active_percent};
+            explicit ScopedLayoutScale(int percent) {
+                if (UiScale::active_percent != percent) UiScale::setActivePercent(percent);
+            }
+            ~ScopedLayoutScale() {
+                if (UiScale::active_percent != previous) UiScale::setActivePercent(previous);
+            }
+        } scale(scope_layout_scale_);
+        const double began = juce::Time::getMillisecondCounterHiRes();
+        bool changed = false;
+        const int oldest = (scope_write_position_ + kScopeHistorySize - scope_size_) % kScopeHistorySize;
+        const bool common = scope_common_.getToggleState();
+        const auto prepare = [&](std::size_t channel, juce::Rectangle<int> bounds, bool detail) {
+            if (bounds.getWidth() < 2 || bounds.getHeight() < 1) return;
+            auto& display = scope_display_[channel];
+            auto& path = detail ? display.detail : display.overview;
+            auto& size = detail ? display.detail_size : display.overview_size;
+            auto& revision = detail ? display.detail_revision : display.overview_revision;
+            const juce::Point<int> dimensions(bounds.getWidth(), bounds.getHeight());
+            if (revision == scope_revision_ && size == dimensions) return;
+            const auto raw = [&](std::size_t i) { return scope_history_[channel][(oldest + i) % kScopeHistorySize]; };
+            if (display.revision != scope_revision_) {
+                ++scope_analysis_count_;
+                // Discard phase memory when this row has been offscreen beyond history.
+                if (scope_last_sample_end_ > display.sample_end + kScopeHistorySize) display.sync.reset();
+                const bool allow_search = (!common || scope_output_gain_ > 0.000001F)
+                    && juce::Time::getMillisecondCounterHiRes() - began < 3.0;
+                const auto note = channel < timbre_.layers.size()
+                    ? mgstc::engine::layerMidiNote(timbre_.layers[channel], audition_note_).value_or(audition_note_)
+                    : audition_note_;
+                display.window = display.sync.select(static_cast<std::size_t>(scope_size_), raw,
+                    mgstc::app::scopePeriodSamples(note), allow_search, scope_last_sample_end_);
+                display.revision = scope_revision_;
+                display.sample_end = scope_last_sample_end_;
+            }
+            const auto sample = [&](std::size_t i) {
+                return common ? scope_output_history_[channel][(oldest + i) % kScopeHistorySize] : raw(i);
+            };
+            const auto& window = display.window;
+            float peak = 0.0001F;
+            if (scope_size_ > 0) {
+                peak = std::max(std::abs(mgstc::app::scopeSampleLinear(scope_size_, raw, window.start)),
+                    std::abs(mgstc::app::scopeSampleLinear(scope_size_, raw, window.start + window.span)));
+                for (auto i = static_cast<std::size_t>(std::ceil(window.start));
+                    i < static_cast<std::size_t>(scope_size_) && static_cast<double>(i) <= window.start + window.span; ++i)
+                    peak = std::max(peak, std::abs(mgstc::app::finiteScopeSample(raw(i))));
+            }
+            const float gain = common ? scope_output_gain_ : 0.86F / std::max(peak, 0.0001F);
+            mgstc::app::buildScopeWindowPath(path,
+                {0.0F, 0.0F, static_cast<float>(bounds.getWidth() - 1), static_cast<float>(bounds.getHeight())},
+                static_cast<std::size_t>(scope_size_), sample, display.window, gain, true);
+            ++scope_path_rebuilds_;
+            size = dimensions;
+            revision = scope_revision_;
+            changed = true;
+        };
+        if (!focus_.getToggleState()) {
+            auto mix = workspaceArea().withTrimmedTop(overviewHeight()).withHeight(UiLayout::fieldH);
+            mix.removeFromLeft(UiLayout::compositeOverviewLabelW);
+            mix.removeFromRight(kScrollBarSize);
+            mix.reduce(UiLayout::sm, 0);
+            prepare(17, mix, false);
+            const juce::Rectangle<int> visible(overview_view_.getViewPosition(),
+                juce::Point<int>(overview_view_.getViewPositionX() + overview_view_.getViewWidth(),
+                    overview_view_.getViewPositionY() + overview_view_.getViewHeight()));
+            for (std::size_t i = 0; i < timbre_.layers.size(); ++i) {
+                auto row = juce::Rectangle<int>(0, static_cast<int>(i) * overviewRowHeight(),
+                    overview_content_.getWidth(), overviewRowHeight());
+                if (visible.intersects(row)) prepare(i,
+                    row.withTrimmedLeft(UiLayout::compositeOverviewLabelW).reduced(UiLayout::sm, UiLayout::xs), false);
+            }
+        }
+        if (selected_layer_ >= 0 && selected_layer_ < static_cast<int>(timbre_.layers.size())
+            && selected_layer_ < static_cast<int>(graph_bounds_.size())) {
+            const auto index = static_cast<std::size_t>(selected_layer_);
+            if (timbre_.layers[index].volume_envelope.kind == mgstc::engine::EnvelopeKind::Sequence)
+                prepare(index, timelinePlotBounds(graph_bounds_[index]), true);
+        }
+        if (changed) repaintScopeOverlay();
     }
 
     void repaintScopeOverlay() {
@@ -7051,6 +7265,7 @@ public:
         std::uint8_t midi_note) {
         if (frame.program_generation < scope_program_generation_) return false;
         if (frame.program_generation != scope_program_generation_) {
+            resetScopeSynchronization();
             scope_program_generation_ = frame.program_generation;
             scope_last_frame_sequence_ = 0;
             scope_last_sample_end_ = 0;
@@ -7075,6 +7290,7 @@ public:
             || (frame.sample_end != 0 && scope_last_sample_end_ != 0
                 && frame.sample_end != scope_last_sample_end_ + frame.kSampleCount);
         if (gap) {
+            resetScopeSynchronization();
             for (auto& history : scope_history_) history.fill(0.0F);
             scope_size_ = scope_write_position_ = 0;
             scope_visible_sample_count_ = 0;
@@ -7084,7 +7300,9 @@ public:
         constexpr float kVisibleAmplitude = 1.0e-5F;
         const bool was_visible = scope_visible_sample_count_ != 0;
         const bool had_positions = std::any_of(scope_position_active_.begin(), scope_position_active_.end(), [](bool value) { return value; });
-        audition_note_ = scopeDisplayNote(frame.selection_context, frame.selection_note, midi_note);
+        const auto note = scopeDisplayNote(frame.selection_context, frame.selection_note, midi_note);
+        if (audition_note_ != note) resetScopeSynchronization();
+        audition_note_ = note;
         for (std::size_t layer = 0; layer < scope_tracks_.size(); ++layer) {
             const int track = scope_tracks_[layer];
             if (track < 0 || track >= 17) { scope_position_active_[layer] = false; continue; }
@@ -7099,6 +7317,8 @@ public:
                     if (std::abs(sample) >= kVisibleAmplitude) --scope_visible_sample_count_;
                     sample = 0.0F;
                 }
+                scope_output_history_[layer].fill(0.0F);
+                scope_display_[layer].sync.reset();
             }
             scope_position_active_[layer] = valid && frame.playback_positions[index].active;
             scope_positions_[layer] = frame.playback_positions[index].count;
@@ -7121,6 +7341,11 @@ public:
                     --scope_visible_sample_count_;
                 }
                 cached = sources[channel] ? sources[channel][index] : 0.0F;
+                const int track = channel < 17 ? scope_tracks_[channel] : -1;
+                const auto gains = frame.mixer_gains[index];
+                const float source_gain = track < 3 ? gains.psg : track < 8 ? gains.scc : gains.opll;
+                scope_output_history_[channel][scope_write_position_] = channel == 17
+                    ? cached : cached * gains.master * source_gain;
                 if (std::abs(cached) >= kVisibleAmplitude) {
                     ++scope_visible_sample_count_;
                 }
@@ -7131,6 +7356,7 @@ public:
         }
         const bool changed = gap || was_visible || scope_visible_sample_count_ != 0 || had_positions
             || std::any_of(scope_position_active_.begin(), scope_position_active_.end(), [](bool value) { return value; });
+        if (changed) ++scope_revision_;
         if (changed) repaintScopeOverlay();
         return changed;
     }
@@ -7138,6 +7364,9 @@ public:
     void resized() override {
         edit_scene_dirty_ = overview_scene_dirty_ = true;
         using namespace UiLayout;
+        scope_layout_scale_ = UiScale::active_percent;
+        scope_scale_label_width_ = juce::GlyphArrangement::getStringWidthInt(
+            UiFonts::body(), scope_scale_label_.getText()) + xs * 2;
         auto area = getLocalBounds().reduced(panelPad);
         auto header = area.removeFromTop(textButtonH);
         tempo_.setBounds(header.removeFromRight(compositeTempoFieldW));
@@ -7165,6 +7394,16 @@ public:
         zoom_in_.setBounds(header.removeFromLeft(textButtonH));
         header.removeFromLeft(controlGap);
         zoom_out_.setBounds(header.removeFromLeft(textButtonH));
+        header.removeFromLeft(controlGap);
+        if (scopeScaleNeedsOwnRow()) {
+            area.removeFromTop(sm);
+            header = area.removeFromTop(textButtonH);
+        }
+        scope_scale_label_.setBounds(header.removeFromLeft(scopeScaleLabelWidth()));
+        header.removeFromLeft(controlGap);
+        const int scope_button_width = juce::jmax(0, juce::jmin(libraryButtonMinW, header.getWidth() / 2));
+        scope_auto_.setBounds(header.removeFromLeft(scope_button_width));
+        scope_common_.setBounds(header.removeFromLeft(scope_button_width));
         auto side = inspectorArea();
         setup_tab_.setVisible(inspector_visible_);
         count_tab_.setVisible(inspector_visible_);
@@ -7222,6 +7461,7 @@ public:
         lane_layout_applied_ = false;
         lane_layout_dirty_ = true;
         ensureLaneLayout();
+        refreshScopeDisplay();
     }
 
     juce::String verifyLoopInteraction(const juce::File& directory) {
@@ -8451,7 +8691,7 @@ public:
             juce::Graphics::ScopedSaveState body_state(graphics);
             graphics.reduceClipRegion(body);
             if (layer.volume_envelope.kind == mgstc::engine::EnvelopeKind::Sequence)
-                drawScope(graphics, plot, index, colour.withAlpha(0.32F));
+                drawScope(graphics, plot, index, colour.withAlpha(0.32F), true);
         }
         const auto scene_bounds = graphArea();
         const auto scene_scale = juce::Component::getApproximateScaleFactorForComponent(this);
@@ -10582,8 +10822,20 @@ private:
 
     [[nodiscard]] int timelineChromeHeight() const noexcept {
         using namespace UiLayout;
-        // Add/help/tempo row only; envelope edit tools live in the edit-tier dock.
-        return textButtonH + sm;
+        return textButtonH + sm + (scopeScaleNeedsOwnRow() ? textButtonH + sm : 0);
+    }
+
+    [[nodiscard]] bool scopeScaleNeedsOwnRow() const noexcept {
+        using namespace UiLayout;
+        const int add_width = timbre_.layers.empty()
+            ? compositeAddOpllW + compositeAddSccW + compositeAddPsgW + controlGap * 2 : compositeSelectorW;
+        const int occupied = compositeTempoFieldW + compositeTempoLabelW + sm + add_width
+            + compositeFocusW * 2 + compositeSelectorW + textButtonH * 2 + controlGap * 5;
+        return getWidth() - panelPad * 2 < occupied + scopeScaleLabelWidth() + controlGap + libraryButtonMinW * 2;
+    }
+
+    [[nodiscard]] int scopeScaleLabelWidth() const noexcept {
+        return scope_scale_label_width_;
     }
 
     [[nodiscard]] juce::Rectangle<int> editHeaderArea() const {
@@ -11100,7 +11352,7 @@ private:
         juce::Graphics& graphics,
         juce::Rectangle<int> bounds,
         std::size_t channel,
-        juce::Colour colour) const {
+        juce::Colour colour, bool detail = false) const {
         if (bounds.isEmpty()) return;
         juce::Graphics::ScopedSaveState clipped(graphics);
         graphics.reduceClipRegion(bounds);
@@ -11112,30 +11364,15 @@ private:
         if (scope_size_ < 2 || bounds.getWidth() < 2) {
             return;
         }
-        const int sample_count = juce::jlimit(
-            2,
-            scope_size_,
-            juce::roundToInt(2.0 * mgstc::app::scopePeriodSamples(audition_note_)));
-        const int oldest =
-            (scope_write_position_ + kScopeHistorySize - scope_size_)
-            % kScopeHistorySize;
-        const int logical_start = scope_size_ - sample_count;
         const std::size_t scope_channel = channel >= timbre_.layers.size()
             ? 17 : channel;
-        const auto sample_at = [&](std::size_t logical_index) {
-            return scope_history_[scope_channel][static_cast<std::size_t>(
-                (oldest + logical_start + logical_index)
-                % kScopeHistorySize)];
-        };
-        const float peak = mgstc::app::scopePeak(static_cast<std::size_t>(sample_count), sample_at);
-        juce::Path path;
-        auto path_bounds = bounds.toFloat().withWidth(static_cast<float>(bounds.getWidth() - 1));
-        path_bounds.setCentre(path_bounds.getCentreX(), static_cast<float>(bounds.getCentreY()));
-        mgstc::app::buildScopePath(path, path_bounds, static_cast<std::size_t>(bounds.getWidth()),
-            [&](std::size_t x) { return sample_at(juce::roundToInt(static_cast<double>(x)
-                * static_cast<double>(sample_count - 1) / static_cast<double>(bounds.getWidth() - 1))); }, 0.86F / peak);
+        const auto& display = scope_display_[scope_channel];
+        const auto& path = detail ? display.detail : display.overview;
         graphics.setColour(colour);
-        graphics.strokePath(path, juce::PathStrokeType(1.4F));
+        graphics.strokePath(path, juce::PathStrokeType(1.4F),
+            juce::AffineTransform::translation(static_cast<float>(bounds.getX()),
+                static_cast<float>(bounds.getY()) + static_cast<float>(bounds.getCentreY())
+                    - bounds.toFloat().getCentreY()));
     }
 
     struct EditLaneSlots {
@@ -14783,6 +15020,9 @@ private:
     juce::ComboBox auto_mode_;
     juce::TextButton add_channel_;
     juce::TextButton compact_overview_;
+    MorphDistributionButton scope_auto_, scope_common_;
+    juce::Label scope_scale_label_;
+    int scope_scale_label_width_{};
     juce::TextButton step_edit_mode_;
     juce::TextButton psg_add_;
     juce::TextButton scc_add_;
@@ -14934,6 +15174,19 @@ private:
     static constexpr int kScopeHistorySize = 4096;
     std::array<std::array<float, kScopeHistorySize>, 18>
         scope_history_{};
+    std::array<std::array<float, kScopeHistorySize>, 18> scope_output_history_{};
+    struct ScopeDisplayCache {
+        mgstc::app::ScopeSynchronizer sync;
+        mgstc::app::ScopeWindow window;
+        juce::Path overview, detail;
+        juce::Point<int> overview_size, detail_size;
+        std::uint64_t revision{}, overview_revision{}, detail_revision{}, sample_end{};
+    };
+    std::array<ScopeDisplayCache, 18> scope_display_;
+    std::uint64_t scope_revision_{1};
+    float scope_output_gain_{1.0F};
+    std::uint64_t scope_analysis_count_{}, scope_path_rebuilds_{};
+    int scope_layout_scale_{UiScale::active_percent};
     std::array<int, 17> scope_tracks_ = [] { std::array<int, 17> value; value.fill(-1); return value; }();
     std::array<std::uint64_t, 17> scope_generations_{};
     std::array<std::uint32_t, 17> scope_positions_{};
@@ -15164,6 +15417,14 @@ void CompositeTimeline::setScopeTracks(const std::array<int, 17>& tracks, std::u
 
 void CompositeTimeline::repaintScopeOverlay() {
     impl_->repaintScopeOverlay();
+}
+
+void CompositeTimeline::refreshScopeDisplay() {
+    impl_->refreshScopeDisplay();
+}
+
+void CompositeTimeline::setScopeOutputGain(float gain) {
+    impl_->setScopeOutputGain(gain);
 }
 
 }  // namespace mgstc::app

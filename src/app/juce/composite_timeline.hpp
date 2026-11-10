@@ -152,6 +152,9 @@ public:
         std::uint8_t midi_note);
     void setScopeTracks(const std::array<int, 17>& tracks, std::uint64_t context);
     void repaintScopeOverlay();
+    // Once per display tick, after appending all available frames.
+    void refreshScopeDisplay();
+    void setScopeOutputGain(float gain);
 
     void resized() override;
 
