@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -84,6 +85,10 @@ struct ToneImportResult {
 // short waits. Crossing these limits means the bytes are not one timbre load.
 inline constexpr std::uint32_t kVgmCandidateMaxSamples = 2'940;
 inline constexpr std::uint32_t kVgmCandidateMaxCommands = 48;
+
+// Resource protection for the complete expanded VGZ, independent of candidate
+// command/time windows. This is not a limit imposed by the VGM file format.
+inline constexpr std::size_t kVgzMaxExpandedBytes = 256U * 1024U * 1024U;
 
 [[nodiscard]] const char* toneImportFormatName(ToneImportFormat format) noexcept;
 

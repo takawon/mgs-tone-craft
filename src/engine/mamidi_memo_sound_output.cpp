@@ -43,9 +43,11 @@ bool MAmidiMemoSoundOutput::open() {
     }
     // A faulted worker may have exited while its std::thread is still joinable.
     stopWorker();
+    const bool quarantine = recovery_required_.load(std::memory_order_acquire)
+        || restarted_tracks_ != kAllTracks;
 
     setError({});
-    producer_error_.store(ProducerError::None, std::memory_order_release);
+    producer_error_.store(quarantine ? ProducerError::Full : ProducerError::None, std::memory_order_release);
     connection_state_.store(MAmidiConnectionState::Connecting, std::memory_order_release);
     if (!client_.connect(host_, port_)) {
         setError(client_.lastError());
@@ -62,10 +64,20 @@ bool MAmidiMemoSoundOutput::open() {
     close_acknowledged_.store(true, std::memory_order_release);
     reset_requested_.store(0, std::memory_order_relaxed);
     reset_acknowledged_.store(0, std::memory_order_relaxed);
+    recovery_required_.store(quarantine, std::memory_order_release);
+    restarted_tracks_ = quarantine ? 0 : kAllTracks;
+    pending_level_tracks_ = 0;
+    queued_note_tokens_.fill(0);
+    if (!quarantine) {
+        desired_psg_ = {};
+        desired_opll_ = {};
+        desired_scc_ = {};
+    }
     emission_enabled_.store(true, std::memory_order_release);
     startWorker();
     open_.store(true, std::memory_order_release);
     connection_state_.store(MAmidiConnectionState::Connected, std::memory_order_release);
+    if (quarantine) allNotesOff();
     return true;
 }
 
@@ -111,7 +123,44 @@ bool MAmidiMemoSoundOutput::writeRegister(const RegisterWrite& write) {
         producer_error_.store(ProducerError::InvalidWrite, std::memory_order_relaxed);
         return false;
     }
-    return enqueueChipAccess(*mapped);
+    const bool partial = !recovery_required_.load(std::memory_order_acquire)
+        && restarted_tracks_ != kAllTracks;
+    if (partial && (write.track >= queued_note_tokens_.size()
+        || (restarted_tracks_ & (1U << write.track)) == 0)) return true;
+    rememberDesired(*mapped);
+    if (partial && (write.reason == WriteReason::EnvelopeY || write.reason == WriteReason::RhythmControl)) {
+        // A fresh voice may explicitly control another physical channel. Its
+        // Y value is intentional; retired voices must not overwrite it later.
+        if (write.chip == ChipId::Psg) {
+            if (write.address >= 8 && write.address <= 10 && write.value != 0)
+                pending_level_tracks_ |= 1U << (write.address - 8);
+            if (write.address == 7)
+                for (std::uint8_t channel = 0; channel < 3; ++channel)
+                    if (((write.value >> channel) & 0x09U) != 0x09U)
+                        pending_level_tracks_ |= 1U << channel;
+        } else if (write.chip == ChipId::Opll) {
+            if (write.address >= 0x20 && write.address <= 0x28 && (write.value & 0x10U) != 0)
+                pending_level_tracks_ |= 1U << (write.address - 0x20 + 8);
+            if (write.address == 0x0E) {
+                if ((write.value & 0x10U) != 0) pending_level_tracks_ |= 1U << 14;
+                if ((write.value & 0x09U) != 0) pending_level_tracks_ |= 1U << 15;
+                if ((write.value & 0x06U) != 0) pending_level_tracks_ |= 1U << 16;
+            }
+        }
+        return enqueueChipAccess(*mapped);
+    }
+    auto access = maskUnstartedTracks(*mapped, restarted_tracks_);
+    if (partial && write.chip == ChipId::Psg && write.address == 7 && write.track < 3) {
+        const auto bits = (1U << write.track) | (1U << (write.track + 3));
+        access.data = (queued_psg_mixer_ & ~bits) | (mapped->data & bits);
+        rememberDesired(access);
+    } else if (partial && write.chip == ChipId::Scc && write.port == 3
+        && write.track >= 3 && write.track < 8) {
+        const auto bit = 1U << (write.track - 3);
+        access.data = (queued_scc_keys_ & ~bit) | (mapped->data & bit);
+        rememberDesired(access);
+    }
+    return enqueueChipAccess(access);
 }
 
 bool MAmidiMemoSoundOutput::writeRegisters(
@@ -121,22 +170,191 @@ bool MAmidiMemoSoundOutput::writeRegisters(
         return false;
     }
 
+    bool delivered = true;
     for (const auto& write : writes) {
         if (!writeRegister(write)) {
-            return false;
+            delivered = false;
+            // Keep the complete desired image, including writes after the
+            // first dropped one. Invalid input remains a hard error.
+            if (!recoverableWriteFailure()) return false;
         }
     }
-    return true;
+    return delivered && restoreFreshLevels();
 }
 
 void MAmidiMemoSoundOutput::reset() {
+    desired_psg_ = {};
+    desired_opll_ = {};
+    desired_scc_ = {};
+    restarted_tracks_ = recovery_required_.load(std::memory_order_acquire) ? 0 : kAllTracks;
+    pending_level_tracks_ = 0;
+    producer_error_.store(recovery_required_.load(std::memory_order_acquire)
+        ? ProducerError::Full : ProducerError::None, std::memory_order_relaxed);
     allNotesOff();
+}
+
+void MAmidiMemoSoundOutput::rememberDesired(MAmidiChipAccess access) noexcept {
+    const auto save = [&](auto& image, std::uint32_t address) {
+        if (address < image.size()) image[address] = {
+            static_cast<std::uint8_t>(access.data), true};
+    };
+    if (access.device_id == static_cast<std::uint8_t>(MAmidiDeviceId::Psg))
+        save(desired_psg_, access.address);
+    else if (access.device_id == static_cast<std::uint8_t>(MAmidiDeviceId::Opll))
+        save(desired_opll_, access.address);
+    else if (access.device_id == static_cast<std::uint8_t>(MAmidiDeviceId::Scc))
+        save(desired_scc_, access.address - (scc_plus_ ? kMAmidiSccPlusOffset : 0));
+}
+
+MAmidiChipAccess MAmidiMemoSoundOutput::maskUnstartedTracks(
+    MAmidiChipAccess access, std::uint32_t tracks) const noexcept {
+    if (tracks == kAllTracks) return access;
+    const auto address = access.address;
+    if (access.device_id == static_cast<std::uint8_t>(MAmidiDeviceId::Psg)) {
+        if (address >= 8 && address <= 10 && (tracks & (1U << (address - 8))) == 0)
+            access.data = 0;
+        if (address == 7) {
+            const auto muted = (~tracks) & 7U;
+            access.data |= muted | (muted << 3U);
+        }
+    } else if (access.device_id == static_cast<std::uint8_t>(MAmidiDeviceId::Opll)) {
+        if (address >= 0x20 && address <= 0x28
+            && (tracks & (1U << (address - 0x20 + 8))) == 0) access.data &= ~0x10U;
+        if (address >= 0x30 && address <= 0x38
+            && (tracks & (1U << (address - 0x30 + 8))) == 0) access.data |= 0x0FU;
+        if (address == 0x0E) {
+            std::uint32_t rhythm_keys = 0;
+            if ((tracks & (1U << 14)) != 0) rhythm_keys |= 0x10;
+            if ((tracks & (1U << 15)) != 0) rhythm_keys |= 0x09;
+            if ((tracks & (1U << 16)) != 0) rhythm_keys |= 0x06;
+            access.data &= 0xE0U | rhythm_keys;
+        }
+    } else if (access.device_id == static_cast<std::uint8_t>(MAmidiDeviceId::Scc)) {
+        const auto relative = address - (scc_plus_ ? kMAmidiSccPlusOffset : 0);
+        if (relative >= kMAmidiSccVolumeBase && relative < kMAmidiSccKeyAddress
+            && (tracks & (1U << (relative - kMAmidiSccVolumeBase + 3))) == 0)
+            access.data = 0;
+        if (relative == kMAmidiSccKeyAddress) access.data &= (tracks >> 3U) & 0x1FU;
+    }
+    return access;
+}
+
+bool MAmidiMemoSoundOutput::restoreMutedImage() noexcept {
+    const auto restore = [&](const auto& image, MAmidiDeviceId chip, std::uint32_t offset) {
+        for (std::size_t address = 0; address < image.size(); ++address) {
+            if (!image[address].present) continue;
+            const MAmidiChipAccess desired{static_cast<std::uint8_t>(chip), unit_no_,
+                static_cast<std::uint32_t>(address) + offset, image[address].value};
+            if (!tryEnqueueChipAccess(maskUnstartedTracks(desired, 0))) return false;
+        }
+        return true;
+    };
+    return restore(desired_psg_, MAmidiDeviceId::Psg, 0)
+        && restore(desired_opll_, MAmidiDeviceId::Opll, 0)
+        && restore(desired_scc_, MAmidiDeviceId::Scc, scc_plus_ ? kMAmidiSccPlusOffset : 0);
+}
+
+bool MAmidiMemoSoundOutput::restoreFreshLevels() noexcept {
+    if (pending_level_tracks_ == 0) return true;
+    const auto send = [&](const auto& image, MAmidiDeviceId chip, std::uint32_t address,
+                          std::uint32_t offset = 0) {
+        if (!image[address].present) return true;
+        return tryEnqueueChipAccess(maskUnstartedTracks({static_cast<std::uint8_t>(chip), unit_no_,
+            address + offset, image[address].value}, restarted_tracks_ | pending_level_tracks_));
+    };
+    // Normal NoteOn usually writes these values itself. Complete a recovered
+    // NoteOn that emits only pitch/key without replaying any previous key-on.
+    if ((pending_level_tracks_ & 7U) != 0 && desired_psg_[7].present) {
+        const auto channels = pending_level_tracks_ & 7U;
+        const auto bits = channels | (channels << 3U);
+        const auto mixer = (queued_psg_mixer_ & ~bits) | (desired_psg_[7].value & bits);
+        if (!tryEnqueueChipAccess({static_cast<std::uint8_t>(MAmidiDeviceId::Psg), unit_no_, 7, mixer})) return false;
+    }
+    for (std::uint32_t track = 0; track < 17; ++track) {
+        if ((pending_level_tracks_ & (1U << track)) == 0) continue;
+        if (track < 3) {
+            if (!send(desired_psg_, MAmidiDeviceId::Psg, 8 + track)) return false;
+        } else if (track < 8) {
+            if (!send(desired_scc_, MAmidiDeviceId::Scc, kMAmidiSccVolumeBase + track - 3,
+                scc_plus_ ? kMAmidiSccPlusOffset : 0)) return false;
+        } else if (!send(desired_opll_, MAmidiDeviceId::Opll, 0x30 + track - 8)) return false;
+    }
+    pending_level_tracks_ = 0;
+    return true;
+}
+
+void MAmidiMemoSoundOutput::beginTick(std::uint32_t new_note_tracks) noexcept {
+    if (!isOpen() || !emission_enabled_.load(std::memory_order_acquire)) return;
+    if (offline_silence_requested_.exchange(false, std::memory_order_acq_rel)
+        && (recovery_required_.load(std::memory_order_acquire) || restarted_tracks_ != kAllTracks)) {
+        recovery_required_.store(true, std::memory_order_release);
+        producer_error_.store(ProducerError::Full, std::memory_order_relaxed);
+        restarted_tracks_ = 0;
+        pending_level_tracks_ = 0;
+        allNotesOff();
+        return;
+    }
+    new_note_tracks &= kAllTracks;
+    if (recovery_required_.load(std::memory_order_acquire) || restarted_tracks_ != kAllTracks) {
+        const auto token = captureNoteToken();
+        for (std::uint8_t track = 0; track < queued_note_tokens_.size(); ++track)
+            if (token == 0 || queued_note_tokens_[track] != token) new_note_tracks &= ~(1U << track);
+    }
+    if (recovery_required_.load(std::memory_order_acquire)) {
+        if (new_note_tracks == 0
+            || reset_acknowledged_.load(std::memory_order_acquire)
+                < reset_requested_.load(std::memory_order_acquire)) return;
+        // A partly queued image is invalidated by tryEnqueueChipAccess if
+        // congestion recurs. Never admit its key-ons before a new silence ack.
+        if (!restoreMutedImage()) return;
+        restarted_tracks_ = new_note_tracks;
+        pending_level_tracks_ = new_note_tracks;
+        recovery_required_.store(false, std::memory_order_release);
+        if (producer_error_.load(std::memory_order_relaxed) == ProducerError::Full)
+            producer_error_.store(ProducerError::None, std::memory_order_relaxed);
+    } else {
+        pending_level_tracks_ |= new_note_tracks & ~restarted_tracks_;
+        restarted_tracks_ |= new_note_tracks;
+    }
+}
+
+std::uint64_t MAmidiMemoSoundOutput::captureNoteToken() const noexcept {
+    if (!isOpen() || !emission_enabled_.load(std::memory_order_acquire)
+        || offline_silence_requested_.load(std::memory_order_acquire)) return 0;
+    const auto generation = emission_generation_.load(std::memory_order_acquire);
+    // Also compare emission generation: a reset increments it before publishing
+    // reset_requested_, and that publication gap must never look ready.
+    if (reset_requested_.load(std::memory_order_acquire) != generation
+        || reset_acknowledged_.load(std::memory_order_acquire) != generation
+        || emission_generation_.load(std::memory_order_acquire) != generation) return 0;
+    return generation + 1;
+}
+
+void MAmidiMemoSoundOutput::noteQueued(std::uint8_t track, std::uint64_t token) noexcept {
+    if (track < queued_note_tokens_.size()) queued_note_tokens_[track] = token;
+}
+
+bool MAmidiMemoSoundOutput::recoverableWriteFailure() const noexcept {
+    return isOpen()
+        && producer_error_.load(std::memory_order_relaxed) == ProducerError::Full;
+}
+
+void MAmidiMemoSoundOutput::setEmissionEnabled(bool enabled) noexcept {
+    const bool previous = emission_enabled_.exchange(enabled, std::memory_order_acq_rel);
+    if (previous && !enabled) emission_generation_.fetch_add(1, std::memory_order_acq_rel);
+    if (!previous && enabled) {
+        // A silence request skipped during offline output is not proof that
+        // the physical device is silent. Require a fresh realtime barrier.
+        offline_silence_requested_.store(true, std::memory_order_release);
+    }
 }
 
 void MAmidiMemoSoundOutput::allNotesOff() {
     if (!isOpen()) {
         return;
     }
+    queued_psg_mixer_ = kMAmidiPsgMixerMask;
+    queued_scc_keys_ = 0;
     // Capacity-independent control lane. The worker invalidates older queued
     // writes, acknowledges any already-posted batch, then sends full silence
     // before admitting the new generation. The realtime caller never waits.
@@ -156,12 +374,29 @@ bool MAmidiMemoSoundOutput::enqueueChipAccess(MAmidiChipAccess access) {
         producer_error_.store(ProducerError::Closed, std::memory_order_relaxed);
         return false;
     }
+    if (recovery_required_.load(std::memory_order_acquire)) {
+        dropped_writes_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return tryEnqueueChipAccess(access);
+}
+
+bool MAmidiMemoSoundOutput::tryEnqueueChipAccess(MAmidiChipAccess access) {
     if (!queue_.tryPush({access, emission_generation_.load(std::memory_order_acquire)})) {
         dropped_writes_.fetch_add(1, std::memory_order_relaxed);
         producer_error_.store(ProducerError::Full, std::memory_order_relaxed);
+        recovery_required_.store(true, std::memory_order_release);
+        restarted_tracks_ = 0;
+        pending_level_tracks_ = 0;
+        allNotesOff();
         return false;
     }
     submitted_writes_.fetch_add(1, std::memory_order_release);
+    if (access.device_id == static_cast<std::uint8_t>(MAmidiDeviceId::Psg) && access.address == 7)
+        queued_psg_mixer_ = access.data;
+    if (access.device_id == static_cast<std::uint8_t>(MAmidiDeviceId::Scc)
+        && access.address == kMAmidiSccKeyAddress + (scc_plus_ ? kMAmidiSccPlusOffset : 0))
+        queued_scc_keys_ = access.data;
     wake_cv_.notify_one();
     return true;
 }
@@ -223,6 +458,15 @@ std::string MAmidiMemoSoundOutput::statusText() const {
     const auto error = lastError();
     switch (connectionState()) {
     case MAmidiConnectionState::Connected:
+        if (producer_error_.load(std::memory_order_relaxed) == ProducerError::InvalidWrite)
+            return "MAmidiMEmo connected: Invalid MAmidiMEmo register write";
+        if (recovery_required_.load(std::memory_order_acquire)) {
+            const bool silenced = reset_acknowledged_.load(std::memory_order_acquire)
+                >= reset_requested_.load(std::memory_order_acquire);
+            return silenced ? "MAmidiMEmo send queue is full; waiting for next Note On"
+                : "MAmidiMEmo send queue is full; silencing for resynchronization";
+        }
+        if (!error.empty()) return "MAmidiMEmo connected: " + error;
         return "MAmidiMEmo connected (" + host_ + ":"
             + std::to_string(port_) + ")";
     case MAmidiConnectionState::Connecting:
@@ -268,7 +512,9 @@ void MAmidiMemoSoundOutput::workerLoop() {
         return true;
     };
     auto fail = [&] {
-        setError(client_.lastError());
+        setError(recovery_required_.load(std::memory_order_acquire)
+            ? "Hardware resynchronization/silence failed: " + client_.lastError()
+            : client_.lastError());
         connection_state_.store(MAmidiConnectionState::Faulted, std::memory_order_release);
         open_.store(false, std::memory_order_release);
         clearQueue(true);
@@ -341,7 +587,7 @@ void MAmidiMemoSoundOutput::enqueuePsgSilence() {
     MAmidiChipAccess silence[kMAmidiPsgSilenceWriteCount]{};
     fillPsgSilenceWrites(silence, unit_no_);
     for (const auto& access : silence) {
-        static_cast<void>(enqueueChipAccess(access));
+        static_cast<void>(tryEnqueueChipAccess(access));
     }
 }
 
@@ -349,7 +595,7 @@ void MAmidiMemoSoundOutput::enqueueOpllSilence() {
     MAmidiChipAccess silence[kMAmidiOpllSilenceWriteCount]{};
     fillOpllSilenceWrites(silence, unit_no_);
     for (const auto& access : silence) {
-        static_cast<void>(enqueueChipAccess(access));
+        static_cast<void>(tryEnqueueChipAccess(access));
     }
 }
 
@@ -357,7 +603,7 @@ void MAmidiMemoSoundOutput::enqueueSccSilence() {
     MAmidiChipAccess silence[kMAmidiSccSilenceWriteCount]{};
     fillSccSilenceWrites(silence, unit_no_, scc_plus_);
     for (const auto& access : silence) {
-        static_cast<void>(enqueueChipAccess(access));
+        static_cast<void>(tryEnqueueChipAccess(access));
     }
 }
 

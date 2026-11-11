@@ -198,6 +198,9 @@ using mgstc::app::PcAudioBackend;
 using SccWaveform = mgstc::engine::SccWaveform;
 
 class SharedAudioService final : public SharedAudioHost, private juce::Timer {
+#if defined(MGSTC_STANDALONE_AUDIO_TESTING)
+    friend struct SharedAudioServiceTestAccess;
+#endif
 public:
     explicit SharedAudioService(bool offline_snapshot_capture = false)
         : offline_snapshot_capture_(offline_snapshot_capture) {
@@ -365,45 +368,47 @@ public:
     [[nodiscard]] bool applyPcAudioSettings(
         PcAudioBackend backend,
         std::string driver_name) {
-        MGSTC_UI_ACTIVITY("settings: apply PC audio (device open)");
-        waitForPcAudioRecovery();
-        stopActiveAudio();
-        pc_audio_note_.clear();
-
-        if (backend == PcAudioBackend::Asio) {
-            if (asio_audio_.open(driver_name)
-                && asio_audio_.start(engine_)) {
-                active_audio_ = &asio_audio_;
-                pc_audio_backend_ = PcAudioBackend::Asio;
-                asio_driver_name_ = std::move(driver_name);
-                drainAudioStatuses(asio_audio_);
-                savePcAudioSettings();
-                publishHangHints();
-                return true;
-            }
-            pc_audio_note_ = "ASIOを開始できません: "
-                + asio_audio_.lastError()
-                + "。既定出力へ戻しました。";
-            asio_audio_.close();
-        }
-
-        const auto started = wasapi_audio_.start(engine_);
-        active_audio_ = started ? &wasapi_audio_ : nullptr;
-        pc_audio_backend_ = PcAudioBackend::Wasapi;
-        if (!started && pc_audio_note_.empty()) {
-            pc_audio_note_ = "既定のWASAPI出力を開始できません。";
-        }
-        if (backend == PcAudioBackend::Asio) {
-            asio_driver_name_ = std::move(driver_name);
-        }
+        if (audio_shutdown_requested_) return false;
+        // A later Apply replaces the queued request, never the retired worker.
+        pending_pc_audio_ = PcAudioRequest{backend, std::move(driver_name)};
+        pc_audio_backend_ = backend;
+        asio_driver_name_ = pending_pc_audio_->driver_name;
         savePcAudioSettings();
-        publishHangHints();
-        return backend == PcAudioBackend::Wasapi && started;
+        pc_audio_note_.clear();
+        requestPcAudioStop();
+        advancePcAudioTransition();
+        // The existing bool means completed successfully, not merely accepted.
+        return !pc_audio_stop_requested_ && !device_recovery_busy_
+            && active_audio_ != nullptr && pc_audio_backend_ == backend;
+    }
+
+    // Normal close keeps this service, its Host and executable code alive until
+    // every WASAPI generation has really joined. The message loop keeps polling.
+    void requestAudioShutdown() {
+        audio_shutdown_requested_ = true;
+        pending_pc_audio_.reset();
+        requestPcAudioStop();
+        advancePcAudioTransition();
+    }
+
+    void cancelAudioShutdown() {
+        audio_shutdown_requested_ = false;
+        // Cancellation does not resurrect a closed generation or restart audio.
+        pc_audio_note_ = "終了を取り消しました。音声の停止・回収は継続します。";
+    }
+
+    [[nodiscard]] bool audioShutdownReady() const noexcept {
+        return audio_shutdown_requested_ && !device_recovery_busy_
+            && !pc_audio_stop_requested_ && !wasapi_audio_.stopPending();
     }
 
     [[nodiscard]] bool showAsioControlPanel() {
         MGSTC_UI_ACTIVITY("settings: ASIO control panel");
-        waitForPcAudioRecovery();
+        if (audio_shutdown_requested_ || device_recovery_busy_
+            || pc_audio_stop_requested_) {
+            pc_audio_note_ = "音声の停止・回収／起動を待っています。ASIO設定は完了後に開いてください。";
+            return false;
+        }
         if (pc_audio_backend_ != PcAudioBackend::Asio
             || asio_driver_name_.empty()) {
             pc_audio_note_ =
@@ -446,11 +451,19 @@ public:
     }
 
     [[nodiscard]] bool asioControlPanelAvailable() const noexcept {
-        return pc_audio_backend_ == PcAudioBackend::Asio
+        return !audio_shutdown_requested_ && !device_recovery_busy_
+            && !pc_audio_stop_requested_ && pc_audio_backend_ == PcAudioBackend::Asio
             && asio_audio_.hasControlPanel();
     }
 
     [[nodiscard]] std::string pcAudioStatus() const {
+        if (pc_audio_stop_requested_ || device_recovery_busy_) {
+            auto status = audio_shutdown_requested_
+                ? std::string("終了待ち: 音声ワーカーを回収中です。完了まで終了しません。")
+                : std::string("音声切替待ち: 停止・回収／起動を待っています。新出力はまだ使用できません。");
+            if (!pc_audio_note_.empty()) status += "\n" + pc_audio_note_;
+            return status;
+        }
         if (pc_audio_backend_ == PcAudioBackend::Asio
             && active_audio_ == &asio_audio_
             && asio_audio_.running()) {
@@ -696,7 +709,7 @@ public:
         mgstc::engine::MAmidiOutputSettings settings, int silence_seconds) {
         if (startupOutputPending() || offline_snapshot_capture_) return false;
         startup_output_error_.clear();
-        engine_.setMAmidiSettings(std::move(settings));
+        if (!engine_.setMAmidiSettings(std::move(settings))) return false;
         setOpllKeyOffForceSilenceSeconds(silence_seconds);
         saveSoundOutputSettings();
         return true;
@@ -898,14 +911,14 @@ private:
             nullptr, nullptr, nullptr, path.toWideCharPointer()));
     }
 
-    void stopActiveAudio() {
-        waitForPcAudioRecovery();
-        if (active_audio_ != nullptr) {
-            active_audio_->stop();
-            active_audio_ = nullptr;
-        }
+    void requestPcAudioStop() {
+        active_audio_ = nullptr;
+        pc_audio_stop_requested_ = true;
+        device_recovery_cancel_.store(true, std::memory_order_release);
+        // ASIO retains its existing synchronous stop/close contract.
         asio_audio_.close();
-        wasapi_audio_.stop();
+        // start() owns the sink on the device worker until that thread exits.
+        if (!device_recovery_busy_) wasapi_audio_.requestStop();
     }
 
     static void drainAudioStatuses(
@@ -915,23 +928,23 @@ private:
         }
     }
 
-    // Device teardown / open takes hundreds of ms normally and seconds when the
-    // endpoint is disappearing — which is exactly when a device error arrives.
-    // Never run it on the message thread from the poll timer: that froze the UI
-    // with no user action ("偶発フリーズ"). The timer only starts and collects.
+    // The message thread owns the transition and pending request. The existing
+    // device worker only performs WASAPI start; it never owns this service.
     void beginPcAudioRecovery(
         std::string note,
         bool restart_wasapi,
         bool close_asio) {
-        joinDeviceWorkerThread();
-        active_audio_ = nullptr;
         pc_audio_backend_ = PcAudioBackend::Wasapi;
         pc_audio_note_ = std::move(note);
-        if (close_asio) {
-            MGSTC_UI_ACTIVITY("audio: ASIO close after device error");
-            asio_audio_.close();
-        }
-        device_recovery_restart_ = restart_wasapi;
+        static_cast<void>(close_asio); // requestPcAudioStop always closes ASIO.
+        pending_pc_audio_.reset();
+        if (restart_wasapi && !audio_shutdown_requested_)
+            pending_pc_audio_ = PcAudioRequest{PcAudioBackend::Wasapi, asio_driver_name_};
+        requestPcAudioStop();
+        advancePcAudioTransition();
+    }
+
+    void startWasapiOnDeviceWorker() {
         device_recovery_started_.store(false, std::memory_order_relaxed);
         device_recovery_cancel_.store(false, std::memory_order_relaxed);
         device_recovery_done_.store(false, std::memory_order_release);
@@ -940,21 +953,16 @@ private:
                 std::thread([this] { runPcAudioRecovery(); });
             device_recovery_busy_ = true;
         } catch (...) {
-            // No worker available: do it inline rather than leave the sink
-            // half-torn-down.
-            MGSTC_UI_ACTIVITY("audio: inline device recovery");
-            runPcAudioRecovery();
-            finishPcAudioRecovery();
+            // Never replace a failed background launch with a blocking UI open.
+            pc_audio_note_ += "\n音声の起動スレッドを作成できません。再適用してください。";
         }
     }
 
     // Device worker thread.
     void runPcAudioRecovery() {
-        wasapi_audio_.stop();
         bool started = false;
-        if (device_recovery_restart_
-            && !device_recovery_cancel_.load(std::memory_order_acquire)) {
-            started = wasapi_audio_.start(engine_);
+        if (!device_recovery_cancel_.load(std::memory_order_acquire)) {
+            started = wasapi_audio_.start(engine_, device_recovery_cancel_);
         }
         device_recovery_started_.store(started, std::memory_order_relaxed);
         device_recovery_done_.store(true, std::memory_order_release);
@@ -967,10 +975,17 @@ private:
             device_recovery_started_.load(std::memory_order_relaxed);
         wasapi_audio_.setMasterVolumePercent(
             static_cast<std::uint32_t>(master_volume_percent_));
-        active_audio_ = started ? &wasapi_audio_ : nullptr;
-        if (device_recovery_restart_ && !started) {
-            pc_audio_note_ +=
-                "\n既定のWASAPI出力も開始できません。";
+        if (pc_audio_stop_requested_ || audio_shutdown_requested_
+            || device_recovery_cancel_.load(std::memory_order_acquire)) {
+            active_audio_ = nullptr;
+            pc_audio_stop_requested_ = true;
+            wasapi_audio_.requestStop();
+        } else {
+            active_audio_ = started ? &wasapi_audio_ : nullptr;
+            if (!started) {
+                pc_audio_note_ += "\n既定のWASAPI出力を開始できません。再適用してください。";
+                pc_audio_stop_requested_ = wasapi_audio_.stopPending();
+            }
         }
         drainAudioStatuses(wasapi_audio_);
         savePcAudioSettings();
@@ -985,13 +1000,41 @@ private:
         device_worker_.join();
     }
 
-    // User-initiated device work must not race the recovery worker.
-    void waitForPcAudioRecovery() {
-        if (!device_recovery_busy_) {
-            return;
+    void advancePcAudioTransition() {
+        if (device_recovery_busy_) {
+            // done is only a notification. The native handle proves thread exit
+            // before the message thread joins and accesses the sink again.
+            if (!device_recovery_done_.load(std::memory_order_acquire)
+                || WaitForSingleObject(device_worker_.native_handle(), 0) != WAIT_OBJECT_0)
+                return;
+            finishPcAudioRecovery();
         }
-        device_recovery_cancel_.store(true, std::memory_order_release);
-        finishPcAudioRecovery();
+        if (!pc_audio_stop_requested_) return;
+        wasapi_audio_.requestStop();
+        if (!wasapi_audio_.reapStopped()) return;
+        drainAudioStatuses(wasapi_audio_);
+        pc_audio_stop_requested_ = false;
+        if (audio_shutdown_requested_ || !pending_pc_audio_) return;
+        const auto request = std::move(*pending_pc_audio_);
+        pending_pc_audio_.reset();
+        if (request.backend == PcAudioBackend::Asio) {
+            if (asio_audio_.open(request.driver_name) && asio_audio_.start(engine_)) {
+                active_audio_ = &asio_audio_;
+                pc_audio_backend_ = PcAudioBackend::Asio;
+                drainAudioStatuses(asio_audio_);
+                pc_audio_note_.clear();
+                savePcAudioSettings();
+                publishHangHints();
+                return;
+            }
+            pc_audio_note_ = "ASIOを開始できません: " + asio_audio_.lastError()
+                + "。既定出力を選択しました。";
+            asio_audio_.close();
+        }
+        pc_audio_backend_ = PcAudioBackend::Wasapi;
+        startWasapiOnDeviceWorker();
+        savePcAudioSettings();
+        publishHangHints();
     }
 
     void timerCallback() override {
@@ -1000,12 +1043,9 @@ private:
             publishHangHints();
         }
         pollOpllKeyOffForceSilence();
-        if (device_recovery_busy_) {
-            if (device_recovery_done_.load(std::memory_order_acquire)) {
-                finishPcAudioRecovery();
-            }
+        advancePcAudioTransition();
+        if (device_recovery_busy_ || pc_audio_stop_requested_ || audio_shutdown_requested_)
             return;
-        }
         if (suppress_pc_audio_fallback_ || active_audio_ == nullptr) {
             return;
         }
@@ -1027,7 +1067,7 @@ private:
         if (active_audio_ == &asio_audio_) {
             const auto detail = asio_audio_.lastError();
             beginPcAudioRecovery(
-                "ASIOデバイスが停止したため既定出力へ戻しました。"
+                "ASIOデバイスが停止しました。既定出力への切替を試みます。"
                     + (detail.empty() ? std::string{}
                                       : "\n" + detail),
                 /*restart_wasapi=*/true,
@@ -1089,6 +1129,7 @@ private:
             pc_audio_note_ += pc_audio_note_.empty() ? "" : "\n";
             pc_audio_note_ +=
                 "既定のWASAPI出力を開始できません。";
+            pc_audio_stop_requested_ = wasapi_audio_.stopPending();
         }
     }
 
@@ -1159,6 +1200,9 @@ private:
 
     mgstc::app::ScopeFrameDistributor scope_frames_;
     mgstc::engine::RealtimeEngineHost engine_;
+    // Cancellation view must outlive the sink even in destructor fallback:
+    // reverse member destruction joins WASAPI before destroying this atomic.
+    std::atomic<bool> device_recovery_cancel_{false};
     mgstc::audio::WasapiAudioSink wasapi_audio_;
     mgstc::audio::AsioAudioSink asio_audio_;
     mgstc::audio::AudioSink* active_audio_{};
@@ -1190,10 +1234,12 @@ private:
     // Message thread owns these; only the two atomics cross to the worker.
     std::thread device_worker_;
     bool device_recovery_busy_{};
-    bool device_recovery_restart_{};
+    struct PcAudioRequest { PcAudioBackend backend; std::string driver_name; };
+    std::optional<PcAudioRequest> pending_pc_audio_;
+    bool pc_audio_stop_requested_{};
+    bool audio_shutdown_requested_{};
     std::atomic<bool> device_recovery_started_{false};
     std::atomic<bool> device_recovery_done_{false};
-    std::atomic<bool> device_recovery_cancel_{false};
     int master_volume_percent_{100};
     std::uint64_t master_volume_revision_{1};
     int opll_keyoff_force_silence_seconds_{20};
@@ -2368,6 +2414,9 @@ private:
 class Application final
     : public juce::JUCEApplication,
       private juce::Timer {
+#if defined(MGSTC_STANDALONE_AUDIO_TESTING)
+    friend struct ApplicationTestAccess;
+#endif
 public:
     [[nodiscard]] const juce::String
     getApplicationName() override {
@@ -2439,6 +2488,8 @@ public:
 
     void shutdown() override {
         stopTimer();
+        audio_shutdown_pending_ = false;
+        audio_shutdown_notice_.reset();
         hang_watchdog_.stop();
         snapshot_window_ = nullptr;
         launcher_window_.reset();
@@ -3502,7 +3553,7 @@ private:
         append_if_dirty(scc_envelope_window_);
         append_if_dirty(opll_envelope_window_);
         if (unsaved_editors.isEmpty()) {
-            quit();
+            beginAudioShutdown();
             return;
         }
 
@@ -3533,9 +3584,39 @@ private:
             [this](int result) {
                 close_confirmation_pending_ = false;
                 if (result == 1) {
-                    quit();
+                    beginAudioShutdown();
                 }
             });
+    }
+
+    void beginAudioShutdown() {
+        if (audio_shutdown_pending_) return;
+        if (audio_service_ == nullptr) { quit(); return; }
+        audio_service_->requestAudioShutdown();
+        if (audio_service_->audioShutdownReady()) { quit(); return; }
+        audio_shutdown_pending_ = true;
+        startTimerHz(10);
+        audio_shutdown_notice_ = std::make_unique<juce::AlertWindow>(
+            juce::String::fromUTF8("終了待ち"),
+            juce::String::fromUTF8(
+                "音声処理またはデバイスの応答を待っています。\n"
+                "音声ワーカーの回収が完了するまで終了しません。\n"
+                "終了を取り消しても停止・回収は継続します。"),
+            juce::MessageBoxIconType::InfoIcon);
+        audio_shutdown_notice_->addButton(
+            juce::String::fromUTF8("終了を取り消す"), 1,
+            juce::KeyPress(juce::KeyPress::escapeKey));
+        audio_shutdown_notice_->enterModalState(true,
+            juce::ModalCallbackFunction::create([](int result) {
+                auto* app = dynamic_cast<Application*>(juce::JUCEApplication::getInstance());
+                if (app != nullptr && result == 1 && app->audio_shutdown_pending_) {
+                    app->audio_shutdown_pending_ = false;
+                    app->stopTimer();
+                    app->audio_service_->cancelAudioShutdown();
+                    if (app->audio_shutdown_notice_ != nullptr)
+                        app->audio_shutdown_notice_->setVisible(false);
+                }
+            }), false);
     }
 
     void activateEditor(const juce::String& requested_editor) {
@@ -3606,6 +3687,16 @@ private:
     }
 
     void timerCallback() override {
+        if (audio_shutdown_pending_) {
+            if (audio_service_->audioShutdownReady()) {
+                audio_shutdown_pending_ = false;
+                stopTimer();
+                audio_shutdown_notice_->exitModalState(0);
+                audio_shutdown_notice_.reset();
+                quit();
+            }
+            return;
+        }
         if (launcher_verify_index_ >= 0) {
             verifyLauncherStep();
             return;
@@ -3758,6 +3849,8 @@ private:
     bool notifying_library_change_{};
     MainWindow* snapshot_window_{};
     std::unique_ptr<SharedAudioService> audio_service_;
+    std::unique_ptr<juce::AlertWindow> audio_shutdown_notice_;
+    bool audio_shutdown_pending_{};
     std::unique_ptr<SharedMidiInputService> midi_service_;
     std::unique_ptr<StandaloneEditorContext> editor_session_;
     mgstc::app::EditorLink editor_link_;
@@ -3786,4 +3879,6 @@ private:
 
 } // namespace
 
+#if !defined(MGSTC_STANDALONE_AUDIO_TESTING)
 START_JUCE_APPLICATION(Application)
+#endif

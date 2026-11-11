@@ -58,6 +58,7 @@
 #include "mgstc/engine/pc_keyboard.hpp"
 #include "mgstc/engine/register_mapper.hpp"
 #include "mgstc/engine/realtime_engine_host.hpp"
+#include "realtime_engine_host_test_access.hpp"
 #include "mgstc/engine/runtime_session.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/timbre_library.hpp"
@@ -1942,6 +1943,7 @@ void testMAmidiRpcClientConnectsToMockChipServer() {
             }),
             true);
         // Skip probe at [0]; PSG volume, masked mixer, OPLL, SCC vol/key.
+        REQUIRE_EQ(received.size(), static_cast<std::size_t>(6));
         REQUIRE_EQ(received[1].device_id, static_cast<std::uint8_t>(11));
         REQUIRE_EQ(received[1].address, 8U);
         REQUIRE_EQ(received[1].data, 0x0FU);
@@ -9722,6 +9724,8 @@ void testWasapiSinkConstructsWithoutOpeningDevice() {
 #endif
 
 #include "tone_import_tests.inc.cpp"
+#include "mamidi_recovery_tests.inc.cpp"
+#include "mamidi_transition_tests.inc.cpp"
 
 void testCompositeLoopPitchProfilesUseAbsoluteCountsAndRepeatDrift() {
     using namespace mgstc::engine;
@@ -10408,6 +10412,73 @@ std::vector<std::uint8_t> testFurnaceWaveFile(
     bytes[size_at + 2] = static_cast<std::uint8_t>((size >> 16) & 0xFF);
     bytes[size_at + 3] = static_cast<std::uint8_t>((size >> 24) & 0xFF);
     return bytes;
+}
+
+void testFurnaceWaveListByteCountBoundaries() {
+    using namespace mgstc::engine;
+    TimbreLibraryEntry entry;
+    entry.category = TimbreCategory::Opll;
+    entry.name = "WL count";
+    entry.opll_registers = encodeOpllPatch(defaultOpllPatch());
+    const auto exported = exportFurnaceInstruments(entry);
+    REQUIRE_EQ(exported.files.size(), std::size_t{1});
+    const auto wave_file = writeFurnaceWavetable("WL", SccWaveform{});
+    REQUIRE_EQ(wave_file.size() > 20, true);
+    struct Fixture {
+        std::vector<std::uint8_t> bytes;
+        std::size_t count_at{};
+        std::size_t pointers_at{};
+        std::size_t list_end{};
+    };
+    const auto fixture = [&](std::uint8_t count) {
+        Fixture value{exported.files[0].bytes};
+        value.bytes.insert(value.bytes.end(), {'W', 'L'});
+        appendU16(value.bytes, static_cast<std::uint16_t>(1 + 5 * count));
+        value.count_at = value.bytes.size();
+        value.bytes.push_back(count);
+        for (int index = 0; index < count; ++index) {
+            value.bytes.push_back(static_cast<std::uint8_t>(index + 1));
+        }
+        value.pointers_at = value.bytes.size();
+        for (int index = 0; index < count; ++index) appendU32(value.bytes, 0);
+        value.list_end = value.bytes.size();
+        value.bytes.insert(value.bytes.end(), {'E', 'N'});
+        const auto wave_at = static_cast<std::uint32_t>(value.bytes.size());
+        value.bytes.insert(value.bytes.end(), wave_file.begin() + 20, wave_file.end());
+        for (int index = 0; index < count; ++index) {
+            for (std::size_t byte = 0; byte < 4; ++byte) {
+                value.bytes[value.pointers_at + static_cast<std::size_t>(index) * 4 + byte]
+                    = static_cast<std::uint8_t>(wave_at >> (byte * 8));
+            }
+        }
+        return value;
+    };
+    for (const auto count : {std::uint8_t{0}, std::uint8_t{1}, std::uint8_t{255}}) {
+        const auto input = fixture(count);
+        const auto result = importFurnaceTones(input.bytes, "wl.fui");
+        REQUIRE_EQ(result.valid(), true);
+        REQUIRE_EQ(result.candidates.size(), std::size_t{1});
+        REQUIRE_EQ(encodeOpllPatch(std::get<OpllPatchParameters>(result.candidates[0].data)),
+            entry.opll_registers);
+    }
+    const auto rejected = [](const std::vector<std::uint8_t>& bytes) {
+        const auto result = importFurnaceTones(bytes, "cut-wl.fui");
+        REQUIRE_EQ(result.valid(), false);
+        REQUIRE_EQ(result.candidates.empty(), true);
+    };
+    auto missing_count = fixture(0);
+    missing_count.bytes.resize(missing_count.count_at);
+    rejected(missing_count.bytes);
+    auto missing_pointer = fixture(255);
+    missing_pointer.bytes.resize(missing_pointer.list_end - 1);
+    rejected(missing_pointer.bytes);
+    auto invalid_pointer = fixture(255);
+    std::fill_n(invalid_pointer.bytes.begin()
+        + static_cast<std::ptrdiff_t>(invalid_pointer.pointers_at + 254 * 4), 4, 0xFF);
+    rejected(invalid_pointer.bytes);
+    auto short_wave = fixture(255);
+    short_wave.bytes.pop_back();
+    rejected(short_wave.bytes);
 }
 
 void testFurnaceWavetableAndInstrumentExchange() {
@@ -12014,7 +12085,14 @@ int main(int argc, char** argv) {
         {"EngineCoreRemoteBackendSilencesLocalMix", testEngineCoreRemoteBackendSilencesLocalMix},
         {"EngineCoreOfflineMirrorsWithoutRemoteWrites", testEngineCoreOfflineMirrorsWithoutRemoteWrites},
         {"MAmidiIdleWaitsForServerAcknowledgement", testMAmidiIdleWaitsForServerAcknowledgement},
+        {"MAmidiCongestionContinuesMirrorAndRecoversFreshNotes", testMAmidiCongestionContinuesMirrorAndRecoversFreshNotes},
+        {"MAmidiCongestionFailureClassification", testMAmidiCongestionFailureClassification},
+        {"MAmidiRecoveryRestoresLevelsWithoutRetriggering", testMAmidiRecoveryRestoresLevelsWithoutRetriggering},
+        {"MAmidiRecoveryPreservesFreshManualWrites", testMAmidiRecoveryPreservesFreshManualWrites},
+        {"MAmidiHostCongestionMaintainsSelection", testMAmidiHostCongestionMaintainsSelection},
         {"MAmidiHostManualHandoffAndOffline", testMAmidiHostManualHandoffAndOffline},
+        {"MAmidiTransitionTimeoutPreservesOwnerAndRetries", testMAmidiTransitionTimeoutPreservesOwnerAndRetries},
+        {"MAmidiSharedLeaseTimeoutPreservesOtherHost", testMAmidiSharedLeaseTimeoutPreservesOtherHost},
         {"MAmidiStopSurvivesFullQueueAndOfflineCancelsBlockedBatch", testMAmidiStopSurvivesFullQueueAndOfflineCancelsBlockedBatch},
         {"EngineCoreWaveformMonitorKeepsScopeWithSilentMix", testEngineCoreWaveformMonitorKeepsScopeWithSilentMix},
         {"EngineCoreSplitsAtEightHundredFrameBoundary", testEngineCoreSplitsAtEightHundredFrameBoundary},
@@ -12065,6 +12143,7 @@ int main(int argc, char** argv) {
         {"ToneLibrarySqliteV1RoundTripAndPortableFormat", testToneLibrarySqliteV1RoundTripAndPortableFormat},
         {"ToneLibrarySchemaV2PreservesMembers", testToneLibrarySchemaV2PreservesMembers},
         {"FurnaceWavetableAndInstrumentExchange", testFurnaceWavetableAndInstrumentExchange},
+        {"FurnaceWaveListByteCountBoundaries", testFurnaceWaveListByteCountBoundaries},
         {"MgstcToneSetFileRoundTripAndFailedWrite", testMgstcToneSetFileRoundTripAndFailedWrite},
         {"EditorSetFilterAndMembershipAppend", testEditorSetFilterAndMembershipAppend},
         {"ToneLibraryStartupRecovery", testToneLibraryStartupRecovery},
@@ -12157,12 +12236,17 @@ int main(int argc, char** argv) {
         {"PcKeyboardPhysicalLayoutAndOctaveSlide", testPcKeyboardPhysicalLayoutAndOctaveSlide},
         {"SequentialVoiceAllocatorPolyMonoAndStealing", testSequentialVoiceAllocatorPolyMonoAndStealing},
         {"GzipStoredRoundTrip", testGzipStoredRoundTrip},
+        {"GzipOutputLimitStoredAndMalformed", testGzipOutputLimitStoredAndMalformed},
+        {"GzipOutputLimitHuffmanGrowth", testGzipOutputLimitHuffmanGrowth},
+        {"GzipOutputLimitLiteral", testGzipOutputLimitLiteral},
+        {"ToneImportReportsGzipFailureWithoutExtension", testToneImportReportsGzipFailureWithoutExtension},
         {"ToneImportRejectsEmptyAndUnknown", testToneImportRejectsEmptyAndUnknown},
         {"ToneImportRejectsCompressedMgs", testToneImportRejectsCompressedMgs},
         {"ToneImportRejectsCompressedMgsAfterEofMarker",
          testToneImportRejectsCompressedMgsAfterEofMarker},
         {"ToneImportVgmCompleteOpllAndDuplicates",
          testToneImportVgmCompleteOpllAndDuplicates},
+        {"ToneImportVgmDataBlockBounds", testToneImportVgmDataBlockBounds},
         {"ToneImportVgmRejectsPartialAndLongWait",
          testToneImportVgmRejectsPartialAndLongWait},
         {"ToneImportVgmSccCompleteReorderAndPartial",

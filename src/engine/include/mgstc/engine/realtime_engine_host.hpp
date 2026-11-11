@@ -74,7 +74,9 @@ public:
     // select a mode while UI status/control is proxied until completion; it
     // must not race settings changes. Never call these operations from audio.
     // Does not auto-fall back to emulator on failure.
-    void setMAmidiSettings(MAmidiOutputSettings settings);
+    // False means control exclusion timed out or was unavailable; settings
+    // remain unchanged. Connection errors are reported separately in status.
+    bool setMAmidiSettings(MAmidiOutputSettings settings);
     [[nodiscard]] const MAmidiOutputSettings& mamidiSettings() const noexcept;
     [[nodiscard]] bool setSoundOutputKind(SoundOutputKind kind);
     [[nodiscard]] SoundOutputKind soundOutputKind() const noexcept;
@@ -145,7 +147,7 @@ public:
     // playback waveform uses this ring only while an editor context is live.
     void setOpllScopeEnabled(bool enabled) noexcept;
     [[nodiscard]] bool opllScopeEnabled() const noexcept {
-        return opll_scope_enabled_;
+        return (opll_scope_request_.load(std::memory_order_acquire) & 1U) != 0;
     }
 
     // Software envelope / pending key work on the active program. Does not
@@ -213,13 +215,23 @@ private:
     };
     class OutputTransition {
     public:
-        explicit OutputTransition(RealtimeEngineHost& host);
+        enum class WaitPolicy { Destruction };
+        OutputTransition(RealtimeEngineHost& host,
+            std::chrono::steady_clock::time_point deadline);
+        OutputTransition(RealtimeEngineHost& host, WaitPolicy);
         ~OutputTransition();
+        explicit operator bool() const noexcept { return entered_; }
     private:
+        void closeGate();
         RealtimeEngineHost& host_;
-        std::unique_lock<std::mutex> lock_;
+        std::unique_lock<std::timed_mutex> lock_;
+        bool entered_{};
     };
     [[nodiscard]] bool relinquishHardwareOutput();
+    [[nodiscard]] bool relinquishHardwareOutputProtected();
+    void applyMAmidiSettingsProtected(MAmidiOutputSettings settings);
+    enum class OutputControlError : std::uint8_t { None, Unavailable, TimedOut };
+    [[nodiscard]] const char* outputControlErrorText() const noexcept;
     void applyRealtimePolicy(EngineCore& engine) noexcept;
     [[nodiscard]] bool hasPendingProgramLoad() const noexcept;
     enum class ProgramSlotState : std::uint8_t {
@@ -248,6 +260,7 @@ private:
     void allNotesStopped() noexcept;
     SpectrumGuideNote currentGuideNote() const noexcept;
     void annotateGuideNote(OpllScopeFrame& frame) const noexcept;
+    [[nodiscard]] bool isCurrentScopeFrame(const OpllScopeFrame& frame) const noexcept;
     void selectScope(std::uint32_t mask, std::uint64_t context) noexcept;
 
     struct ActiveGuideNote {
@@ -276,7 +289,8 @@ private:
     std::atomic<bool> offline_rendering_{false};
     std::atomic<std::uint64_t> output_routing_revision_{0};
     mutable std::atomic<std::uint32_t> output_access_{0};
-    std::mutex output_control_mutex_;
+    mutable std::timed_mutex output_control_mutex_;
+    std::atomic<OutputControlError> output_control_error_{OutputControlError::None};
     std::string output_error_;
     std::uint8_t active_program_{};
     MixerGains current_gains_{};
@@ -308,7 +322,10 @@ private:
     std::uint64_t spectrum_sample_clock_{};
     std::uint64_t spectrum_pcm_epoch_{};
     bool clipping_{};
-    bool opll_scope_enabled_{true};
+    // UI request: low bit enabled, upper bits capture lifetime. Only the audio
+    // consumer applies this request to the active core under RealtimeAccess.
+    std::atomic<std::uint64_t> opll_scope_request_{1};
+    std::uint64_t applied_opll_scope_request_{1};
 };
 
 }  // namespace mgstc::engine

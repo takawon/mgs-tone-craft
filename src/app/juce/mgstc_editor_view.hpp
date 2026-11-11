@@ -1759,7 +1759,7 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
     UiScale::forceGlobalForNonEditorUi();
     auto* session = &session_ref;
 
-    class SettingsContent final : public juce::Component {
+    class SettingsContent final : public juce::Component, private juce::Timer {
     public:
         SettingsContent(
             EditorSession& session,
@@ -1886,6 +1886,8 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
             asio_driver_.setEnabled(
                 pc_audio_kind_.getSelectedId() == 2);
             refreshPcAudioStatus();
+            if (session_.snapshot().capabilities.audio_device_settings)
+                startTimerHz(5);
             applyCapabilityGrey();
 
             mamidi_help_.setText(
@@ -2109,6 +2111,12 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
                 session_.snapshot().asio_control_panel_available);
         }
 
+        void timerCallback() override {
+            // Asynchronous device completion must update an already-open dialog.
+            // Do not overwrite the user's not-yet-applied driver/backend choice.
+            refreshPcAudioStatus();
+        }
+
         void applyCapabilityGrey() {
             const auto caps = session_.snapshot().capabilities;
             if (!caps.midi_device_settings) {
@@ -2287,7 +2295,8 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
                 pc_backend,
                 driver_name)) {
             safe_content->pc_audio_kind_.setSelectedId(
-                1, juce::sendNotificationSync);
+                session->snapshot().pc_audio_backend == PcAudioBackend::Asio ? 2 : 1,
+                juce::sendNotificationSync);
         }
         safe_content->refreshPcAudioStatus();
 

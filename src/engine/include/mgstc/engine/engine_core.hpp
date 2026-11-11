@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <optional>
 
 #include "mgstc/engine/dc_blocker.hpp"
 #include "mgstc/engine/spectrum_capture.hpp"
@@ -60,6 +61,8 @@ struct OpllScopeFrame {
     std::uint64_t selection_context{};
     std::uint64_t scope_ui_context{};
     std::uint64_t program_generation{};
+    // Transient host capture lifetime; never part of a saved timbre or state.
+    std::uint64_t capture_generation{};
     std::uint8_t selection_note{60};
     std::uint64_t sequence{};
     // Exclusive end at the internal48kHz clock; resets with the program.
@@ -118,6 +121,9 @@ public:
     [[nodiscard]] const RuntimeSession& session() const noexcept {
         return session_;
     }
+
+    [[nodiscard]] bool queueNoteOn(std::uint8_t track, std::uint8_t midi_note,
+        std::optional<std::uint64_t> output_token = {}) noexcept;
 
     [[nodiscard]] const TickClock& clock() const noexcept {
         return clock_;

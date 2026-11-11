@@ -28,6 +28,16 @@ public:
     [[nodiscard]] virtual bool writeRegisters(
         std::span<const RegisterWrite> writes) = 0;
 
+    // Audio producer only. Called once per runtime tick with newly started
+    // physical tracks; implementations must not wait, allocate or perform I/O.
+    virtual void beginTick(std::uint32_t /*new_note_tracks*/) noexcept {}
+    // Atomic-only capture is also called when control-side commands enter the
+    // input queue. Delivery keeps that token instead of sampling it later.
+    [[nodiscard]] virtual std::uint64_t captureNoteToken() const noexcept { return 0; }
+    virtual void noteQueued(std::uint8_t /*track*/, std::uint64_t /*token*/) noexcept {}
+    // A remote transport may defer delivery while the local mirror continues.
+    [[nodiscard]] virtual bool recoverableWriteFailure() const noexcept { return false; }
+
     virtual void reset() = 0;
     virtual void allNotesOff() = 0;
 

@@ -10,8 +10,11 @@ function Write-BuildEvidence([string]$Path, [string]$Json) {
                 else { [IO.File]::Move($temporary, $Path) }
                 return
             } catch [IO.IOException] {
-                $nativeError = $_.Exception.HResult -band 0xffff
-                if ($nativeError -notin @(32, 33) -or $attempt -ge 9) { throw }
+                # PowerShell may wrap the IOException from a .NET method call.
+                $nativeError = $_.Exception.GetBaseException().HResult -band 0xffff
+                $canRetry = $nativeError -in @(32, 33) -or
+                    ($nativeError -eq 1175 -and [IO.File]::Exists($temporary) -and [IO.File]::Exists($Path))
+                if (-not $canRetry -or $attempt -ge 9) { throw }
                 Start-Sleep -Milliseconds 100
             }
         }

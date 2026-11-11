@@ -13,6 +13,16 @@
 
 OPLL PatchSlideはDBを別途配置しなくてもビルドできます。探索機能を使う場合は、下記の手動配置を行ってください。配布物を作る場合は[共通配布物とリリース準備](#共通配布物とリリース準備)、起動に問題がある場合は[起動診断と画面キャプチャ](#起動診断と画面キャプチャ)、日本語パスや依存記録の問題は[日本語パスについて](#日本語パスについて)を参照してください。
 
+## WASAPI寿命管理のAddressSanitizer検査
+
+MSVC AddressSanitizerを導入した環境では、独立したDebugビルド先でWASAPI寿命管理テストを実行できます。通常の製品ビルド先を指定しないでください。
+
+```powershell
+.\tools\build.cmd -Configuration Debug -BuildDirectory build-wasapi-asan -WasapiTestAsan -DependencySourceRoot build/_deps
+```
+
+この診断経路は専用テストとエンジンを計装し、実デバイスを停止させずに模擬デバイスの寿命境界を検査します。既存の依存ソースを利用する例のため、通常ビルドを先に実行してください。ASanはメモリ不正アクセスの検出用で、データ競合の検出器や実機・DAW検証の代わりにはなりません。性能測定には通常ビルドを使います。
+
 ## OPLL PatchSlide DBの手動配置
 
 開発用のアプリでOPLL PatchSlideを使う場合は、共通の`%ProgramData%\OPLL_PatchSlide_DB\`フォルダー（通常は`C:\ProgramData\OPLL_PatchSlide_DB\`）へ、次の3ファイルを配置してください。StandaloneとVST3は同じファイルを読み取り専用で使います。ビルド時や起動時には自動コピーしません。

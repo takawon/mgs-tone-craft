@@ -24,6 +24,10 @@ param(
 
     [switch]$BuildBenchmarks,
 
+    # Build and run only the isolated Windows WASAPI lifetime regression with
+    # MSVC AddressSanitizer in an explicitly separate build tree.
+    [switch]$WasapiTestAsan,
+
     # Diagnostic only: retain all normal validation and emit phase timings.
     [switch]$Timings,
 
@@ -41,7 +45,19 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 if ($RecoverDependencies -and ($PlanOnly -or $Target.Count -gt 0)) {
     throw "-RecoverDependencies requires a complete build, without -PlanOnly or -Target."
 }
-if ($Target.Count -gt 0 -and -not $SkipTests -and -not $PlanOnly) {
+if ($WasapiTestAsan) {
+    if ($env:OS -ne "Windows_NT" -or $Configuration -ne "Debug" -or
+        [string]::IsNullOrWhiteSpace($BuildDirectory)) {
+        throw "-WasapiTestAsan requires Windows, Debug, and an explicit isolated -BuildDirectory."
+    }
+    if ($RecoverDependencies -or $BuildBenchmarks -or $PlanOnly -or $SkipTests -or
+        $Target.Count -gt 0 -or $TestRegex -ne "") {
+        throw "-WasapiTestAsan owns its isolated target and focused test run; do not combine other build selectors."
+    }
+    $Target = @("mgstc_wasapi_lifetime_tests")
+    $TestRegex = "^mgstc_wasapi_lifetime_tests$"
+}
+if ($Target.Count -gt 0 -and -not $SkipTests -and -not $PlanOnly -and -not $WasapiTestAsan) {
     throw "-Target requires -SkipTests (or -PlanOnly). Test validation must build all test prerequisites."
 }
 
@@ -337,6 +353,21 @@ try {
     }
 
     $resolvedBuildDirectory = [IO.Path]::GetFullPath($resolvedBuildDirectory)
+    if ($WasapiTestAsan) {
+        $normalBuildDirectory = [IO.Path]::GetFullPath((Join-Path $projectRoot "build"))
+        if ([string]::Equals($resolvedBuildDirectory.TrimEnd('\', '/'),
+                $normalBuildDirectory.TrimEnd('\', '/'),
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "-WasapiTestAsan requires a build tree separate from the normal build directory."
+        }
+        $asanCache = Join-Path $resolvedBuildDirectory "CMakeCache.txt"
+        if (Test-Path -LiteralPath $asanCache -PathType Leaf) {
+            $cacheText = [IO.File]::ReadAllText($asanCache)
+            if ($cacheText -notmatch '(?m)^MGSTC_WASAPI_TEST_ASAN:BOOL=ON\r?$') {
+                throw "-WasapiTestAsan cannot reuse a CMake cache that is not already configured for ASan. Choose a new isolated -BuildDirectory."
+            }
+        }
+    }
     $buildDirectoryPrefix = $resolvedBuildDirectory.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
     if ($resolvedBuildDirectory -eq $projectRoot -or
         $projectRoot.StartsWith($buildDirectoryPrefix, [StringComparison]::OrdinalIgnoreCase) -or
@@ -437,6 +468,7 @@ try {
         $configureArguments += @("--profiling-format=google-trace", "--profiling-output=$(Join-Path $resolvedBuildDirectory '.mgstc-cmake-profile.json')")
     }
     if ($BuildBenchmarks) { $configureArguments += "-DMGSTC_BUILD_BENCHMARKS=ON" }
+    if ($WasapiTestAsan) { $configureArguments += "-DMGSTC_WASAPI_TEST_ASAN=ON" }
     if ($DependencySourceRoot) {
         $sourceRoot = if ([IO.Path]::IsPathRooted($DependencySourceRoot)) {
             [IO.Path]::GetFullPath($DependencySourceRoot)

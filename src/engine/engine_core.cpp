@@ -6,6 +6,15 @@
 
 namespace mgstc::engine {
 
+bool EngineCore::queueNoteOn(std::uint8_t track, std::uint8_t midi_note,
+    std::optional<std::uint64_t> output_token) noexcept {
+    const auto token = output_token ? *output_token
+        : (output_backend_ != nullptr ? output_backend_->captureNoteToken() : 0);
+    if (!session_.queueNoteOn(track, midi_note)) return false;
+    if (output_backend_ != nullptr) output_backend_->noteQueued(track, token);
+    return true;
+}
+
 bool EngineCore::validGain(float value) noexcept {
     return std::isfinite(value) && value >= 0.0F;
 }
@@ -16,7 +25,8 @@ bool EngineCore::writeActiveRegisters(
     // Offline bounces can begin between notes, without a route reinitialization.
     const bool mirrored = emulator_.writeRegisters(writes);
     return mirrored && (output_backend_ == nullptr || offline_rendering_
-        || output_backend_->writeRegisters(writes));
+        || output_backend_->writeRegisters(writes)
+        || output_backend_->recoverableWriteFailure());
 }
 
 ChipSamples EngineCore::renderScopeSample(std::uint32_t channel_mask) noexcept {
@@ -107,6 +117,9 @@ RenderResult EngineCore::render(
     const auto frame_count = interleaved_stereo.size() / 2;
     for (std::size_t frame = 0; frame < frame_count; ) {
         if (clock_.tickDue()) {
+            std::array<std::uint64_t, RuntimeSession::kTrackCount> previous_notes{};
+            for (std::uint8_t track = 0; track < RuntimeSession::kTrackCount; ++track)
+                previous_notes[track] = session_.noteStartGeneration(track);
             result.tick_result = session_.processTick();
             if (!result.tick_result.ok()) {
                 std::fill(
@@ -117,6 +130,13 @@ RenderResult EngineCore::render(
                 result.error = RenderError::Runtime;
                 result.frames = frame;
                 return result;
+            }
+            if (remote_output) {
+                std::uint32_t new_note_tracks = 0;
+                for (std::uint8_t track = 0; track < RuntimeSession::kTrackCount; ++track)
+                    if (previous_notes[track] != session_.noteStartGeneration(track))
+                        new_note_tracks |= 1U << track;
+                output_backend_->beginTick(new_note_tracks);
             }
             if (!writeActiveRegisters(session_.writes())) {
                 std::fill(

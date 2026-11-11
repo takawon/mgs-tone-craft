@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -7,10 +8,14 @@
 
 namespace mgstc::audio {
 
+#if defined(MGSTC_WASAPI_TESTING)
+namespace detail { struct WasapiTestHooks; struct WasapiAudioSinkTestAccess; }
+#endif
+
 class WasapiAudioSink final : public AudioSink {
 public:
-    // Longest the caller waits for the render worker to leave a stuck WASAPI
-    // call before the worker is abandoned instead of joined.
+    // stop() bounds its wait, retaining an unjoined generation on timeout.
+    // UI callers use requestStop()/reapStopped() instead of waiting here.
     static constexpr std::uint32_t kStopWaitMs = 1500;
     static constexpr std::uint32_t kStartWaitMs = 5000;
 
@@ -21,7 +26,14 @@ public:
 
     [[nodiscard]] bool start(
         engine::RealtimeEngineHost& engine) override;
+    // The cancellation view must remain valid and must not be reset to false
+    // until this generation is joined. It is an intent; close() is the barrier.
+    [[nodiscard]] bool start(engine::RealtimeEngineHost& engine,
+        const std::atomic<bool>& cancellation);
     void stop() noexcept override;
+    void requestStop() noexcept;
+    [[nodiscard]] bool reapStopped() noexcept;
+    [[nodiscard]] bool stopPending() const noexcept;
     [[nodiscard]] bool running() const noexcept override;
     [[nodiscard]] bool pollStatus(
         AudioSinkStatus& status) noexcept override;
@@ -30,12 +42,18 @@ public:
     [[nodiscard]] std::uint32_t masterVolumePercent() const noexcept;
 
 private:
-    void abandonStuckWorker() noexcept;
-
+    [[nodiscard]] bool startImpl(engine::RealtimeEngineHost& engine,
+        const std::atomic<bool>* cancellation);
     struct Impl;
-    // shared_ptr so an abandoned render worker keeps its own state (and event
-    // handles) alive after the sink has moved on to a fresh Impl.
-    std::shared_ptr<Impl> impl_;
+    // Control calls are externally serialized. This one-slot registry owns the
+    // active or retired generation until true thread exit and join. The worker
+    // borrows Impl; it never owns or destroys it. Destruction waits for safety.
+    std::unique_ptr<Impl> impl_;
+    std::atomic<std::uint32_t> master_volume_percent_{100};
+#if defined(MGSTC_WASAPI_TESTING)
+    friend struct detail::WasapiAudioSinkTestAccess;
+    detail::WasapiTestHooks* test_hooks_{};
+#endif
 };
 
 }  // namespace mgstc::audio

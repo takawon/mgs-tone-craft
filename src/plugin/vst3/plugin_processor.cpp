@@ -1898,10 +1898,10 @@ void MgstcAudioProcessor::serviceOpllKeyoffSilence() noexcept {
 bool MgstcAudioProcessor::editorApplyHardwareSettings(
     mgstc::app::HardwareOutputSettings settings, int keyoff_seconds) {
     if (onAudioThread()) return false;
-    engine_.setMAmidiSettings({
+    if (!engine_.setMAmidiSettings({
         settings.host.empty() ? "localhost" : std::move(settings.host),
         settings.port == 0 ? std::uint16_t{30000} : settings.port,
-        settings.unit_no, settings.scc_plus, settings.waveform_monitor});
+        settings.unit_no, settings.scc_plus, settings.waveform_monitor})) return false;
     opll_keyoff_silence_seconds_ = std::clamp(keyoff_seconds, 0, 9999);
     saveHardwarePreferences();
     return !engine_.ownsHardwareOutput() || engine_.hardwareOutputConnected();

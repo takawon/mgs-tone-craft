@@ -902,7 +902,7 @@ ToneImportFormat detectToneImportFormat(
     }
     if (looksLikeGzip(bytes) && [&] {
             std::string error;
-            const auto inflated = inflateGzip(bytes, &error);
+            const auto inflated = inflateGzip(bytes, kVgzMaxExpandedBytes, &error);
             return inflated && looksLikeVgm(*inflated);
         }()) {
         return ToneImportFormat::Vgz;
@@ -961,6 +961,15 @@ ToneImportResult importTones(
     }
     result.format = detectToneImportFormat(bytes, extension);
     if (result.format == ToneImportFormat::Unknown) {
+        if (looksLikeGzip(bytes)) {
+            // Detection has no diagnostic channel. Preserve the bounded
+            // decoder's error even when the input has no VGZ extension.
+            std::string error;
+            if (!inflateGzip(bytes, kVgzMaxExpandedBytes, &error)) {
+                result.errors.push_back(std::move(error));
+                return result;
+            }
+        }
         if (looksLikeCompressedMgs(bytes)) {
             result.errors.emplace_back("compressed MGS is not supported");
         } else {
@@ -971,7 +980,7 @@ ToneImportResult importTones(
     switch (result.format) {
     case ToneImportFormat::Vgz: {
         std::string error;
-        const auto inflated = inflateGzip(bytes, &error);
+        const auto inflated = inflateGzip(bytes, kVgzMaxExpandedBytes, &error);
         if (!inflated) {
             result.errors.push_back(
                 error.empty() ? "failed to expand VGZ" : error);

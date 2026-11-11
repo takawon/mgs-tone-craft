@@ -1,5 +1,10 @@
 #include "mgstc/engine/realtime_engine_host.hpp"
 
+#if defined(MGSTC_HOST_RENDER_GAP_TESTING)
+// Only the isolated lifetime test compiles this probe; product audio has none.
+extern void mgstcHostRenderGapTestHook() noexcept;
+#endif
+
 #include <type_traits>
 #include <algorithm>
 #include <chrono>
@@ -17,6 +22,8 @@ namespace mgstc::engine {
 
 namespace {
 constexpr std::uint32_t kOutputClosed = 0x80000000U;
+constexpr auto kOutputControlWait = std::chrono::milliseconds(500);
+using OutputDeadline = std::chrono::steady_clock::time_point;
 
 // This is a control-thread coordinator. The mapping contains only pointers
 // belonging to this process, allowing two loaded copies of the plugin module
@@ -39,16 +46,24 @@ struct OutputLease {
         mutex = CreateMutexW(nullptr, FALSE,
             (L"Local\\MGSTC.OutputControl.v1." + suffix).c_str());
         if (mutex == nullptr) return;
-        if (WaitForSingleObject(mutex, INFINITE) > WAIT_ABANDONED) return;
+        // Named page-file mappings are atomically created/opened by Windows
+        // and begin zero-filled. No shared State is accessed during setup.
         mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
             PAGE_READWRITE, 0, sizeof(State),
             (L"Local\\MGSTC.OutputOwner.v1." + suffix).c_str());
         if (mapping != nullptr)
             state = static_cast<State*>(MapViewOfFile(mapping,
                 FILE_MAP_ALL_ACCESS, 0, 0, sizeof(State)));
-        ReleaseMutex(mutex);
     }
-    bool lock() { return state != nullptr
+    bool lock(OutputDeadline deadline) {
+        if (state == nullptr) return false;
+        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        const auto timeout = static_cast<DWORD>(std::max<std::int64_t>(0,
+            remaining.count()));
+        return WaitForSingleObject(mutex, timeout) <= WAIT_ABANDONED;
+    }
+    bool lockForDestruction() { return state != nullptr
         && WaitForSingleObject(mutex, INFINITE) <= WAIT_ABANDONED; }
     void unlock() { ReleaseMutex(mutex); }
     bool lockDevice() {
@@ -75,10 +90,11 @@ struct OutputLease {
         state->device_lock = nullptr;
     }
 #else
-    std::mutex mutex;
+    std::timed_mutex mutex;
     State local{};
     State* state{&local};
-    bool lock() { mutex.lock(); return true; }
+    bool lock(OutputDeadline deadline) { return mutex.try_lock_until(deadline); }
+    bool lockForDestruction() { mutex.lock(); return true; }
     void unlock() { mutex.unlock(); }
     bool lockDevice() { return true; }
     void unlockDevice() {}
@@ -92,8 +108,13 @@ OutputLease& outputLease() {
     return *lease;
 }
 struct LeaseLock {
+    enum class WaitPolicy { Destruction };
     OutputLease& lease{outputLease()};
-    bool locked{lease.lock()};
+    bool locked{};
+    explicit LeaseLock(OutputDeadline deadline
+        = std::chrono::steady_clock::now() + kOutputControlWait)
+        : locked(lease.lock(deadline)) {}
+    explicit LeaseLock(WaitPolicy) : locked(lease.lockForDestruction()) {}
     ~LeaseLock() { if (locked) lease.unlock(); }
 };
 } // namespace
@@ -107,16 +128,56 @@ RealtimeEngineHost::RealtimeAccess::RealtimeAccess(
 RealtimeEngineHost::RealtimeAccess::~RealtimeAccess() {
     if (entered_) host_.output_access_.fetch_sub(1, std::memory_order_release);
 }
-RealtimeEngineHost::OutputTransition::OutputTransition(RealtimeEngineHost& host)
-    : host_(host), lock_(host.output_control_mutex_) {
+void RealtimeEngineHost::OutputTransition::closeGate() {
     host_.output_switch_pending_.store(true, std::memory_order_release);
     host_.output_access_.fetch_or(kOutputClosed, std::memory_order_acq_rel);
+}
+RealtimeEngineHost::OutputTransition::OutputTransition(RealtimeEngineHost& host,
+    OutputDeadline deadline)
+    : host_(host), lock_(host.output_control_mutex_, std::defer_lock) {
+    if (!lock_.try_lock_until(deadline)) {
+        host_.output_control_error_.store(OutputControlError::TimedOut, std::memory_order_release);
+        return;
+    }
+    closeGate();
+    const auto timed_out = [&] {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            // Keep an in-flight audio reader counted when undoing our gate.
+            host_.output_access_.fetch_and(~kOutputClosed, std::memory_order_release);
+            host_.output_switch_pending_.store(false, std::memory_order_release);
+            host_.output_control_error_.store(OutputControlError::TimedOut, std::memory_order_release);
+            return true;
+        }
+        return false;
+    };
+    while (host_.output_access_.load(std::memory_order_acquire) != kOutputClosed) {
+        if (timed_out()) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (timed_out()) return;
+    entered_ = true;
+    host_.output_control_error_.store(OutputControlError::None, std::memory_order_release);
+}
+RealtimeEngineHost::OutputTransition::OutputTransition(RealtimeEngineHost& host, WaitPolicy)
+    : host_(host), lock_(host.output_control_mutex_) {
+    // Destruction cannot return while an admitted audio reader still uses us.
+    closeGate();
     while (host_.output_access_.load(std::memory_order_acquire) != kOutputClosed)
-        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    entered_ = true;
 }
 RealtimeEngineHost::OutputTransition::~OutputTransition() {
-    host_.output_access_.store(0, std::memory_order_release);
+    if (!entered_) return;
+    host_.output_access_.fetch_and(~kOutputClosed, std::memory_order_release);
     host_.output_switch_pending_.store(false, std::memory_order_release);
+}
+
+const char* RealtimeEngineHost::outputControlErrorText() const noexcept {
+    switch (output_control_error_.load(std::memory_order_acquire)) {
+    case OutputControlError::Unavailable: return "MAmidiMEmo ownership coordinator is unavailable";
+    case OutputControlError::TimedOut: return "Output control transition timed out";
+    default: return nullptr;
+    }
 }
 
 static_assert(std::is_nothrow_move_assignable_v<EngineCore>);
@@ -139,10 +200,11 @@ RealtimeEngineHost::RealtimeEngineHost()
 }
 
 void RealtimeEngineHost::setOpllScopeEnabled(bool enabled) noexcept {
-    OutputTransition transition(*this);
-    opll_scope_enabled_ = enabled;
-    for (std::size_t index = 0; index < kProgramSlotCount; ++index) {
-        programs_[index].engine.setOpllScopeEnabled(enabled);
+    auto previous = opll_scope_request_.load(std::memory_order_acquire);
+    while (((previous & 1U) != 0) != enabled) {
+        const auto next = ((previous & ~std::uint64_t{1}) + 2U) | (enabled ? 1U : 0U);
+        if (opll_scope_request_.compare_exchange_weak(previous, next,
+                std::memory_order_acq_rel, std::memory_order_acquire)) return;
     }
 }
 
@@ -153,14 +215,15 @@ bool RealtimeEngineHost::hasRealtimeWork() const noexcept {
 }
 
 RealtimeEngineHost::~RealtimeEngineHost() {
-    LeaseLock lease;
+    // Keep lifetime drain distinct from the bounded interactive operations.
+    LeaseLock lease(LeaseLock::WaitPolicy::Destruction);
+    OutputTransition transition(*this, OutputTransition::WaitPolicy::Destruction);
     if (lease.locked && lease.lease.state->owner == this) {
-        static_cast<void>(relinquishHardwareOutput());
+        static_cast<void>(relinquishHardwareOutputProtected());
         lease.lease.state->owner = nullptr;
         lease.lease.state->relinquish = nullptr;
         lease.lease.unlockDevice();
     } else {
-        OutputTransition transition(*this);
         mamidi_->close();
     }
 }
@@ -226,12 +289,13 @@ bool RealtimeEngineHost::submitProgram(
     }
 
     slot.state.store(ProgramSlotState::Pending, std::memory_order_release);
-    const auto command = EngineCommand::loadProgram(
+    auto command = EngineCommand::loadProgram(
         edit.slot,
         edit.generation,
         audition.retrigger,
         audition.track,
         audition.midi_note);
+    if (audition.retrigger) command.output_note_token = mamidi_->captureNoteToken();
     if (!commands_.tryPush(command)) {
         slot.state.store(
             ProgramSlotState::Editing,
@@ -261,14 +325,42 @@ bool RealtimeEngineHost::discardProgramEdit(
 
 bool RealtimeEngineHost::submit(
     const EngineCommand& command) noexcept {
-    return commands_.tryPush(command);
+    auto stamped = command;
+    if (command.type == EngineCommandType::NoteOn
+        || (command.type == EngineCommandType::LoadProgram && command.retrigger))
+        stamped.output_note_token = mamidi_->captureNoteToken();
+    return commands_.tryPush(stamped);
 }
 
-void RealtimeEngineHost::setMAmidiSettings(
+bool RealtimeEngineHost::setMAmidiSettings(
     MAmidiOutputSettings settings) {
-    LeaseLock lease;
-    if (!lease.locked) return;
-    OutputTransition transition(*this);
+    const auto deadline = std::chrono::steady_clock::now() + kOutputControlWait;
+    {
+        OutputTransition local(*this, deadline);
+        if (!local) return false;
+        // Inactive connection preferences are local state. Do not let another
+        // instance's RPC shutdown delay construction or discard saved settings.
+        if (output_kind_ == SoundOutputKind::Emulator
+            && !hardware_owned_.load(std::memory_order_acquire) && !mamidi_->isOpen()) {
+            applyMAmidiSettingsProtected(std::move(settings));
+            return true;
+        }
+    }
+    // Release the local probe before the shared lease: every live remote
+    // operation keeps the same Lease -> Host lock order.
+    LeaseLock lease(deadline);
+    if (!lease.locked) {
+        output_control_error_.store(lease.lease.state == nullptr
+            ? OutputControlError::Unavailable : OutputControlError::TimedOut, std::memory_order_release);
+        return false;
+    }
+    OutputTransition transition(*this, deadline);
+    if (!transition) return false;
+    applyMAmidiSettingsProtected(std::move(settings));
+    return true;
+}
+
+void RealtimeEngineHost::applyMAmidiSettingsProtected(MAmidiOutputSettings settings) {
     const bool endpoint_changed =
         settings.host != mamidi_settings_.host
         || settings.port != mamidi_settings_.port
@@ -305,7 +397,14 @@ const MAmidiOutputSettings& RealtimeEngineHost::mamidiSettings()
 }
 
 bool RealtimeEngineHost::relinquishHardwareOutput() {
-    OutputTransition transition(*this);
+    // Keep the process-shared v1 callback ABI unchanged. This opaque old-owner
+    // boundary has its own bounded gate deadline.
+    OutputTransition transition(*this, std::chrono::steady_clock::now() + kOutputControlWait);
+    if (!transition) return false;
+    return relinquishHardwareOutputProtected();
+}
+
+bool RealtimeEngineHost::relinquishHardwareOutputProtected() {
     mamidi_->close();
     if (!mamidi_->closeAcknowledged()) {
         output_error_ = "Previous MAmidiMEmo writes were not acknowledged; release the previous owner explicitly";
@@ -328,15 +427,20 @@ bool RealtimeEngineHost::relinquishHardwareOutput() {
 }
 
 bool RealtimeEngineHost::setSoundOutputKind(SoundOutputKind kind) {
-    LeaseLock lease;
+    const auto deadline = std::chrono::steady_clock::now() + kOutputControlWait;
+    LeaseLock lease(deadline);
     if (!lease.locked) {
-        output_error_ = "MAmidiMEmo ownership coordinator is unavailable";
+        output_control_error_.store(lease.lease.state == nullptr
+            ? OutputControlError::Unavailable : OutputControlError::TimedOut, std::memory_order_release);
         return false;
     }
-    desired_output_kind_.store(kind, std::memory_order_release);
+    // Acquire our own exclusion before changing the previous owner. A later
+    // local timeout must never leave a completed handoff only half applied.
+    OutputTransition transition(*this, deadline);
+    if (!transition) return false;
     if (kind == SoundOutputKind::Emulator) {
-        OutputTransition transition(*this);
         mamidi_->close();
+        desired_output_kind_.store(kind, std::memory_order_release);
         output_kind_.store(kind, std::memory_order_release);
         hardware_owned_.store(false, std::memory_order_release);
         applyOutputRouting();
@@ -356,12 +460,9 @@ bool RealtimeEngineHost::setSoundOutputKind(SoundOutputKind kind) {
         return true;
     }
     if (lease.lease.state->owner == this) return true;
-    output_switch_pending_.store(true, std::memory_order_release);
     if (lease.lease.state->owner != nullptr) {
         if (!lease.lease.state->relinquish(lease.lease.state->owner)) {
             output_error_ = "The previous MAmidiMEmo owner could not stop safely";
-            desired_output_kind_.store(SoundOutputKind::Emulator, std::memory_order_release);
-            output_switch_pending_.store(false, std::memory_order_release);
             return false;
         }
         lease.lease.state->owner = nullptr;
@@ -369,17 +470,13 @@ bool RealtimeEngineHost::setSoundOutputKind(SoundOutputKind kind) {
     }
     if (!lease.lease.lockDevice()) {
         output_error_ = "MAmidiMEmo is owned by another MGSTC process";
-        desired_output_kind_.store(SoundOutputKind::Emulator, std::memory_order_release);
-        output_switch_pending_.store(false, std::memory_order_release);
         return false;
     }
-    OutputTransition transition(*this);
     mamidi_->setEndpoint(mamidi_settings_.host, mamidi_settings_.port);
     mamidi_->setUnitNo(mamidi_settings_.unit_no);
     mamidi_->setSccPlus(mamidi_settings_.scc_plus);
     if (!mamidi_->open()) {
         output_error_ = mamidi_->lastError();
-        desired_output_kind_.store(SoundOutputKind::Emulator, std::memory_order_release);
         lease.lease.unlockDevice();
         return false;
     }
@@ -390,6 +487,7 @@ bool RealtimeEngineHost::setSoundOutputKind(SoundOutputKind kind) {
     };
     hardware_owned_.store(true, std::memory_order_release);
     output_kind_.store(kind, std::memory_order_release);
+    desired_output_kind_.store(kind, std::memory_order_release);
     applyOutputRouting();
     // Old terminal silence is acknowledged before new initialization begins.
     auto& core = programs_[active_program_].engine;
@@ -406,12 +504,20 @@ SoundOutputKind RealtimeEngineHost::soundOutputKind() const noexcept {
 }
 
 bool RealtimeEngineHost::reconnectMAmidi() {
-    LeaseLock lease;
-    if (!lease.locked || lease.lease.state->owner != this) {
+    const auto deadline = std::chrono::steady_clock::now() + kOutputControlWait;
+    LeaseLock lease(deadline);
+    if (!lease.locked) {
+        output_control_error_.store(lease.lease.state == nullptr
+            ? OutputControlError::Unavailable : OutputControlError::TimedOut, std::memory_order_release);
+        return false;
+    }
+    output_control_error_.store(OutputControlError::None, std::memory_order_release);
+    if (lease.lease.state->owner != this) {
         output_error_ = "Select hardware output before reconnecting";
         return false;
     }
-    OutputTransition transition(*this);
+    OutputTransition transition(*this, deadline);
+    if (!transition) return false;
     mamidi_->close();
     mamidi_->setEndpoint(mamidi_settings_.host, mamidi_settings_.port);
     mamidi_->setUnitNo(mamidi_settings_.unit_no);
@@ -429,7 +535,13 @@ bool RealtimeEngineHost::reconnectMAmidi() {
 }
 
 std::string RealtimeEngineHost::soundOutputStatus() const {
-    LeaseLock lease;
+    const auto deadline = std::chrono::steady_clock::now() + kOutputControlWait;
+    LeaseLock lease(deadline);
+    if (!lease.locked) return lease.lease.state == nullptr
+        ? "MAmidiMEmo ownership coordinator is unavailable" : "Output control transition timed out";
+    std::unique_lock control(output_control_mutex_, std::defer_lock);
+    if (!control.try_lock_until(deadline)) return "Output control transition timed out";
+    if (const auto error = outputControlErrorText()) return error;
     if (!output_error_.empty()) return output_error_;
     if (output_kind_ == SoundOutputKind::Emulator) {
         return "Output: Emulator";
@@ -441,7 +553,13 @@ std::string RealtimeEngineHost::soundOutputStatus() const {
 }
 
 std::string RealtimeEngineHost::soundOutputLastError() const {
-    LeaseLock lease;
+    const auto deadline = std::chrono::steady_clock::now() + kOutputControlWait;
+    LeaseLock lease(deadline);
+    if (!lease.locked) return lease.lease.state == nullptr
+        ? "MAmidiMEmo ownership coordinator is unavailable" : "Output control transition timed out";
+    std::unique_lock control(output_control_mutex_, std::defer_lock);
+    if (!control.try_lock_until(deadline)) return "Output control transition timed out";
+    if (const auto error = outputControlErrorText()) return error;
     if (!output_error_.empty()) return output_error_;
     if (mamidi_ == nullptr) {
         return {};
@@ -464,7 +582,16 @@ bool RealtimeEngineHost::pollNotice(EngineNotice& notice) noexcept {
 
 bool RealtimeEngineHost::pollOpllScope(
     OpllScopeFrame& frame) noexcept {
-    return opll_scope_frames_->tryPop(frame);
+    for (std::size_t count = 0; count < kOpllScopeCapacity; ++count) {
+        if (!opll_scope_frames_->tryPop(frame)) return false;
+        if (isCurrentScopeFrame(frame)) return true;
+    }
+    return false;
+}
+
+bool RealtimeEngineHost::isCurrentScopeFrame(const OpllScopeFrame& frame) const noexcept {
+    const auto request = opll_scope_request_.load(std::memory_order_acquire);
+    return (request & 1U) != 0 && frame.capture_generation == (request >> 1U);
 }
 
 bool RealtimeEngineHost::setScopeSelection(std::uint32_t track_mask,
@@ -502,8 +629,10 @@ bool RealtimeEngineHost::pollLatestOpllScope(
          count < kOpllScopeCapacity
          && opll_scope_frames_->tryPop(next);
          ++count) {
-        frame = next;
-        found = true;
+        if (isCurrentScopeFrame(next)) {
+            frame = next;
+            found = true;
+        }
     }
     return found;
 }
@@ -515,7 +644,11 @@ void RealtimeEngineHost::setSpectrogramCaptureEnabled(
 
 bool RealtimeEngineHost::pollSpectrogramScope(
     OpllScopeFrame& frame) noexcept {
-    return spectrogram_scope_frames_->tryPop(frame);
+    for (std::size_t count = 0; count < kSpectrogramScopeCapacity; ++count) {
+        if (!spectrogram_scope_frames_->tryPop(frame)) return false;
+        if (isCurrentScopeFrame(frame)) return true;
+    }
+    return false;
 }
 
 void RealtimeEngineHost::setSpectrumCaptureEnabled(bool enabled) noexcept {
@@ -649,7 +782,7 @@ void RealtimeEngineHost::loadProgram(
     }
 
     static_cast<void>(incoming.engine.setGains(current_gains_));
-    incoming.engine.setOpllScopeEnabled(opll_scope_enabled_);
+    incoming.engine.setOpllScopeEnabled(opllScopeEnabled());
     applyOutputRouting(incoming.engine);
     applyRealtimePolicy(incoming.engine);
     incoming.engine.hardReset();
@@ -668,9 +801,9 @@ void RealtimeEngineHost::loadProgram(
         std::memory_order_release);
 
     if (command.retrigger
-        && !incoming.engine.session().queueNoteOn(
+        && !incoming.engine.queueNoteOn(
             command.track,
-            command.midi_note)) {
+            command.midi_note, command.output_note_token)) {
         reject(command.type);
     } else if (command.retrigger) {
         noteStarted(command.track, command.midi_note);
@@ -764,9 +897,9 @@ void RealtimeEngineHost::applyPendingCommands() noexcept {
             loadProgram(command);
             break;
         case EngineCommandType::NoteOn:
-            if (!programs_[active_program_].engine.session().queueNoteOn(
+            if (!programs_[active_program_].engine.queueNoteOn(
                     command.track,
-                    command.midi_note)) {
+                    command.midi_note, command.output_note_token)) {
                 reject(command.type);
             } else {
                 noteStarted(command.track, command.midi_note);
@@ -818,7 +951,7 @@ bool RealtimeEngineHost::realtimeNoteOn(
     std::uint8_t midi_note) noexcept {
     RealtimeAccess access(*this);
     if (!access) return false;
-    if (!programs_[active_program_].engine.session().queueNoteOn(
+    if (!programs_[active_program_].engine.queueNoteOn(
             track, midi_note)) {
         return false;
     }
@@ -858,6 +991,9 @@ void RealtimeEngineHost::realtimeStop() noexcept {
 RenderResult RealtimeEngineHost::render(
     std::span<float> interleaved_stereo) noexcept {
     servicePendingControlCommands();
+#if defined(MGSTC_HOST_RENDER_GAP_TESTING)
+    ::mgstcHostRenderGapTestHook();
+#endif
     return renderAudio(interleaved_stereo);
 }
 
@@ -870,6 +1006,15 @@ RenderResult RealtimeEngineHost::renderAudio(
     }
     auto& core = programs_[active_program_].engine;
     applyRealtimePolicy(core);
+    const auto scope_request = opll_scope_request_.load(std::memory_order_acquire);
+    const bool scope_enabled = (scope_request & 1U) != 0;
+    if (applied_opll_scope_request_ != scope_request) {
+        // A close/reopen between callbacks also starts a fresh 800-sample
+        // window, even when the current enabled bit has returned to true.
+        core.resetScopeCapture();
+        applied_opll_scope_request_ = scope_request;
+    }
+    core.setOpllScopeEnabled(scope_enabled);
     SpectrumCapture* capture = nullptr;
     if (spectrum_enabled_.load(std::memory_order_acquire)) {
         spectrum_capture_->begin(spectrum_sample_clock_,
@@ -884,7 +1029,7 @@ RenderResult RealtimeEngineHost::renderAudio(
     RenderResult result{};
     // Preserve every completed window even when a host callback spans several
     // ticks. Commands and capture context are serviced once for the whole call.
-    const bool split_scope = opll_scope_enabled_
+    const bool split_scope = scope_enabled
         && interleaved_stereo.size() > OpllScopeFrame::kSampleCount * 2
         && interleaved_stereo.size() % 2 == 0;
     std::size_t offset = 0;
@@ -899,9 +1044,11 @@ RenderResult RealtimeEngineHost::renderAudio(
             result.tick_result = part.tick_result;
         if (!part.ok()) result.error = part.error;
         offset += run;
-        if (opll_scope_enabled_) {
+        if (scope_enabled) {
             auto& scope = *scope_frame_work_;
-            if (programs_[active_program_].engine.takeOpllScopeFrame(scope)) {
+            if (programs_[active_program_].engine.takeOpllScopeFrame(scope)
+                && opll_scope_request_.load(std::memory_order_acquire) == scope_request) {
+                scope.capture_generation = scope_request >> 1U;
                 annotateGuideNote(scope);
                 scope.scope_ui_context = scope_ui_context_;
                 scope.selection_note = scope_selection_note_;

@@ -1,8 +1,11 @@
 #include "mgstc/engine/gzip_inflate.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <new>
+#include <stdexcept>
 
 namespace mgstc::engine {
 namespace {
@@ -144,6 +147,7 @@ constexpr std::array<int, 32> kDistExtra{
 bool inflate(
     std::span<const std::uint8_t> deflate,
     std::vector<std::uint8_t>& output,
+    std::size_t max_output_bytes,
     std::string* error) {
     BitReader bits{deflate};
     Huffman lit;
@@ -156,6 +160,33 @@ bool inflate(
             *error = message;
         }
         return false;
+    };
+
+    // Reserve explicitly before every append so vector's automatic geometric
+    // growth cannot overshoot the resource limit. ISIZE is not a trusted bound.
+    const auto prepareAppend = [&](std::size_t count) {
+        if (count > max_output_bytes - output.size()) {
+            return fail("gzip expanded data exceeds output byte limit");
+        }
+        const auto required = output.size() + count;
+        if (required <= output.capacity()) {
+            return true;
+        }
+        const auto capacity = output.capacity();
+        const auto target = std::max(required, capacity == 0
+            ? std::min(max_output_bytes, std::size_t{4096})
+            : capacity + std::min(capacity, max_output_bytes - capacity));
+        try {
+            output.reserve(target);
+        } catch (const std::bad_alloc&) {
+            return fail("gzip output allocation failed");
+        } catch (const std::length_error&) {
+            return fail("gzip output allocation is too large");
+        }
+        if (output.capacity() > max_output_bytes) {
+            return fail("gzip output capacity exceeds output byte limit");
+        }
+        return true;
     };
 
     while (true) {
@@ -180,6 +211,9 @@ bool inflate(
             }
             if (bits.byte_pos + len > bits.data.size()) {
                 return fail("truncated stored deflate payload");
+            }
+            if (!prepareAppend(len)) {
+                return false;
             }
             output.insert(
                 output.end(),
@@ -294,6 +328,9 @@ bool inflate(
                     return fail("truncated Huffman literal");
                 }
                 if (symbol < 256) {
+                    if (!prepareAppend(1)) {
+                        return false;
+                    }
                     output.push_back(static_cast<std::uint8_t>(symbol));
                     continue;
                 }
@@ -332,6 +369,9 @@ bool inflate(
                     || static_cast<std::size_t>(distance) > output.size()) {
                     return fail("invalid back-reference distance");
                 }
+                if (!prepareAppend(static_cast<std::size_t>(length))) {
+                    return false;
+                }
                 for (int i = 0; i < length; ++i) {
                     output.push_back(
                         output[output.size()
@@ -355,6 +395,7 @@ bool looksLikeGzip(std::span<const std::uint8_t> bytes) noexcept {
 
 std::optional<std::vector<std::uint8_t>> inflateGzip(
     std::span<const std::uint8_t> bytes,
+    std::size_t max_output_bytes,
     std::string* error) {
     const auto fail = [&](const char* message)
         -> std::optional<std::vector<std::uint8_t>> {
@@ -399,9 +440,8 @@ std::optional<std::vector<std::uint8_t>> inflateGzip(
     const auto deflate = bytes.subspan(
         position, bytes.size() - position - 8);
     std::vector<std::uint8_t> output;
-    output.reserve(bytes.size() * 2);
     std::string inflate_error;
-    if (!inflate(deflate, output, &inflate_error)) {
+    if (!inflate(deflate, output, max_output_bytes, &inflate_error)) {
         return fail(
             inflate_error.empty() ? "gzip inflate failed" : inflate_error.c_str());
     }

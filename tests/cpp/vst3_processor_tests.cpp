@@ -43,6 +43,7 @@
 #include "mgstc/engine/scc_morph.hpp"
 #include "mgstc/engine/mgs_composite_io.hpp"
 #include "mgstc/engine/sinc_rate_conv.hpp"
+#include "realtime_engine_host_test_access.hpp"
 
 struct LibraryManagerListTabTestAccess {
     static void run() {
@@ -5905,6 +5906,41 @@ void testProcessorHardwareRoutingWithMockRpc() {
         settings.unit_no = 2;
         require(b.editorApplyHardwareSettings(settings, 20), "second processor configures shared RPC endpoint");
         require(a.editorRequestHardwareMode(true), "processor explicitly acquires hardware");
+        {
+            test::HeldHostAccess audio(a.editorEngineForAnalysis(), test::HeldHostAccess::Kind::Audio);
+            auto changed = settings;
+            changed.host = "127.0.0.2";
+            changed.waveform_monitor = true;
+            require(!a.editorApplyHardwareSettings(changed, 123),
+                "settings application reports an audio exclusion timeout");
+            mgstc::app::EditorSnapshot unchanged;
+            a.editorPopulateOutputSnapshot(unchanged);
+            require(unchanged.hardware_settings.host == "127.0.0.1"
+                && unchanged.hardware_settings.unit_no == 1
+                && !unchanged.hardware_settings.waveform_monitor
+                && unchanged.opll_keyoff_silence_seconds == 20,
+                "failed settings application retains connection and key-off preferences");
+            require(unchanged.hardware_output && unchanged.desired_hardware_output
+                && unchanged.hardware_owned && unchanged.hardware_connected
+                && !unchanged.output_switch_pending,
+                "failed settings application retains output selection and ownership");
+            require(!a.editorReconnectHardware(), "reconnect times out safely while audio is admitted");
+            require(!b.editorRequestHardwareMode(true), "another Processor cannot stop an admitted old owner");
+            const auto scope_start = std::chrono::steady_clock::now();
+            a.editorRetainCompositeScope();
+            require(Access::scopeEnabled(a), "first scope retain is remembered while audio is admitted");
+            a.editorReleaseCompositeScope();
+            require(!Access::scopeEnabled(a), "last scope release is remembered while audio is admitted");
+            a.editorRetainCompositeScope();
+            require(Access::scopeEnabled(a), "scope reopen retries the current request");
+            a.editorReleaseCompositeScope();
+            require(std::chrono::steady_clock::now() - scope_start < std::chrono::milliseconds(100),
+                "scope clients waited for the admitted audio callback");
+            require(sameBlock(original, stateBytes(a)), "control timeouts leave Plugin State unchanged");
+        }
+        settings.unit_no = 1;
+        require(a.editorApplyHardwareSettings(settings, 20), "settings retry succeeds after audio returns");
+        require(a.editorReconnectHardware(), "reconnect retry succeeds after audio returns");
         processEmpty(a, 512); // finish route-edge cleanup before starting PCM preview
         auto pcm = std::make_shared<SourcePcm>();
         pcm->sample_rate = 48000; pcm->channels = 2;
@@ -5949,8 +5985,101 @@ void testProcessorHardwareRoutingWithMockRpc() {
         restored.setStateInformation(original.getData(), static_cast<int>(original.getSize()));
         restored.editorPopulateOutputSnapshot(snap);
         require(!snap.hardware_output && !snap.hardware_owned, "restored project does not acquire hardware");
+        {
+            auto temporary = std::make_unique<MgstcAudioProcessor>();
+            temporary->prepareToPlay(48'000.0, 512);
+            settings.unit_no = 3;
+            require(temporary->editorApplyHardwareSettings(settings, 20), "temporary Processor configures hardware");
+            require(temporary->editorRequestHardwareMode(true), "temporary Processor takes hardware before destruction");
+        }
+        require(b.editorRequestHardwareMode(true), "destroyed Processor releases its output lease normally");
         require(b.editorRequestHardwareMode(false), "explicit release closes hardware safely");
         require(writes.load(std::memory_order_acquire) > 0, "realtime processor reaches mock RPC server");
+    }
+    server.stop();
+}
+
+void testProcessorHardwareCongestionWithMockRpc() {
+    using namespace mgstc::engine;
+    constexpr std::uint16_t port = 39125;
+    std::atomic<bool> blocked{false}, entered{false};
+    std::atomic<std::uint64_t> writes{0};
+    rpc::server server(port);
+    server.bind(MAmidiRpcClient::kMethodName,
+        [&](unsigned char device, unsigned char, unsigned int, unsigned int) {
+            if (device == 0) return;
+            entered.store(true, std::memory_order_release);
+            while (blocked.load(std::memory_order_acquire))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            writes.fetch_add(1, std::memory_order_release);
+        });
+    server.async_run(1);
+    {
+        auto processor = std::make_unique<MgstcAudioProcessor>();
+        struct Release {
+            std::atomic<bool>& blocked;
+            ~Release() { blocked.store(false, std::memory_order_release); }
+        } release{blocked};
+        processor->prepareToPlay(48'000.0, 512);
+        const auto saved = stateBytes(*processor);
+        mgstc::app::HardwareOutputSettings settings;
+        settings.host = "127.0.0.1"; settings.port = port;
+        settings.waveform_monitor = true;
+        require(processor->editorApplyHardwareSettings(settings, 20), "configure recovery mock");
+        require(processor->editorRequestHardwareMode(true), "select hardware for recovery mock");
+        processEmpty(*processor, 512);
+        auto& host = processor->editorEngineForAnalysis();
+        auto edit = host.beginProgramEdit();
+        require(edit.valid(), "borrow prepared route for recovery test");
+        auto* remote = dynamic_cast<MAmidiMemoSoundOutput*>(edit.engine->outputBackend());
+        require(remote != nullptr, "prepared and active programs share hardware route");
+        require(host.discardProgramEdit(edit), "release borrowed program slot");
+        require(remote->waitForIdle(2000), "initial route silence acknowledged");
+        blocked.store(true, std::memory_order_release);
+        entered.store(false, std::memory_order_release);
+        require(remote->enqueueChipAccess({11, 0, 8, 15}), "block mock sender");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(entered.load(std::memory_order_acquire), "mock sender reaches blocked acknowledgement");
+        bool full = false;
+        for (int index = 0; index < 20000; ++index)
+            if (!remote->enqueueChipAccess({11, 0, 8, 15})) { full = true; break; }
+        require(full, "bounded hardware queue reaches capacity");
+        juce::AudioBuffer<float> buffer(2, 512);
+        juce::MidiBuffer midi;
+        midi.addEvent(juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(100)), 0);
+        const auto before = Access::frame(*processor);
+        processor->processBlock(buffer, midi);
+        midi.clear();
+        midi.addEvent(juce::MidiMessage::noteOff(1, 60), 0);
+        processor->processBlock(buffer, midi);
+        for (int block = 0; block < 4; ++block) processEmpty(*processor, 512);
+        require(Access::frame(*processor) > before, "DAW processing continues during congestion");
+        require(channelPeak(buffer, 0, 512) == 0 && channelPeak(buffer, 1, 512) == 0,
+            "congested hardware selection remains silent at final DAW output");
+        require(processor->editorHardwareStatus().find("queue is full") != std::string::npos,
+            "Editor boundary exposes congestion without rendering failure");
+        mgstc::app::EditorSnapshot snap;
+        processor->editorPopulateOutputSnapshot(snap);
+        require(snap.hardware_output && snap.hardware_owned, "congestion retains mode and lease");
+        require(sameBlock(saved, stateBytes(*processor)), "congestion does not alter Plugin State");
+        blocked.store(false, std::memory_order_release);
+        require(remote->waitForIdle(3000), "old writes and silence complete");
+        const auto silenced = writes.load(std::memory_order_acquire);
+        processEmpty(*processor, 512);
+        require(remote->waitForIdle(2000), "waiting-note processing stays nonblocking");
+        require(writes.load(std::memory_order_acquire) == silenced,
+            "pre-ack DAW NoteOn is not replayed after silence");
+        midi.clear();
+        midi.addEvent(juce::MidiMessage::noteOn(1, 65, static_cast<juce::uint8>(100)), 0);
+        processor->processBlock(buffer, midi);
+        processEmpty(*processor, 512);
+        require(remote->waitForIdle(2000), "new DAW NoteOn restores hardware");
+        require(writes.load(std::memory_order_acquire) > silenced, "fresh note reaches RPC route");
+        require(processor->editorHardwareStatus().find("queue is full") == std::string::npos,
+            "successful resynchronization clears congestion status");
+        require(processor->editorRequestHardwareMode(false), "release recovered hardware");
     }
     server.stop();
 }
@@ -8864,6 +8993,7 @@ int main() {
             LibraryManagerListTabTestAccess::run();
             testLibraryPreviewsPreserveCommittedPluginState();
             testProcessorHardwareRoutingWithMockRpc();
+            testProcessorHardwareCongestionWithMockRpc();
             testOpllKeyoffSilenceDeadline();
             testVstPcmPreviewStereoRangeGainAndHostRate();
             testVstPcmPreviewMuteClampAndInvalidRequests();
@@ -8955,6 +9085,7 @@ int main() {
         LibraryManagerListTabTestAccess::run();
         testLibraryPreviewsPreserveCommittedPluginState();
         testProcessorHardwareRoutingWithMockRpc();
+        testProcessorHardwareCongestionWithMockRpc();
         testOpllKeyoffSilenceDeadline();
         testCommittedTimelineEditSupersedesPickerPreview();
         testCompositeEditorDelayedKeyOff();

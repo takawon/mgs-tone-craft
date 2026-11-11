@@ -31,6 +31,17 @@ project(
 
 option(MGSTC_BUILD_TESTS "Build engine tests" ON)
 option(MGSTC_BUILD_BENCHMARKS "Build explicit performance benchmarks" OFF)
+option(MGSTC_WASAPI_TEST_ASAN
+    "Instrument the WASAPI lifetime test and its engine dependency with MSVC AddressSanitizer"
+    OFF)
+if(MGSTC_WASAPI_TEST_ASAN AND (NOT WIN32 OR NOT MSVC OR NOT MGSTC_BUILD_TESTS))
+    message(FATAL_ERROR "MGSTC_WASAPI_TEST_ASAN requires Windows, MSVC, and MGSTC_BUILD_TESTS=ON")
+endif()
+if(MGSTC_WASAPI_TEST_ASAN)
+    # Debug's default /RTC1 cannot be combined with AddressSanitizer. This
+    # diagnostic option is used only in the wrapper's isolated build tree.
+    string(REGEX REPLACE "/RTC[1su]+" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+endif()
 
 # About shows MGSTC_DOC_VERSION. Prefer local SPECIFICATION.md when present
 # (private working tree). Public checkouts use the tracked VERSION file.
@@ -570,6 +581,39 @@ if(MGSTC_BUILD_TESTS)
         endfunction()
         mgstc_add_shared_ui_test(mgstc_ui_header_tests tests/cpp/editor_header_layout_tests.cpp)
         mgstc_add_shared_ui_test(mgstc_ui_vst3_scale_tests tests/cpp/vst3_editor_scale_tests.cpp)
+
+        if(WIN32)
+            # Exercise the real Standalone SharedAudioService from a controlled
+            # test entry point while reusing the common JUCE/editor implementation.
+            add_executable(mgstc_standalone_audio_lifetime_tests
+                tests/cpp/standalone_audio_lifetime_tests.cpp
+                src/app/juce/asio_audio_sink.cpp
+                src/app/juce/ui_hang_watchdog.cpp
+                src/engine/wasapi_audio_sink.cpp)
+            target_include_directories(mgstc_standalone_audio_lifetime_tests PRIVATE
+                $<TARGET_PROPERTY:mgstc_vst3,INCLUDE_DIRECTORIES>
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/app/juce
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/app/windows
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/include)
+            target_link_libraries(mgstc_standalone_audio_lifetime_tests PRIVATE
+                mgstc_vst3 mgstc_binary_data mgstc_engine rpc ws2_32
+                gdiplus windowscodecs ole32 uuid)
+            target_compile_features(mgstc_standalone_audio_lifetime_tests PRIVATE cxx_std_20)
+            target_compile_definitions(mgstc_standalone_audio_lifetime_tests PRIVATE
+                $<TARGET_PROPERTY:mgstc_vst3,COMPILE_DEFINITIONS>
+                MGSTC_WASAPI_TESTING=1 MGSTC_STANDALONE_AUDIO_TESTING=1
+                MGSTC_TEST_ISOLATED_PREFERENCES=1
+                JUCE_ASIO=1 JUCE_MODAL_LOOPS_PERMITTED=1
+                WIN32_LEAN_AND_MEAN NOMINMAX)
+            if(MSVC)
+                target_compile_options(mgstc_standalone_audio_lifetime_tests PRIVATE
+                    /W4 /permissive- /EHsc /utf-8 /bigobj)
+            endif()
+            add_test(NAME mgstc_standalone_audio_lifetime_tests
+                COMMAND mgstc_standalone_audio_lifetime_tests)
+            set_tests_properties(mgstc_standalone_audio_lifetime_tests
+                PROPERTIES TIMEOUT 120)
+        endif()
     endif()
     add_executable(mgstc_patchslide_stock_tests tests/cpp/patchslide_stock_tests.cpp)
     target_compile_features(mgstc_patchslide_stock_tests PRIVATE cxx_std_20)
@@ -689,6 +733,42 @@ if(MGSTC_BUILD_TESTS)
     endif()
 
     add_test(NAME mgstc_engine_tests COMMAND mgstc_engine_tests)
+
+    if(WIN32)
+        # Compile the production sink source with test-only adapters in this
+        # isolated executable. Product targets never receive fault hooks.
+        add_executable(mgstc_wasapi_lifetime_tests
+            tests/cpp/wasapi_lifetime_tests.cpp
+            src/engine/realtime_engine_host.cpp
+            src/engine/wasapi_audio_sink.cpp
+        )
+        target_link_libraries(mgstc_wasapi_lifetime_tests PRIVATE
+            mgstc_engine Threads::Threads ole32 uuid)
+        target_include_directories(mgstc_wasapi_lifetime_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp)
+        target_compile_definitions(mgstc_wasapi_lifetime_tests PRIVATE
+            MGSTC_WASAPI_TESTING=1 MGSTC_HOST_RENDER_GAP_TESTING=1
+            WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_compile_features(mgstc_wasapi_lifetime_tests PRIVATE cxx_std_20)
+        if(MSVC)
+            target_compile_options(mgstc_wasapi_lifetime_tests PRIVATE
+                /W4 /permissive- /EHsc /utf-8)
+        endif()
+        if(MGSTC_WASAPI_TEST_ASAN)
+            target_compile_definitions(mgstc_wasapi_lifetime_tests PRIVATE
+                MGSTC_WASAPI_TEST_ASAN=1)
+            # Match MSVC STL annotations across the engine/RPC boundary while
+            # retaining sanitizer container checks in this isolated build.
+            target_compile_options(rpc PRIVATE /fsanitize=address)
+            target_compile_options(mgstc_engine PRIVATE /fsanitize=address)
+            target_compile_options(mgstc_wasapi_lifetime_tests PRIVATE
+                /fsanitize=address)
+            target_link_options(mgstc_wasapi_lifetime_tests PRIVATE /INCREMENTAL:NO)
+        endif()
+        add_test(NAME mgstc_wasapi_lifetime_tests COMMAND mgstc_wasapi_lifetime_tests)
+        set_tests_properties(mgstc_wasapi_lifetime_tests PROPERTIES TIMEOUT 75)
+    endif()
 
     foreach(_patchslide_component database timbre)
         add_executable(mgstc_patchslide_${_patchslide_component}_tests

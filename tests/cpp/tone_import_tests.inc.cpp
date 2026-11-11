@@ -59,9 +59,112 @@ void testGzipStoredRoundTrip() {
     const std::vector<std::uint8_t> payload{'V', 'g', 'm', ' ', 1, 2, 3, 4};
     const auto gz = gzipStored(payload);
     std::string error;
-    const auto inflated = mgstc::engine::inflateGzip(gz, &error);
+    const auto inflated = mgstc::engine::inflateGzip(gz, payload.size(), &error);
     REQUIRE_EQ(inflated.has_value(), true);
     REQUIRE_EQ(*inflated, payload);
+    REQUIRE_EQ(inflated->capacity() <= payload.size(), true);
+}
+
+void testGzipOutputLimitStoredAndMalformed() {
+    const std::vector<std::uint8_t> payload(4097, 0x5A);
+    const auto gz = gzipStored(payload);
+    std::string error;
+    const auto exact = mgstc::engine::inflateGzip(gz, payload.size(), &error);
+    REQUIRE_EQ(exact.has_value(), true);
+    REQUIRE_EQ(*exact, payload);
+    REQUIRE_EQ(exact->capacity() <= payload.size(), true);
+    const auto over = mgstc::engine::inflateGzip(gz, payload.size() - 1, &error);
+    REQUIRE_EQ(over.has_value(), false);
+    REQUIRE_EQ(error, std::string("gzip expanded data exceeds output byte limit"));
+
+    const auto empty = mgstc::engine::inflateGzip(gzipStored({}), 0, &error);
+    REQUIRE_EQ(empty.has_value(), true);
+    REQUIRE_EQ(empty->capacity(), std::size_t{0});
+    REQUIRE_EQ(mgstc::engine::inflateGzip(gz, 0, &error).has_value(), false);
+
+    auto corrupt = gz;
+    corrupt[corrupt.size() - 8] ^= 1;
+    REQUIRE_EQ(mgstc::engine::inflateGzip(corrupt, payload.size(), &error).has_value(), false);
+    REQUIRE_EQ(error, std::string("gzip crc mismatch"));
+    corrupt = gz;
+    corrupt.back() ^= 1;
+    REQUIRE_EQ(mgstc::engine::inflateGzip(corrupt, payload.size(), &error).has_value(), false);
+    REQUIRE_EQ(error, std::string("gzip size mismatch"));
+    corrupt = gz;
+    corrupt.erase(corrupt.end() - 9);
+    REQUIRE_EQ(mgstc::engine::inflateGzip(corrupt, payload.size(), &error).has_value(), false);
+    REQUIRE_EQ(error, std::string("truncated stored deflate payload"));
+    corrupt = gz;
+    corrupt[13] ^= 1;
+    REQUIRE_EQ(mgstc::engine::inflateGzip(corrupt, payload.size(), &error).has_value(), false);
+    REQUIRE_EQ(error, std::string("invalid stored deflate length"));
+}
+
+void testGzipOutputLimitHuffmanGrowth() {
+    // Self-authored repeated-byte payloads encoded with fixed/dynamic DEFLATE.
+    const std::vector<std::uint8_t> fixed{
+        0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x0A,
+        0x73, 0x72, 0x1A, 0x05, 0xA3, 0x60, 0x14, 0x8C, 0x82, 0x51,
+        0x30, 0x0A, 0x46, 0xC1, 0x28, 0x18, 0x05, 0xA3, 0x60, 0x14,
+        0x8C, 0x82, 0x51, 0x30, 0x0A, 0x46, 0xC1, 0xB0, 0x07, 0x00,
+        0xE9, 0x8F, 0x43, 0x2F, 0x01, 0x10, 0x00, 0x00};
+    std::vector<std::uint8_t> dynamic{
+        0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A,
+        0xED, 0xC1, 0x81, 0x00, 0x00, 0x00, 0x00, 0xC3, 0x20, 0xB6,
+        0xF9, 0x4B, 0xFD, 0x20, 0x55, 0x01};
+    dynamic.resize(88, 0);
+    dynamic.insert(dynamic.end(), {
+        0xC0, 0x0D, 0xAD, 0x86, 0xC1, 0x3E, 0x01, 0x00, 0x01, 0x00});
+
+    const auto check = [](const auto& gz, std::size_t size, std::uint8_t value) {
+        std::string error;
+        const auto exact = mgstc::engine::inflateGzip(gz, size, &error);
+        REQUIRE_EQ(exact.has_value(), true);
+        REQUIRE_EQ(*exact, std::vector<std::uint8_t>(size, value));
+        // Non-geometric limits force the final growth to clamp its capacity.
+        REQUIRE_EQ(exact->capacity() <= size, true);
+        REQUIRE_EQ(mgstc::engine::inflateGzip(gz, size - 1, &error).has_value(), false);
+        REQUIRE_EQ(error, std::string("gzip expanded data exceeds output byte limit"));
+        // The footer may claim any size, including a wrapped 32-bit value.
+        // A small/forged ISIZE must never bypass the incremental limit.
+        auto forged = gz;
+        std::fill(forged.end() - 4, forged.end(), 0);
+        REQUIRE_EQ(mgstc::engine::inflateGzip(forged, size - 1, &error).has_value(), false);
+        REQUIRE_EQ(error, std::string("gzip expanded data exceeds output byte limit"));
+    };
+    check(fixed, 4097, 'B');
+    check(dynamic, 65537, 'A');
+    auto truncated = dynamic;
+    truncated.erase(truncated.end() - 9);
+    std::string error;
+    REQUIRE_EQ(mgstc::engine::inflateGzip(truncated, 65537, &error).has_value(), false);
+    REQUIRE_EQ(error.empty(), false);
+}
+
+void testGzipOutputLimitLiteral() {
+    const std::vector<std::uint8_t> payload{'V', 'g', 'm', ' ', 1, 2, 3, 4};
+    // Fixed Huffman literals, without a length/distance match.
+    const std::vector<std::uint8_t> gz{
+        0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 3,
+        0x0B, 0x4B, 0xCF, 0x55, 0x60, 0x64, 0x62, 0x66, 0x01, 0x00,
+        0x12, 0x40, 0xA9, 0x5A, 8, 0, 0, 0};
+    std::string error;
+    const auto exact = mgstc::engine::inflateGzip(gz, payload.size(), &error);
+    REQUIRE_EQ(exact.has_value(), true);
+    REQUIRE_EQ(*exact, payload);
+    REQUIRE_EQ(exact->capacity() <= payload.size(), true);
+    REQUIRE_EQ(mgstc::engine::inflateGzip(gz, payload.size() - 1, &error).has_value(), false);
+    REQUIRE_EQ(error, std::string("gzip expanded data exceeds output byte limit"));
+}
+
+void testToneImportReportsGzipFailureWithoutExtension() {
+    auto gz = gzipStored(makeVgm({0x66}));
+    gz[gz.size() - 8] ^= 1;
+    const auto result = mgstc::engine::importTones(gz);
+    REQUIRE_EQ(result.valid(), false);
+    REQUIRE_EQ(result.candidates.empty(), true);
+    REQUIRE_EQ(result.errors.size(), std::size_t{1});
+    REQUIRE_EQ(result.errors.front(), std::string("gzip crc mismatch"));
 }
 
 void appendMgsMusicTrack(
@@ -153,6 +256,60 @@ void testToneImportVgmCompleteOpllAndDuplicates() {
         &result.candidates.front().data);
     REQUIRE_EQ(patch != nullptr, true);
     REQUIRE_EQ(mgstc::engine::encodeOpllPatch(*patch), registers);
+}
+
+void testToneImportVgmDataBlockBounds() {
+    using namespace mgstc::engine;
+    const std::array<std::uint8_t, 8> first{
+        0x21, 0x24, 0x0A, 0x02, 0xF3, 0xAF, 0x60, 0x26};
+    auto second = first;
+    second[0] ^= 1;
+    auto prefix = opllWrites(first);
+    prefix.pop_back();
+    const auto suffix = opllWrites(second);
+    const auto block = [](std::uint32_t size,
+                          std::span<const std::uint8_t> payload,
+                          std::uint8_t type = 0) {
+        std::vector<std::uint8_t> bytes{0x67, 0x66, type};
+        appendU32(bytes, size);
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+        return bytes;
+    };
+    const auto expect_prefix = [&](const std::vector<std::uint8_t>& tail,
+                                   std::size_t count) {
+        auto commands = prefix;
+        commands.insert(commands.end(), tail.begin(), tail.end());
+        const auto result = importTones(makeVgm(commands), "vgm");
+        REQUIRE_EQ(result.valid(), true);
+        REQUIRE_EQ(result.candidates.size(), count);
+        REQUIRE_EQ(encodeOpllPatch(std::get<OpllPatchParameters>(result.candidates[0].data)), first);
+        if (count == 2) {
+            REQUIRE_EQ(encodeOpllPatch(std::get<OpllPatchParameters>(result.candidates[1].data)), second);
+        }
+    };
+
+    const std::array<std::uint8_t, 3> payload{0x66, 0x51, 0x00};
+    expect_prefix(block(3, payload), 1); // Payload ends exactly at EOF.
+    expect_prefix(block(4, payload), 1); // One byte short; keep earlier candidates.
+    for (std::size_t header_bytes = 0; header_bytes < 6; ++header_bytes) {
+        auto truncated = block(0, {});
+        truncated.resize(1 + header_bytes);
+        expect_prefix(truncated, 1);
+    }
+    for (const auto size : {0x7FFFFFFFU, 0xFFFFFFFBU, 0xFFFFFFFFU}) {
+        auto oversized = block(size, {}, 0xE0);
+        oversized.insert(oversized.end(), suffix.begin(), suffix.end());
+        // A wrapped header advance must not admit later bytes as commands.
+        expect_prefix(oversized, 1);
+        const auto result = importTones(makeVgm(oversized), "vgm");
+        REQUIRE_EQ(result.candidates.empty(), true);
+        REQUIRE_EQ(result.valid(), false);
+    }
+    auto consecutive = block(0, {});
+    const auto next = block(3, payload);
+    consecutive.insert(consecutive.end(), next.begin(), next.end());
+    consecutive.insert(consecutive.end(), suffix.begin(), suffix.end());
+    expect_prefix(consecutive, 2);
 }
 
 void testToneImportVgmRejectsPartialAndLongWait() {

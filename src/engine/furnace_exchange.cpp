@@ -469,9 +469,6 @@ bool readNewInstrument(Cursor& cursor, Instrument& instrument) {
             instrument.notes.push_back("Wavetable Synth は変換しません");
         } else if (first == 'W' && second == 'L') {
             const int count = cursor.u8();
-            if (count > 256) {
-                return false;
-            }
             std::vector<int> indexes(static_cast<std::size_t>(count));
             std::vector<std::uint32_t> pointers(static_cast<std::size_t>(count));
             for (int index = 0; index < count; ++index) {

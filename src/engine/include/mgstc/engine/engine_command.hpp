@@ -26,6 +26,7 @@ struct EngineCommand {
     bool retrigger{};
     std::uint8_t program_slot{0xFF};
     std::uint32_t scope_track_mask{};
+    std::uint64_t output_note_token{};
 
     [[nodiscard]] static EngineCommand noteOn(
         std::uint8_t track,

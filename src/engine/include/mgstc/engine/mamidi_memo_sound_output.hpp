@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -40,6 +41,10 @@ public:
         const RegisterWrite& write) override;
     [[nodiscard]] bool writeRegisters(
         std::span<const RegisterWrite> writes) override;
+    void beginTick(std::uint32_t new_note_tracks) noexcept override;
+    [[nodiscard]] std::uint64_t captureNoteToken() const noexcept override;
+    void noteQueued(std::uint8_t track, std::uint64_t token) noexcept override;
+    [[nodiscard]] bool recoverableWriteFailure() const noexcept override;
 
     void reset() override;
     void allNotesOff() override;
@@ -68,10 +73,7 @@ public:
         return client_.acknowledgementBatchCount();
     }
     // Audio consumer only. No RPC, allocation or mutex acquisition.
-    void setEmissionEnabled(bool enabled) noexcept {
-        if (emission_enabled_.exchange(enabled, std::memory_order_acq_rel) && !enabled)
-            emission_generation_.fetch_add(1, std::memory_order_acq_rel);
-    }
+    void setEmissionEnabled(bool enabled) noexcept;
 
 private:
     void startWorker();
@@ -83,6 +85,12 @@ private:
     void enqueueOpllSilence();
     void enqueueSccSilence();
     void enqueueSilence();
+    [[nodiscard]] bool tryEnqueueChipAccess(MAmidiChipAccess access);
+    void rememberDesired(MAmidiChipAccess access) noexcept;
+    [[nodiscard]] MAmidiChipAccess maskUnstartedTracks(
+        MAmidiChipAccess access, std::uint32_t tracks) const noexcept;
+    [[nodiscard]] bool restoreMutedImage() noexcept;
+    [[nodiscard]] bool restoreFreshLevels() noexcept;
 
     std::string host_{kDefaultHost};
     std::uint16_t port_{kDefaultPort};
@@ -111,6 +119,20 @@ private:
     std::atomic<bool> close_acknowledged_{true};
     std::atomic<std::uint64_t> reset_requested_{0};
     std::atomic<std::uint64_t> reset_acknowledged_{0};
+    // Producer-owned desired register values. The worker sees only queued
+    // payloads. Control access uses the host's existing producer exclusion.
+    static constexpr std::uint32_t kAllTracks = (1U << 17) - 1U;
+    struct DesiredRegister { std::uint8_t value{}; bool present{}; };
+    std::array<DesiredRegister, 14> desired_psg_{};
+    std::array<DesiredRegister, 0x39> desired_opll_{};
+    std::array<DesiredRegister, 0x90> desired_scc_{};
+    std::uint32_t restarted_tracks_{kAllTracks};
+    std::uint32_t pending_level_tracks_{};
+    std::array<std::uint64_t, 17> queued_note_tokens_{};
+    std::uint32_t queued_psg_mixer_{0x3F};
+    std::uint32_t queued_scc_keys_{};
+    std::atomic<bool> recovery_required_{false};
+    std::atomic<bool> offline_silence_requested_{false};
     mutable std::mutex error_mutex_{};
 };
 

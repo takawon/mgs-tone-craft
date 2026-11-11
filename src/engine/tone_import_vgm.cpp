@@ -257,11 +257,16 @@ ToneImportResult importVgm(std::span<const std::uint8_t> bytes) {
             continue;
         }
         if (opcode == 0x67) {
-            if (position + 6 > bytes.size()) {
+            constexpr std::size_t header_size = 6;
+            const auto remaining = bytes.size() - position;
+            if (remaining < header_size) {
                 break;
             }
             const auto size = readU32(bytes, position + 2);
-            position += 6 + size;
+            if (static_cast<std::size_t>(size) > remaining - header_size) {
+                break;
+            }
+            position += header_size + static_cast<std::size_t>(size);
             bumpCommands();
             continue;
         }
