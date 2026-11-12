@@ -16,6 +16,7 @@
 #include "plugin_state.hpp"
 #include "plugin_pcm_preview.hpp"
 #include "editor_session.hpp"
+#include "hardware_output_control.hpp"
 #include "scope_frame_distributor.hpp"
 #include "vst3_diagnostic.hpp"
 #include "mgstc/audio/stereo_sample_rate_converter.hpp"
@@ -154,10 +155,10 @@ public:
         return engine_;
     }
     void editorPopulateOutputSnapshot(mgstc::app::EditorSnapshot& snapshot) const;
-    [[nodiscard]] bool editorApplyHardwareSettings(
+    [[nodiscard]] mgstc::app::HardwareRequestReceipt editorApplyHardwareSettings(
         mgstc::app::HardwareOutputSettings settings, int keyoff_seconds);
-    [[nodiscard]] bool editorRequestHardwareMode(bool hardware);
-    [[nodiscard]] bool editorReconnectHardware();
+    [[nodiscard]] mgstc::app::HardwareRequestReceipt editorRequestHardwareMode(bool hardware);
+    [[nodiscard]] mgstc::app::HardwareRequestReceipt editorReconnectHardware();
     [[nodiscard]] std::string editorHardwareStatus() const;
     void editorArmOpllKeyoffSilence(std::uint8_t track,
         std::optional<std::uint64_t> expected_restore_revision = {}) noexcept;
@@ -170,7 +171,11 @@ public:
 
 private:
     void loadHardwarePreferences();
-    void saveHardwarePreferences() const;
+    [[nodiscard]] static bool saveHardwarePreferences(
+        const mgstc::engine::MAmidiOutputSettings& settings, int keyoff_seconds);
+    void refreshHardwareSnapshot() const;
+    [[nodiscard]] mgstc::app::HardwareRequestReceipt noteHardwareReceipt(
+        mgstc::app::HardwareRequestReceipt receipt) const;
     void updateHostTransport(int num_samples) noexcept;
     void serviceOpllKeyoffSilence() noexcept;
     void armOpllKeyoffSilence(std::uint8_t track,
@@ -303,6 +308,12 @@ private:
     [[nodiscard]] bool hostIsEngineRate() const noexcept;
 
     mgstc::engine::RealtimeEngineHost engine_{};
+    mutable mgstc::app::HardwareOutputControl hardware_control_{engine_};
+    mutable std::mutex hardware_ui_mutex_;
+    mutable mgstc::engine::SoundOutputSnapshot hardware_snapshot_{};
+    mutable bool hardware_snapshot_stale_{};
+    mutable std::string hardware_notice_;
+    mutable std::optional<mgstc::app::HardwareControlResult> hardware_last_result_;
     PluginPcmPreview pcm_preview_{};
     // Message/background control only. Never accessed by processBlock.
     std::mutex background_tasks_mu_;

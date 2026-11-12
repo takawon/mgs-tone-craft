@@ -436,6 +436,10 @@ bool MAmidiMemoSoundOutput::sccPlus() const noexcept {
 
 std::string MAmidiMemoSoundOutput::lastError() const {
     std::lock_guard lock(error_mutex_);
+    return lastErrorProtected();
+}
+
+std::string MAmidiMemoSoundOutput::lastErrorProtected() const {
     if (!last_error_.empty()) return last_error_;
     switch (producer_error_.load(std::memory_order_relaxed)) {
     case ProducerError::Closed: return "MAmidiMEmo output is not open";
@@ -455,7 +459,21 @@ std::uint64_t MAmidiMemoSoundOutput::droppedWrites() const noexcept {
 }
 
 std::string MAmidiMemoSoundOutput::statusText() const {
-    const auto error = lastError();
+    return statusTextForError(lastError());
+}
+
+bool MAmidiMemoSoundOutput::tryStatusText(
+    std::string& status, std::string& error) const {
+    std::unique_lock lock(error_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    auto copied_error = lastErrorProtected();
+    auto copied_status = statusTextForError(copied_error);
+    error = std::move(copied_error);
+    status = std::move(copied_status);
+    return true;
+}
+
+std::string MAmidiMemoSoundOutput::statusTextForError(const std::string& error) const {
     switch (connectionState()) {
     case MAmidiConnectionState::Connected:
         if (producer_error_.load(std::memory_order_relaxed) == ProducerError::InvalidWrite)

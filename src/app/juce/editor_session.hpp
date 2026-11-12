@@ -16,6 +16,7 @@
 #include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/timbre_library.hpp"
 #include "patchslide_stock.hpp"
+#include "hardware_output_control.hpp"
 
 namespace mgstc::engine {
 struct OpllScopeFrame;
@@ -103,6 +104,8 @@ struct EditorSnapshot {
     bool hardware_owned{false};
     bool hardware_connected{false};
     bool output_switch_pending{false};
+    bool output_operation_failed{};
+    bool output_silence_unconfirmed{};
     std::string output_status;
     HardwareOutputSettings hardware_settings{};
     std::vector<MidiDevice> midi_devices;
@@ -152,11 +155,11 @@ public:
         std::string driver_name) = 0;
     [[nodiscard]] virtual bool showAsioControlPanel() = 0;
     [[nodiscard]] virtual std::string hardwareStatus() = 0;
-    [[nodiscard]] virtual bool applyHardwareSettings(
+    [[nodiscard]] virtual HardwareRequestReceipt applyHardwareSettings(
         HardwareOutputSettings settings,
         int opll_keyoff_silence_seconds) = 0;
-    [[nodiscard]] virtual bool requestHardwareMode(bool hardware) = 0;
-    [[nodiscard]] virtual bool reconnectHardware() = 0;
+    [[nodiscard]] virtual HardwareRequestReceipt requestHardwareMode(bool hardware) = 0;
+    [[nodiscard]] virtual HardwareRequestReceipt reconnectHardware() = 0;
 };
 
 class MidiDrainListener {

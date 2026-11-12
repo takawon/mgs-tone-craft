@@ -232,6 +232,7 @@ public:
 
     ~SharedAudioService() {
         stopTimer();
+        if (auto result = hardware_control_.shutdown()) finishHardwareRequest(*result);
         startup_output_connection_.join();
         // Let an in-flight recovery skip its device open and finish fast; the
         // worker touches members, so it must be joined before teardown.
@@ -682,22 +683,32 @@ public:
     [[nodiscard]] bool startupPcAudioAttempted() const noexcept { return startup_pc_audio_attempted_; }
 
     [[nodiscard]] std::string hardwareStatus() const {
+        refreshHardwareSnapshot();
         if (startupOutputPending()) return "Output: MAmidiMEmo (connecting)";
-        if (!startup_output_error_.empty()) return startup_output_error_;
-        return engine_.soundOutputStatus();
+        if (hardware_control_.pending()) return "Output: processing (closing the window does not cancel)";
+        std::string status = hardware_snapshot_.status;
+        if (!hardware_snapshot_current_)
+            status += " [previous confirmed information; waiting for update]";
+        if (!hardware_notice_.empty()) status += " | " + hardware_notice_;
+        if (!startup_output_error_.empty()) status += " | " + startup_output_error_;
+        return status;
     }
 
     void fillHardwareSnapshot(mgstc::app::EditorSnapshot& snap) const {
+        const auto status = hardwareStatus();
         const bool pending = startupOutputPending();
-        snap.hardware_output = engine_.soundOutputKind()
+        snap.hardware_output = hardware_snapshot_.kind
             == mgstc::engine::SoundOutputKind::MAmidiMemo;
-        snap.desired_hardware_output = pending || engine_.desiredSoundOutputKind()
+        snap.desired_hardware_output = pending || hardware_snapshot_.desired_kind
             == mgstc::engine::SoundOutputKind::MAmidiMemo;
-        snap.hardware_owned = engine_.ownsHardwareOutput();
-        snap.hardware_connected = !pending && engine_.hardwareOutputConnected();
-        snap.output_switch_pending = pending || engine_.outputSwitchPending();
-        snap.output_status = hardwareStatus();
-        const auto& settings = pending ? startup_hardware_settings_ : engine_.mamidiSettings();
+        snap.hardware_owned = hardware_snapshot_.owned;
+        snap.hardware_connected = !pending && hardware_snapshot_.connected;
+        snap.output_switch_pending = pending || hardware_control_.pending()
+            || engine_.outputSwitchPending();
+        snap.output_status = status;
+        snap.output_operation_failed = hardware_operation_failed_ || !startup_output_error_.empty();
+        snap.output_silence_unconfirmed = hardware_silence_unconfirmed_;
+        const auto& settings = pending ? startup_hardware_settings_ : hardware_snapshot_.settings;
         snap.hardware_settings.host = settings.host;
         snap.hardware_settings.port = settings.port;
         snap.hardware_settings.unit_no = settings.unit_no;
@@ -705,85 +716,116 @@ public:
         snap.hardware_settings.waveform_monitor = settings.waveform_monitor;
     }
 
-    [[nodiscard]] bool applyHardwareSettings(
+    [[nodiscard]] mgstc::app::HardwareRequestReceipt applyHardwareSettings(
         mgstc::engine::MAmidiOutputSettings settings, int silence_seconds) {
-        if (startupOutputPending() || offline_snapshot_capture_) return false;
-        startup_output_error_.clear();
-        if (!engine_.setMAmidiSettings(std::move(settings))) return false;
-        setOpllKeyOffForceSilenceSeconds(silence_seconds);
-        saveSoundOutputSettings();
-        return true;
+        mgstc::app::HardwareControlRequest request;
+        request.kind = mgstc::app::HardwareControlRequest::Kind::Settings;
+        request.settings = std::move(settings);
+        request.silence_seconds = std::clamp(silence_seconds, 0, 9999);
+        return startHardwareRequest(std::move(request));
     }
 
-    [[nodiscard]] bool requestHardwareMode(bool hardware) {
-        if (startupOutputPending() || offline_snapshot_capture_) return false;
-        startup_output_error_.clear();
-        const bool result = engine_.setSoundOutputKind(hardware
-            ? mgstc::engine::SoundOutputKind::MAmidiMemo
-            : mgstc::engine::SoundOutputKind::Emulator);
-        saveSoundOutputSettings();
-        return result;
+    [[nodiscard]] mgstc::app::HardwareRequestReceipt requestHardwareMode(bool hardware) {
+        mgstc::app::HardwareControlRequest request;
+        request.kind = mgstc::app::HardwareControlRequest::Kind::Mode;
+        request.hardware = hardware;
+        return startHardwareRequest(std::move(request));
     }
 
-    [[nodiscard]] bool reconnectHardware() {
-        if (startupOutputPending() || offline_snapshot_capture_) return false;
-        startup_output_error_.clear();
-        return engine_.reconnectMAmidi();
+    [[nodiscard]] mgstc::app::HardwareRequestReceipt reconnectHardware() {
+        mgstc::app::HardwareControlRequest request;
+        request.kind = mgstc::app::HardwareControlRequest::Kind::Reconnect;
+        return startHardwareRequest(std::move(request));
     }
 
-    void saveSoundOutputSettings() const {
-        if (startupOutputPending() || offline_snapshot_capture_) return;
-        const auto file = settingsFile();
+    static void persistHardwareRequest(mgstc::app::HardwareControlResult& result,
+        const juce::File& file) {
+        using Request = mgstc::app::HardwareControlRequest;
+        if (!result.host_accepted || result.request.kind == Request::Kind::Reconnect) return;
         if (file.getParentDirectory().createDirectory().failed()) {
+            result.storage_error = "Could not create the output settings directory";
             return;
         }
         const auto path = file.getFullPathName();
-        const auto& settings = engine_.mamidiSettings();
-        const auto kind =
-            engine_.soundOutputKind()
-                    == mgstc::engine::SoundOutputKind::MAmidiMemo
-                ? L"MAmidiMemo"
-                : L"Emulator";
-        static_cast<void>(WritePrivateProfileStringW(
-            L"SoundOutput",
-            L"Kind",
-            kind,
-            path.toWideCharPointer()));
-        static_cast<void>(WritePrivateProfileStringW(
-            L"SoundOutput",
-            L"Host",
-            juce::String(settings.host).toWideCharPointer(),
-            path.toWideCharPointer()));
-        static_cast<void>(WritePrivateProfileStringW(
-            L"SoundOutput",
-            L"Port",
-            juce::String(static_cast<int>(settings.port))
-                .toWideCharPointer(),
-            path.toWideCharPointer()));
-        static_cast<void>(WritePrivateProfileStringW(
-            L"SoundOutput",
-            L"UnitNo",
-            juce::String(static_cast<int>(settings.unit_no))
-                .toWideCharPointer(),
-            path.toWideCharPointer()));
-        static_cast<void>(WritePrivateProfileStringW(
-            L"SoundOutput",
-            L"SccPlus",
-            settings.scc_plus ? L"1" : L"0",
-            path.toWideCharPointer()));
-        static_cast<void>(WritePrivateProfileStringW(
-            L"SoundOutput",
-            L"WaveformMonitor",
-            settings.waveform_monitor ? L"1" : L"0",
-            path.toWideCharPointer()));
-        static_cast<void>(WritePrivateProfileStringW(
-            nullptr,
-            nullptr,
-            nullptr,
-            path.toWideCharPointer()));
+        bool saved = true;
+        const auto write = [&](const wchar_t* key, const juce::String& value) {
+            if (!WritePrivateProfileStringW(L"SoundOutput", key,
+                    value.toWideCharPointer(), path.toWideCharPointer())) saved = false;
+        };
+        if (result.request.kind == Request::Kind::Mode) {
+            write(L"Kind", result.actual_kind == mgstc::engine::SoundOutputKind::MAmidiMemo
+                ? "MAmidiMemo" : "Emulator");
+        } else {
+            const auto& settings = result.request.settings;
+            write(L"Host", juce::String::fromUTF8(settings.host.c_str()));
+            write(L"Port", juce::String(static_cast<int>(settings.port)));
+            write(L"UnitNo", juce::String(static_cast<int>(settings.unit_no)));
+            write(L"SccPlus", settings.scc_plus ? "1" : "0");
+            write(L"WaveformMonitor", settings.waveform_monitor ? "1" : "0");
+            write(L"OpllKeyOffForceSilenceSeconds", juce::String(result.request.silence_seconds));
+        }
+        // Request the existing cache flush. Its zero result also represents
+        // a successful flush, so it cannot classify individual key writes.
+        static_cast<void>(WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.toWideCharPointer()));
+        if (!saved) result.storage_error = "Output settings could not be saved completely";
+    }
+
+    void finishHardwareRequest(const mgstc::app::HardwareControlResult& result) {
+        if (result.lifetime_id != hardware_control_.lifetimeId()) return;
+        if (result.host_accepted
+            && result.request.kind == mgstc::app::HardwareControlRequest::Kind::Settings) {
+            // The worker saved only values; Message owns the runtime deadline list.
+            opll_keyoff_force_silence_seconds_ = result.request.silence_seconds;
+            if (opll_keyoff_force_silence_seconds_ == 0) opll_silence_dues_.clear();
+        }
+        hardware_notice_ = result.error;
+        hardware_operation_failed_ = !result.host_accepted || !result.connection_succeeded
+            || !result.storage_error.empty();
+        hardware_silence_unconfirmed_ = result.request.kind
+            == mgstc::app::HardwareControlRequest::Kind::Mode
+            && !result.request.hardware && result.host_accepted && !result.close_acknowledged;
+        if (result.request.kind == mgstc::app::HardwareControlRequest::Kind::Settings
+            && result.host_accepted && !result.connection_succeeded)
+            hardware_notice_ = "Settings applied; connection failed: " + result.error;
+        if (result.request.kind == mgstc::app::HardwareControlRequest::Kind::Mode
+            && !result.request.hardware && result.host_accepted && !result.close_acknowledged)
+            hardware_notice_ = "Warning: hardware silence was not acknowledged; output ownership was explicitly released";
+        if (!result.storage_error.empty()) {
+            if (!hardware_notice_.empty()) hardware_notice_ += " | ";
+            hardware_notice_ += result.storage_error;
+        }
         publishHangHints();
     }
 
+    void refreshHardwareSnapshot() const {
+        auto& self = *const_cast<SharedAudioService*>(this);
+        if (auto result = self.hardware_control_.collect()) self.finishHardwareRequest(*result);
+        hardware_snapshot_current_ = engine_.trySoundOutputSnapshot(hardware_snapshot_)
+            == mgstc::engine::OutputSnapshotResult::Ready;
+    }
+
+    mgstc::app::HardwareRequestReceipt startHardwareRequest(
+        mgstc::app::HardwareControlRequest request) {
+        using Status = mgstc::app::HardwareRequestStatus;
+        if (audio_shutdown_requested_ || offline_snapshot_capture_)
+            return {Status::RejectedClosing, 0};
+        if (startupOutputPending()) return {Status::RejectedBusy, 0};
+        refreshHardwareSnapshot();
+        const auto file = settingsFile();
+        const auto receipt = hardware_control_.request(std::move(request),
+            [file](auto& result) { persistHardwareRequest(result, file); });
+        if (receipt.status == Status::Accepted) {
+            hardware_notice_.clear();
+            hardware_operation_failed_ = false;
+            hardware_silence_unconfirmed_ = false;
+            startup_output_error_.clear();
+        } else if (!receipt.accepted()) {
+            hardware_notice_ = receipt.status == Status::RejectedBusy
+                ? "Output operation is already in progress; retry after completion"
+                : "Output operation could not be started";
+        }
+        return receipt;
+    }
     void publishHangHints() const noexcept {
         mgstc::app::publishUiHangPcAudioHint(
             pc_audio_backend_ == PcAudioBackend::Asio
@@ -848,6 +890,8 @@ private:
                 != 0;
         }
         startup_hardware_settings_ = settings;
+        hardware_snapshot_.settings = settings;
+        hardware_snapshot_.status = "Output: Emulator (loaded preferences; state update pending)";
         if (!offline_snapshot_capture_) engine_.setMAmidiSettings(std::move(settings));
 
         wchar_t kind_buffer[64]{};
@@ -1038,6 +1082,7 @@ private:
     }
 
     void timerCallback() override {
+        if (auto result = hardware_control_.collect()) finishHardwareRequest(*result);
         if (auto result = startup_output_connection_.collect()) {
             startup_output_error_ = std::move(result->error);
             publishHangHints();
@@ -1200,6 +1245,12 @@ private:
 
     mgstc::app::ScopeFrameDistributor scope_frames_;
     mgstc::engine::RealtimeEngineHost engine_;
+    mgstc::app::HardwareOutputControl hardware_control_{engine_};
+    mutable mgstc::engine::SoundOutputSnapshot hardware_snapshot_;
+    mutable bool hardware_snapshot_current_{};
+    std::string hardware_notice_;
+    bool hardware_operation_failed_{};
+    bool hardware_silence_unconfirmed_{};
     // Cancellation view must outlive the sink even in destructor fallback:
     // reverse member destruction joins WASAPI before destroying this atomic.
     std::atomic<bool> device_recovery_cancel_{false};

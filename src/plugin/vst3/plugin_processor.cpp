@@ -86,9 +86,13 @@ MgstcAudioProcessor::MgstcAudioProcessor()
     document.sound = mgstc::engine::makePluginDefaultComposite();
     static_cast<void>(commitPluginState(std::move(document), CommitMode::Initial));
     observed_output_revision_ = engine_.outputRoutingRevision();
+    refreshHardwareSnapshot();
 }
 
 MgstcAudioProcessor::~MgstcAudioProcessor() {
+    // A hardware request owns its Host borrow and value-based persistence until
+    // the native worker has exited; Editor lifetime is deliberately unrelated.
+    static_cast<void>(hardware_control_.shutdown());
     cancelPendingUpdate();
     std::vector<std::shared_ptr<mgstc::app::EditorBackgroundTask>> tasks;
     {
@@ -1808,15 +1812,33 @@ bool MgstcAudioProcessor::editorPollLatestOpllScope(
 
 void MgstcAudioProcessor::editorPopulateOutputSnapshot(
     mgstc::app::EditorSnapshot& snapshot) const {
-    snapshot.hardware_output = engine_.soundOutputKind()
+    refreshHardwareSnapshot();
+    std::unique_lock lock(hardware_ui_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        snapshot.output_switch_pending = true;
+        snapshot.output_status = "Output: state update pending";
+        return;
+    }
+    snapshot.hardware_output = hardware_snapshot_.kind
         == mgstc::engine::SoundOutputKind::MAmidiMemo;
-    snapshot.desired_hardware_output = engine_.desiredSoundOutputKind()
+    snapshot.desired_hardware_output = hardware_snapshot_.desired_kind
         == mgstc::engine::SoundOutputKind::MAmidiMemo;
-    snapshot.hardware_owned = engine_.ownsHardwareOutput();
-    snapshot.hardware_connected = engine_.hardwareOutputConnected();
-    snapshot.output_switch_pending = engine_.outputSwitchPending();
-    snapshot.output_status = editorHardwareStatus();
-    const auto& settings = engine_.mamidiSettings();
+    snapshot.hardware_owned = hardware_snapshot_.owned;
+    snapshot.hardware_connected = hardware_snapshot_.connected;
+    snapshot.output_switch_pending = hardware_control_.pending() || engine_.outputSwitchPending();
+    if (hardware_last_result_) {
+        const auto& result = *hardware_last_result_;
+        snapshot.output_operation_failed = !result.host_accepted
+            || !result.connection_succeeded || !result.storage_error.empty();
+        snapshot.output_silence_unconfirmed = result.host_accepted
+            && result.request.kind == mgstc::app::HardwareControlRequest::Kind::Mode
+            && !result.request.hardware && !result.close_acknowledged;
+    }
+    snapshot.output_status = hardware_snapshot_.status;
+    if (hardware_snapshot_stale_) snapshot.output_status += " (previous state; update pending)";
+    if (hardware_control_.pending()) snapshot.output_status += " / processing";
+    if (!hardware_notice_.empty()) snapshot.output_status += " / " + hardware_notice_;
+    const auto& settings = hardware_snapshot_.settings;
     snapshot.hardware_settings = {settings.host, settings.port, settings.unit_no,
         settings.scc_plus, settings.waveform_monitor};
     snapshot.opll_keyoff_silence_seconds = opll_keyoff_silence_seconds_.load(std::memory_order_relaxed);
@@ -1895,37 +1917,88 @@ void MgstcAudioProcessor::serviceOpllKeyoffSilence() noexcept {
     }
 }
 
-bool MgstcAudioProcessor::editorApplyHardwareSettings(
+mgstc::app::HardwareRequestReceipt MgstcAudioProcessor::editorApplyHardwareSettings(
     mgstc::app::HardwareOutputSettings settings, int keyoff_seconds) {
-    if (onAudioThread()) return false;
-    if (!engine_.setMAmidiSettings({
+    if (onAudioThread()) return {mgstc::app::HardwareRequestStatus::RejectedBusy, 0};
+    mgstc::app::HardwareControlRequest request;
+    request.kind = mgstc::app::HardwareControlRequest::Kind::Settings;
+    request.settings = {
         settings.host.empty() ? "localhost" : std::move(settings.host),
         settings.port == 0 ? std::uint16_t{30000} : settings.port,
-        settings.unit_no, settings.scc_plus, settings.waveform_monitor})) return false;
-    opll_keyoff_silence_seconds_ = std::clamp(keyoff_seconds, 0, 9999);
-    saveHardwarePreferences();
-    return !engine_.ownsHardwareOutput() || engine_.hardwareOutputConnected();
+        settings.unit_no, settings.scc_plus, settings.waveform_monitor};
+    request.silence_seconds = std::clamp(keyoff_seconds, 0, 9999);
+    return noteHardwareReceipt(hardware_control_.request(std::move(request), [this](auto& result) {
+        if (!result.host_accepted) return;
+        opll_keyoff_silence_seconds_.store(result.request.silence_seconds, std::memory_order_relaxed);
+        if (!saveHardwarePreferences(result.request.settings, result.request.silence_seconds))
+            result.storage_error = "Settings applied; preferences could not be saved";
+    }));
 }
 
-bool MgstcAudioProcessor::editorRequestHardwareMode(bool hardware) {
-    if (onAudioThread()) return false;
-    return engine_.setSoundOutputKind(hardware
-        ? mgstc::engine::SoundOutputKind::MAmidiMemo
-        : mgstc::engine::SoundOutputKind::Emulator);
+mgstc::app::HardwareRequestReceipt MgstcAudioProcessor::editorRequestHardwareMode(bool hardware) {
+    if (onAudioThread()) return {mgstc::app::HardwareRequestStatus::RejectedBusy, 0};
+    mgstc::app::HardwareControlRequest request;
+    request.kind = mgstc::app::HardwareControlRequest::Kind::Mode;
+    request.hardware = hardware;
+    return noteHardwareReceipt(hardware_control_.request(std::move(request)));
 }
 
-bool MgstcAudioProcessor::editorReconnectHardware() {
-    return !onAudioThread() && engine_.reconnectMAmidi();
+mgstc::app::HardwareRequestReceipt MgstcAudioProcessor::editorReconnectHardware() {
+    if (onAudioThread()) return {mgstc::app::HardwareRequestStatus::RejectedBusy, 0};
+    mgstc::app::HardwareControlRequest request;
+    request.kind = mgstc::app::HardwareControlRequest::Kind::Reconnect;
+    return noteHardwareReceipt(hardware_control_.request(std::move(request)));
+}
+
+mgstc::app::HardwareRequestReceipt MgstcAudioProcessor::noteHardwareReceipt(
+    mgstc::app::HardwareRequestReceipt receipt) const {
+    if (receipt.accepted()) return receipt;
+    std::unique_lock lock(hardware_ui_mutex_, std::try_to_lock);
+    if (lock.owns_lock()) {
+        switch (receipt.status) {
+        case mgstc::app::HardwareRequestStatus::RejectedClosing:
+            hardware_notice_ = "Output request rejected: processor is closing";
+            break;
+        case mgstc::app::HardwareRequestStatus::StartFailed:
+            hardware_notice_ = "Output request failed: worker could not start";
+            break;
+        default:
+            hardware_notice_ = "Output request rejected: another operation is processing";
+            break;
+        }
+    }
+    return receipt;
+}
+
+void MgstcAudioProcessor::refreshHardwareSnapshot() const {
+    std::unique_lock lock(hardware_ui_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    if (auto result = hardware_control_.collect()) {
+        hardware_notice_.clear();
+        if (!result->host_accepted || !result->connection_succeeded)
+            hardware_notice_ = result->error.empty() ? "Output operation failed" : result->error;
+        if (result->host_accepted && !result->connection_succeeded
+            && result->request.kind == mgstc::app::HardwareControlRequest::Kind::Settings)
+            hardware_notice_ = "Settings applied; connection failed: "
+                + (result->error.empty() ? std::string("RPC connection failed") : result->error);
+        if (result->host_accepted
+            && result->request.kind == mgstc::app::HardwareControlRequest::Kind::Mode
+            && !result->request.hardware && !result->close_acknowledged)
+            hardware_notice_ = "Warning: hardware silence was not acknowledged";
+        if (!result->storage_error.empty()) {
+            if (!hardware_notice_.empty()) hardware_notice_ += "; ";
+            hardware_notice_ += result->storage_error;
+        }
+        hardware_last_result_ = std::move(*result);
+    }
+    const auto read = engine_.trySoundOutputSnapshot(hardware_snapshot_);
+    hardware_snapshot_stale_ = read != mgstc::engine::OutputSnapshotResult::Ready;
 }
 
 std::string MgstcAudioProcessor::editorHardwareStatus() const {
-    auto status = engine_.soundOutputStatus();
-    const auto error = engine_.soundOutputLastError();
-    if (!error.empty()) {
-        if (!status.empty()) status += ": ";
-        status += error;
-    }
-    return status;
+    mgstc::app::EditorSnapshot snapshot;
+    editorPopulateOutputSnapshot(snapshot);
+    return snapshot.output_status;
 }
 
 void MgstcAudioProcessor::loadHardwarePreferences() {
@@ -1950,19 +2023,23 @@ void MgstcAudioProcessor::loadHardwarePreferences() {
         value(L"OpllKeyOffForceSilenceSeconds", 20), 0, 9999);
     // Deliberately do not read Kind: construction and state restore cannot
     // acquire hardware. Connection preferences are machine settings only.
+    // This owner-local copy is valid before any competing lease can make a
+    // later try snapshot Busy. Never fall back to reading mutable Host settings.
+    hardware_snapshot_.settings = settings;
     engine_.setMAmidiSettings(std::move(settings));
 #endif
 }
 
-void MgstcAudioProcessor::saveHardwarePreferences() const {
+bool MgstcAudioProcessor::saveHardwarePreferences(
+    const mgstc::engine::MAmidiOutputSettings& settings, int keyoff_seconds) {
 #if JUCE_WINDOWS
     const auto file = mgstcApplicationDataDirectory().getChildFile("settings-v1.ini");
-    if (file.getParentDirectory().createDirectory().failed()) return;
+    if (file.getParentDirectory().createDirectory().failed()) return false;
     const auto path = file.getFullPathName();
-    const auto& settings = engine_.mamidiSettings();
+    bool saved = true;
     const auto write = [&](const wchar_t* key, const juce::String& value) {
-        WritePrivateProfileStringW(L"SoundOutput", key,
-            value.toWideCharPointer(), path.toWideCharPointer());
+        saved = WritePrivateProfileStringW(L"SoundOutput", key,
+            value.toWideCharPointer(), path.toWideCharPointer()) != FALSE && saved;
     };
     write(L"Host", juce::String(settings.host));
     write(L"Port", juce::String(static_cast<int>(settings.port)));
@@ -1970,10 +2047,18 @@ void MgstcAudioProcessor::saveHardwarePreferences() const {
     write(L"SccPlus", settings.scc_plus ? "1" : "0");
     write(L"WaveformMonitor", settings.waveform_monitor ? "1" : "0");
     write(L"OpllKeyOffForceSilenceSeconds", juce::String(
-        opll_keyoff_silence_seconds_.load(std::memory_order_relaxed)));
+        keyoff_seconds));
     // Do not write Kind or replace the INI: preserve Standalone startup route
     // and all unrelated device preferences.
-    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.toWideCharPointer());
+    // Request the existing profile-cache flush. Its zero return and last-error
+    // value do not distinguish successful flushing; key-write success below
+    // must not be presented as a durable-flush guarantee.
+    static_cast<void>(WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.toWideCharPointer()));
+    return saved;
+#else
+    static_cast<void>(settings);
+    static_cast<void>(keyoff_seconds);
+    return true;
 #endif
 }
 

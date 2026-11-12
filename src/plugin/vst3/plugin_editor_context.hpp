@@ -157,18 +157,18 @@ private:
             return self_.processor_.editorHardwareStatus();
         }
 
-        [[nodiscard]] bool applyHardwareSettings(
+        [[nodiscard]] mgstc::app::HardwareRequestReceipt applyHardwareSettings(
             mgstc::app::HardwareOutputSettings settings,
             int keyoff_seconds) override {
             return self_.processor_.editorApplyHardwareSettings(
                 std::move(settings), keyoff_seconds);
         }
 
-        [[nodiscard]] bool requestHardwareMode(bool hardware) override {
+        [[nodiscard]] mgstc::app::HardwareRequestReceipt requestHardwareMode(bool hardware) override {
             return self_.processor_.editorRequestHardwareMode(hardware);
         }
 
-        [[nodiscard]] bool reconnectHardware() override {
+        [[nodiscard]] mgstc::app::HardwareRequestReceipt reconnectHardware() override {
             return self_.processor_.editorReconnectHardware();
         }
 

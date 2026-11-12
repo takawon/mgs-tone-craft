@@ -31,6 +31,11 @@ public:
     static std::uint32_t accessState(const RealtimeEngineHost& host) {
         return host.output_access_.load(std::memory_order_acquire);
     }
+    static void duringBackendErrorLock(RealtimeEngineHost& host,
+        const std::function<void()>& work) {
+        std::lock_guard lock(host.mamidi_->error_mutex_);
+        work();
+    }
     static bool publishScopeFrame(RealtimeEngineHost& host, const OpllScopeFrame& frame,
         bool spectrogram = false) {
         return spectrogram ? host.spectrogram_scope_frames_->tryPush(frame)
@@ -44,7 +49,7 @@ namespace test {
 // during assertion unwinding; no hook is added to the product audio path.
 class HeldHostAccess {
 public:
-    enum class Kind { Audio, Control };
+    enum class Kind { Audio, Control, BackendError };
     HeldHostAccess(RealtimeEngineHost& host, Kind kind)
         : worker_([&, kind] {
             try {
@@ -56,6 +61,8 @@ public:
                 };
                 if (kind == Kind::Audio)
                     RealtimeEngineHostTestAccess::duringRealtimeAccess(host, hold);
+                else if (kind == Kind::BackendError)
+                    RealtimeEngineHostTestAccess::duringBackendErrorLock(host, hold);
                 else RealtimeEngineHostTestAccess::duringOutputTransition(host, hold);
             } catch (...) {
                 std::lock_guard lock(mutex_);

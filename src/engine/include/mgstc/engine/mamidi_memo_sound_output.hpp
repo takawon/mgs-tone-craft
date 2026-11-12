@@ -66,6 +66,9 @@ public:
     [[nodiscard]] MAmidiConnectionState connectionState() const noexcept;
     [[nodiscard]] std::uint64_t droppedWrites() const noexcept;
     [[nodiscard]] std::string statusText() const;
+    // Control/UI only. Caller protects endpoint lifetime; never waits for the
+    // sender's error lock and leaves both outputs unchanged when it is busy.
+    [[nodiscard]] bool tryStatusText(std::string& status, std::string& error) const;
     [[nodiscard]] bool closeAcknowledged() const noexcept {
         return close_acknowledged_.load(std::memory_order_acquire);
     }
@@ -76,6 +79,9 @@ public:
     void setEmissionEnabled(bool enabled) noexcept;
 
 private:
+    friend class RealtimeEngineHostTestAccess;
+    [[nodiscard]] std::string lastErrorProtected() const;
+    [[nodiscard]] std::string statusTextForError(const std::string& error) const;
     void startWorker();
     void stopWorker() noexcept;
     void workerLoop();

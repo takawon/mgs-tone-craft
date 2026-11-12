@@ -59,6 +59,7 @@
 #include "mgstc/engine/register_mapper.hpp"
 #include "mgstc/engine/realtime_engine_host.hpp"
 #include "realtime_engine_host_test_access.hpp"
+#include "../../src/app/juce/hardware_output_control.hpp"
 #include "mgstc/engine/runtime_session.hpp"
 #include "mgstc/engine/scc_waveform.hpp"
 #include "mgstc/engine/timbre_library.hpp"
@@ -9727,6 +9728,141 @@ void testWasapiSinkConstructsWithoutOpeningDevice() {
 #include "mamidi_recovery_tests.inc.cpp"
 #include "mamidi_transition_tests.inc.cpp"
 
+mgstc::app::HardwareControlResult waitForHardwareControl(
+    mgstc::app::HardwareOutputControl& control) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    do {
+        if (auto result = control.collect()) return std::move(*result);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    throw std::runtime_error("Hardware control did not finish in the fixture window");
+}
+
+void testHardwareControlSingleFlightOwnsResultAndStorageFailure() {
+    using namespace mgstc::app;
+    auto host = std::make_unique<mgstc::engine::RealtimeEngineHost>();
+    HardwareOutputControl control(*host);
+    std::mutex mutex;
+    std::condition_variable wake;
+    bool entered = false, released = false;
+    struct Release {
+        std::mutex& mutex;
+        std::condition_variable& wake;
+        bool& released;
+        ~Release() { { std::lock_guard lock(mutex); released = true; } wake.notify_all(); }
+    } release{mutex, wake, released};
+    HardwareControlRequest request;
+    request.kind = HardwareControlRequest::Kind::Settings;
+    request.settings.host = "127.0.0.1";
+    request.settings.port = 39138;
+    request.silence_seconds = 13;
+    const auto admitted = control.request(request, [&](HardwareControlResult& result) {
+        REQUIRE_EQ(result.host_accepted, true);
+        REQUIRE_EQ(result.request.settings.port, std::uint16_t{39138});
+        std::unique_lock lock(mutex);
+        entered = true;
+        wake.notify_all();
+        if (!wake.wait_for(lock, std::chrono::seconds(3), [&] { return released; }))
+            throw std::runtime_error("Fixture release was not delivered");
+        throw std::runtime_error("fixture storage failure");
+    });
+    REQUIRE_EQ(admitted.status, HardwareRequestStatus::Accepted);
+    request.settings.port = 1; // The worker must own the admitted value copy.
+    {
+        std::unique_lock lock(mutex);
+        REQUIRE_EQ(wake.wait_for(lock, std::chrono::seconds(2), [&] { return entered; }), true);
+    }
+    REQUIRE_EQ(control.pending(), true);
+    const auto start = std::chrono::steady_clock::now();
+    for (int marker = 0; marker < 32; ++marker) {
+        REQUIRE_EQ(control.collect().has_value(), false);
+        REQUIRE_EQ(control.request(request).status, HardwareRequestStatus::RejectedBusy);
+    }
+    REQUIRE_EQ(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(250), true);
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+    }
+    wake.notify_all();
+    const auto result = waitForHardwareControl(control);
+    REQUIRE_EQ(result.id, admitted.id);
+    REQUIRE_EQ(result.lifetime_id, control.lifetimeId());
+    REQUIRE_EQ(result.host_accepted, true);
+    REQUIRE_EQ(result.connection_succeeded, true); // Inactive local settings need no RPC.
+    REQUIRE_EQ(result.request.settings.port, std::uint16_t{39138});
+    REQUIRE_EQ(result.request.silence_seconds, 13);
+    REQUIRE_EQ(result.storage_error, std::string("fixture storage failure"));
+    REQUIRE_EQ(control.pending(), false);
+    REQUIRE_EQ(control.collect().has_value(), false);
+    const auto retry = control.request(request);
+    REQUIRE_EQ(retry.status, HardwareRequestStatus::Accepted);
+    REQUIRE_EQ(retry.id > admitted.id, true);
+    REQUIRE_EQ(waitForHardwareControl(control).host_accepted, true);
+    REQUIRE_EQ(control.shutdown().has_value(), false);
+    REQUIRE_EQ(control.request(request).status, HardwareRequestStatus::RejectedClosing);
+}
+
+void testHardwareControlKeepsAcceptedSettingsOnConnectionFailureAndCloseWarning() {
+    using namespace mgstc::app;
+    using namespace mgstc::engine;
+    RecoveryRpcServer mock(39139);
+    auto host = std::make_unique<RealtimeEngineHost>();
+    HardwareOutputControl control(*host);
+    HardwareControlRequest settings;
+    settings.kind = HardwareControlRequest::Kind::Settings;
+    settings.settings = {.host = "127.0.0.1", .port = 39139};
+    REQUIRE_EQ(control.request(settings).accepted(), true);
+    REQUIRE_EQ(waitForHardwareControl(control).host_accepted, true);
+    HardwareControlRequest mode;
+    mode.kind = HardwareControlRequest::Kind::Mode;
+    mode.hardware = true;
+    REQUIRE_EQ(control.request(mode).status, HardwareRequestStatus::Accepted);
+    REQUIRE_EQ(waitForHardwareControl(control).connection_succeeded, true);
+    REQUIRE_EQ(control.request(mode).status, HardwareRequestStatus::AlreadyCurrent);
+
+    auto edit = host->beginProgramEdit();
+    REQUIRE_EQ(edit.valid(), true);
+    auto* remote = dynamic_cast<MAmidiMemoSoundOutput*>(edit.engine->outputBackend());
+    REQUIRE_EQ(remote != nullptr, true);
+    REQUIRE_EQ(host->discardProgramEdit(edit), true);
+    REQUIRE_EQ(remote->waitForIdle(2000), true);
+    mock.fail.store(true, std::memory_order_release);
+    REQUIRE_EQ(remote->enqueueChipAccess({11, 0, 8, 0}), true);
+    const auto fail_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (host->hardwareOutputConnected() && std::chrono::steady_clock::now() < fail_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE_EQ(host->hardwareOutputConnected(), false);
+    mode.hardware = false;
+    REQUIRE_EQ(control.request(mode).status, HardwareRequestStatus::Accepted);
+    const auto released = waitForHardwareControl(control);
+    REQUIRE_EQ(released.host_accepted, true);
+    REQUIRE_EQ(released.actual_kind, SoundOutputKind::Emulator);
+    REQUIRE_EQ(released.owned, false);
+    REQUIRE_EQ(released.close_acknowledged, false);
+    mock.fail.store(false, std::memory_order_release);
+
+    mode.hardware = true;
+    REQUIRE_EQ(control.request(mode).accepted(), true);
+    REQUIRE_EQ(waitForHardwareControl(control).connection_succeeded, true);
+    settings.settings.port = 39140; // No server: settings are still accepted and retained.
+    bool saved = false;
+    REQUIRE_EQ(control.request(settings, [&](HardwareControlResult& result) {
+        saved = result.host_accepted && result.request.settings.port == 39140;
+    }).accepted(), true);
+    const auto failed_connection = waitForHardwareControl(control);
+    REQUIRE_EQ(failed_connection.host_accepted, true);
+    REQUIRE_EQ(failed_connection.connection_succeeded, false);
+    REQUIRE_EQ(failed_connection.actual_kind, SoundOutputKind::MAmidiMemo);
+    REQUIRE_EQ(failed_connection.owned, true);
+    REQUIRE_EQ(saved, true);
+    REQUIRE_EQ(failed_connection.request.settings.port, std::uint16_t{39140});
+    REQUIRE_EQ(failed_connection.error.empty(), false);
+    mode.hardware = false;
+    REQUIRE_EQ(control.request(mode).accepted(), true);
+    REQUIRE_EQ(waitForHardwareControl(control).host_accepted, true);
+    mock.server.stop();
+}
+
 void testCompositeLoopPitchProfilesUseAbsoluteCountsAndRepeatDrift() {
     using namespace mgstc::engine;
     CompositeLayer layer;
@@ -12093,6 +12229,10 @@ int main(int argc, char** argv) {
         {"MAmidiHostManualHandoffAndOffline", testMAmidiHostManualHandoffAndOffline},
         {"MAmidiTransitionTimeoutPreservesOwnerAndRetries", testMAmidiTransitionTimeoutPreservesOwnerAndRetries},
         {"MAmidiSharedLeaseTimeoutPreservesOtherHost", testMAmidiSharedLeaseTimeoutPreservesOtherHost},
+#ifdef _WIN32
+        {"HardwareControlSingleFlightOwnsResultAndStorageFailure", testHardwareControlSingleFlightOwnsResultAndStorageFailure},
+        {"HardwareControlKeepsAcceptedSettingsOnConnectionFailureAndCloseWarning", testHardwareControlKeepsAcceptedSettingsOnConnectionFailureAndCloseWarning},
+#endif
         {"MAmidiStopSurvivesFullQueueAndOfflineCancelsBlockedBatch", testMAmidiStopSurvivesFullQueueAndOfflineCancelsBlockedBatch},
         {"EngineCoreWaveformMonitorKeepsScopeWithSilentMix", testEngineCoreWaveformMonitorKeepsScopeWithSilentMix},
         {"EngineCoreSplitsAtEightHundredFrameBoundary", testEngineCoreSplitsAtEightHundredFrameBoundary},

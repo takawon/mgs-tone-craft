@@ -9,6 +9,7 @@
 // console test binary. Its CMake target supplies the same UI include/definitions
 // and substitutes only the WASAPI device API.
 #include "../../src/app/juce/main.cpp"
+#include "realtime_engine_host_test_access.hpp"
 
 #include <windows.h>
 
@@ -30,6 +31,15 @@ using mgstc::audio::detail::WasapiTestSnapshot;
 using mgstc::audio::detail::WasapiTestStage;
 
 struct SharedAudioServiceTestAccess {
+    static void enableManualOutput(SharedAudioService& service) {
+        service.offline_snapshot_capture_ = false;
+    }
+    static mgstc::engine::RealtimeEngineHost& engine(SharedAudioService& service) {
+        return service.engine_;
+    }
+    static bool outputPending(SharedAudioService& service) {
+        return service.hardware_control_.pending();
+    }
     static void installHooks(SharedAudioService& service,
         WasapiTestHooks* hooks) noexcept {
         WasapiAudioSinkTestAccess::setHooks(service.wasapi_audio_, hooks);
@@ -539,9 +549,193 @@ void testApplicationQuitRemainsPendingThenShutsDownSafely() {
         << " (injected pauses and UI dispatch; not physical device timing)\n";
 }
 
+void testManualOutputSettingsStayResponsiveAndPersistValues() {
+    require(mgstcUseIsolatedApplicationDataDirectory(), "Could not isolate output preferences");
+    juce::ScopedJuceInitialiser_GUI gui;
+    SharedAudioService service(true);
+    SharedAudioServiceTestAccess::enableManualOutput(service);
+    mgstc::engine::MAmidiOutputSettings settings;
+    settings.host = "127.0.0.1";
+    settings.port = 39139;
+    settings.waveform_monitor = true;
+    const auto first = service.applyHardwareSettings(settings, 0);
+    require(first.status == mgstc::app::HardwareRequestStatus::Accepted,
+        "Local settings were not accepted as a request");
+    const auto deadline = std::chrono::steady_clock::now() + 4s;
+    mgstc::app::EditorSnapshot snap;
+    do {
+        service.fillHardwareSnapshot(snap);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(1);
+    } while (SharedAudioServiceTestAccess::outputPending(service)
+        && std::chrono::steady_clock::now() < deadline);
+    if (snap.output_operation_failed)
+        std::cerr << "LOCAL OUTPUT host=" << snap.hardware_settings.host
+            << " port=" << snap.hardware_settings.port
+            << " monitor=" << snap.hardware_settings.waveform_monitor
+            << " seconds=" << service.opllKeyOffForceSilenceSeconds()
+            << " pending=" << SharedAudioServiceTestAccess::outputPending(service)
+            << " status=" << snap.output_status << '\n';
+    require(!SharedAudioServiceTestAccess::outputPending(service)
+        && snap.hardware_settings.host == settings.host
+        && snap.hardware_settings.waveform_monitor
+        && !snap.output_operation_failed
+        && service.opllKeyOffForceSilenceSeconds() == 0,
+        "Accepted local settings were not applied and collected");
+    const auto file = applicationDataDirectory().getChildFile("settings-v1.ini");
+    const auto path = file.getFullPathName();
+    require(GetPrivateProfileIntW(L"SoundOutput", L"Port", 0, path.toWideCharPointer()) == 39139,
+        "Accepted request values were not persisted");
+    // Simulate the saved hardware preference after a failed startup. Even
+    // though the runtime is already emulator, an explicit choice must persist.
+    require(WritePrivateProfileStringW(L"SoundOutput", L"Kind", L"MAmidiMemo",
+        path.toWideCharPointer()) != FALSE, "Could not seed the startup preference");
+    require(service.requestHardwareMode(false).status == mgstc::app::HardwareRequestStatus::Accepted,
+        "Same-mode selection skipped its required persistence request");
+    const auto mode_deadline = std::chrono::steady_clock::now() + 3s;
+    while (SharedAudioServiceTestAccess::outputPending(service)
+        && std::chrono::steady_clock::now() < mode_deadline) service.fillHardwareSnapshot(snap);
+    wchar_t saved_kind[32]{};
+    GetPrivateProfileStringW(L"SoundOutput", L"Kind", L"", saved_kind, 32, path.toWideCharPointer());
+    require(!SharedAudioServiceTestAccess::outputPending(service)
+        && wcscmp(saved_kind, L"Emulator") == 0 && !snap.output_operation_failed,
+        "Explicit emulator choice did not replace the failed startup preference");
+    {
+        mgstc::engine::test::HeldHostAccess held(SharedAudioServiceTestAccess::engine(service),
+            mgstc::engine::test::HeldHostAccess::Kind::Audio);
+        auto changed = settings;
+        changed.port = 39140;
+        const auto receipt = service.applyHardwareSettings(changed, 77);
+        require(receipt.status == mgstc::app::HardwareRequestStatus::Accepted,
+            "Competing settings were not submitted asynchronously");
+        require(service.reconnectHardware().status == mgstc::app::HardwareRequestStatus::RejectedBusy,
+            "Single-flight output boundary accepted a competing request");
+        bool marker{};
+        juce::MessageManager::callAsync([&] { marker = true; });
+        service.fillHardwareSnapshot(snap);
+        require(snap.output_switch_pending, "Pending control request was not visible");
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+        require(marker, "Message marker was blocked behind output control");
+        const auto failed_deadline = std::chrono::steady_clock::now() + 3s;
+        while (SharedAudioServiceTestAccess::outputPending(service)
+            && std::chrono::steady_clock::now() < failed_deadline) {
+            service.fillHardwareSnapshot(snap);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil(1);
+        }
+        require(!SharedAudioServiceTestAccess::outputPending(service),
+            "Finite Host exclusion failure did not finish");
+        require(service.opllKeyOffForceSilenceSeconds() == 0
+            && GetPrivateProfileIntW(L"SoundOutput", L"Port", 0, path.toWideCharPointer()) == 39139,
+            "Rejected Host settings changed runtime seconds or saved draft values");
+    }
+    const auto retry = service.applyHardwareSettings(settings, 12);
+    require(retry.accepted(), "Settings retry was not admitted after failure");
+    const auto retry_deadline = std::chrono::steady_clock::now() + 3s;
+    while (SharedAudioServiceTestAccess::outputPending(service)
+        && std::chrono::steady_clock::now() < retry_deadline) service.fillHardwareSnapshot(snap);
+    require(!SharedAudioServiceTestAccess::outputPending(service)
+        && service.opllKeyOffForceSilenceSeconds() == 12,
+        "Retry result did not update Message-owned runtime settings");
+    // A file in place of the private parent directory is a deterministic
+    // persistence failure; accepted Host/runtime values must stay applied.
+    const auto original_directory = mgstcDiagnosticDataDirectory();
+    const auto blocked_parent = original_directory.getChildFile("blocked-settings-parent");
+    require(blocked_parent.replaceWithText("fixture"), "Could not prepare blocked settings parent");
+    struct RestoreDirectory {
+        juce::File directory;
+        ~RestoreDirectory() { mgstcDiagnosticDataDirectory() = directory; }
+    } restore{original_directory};
+    mgstcDiagnosticDataDirectory() = blocked_parent;
+    settings.port = 39144;
+    require(service.applyHardwareSettings(settings, 13).accepted(), "Save-failure request rejected");
+    const auto save_deadline = std::chrono::steady_clock::now() + 3s;
+    while (SharedAudioServiceTestAccess::outputPending(service)
+        && std::chrono::steady_clock::now() < save_deadline) service.fillHardwareSnapshot(snap);
+    require(!SharedAudioServiceTestAccess::outputPending(service)
+        && snap.hardware_settings.port == 39144 && snap.output_operation_failed
+        && service.opllKeyOffForceSilenceSeconds() == 13
+        && snap.output_status.find("settings directory") != std::string::npos,
+        "Persistence failure was hidden or rolled back accepted settings");
+}
+void testOutputDialogFollowsCompletionAndKeepsDraft() {
+    require(mgstcUseIsolatedApplicationDataDirectory(), "Could not isolate dialog settings");
+    juce::ScopedJuceInitialiser_GUI gui;
+    SharedAudioService service(true);
+    SharedAudioServiceTestAccess::enableManualOutput(service);
+    mgstc::engine::MAmidiOutputSettings settings;
+    settings.port = 39139;
+    require(service.applyHardwareSettings(settings, 20).accepted(), "Initial request rejected");
+    mgstc::app::EditorSnapshot snap;
+    require(pumpUntil(service, [&] {
+        service.fillHardwareSnapshot(snap);
+        return !SharedAudioServiceTestAccess::outputPending(service);
+    }), "Initial settings did not finish");
+    SharedMidiInputService midi(false);
+    StandaloneEditorContext session(service, midi);
+    juce::Component owner;
+    require(mgstc::app::showAppSettings(session, owner, 2) == mgstc::app::SnapshotResult::Success,
+        "Could not open output settings");
+    std::unique_ptr<juce::Component> dialog(juce::Component::getCurrentlyModalComponent());
+    require(dialog != nullptr, "Settings dialog missing");
+    juce::TextEditor* port = nullptr;
+    const auto find = [&](auto&& self, juce::Component& component) -> void {
+        if (auto* edit = dynamic_cast<juce::TextEditor*>(&component);
+            edit != nullptr && edit->getText() == "39139") port = edit;
+        for (auto* child : component.getChildren()) self(self, *child);
+    };
+    find(find, *dialog);
+    require(port != nullptr, "Port field missing");
+    settings.port = 39140;
+    require(service.applyHardwareSettings(settings, 20).accepted(), "Other-view request rejected");
+    require(pumpUntil(service, [&] { return port->getText() == "39140"; }),
+        "Untouched port field did not follow asynchronous completion");
+    port->setText("03000", false);
+    settings.port = 3000;
+    require(service.applyHardwareSettings(settings, 20).accepted(), "Normalized request rejected");
+    require(pumpUntil(service, [&] { return port->getText() == "3000"; }),
+        "Successful normalized input remained incorrectly dirty");
+    settings.port = 39140;
+    require(service.applyHardwareSettings(settings, 20).accepted(), "Follow-up normalized request rejected");
+    require(pumpUntil(service, [&] { return port->getText() == "39140"; }),
+        "Normalized applied field did not follow a later confirmed change");
+    port->setText("39141", false); // actual value changes before queued notifications
+    settings.port = 39142;
+    require(service.applyHardwareSettings(settings, 20).accepted(), "Second request rejected");
+    require(pumpUntil(service, [&] {
+        service.fillHardwareSnapshot(snap);
+        return !SharedAudioServiceTestAccess::outputPending(service)
+            && snap.hardware_settings.port == 39142;
+    }), "Second asynchronous setting did not finish");
+    std::this_thread::sleep_for(220ms);
+    juce::Timer::callPendingTimersSynchronously();
+    require(port->getText() == "39141", "Completed request overwrote an unapplied draft");
+}
+
+void testServiceDestructionWaitsForActiveOutputRequest() {
+    require(mgstcUseIsolatedApplicationDataDirectory(), "Could not isolate destruction settings");
+    juce::ScopedJuceInitialiser_GUI gui;
+    auto service = std::make_unique<SharedAudioService>(true);
+    SharedAudioServiceTestAccess::enableManualOutput(*service);
+    mgstc::engine::test::HeldHostAccess held(SharedAudioServiceTestAccess::engine(*service),
+        mgstc::engine::test::HeldHostAccess::Kind::Audio);
+    mgstc::engine::MAmidiOutputSettings settings;
+    settings.port = 39143;
+    require(service->applyHardwareSettings(settings, 31).accepted(),
+        "Active destruction request rejected");
+    // The owned Host is deliberately still borrowed. Destruction must join the
+    // controller before Host teardown, never release either object early.
+    std::jthread release([&] { std::this_thread::sleep_for(100ms); held.release(); });
+    service.reset();
+    release.join();
+    const auto path = applicationDataDirectory().getChildFile("settings-v1.ini").getFullPathName();
+    require(GetPrivateProfileIntW(L"SoundOutput", L"Port", 0, path.toWideCharPointer()) == 39143,
+        "Service destruction lost the active request's value persistence");
+}
 using Test = void (*)();
 struct Case { const wchar_t* name; Test run; };
 constexpr Case cases[] = {
+    {L"output-dialog-draft", testOutputDialogFollowsCompletionAndKeepsDraft},
+    {L"output-active-destruction", testServiceDestructionWaitsForActiveOutputRequest},
+    {L"manual-output", testManualOutputSettingsStayResponsiveAndPersistValues},
     {L"pending-switch", testPendingSwitchRetargetAndSafeShutdown},
     {L"cancel-close", testCancelShutdownDoesNotResumeClosedGeneration},
     {L"settings-fallback", testSettingsFollowFallbackAndPreserveUnappliedSelection},

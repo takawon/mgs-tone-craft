@@ -168,7 +168,7 @@ private:
             return self_.audio_.hardwareStatus();
         }
 
-        [[nodiscard]] bool applyHardwareSettings(
+        [[nodiscard]] mgstc::app::HardwareRequestReceipt applyHardwareSettings(
             mgstc::app::HardwareOutputSettings settings,
             int opll_keyoff_silence_seconds) override {
             mgstc::engine::MAmidiOutputSettings mamidi{};
@@ -183,11 +183,11 @@ private:
                 std::move(mamidi), opll_keyoff_silence_seconds);
         }
 
-        [[nodiscard]] bool requestHardwareMode(bool hardware) override {
+        [[nodiscard]] mgstc::app::HardwareRequestReceipt requestHardwareMode(bool hardware) override {
             return self_.audio_.requestHardwareMode(hardware);
         }
 
-        [[nodiscard]] bool reconnectHardware() override {
+        [[nodiscard]] mgstc::app::HardwareRequestReceipt reconnectHardware() override {
             return self_.audio_.reconnectHardware();
         }
 

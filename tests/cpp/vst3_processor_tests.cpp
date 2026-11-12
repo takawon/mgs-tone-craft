@@ -976,6 +976,13 @@ struct CompositeWavConversionTestAccess {
 namespace mgstc::plugin {
 
 struct MgstcAudioProcessorTestAccess {
+    static std::optional<mgstc::app::HardwareControlResult> hardwareResult(const MgstcAudioProcessor& processor) {
+        return processor.hardware_last_result_;
+    }
+    static std::optional<mgstc::app::HardwareControlResult> drainHardware(MgstcAudioProcessor& processor) {
+        return processor.hardware_control_.shutdown();
+    }
+
     static void notifyStateRestored(MgstcAudioProcessor& processor) {
         processor.notifyEditorStateRestored();
     }
@@ -5885,6 +5892,251 @@ void testLibraryPreviewsPreserveCommittedPluginState() {
         "ending library previews restores committed sound");
 }
 
+bool finishHardware(MgstcAudioProcessor& processor, mgstc::app::HardwareRequestReceipt receipt) {
+    if (!receipt.accepted()) return false;
+    if (receipt.status == mgstc::app::HardwareRequestStatus::AlreadyCurrent) return true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < deadline) {
+        mgstc::app::EditorSnapshot snapshot;
+        processor.editorPopulateOutputSnapshot(snapshot);
+        if (!snapshot.output_switch_pending) {
+            const auto result = Access::hardwareResult(processor);
+            if (result && result->id == receipt.id)
+                return result->host_accepted && result->connection_succeeded;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    throw std::runtime_error("hardware request did not complete within the bounded test window");
+}
+
+void testProcessorHardwarePendingUiAndFailureContracts() {
+    using namespace mgstc::engine;
+    using namespace mgstc::app;
+    constexpr std::uint16_t port = 39134;
+    std::atomic<bool> hold_probe{false}, probe_entered{false}, fail_writes{false};
+    rpc::server server(port);
+    // The deliberate handler failure must be returned as an RPC error rather
+    // than escaping the server thread and terminating the test process.
+    server.suppress_exceptions(true);
+    server.bind(MAmidiRpcClient::kMethodName,
+        [&](unsigned char device, unsigned char, unsigned int, unsigned int) {
+            if (device == 0 && hold_probe.load(std::memory_order_acquire)) {
+                probe_entered.store(true, std::memory_order_release);
+                const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+                while (hold_probe.load(std::memory_order_acquire)
+                    && std::chrono::steady_clock::now() < limit)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (device != 0 && fail_writes.load(std::memory_order_acquire))
+                throw std::runtime_error("bounded hardware acknowledgement failure");
+        });
+    server.async_run(1);
+    {
+        auto processor = std::make_unique<MgstcAudioProcessor>();
+        auto other = std::make_unique<MgstcAudioProcessor>();
+        struct ReleaseProbe {
+            std::atomic<bool>& hold;
+            ~ReleaseProbe() { hold.store(false, std::memory_order_release); }
+        } release{hold_probe};
+        processor->prepareToPlay(48000, 512);
+        HardwareOutputSettings settings;
+        settings.host = "127.0.0.1"; settings.port = port;
+        require(finishHardware(*processor, processor->editorApplyHardwareSettings(settings, 20)),
+            "configure delayed probe on the shared request boundary");
+        const auto saved_state = stateBytes(*processor);
+        std::unique_ptr<juce::AudioProcessorEditor> editor(processor->createEditor());
+        hold_probe.store(true, std::memory_order_release);
+        const auto request = processor->editorRequestHardwareMode(true);
+        require(request.status == HardwareRequestStatus::Accepted,
+            "manual acquisition returns acceptance before probe completion");
+        const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!probe_entered.load(std::memory_order_acquire)
+            && std::chrono::steady_clock::now() < entered_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(probe_entered.load(std::memory_order_acquire), "worker reaches bounded held probe");
+        require(processor->editorReconnectHardware().status == HardwareRequestStatus::RejectedBusy
+            && processor->editorApplyHardwareSettings(settings, 44).status == HardwareRequestStatus::RejectedBusy
+            && processor->editorRequestHardwareMode(false).status == HardwareRequestStatus::RejectedBusy,
+            "all conflicting instance operations reject while the worker is active");
+        auto late_instance = std::make_unique<MgstcAudioProcessor>();
+        EditorSnapshot initially_busy;
+        late_instance->editorPopulateOutputSnapshot(initially_busy);
+        require(initially_busy.hardware_settings.host == settings.host
+            && initially_busy.hardware_settings.port == settings.port,
+            "initial Busy snapshot retains loaded preferences rather than default settings");
+        editor.reset();
+        editor.reset(processor->createEditor());
+        int markers = 0, inputs = 0, paints = 0;
+        struct PaintProbe final : juce::Component {
+            explicit PaintProbe(int& count) : count_(count) {}
+            void paint(juce::Graphics&) override { ++count_; }
+            int& count_;
+        } paint_probe(paints);
+        paint_probe.setSize(8, 8);
+        juce::Image image(juce::Image::ARGB, 8, 8, true);
+        juce::TextButton input;
+        input.onClick = [&] { ++inputs; };
+        const auto observation = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < observation) {
+            juce::MessageManager::callAsync([&] {
+                ++markers;
+                input.onClick();
+                juce::Graphics graphics(image);
+                paint_probe.paintEntireComponent(graphics, false);
+            });
+            juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+            EditorSnapshot current, unrelated;
+            processor->editorPopulateOutputSnapshot(current);
+            const auto read_start = std::chrono::steady_clock::now();
+            other->editorPopulateOutputSnapshot(unrelated);
+            require(std::chrono::steady_clock::now() - read_start < std::chrono::milliseconds(250),
+                "another instance's snapshot does not wait for the held shared lease");
+            require(current.output_switch_pending, "pending cannot become success during a held probe");
+        }
+        require(markers > 2 && inputs == markers && paints == markers,
+            "Message markers, input commands and paint callbacks progress before probe release");
+        hold_probe.store(false, std::memory_order_release);
+        require(finishHardware(*processor, request), "held probe completes after explicit fixture release");
+        require(sameBlock(saved_state, stateBytes(*processor)), "pending and Editor recreation preserve Plugin State");
+
+        // Persist a new accepted value while no Editor exists and before any
+        // Message snapshot collects the completed native worker.
+        settings.unit_no = 5;
+        probe_entered.store(false, std::memory_order_release);
+        hold_probe.store(true, std::memory_order_release);
+        const auto hidden_request = processor->editorApplyHardwareSettings(settings, 23);
+        require(hidden_request.status == HardwareRequestStatus::Accepted,
+            "active setting change is accepted independently of its Editor");
+        const auto hidden_entered = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!probe_entered.load(std::memory_order_acquire)
+            && std::chrono::steady_clock::now() < hidden_entered)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(probe_entered.load(std::memory_order_acquire), "hidden setting change reaches held probe");
+        editor.reset();
+        hold_probe.store(false, std::memory_order_release);
+        const auto hidden_saved = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        const auto preferences = mgstcApplicationDataDirectory().getChildFile("settings-v1.ini");
+        const auto saved_unit = [&] {
+#if JUCE_WINDOWS
+            // Observe the writer's key/value contract without assuming when
+            // its intermediate file serialization becomes visible to raw reads.
+            return static_cast<int>(GetPrivateProfileIntW(L"SoundOutput", L"UnitNo", -1,
+                preferences.getFullPathName().toWideCharPointer()));
+#else
+            return preferences.loadFileAsString().contains("UnitNo=5") ? 5 : -1;
+#endif
+        };
+        while (saved_unit() != 5
+            && std::chrono::steady_clock::now() < hidden_saved)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const bool observed_while_closed = !editor && saved_unit() == 5;
+        if (!observed_while_closed) {
+            const auto diagnostic = Access::drainHardware(*processor);
+            std::fprintf(stderr,
+                "closed-Editor save observation failed: unit=%d accepted=%d connected=%d error=%s storage=%s\n",
+                saved_unit(), diagnostic && diagnostic->host_accepted,
+                diagnostic && diagnostic->connection_succeeded,
+                diagnostic ? diagnostic->error.c_str() : "no result",
+                diagnostic ? diagnostic->storage_error.c_str() : "no result");
+        }
+        require(observed_while_closed,
+            "worker saves accepted settings while Editor remains closed before collection");
+        require(finishHardware(*processor, hidden_request), "closed Editor request remains collectable by Processor");
+        require(Access::hardwareResult(*processor)->storage_error.empty(),
+            "closed Editor worker confirms preference key writes succeeded");
+
+        auto& host = processor->editorEngineForAnalysis();
+        auto edit = host.beginProgramEdit();
+        require(edit.valid(), "inspect existing hardware backend for acknowledgement failure");
+        auto* remote = dynamic_cast<MAmidiMemoSoundOutput*>(edit.engine->outputBackend());
+        require(remote != nullptr, "active request uses the shared hardware backend");
+        require(host.discardProgramEdit(edit), "release temporary route inspection");
+        require(remote->waitForIdle(2000), "initialization acknowledged before failure injection");
+        fail_writes.store(true, std::memory_order_release);
+        require(remote->enqueueChipAccess({11, 0, 8, 15}), "submit bounded failing write");
+        const auto failed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (remote->isOpen() && std::chrono::steady_clock::now() < failed_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(!remote->isOpen(), "RPC error reaches existing disconnected backend state");
+        require(finishHardware(*processor, processor->editorRequestHardwareMode(false)),
+            "explicit emulator release preserves its existing accepted contract");
+        require(processor->editorHardwareStatus().find("silence was not acknowledged") != std::string::npos,
+            "explicit release reports unacknowledged silence separately from successful handoff");
+        EditorSnapshot released_snapshot;
+        processor->editorPopulateOutputSnapshot(released_snapshot);
+        require(released_snapshot.output_silence_unconfirmed && !released_snapshot.output_operation_failed,
+            "header snapshot distinguishes unconfirmed silence warning from rejected operation");
+        require(processor->editorRequestHardwareMode(false).status == HardwareRequestStatus::AlreadyCurrent,
+            "same emulator selection does not schedule another close");
+        require(processor->editorHardwareStatus().find("silence was not acknowledged") != std::string::npos,
+            "an already-current no-op does not erase the release warning");
+        fail_writes.store(false, std::memory_order_release);
+        require(finishHardware(*processor, processor->editorRequestHardwareMode(true)), "manual retry recovers hardware");
+        settings.port = 39135; // no server: bounded connection refusal, no permanent DNS injection
+        require(!finishHardware(*processor, processor->editorApplyHardwareSettings(settings, 77)),
+            "accepted settings and failed connection remain separate outcomes");
+        EditorSnapshot failed;
+        processor->editorPopulateOutputSnapshot(failed);
+        require(failed.output_operation_failed && failed.hardware_output && failed.hardware_owned && !failed.hardware_connected
+            && failed.hardware_settings.port == settings.port && failed.opll_keyoff_silence_seconds == 77,
+            "D2 retains applied settings and hardware selection after reopen failure");
+        const auto result = Access::hardwareResult(*processor);
+        require(result && result->host_accepted && !result->connection_succeeded,
+            "D2 completion records acceptance without falsely declaring a connection");
+        require(failed.output_status.find("Settings applied; connection failed:") != std::string::npos,
+            "D2 failure notice distinguishes saved settings from an unapplied request");
+        require(mgstcApplicationDataDirectory().getChildFile("settings-v1.ini").loadFileAsString().contains("39135"),
+            "D2 accepted settings are saved independently of Editor lifetime");
+        require(finishHardware(*processor, processor->editorRequestHardwareMode(false)), "release failed connection");
+
+        // Processor teardown can occur off the Message thread while a control
+        // request still owns its Host and persistence state.
+        auto doomed = std::make_unique<MgstcAudioProcessor>();
+        settings.port = port; settings.unit_no = 8;
+        require(finishHardware(*doomed, doomed->editorApplyHardwareSettings(settings, 31)),
+            "configure Processor lifetime fixture");
+        require(finishHardware(*doomed, doomed->editorRequestHardwareMode(true)),
+            "Processor lifetime fixture owns hardware before its pending change");
+        settings.unit_no = 9;
+        probe_entered.store(false, std::memory_order_release);
+        hold_probe.store(true, std::memory_order_release);
+        require(doomed->editorApplyHardwareSettings(settings, 32).status == HardwareRequestStatus::Accepted,
+            "accept settings before pending Processor destruction");
+        const auto destruction_probe = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!probe_entered.load(std::memory_order_acquire)
+            && std::chrono::steady_clock::now() < destruction_probe)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(probe_entered.load(std::memory_order_acquire), "pending destruction fixture reaches held probe");
+        std::atomic<bool> destroyed{false};
+        std::jthread destruction;
+        struct ReleaseAndJoin {
+            std::atomic<bool>& hold;
+            std::jthread& thread;
+            ~ReleaseAndJoin() {
+                hold.store(false, std::memory_order_release);
+                if (thread.joinable()) thread.join();
+            }
+        } release_and_join{hold_probe, destruction};
+        destruction = std::jthread([value = std::move(doomed), &destroyed]() mutable {
+            value.reset();
+            destroyed.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(!destroyed.load(std::memory_order_acquire),
+            "Processor cannot destroy Host or persistence while request is held");
+        hold_probe.store(false, std::memory_order_release);
+        const auto destruction_done = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!destroyed.load(std::memory_order_acquire)
+            && std::chrono::steady_clock::now() < destruction_done)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(destroyed.load(std::memory_order_acquire), "pending Processor destruction finishes after worker release");
+        destruction.join();
+        require(preferences.loadFileAsString().contains("UnitNo=9"),
+            "pending Processor destruction retains worker persistence until it completes");
+    }
+    server.stop();
+}
+
 void testProcessorHardwareRoutingWithMockRpc() {
     using namespace mgstc::engine;
     constexpr std::uint16_t port = 39118;
@@ -5902,16 +6154,16 @@ void testProcessorHardwareRoutingWithMockRpc() {
         const auto original = stateBytes(a);
         mgstc::app::HardwareOutputSettings settings;
         settings.host = "127.0.0.1"; settings.port = port; settings.unit_no = 1;
-        require(a.editorApplyHardwareSettings(settings, 20), "processor accepts hardware settings without mode change");
+        require(finishHardware(a, a.editorApplyHardwareSettings(settings, 20)), "processor accepts hardware settings without mode change");
         settings.unit_no = 2;
-        require(b.editorApplyHardwareSettings(settings, 20), "second processor configures shared RPC endpoint");
-        require(a.editorRequestHardwareMode(true), "processor explicitly acquires hardware");
+        require(finishHardware(b, b.editorApplyHardwareSettings(settings, 20)), "second processor configures shared RPC endpoint");
+        require(finishHardware(a, a.editorRequestHardwareMode(true)), "processor explicitly acquires hardware");
         {
             test::HeldHostAccess audio(a.editorEngineForAnalysis(), test::HeldHostAccess::Kind::Audio);
             auto changed = settings;
             changed.host = "127.0.0.2";
             changed.waveform_monitor = true;
-            require(!a.editorApplyHardwareSettings(changed, 123),
+            require(!finishHardware(a, a.editorApplyHardwareSettings(changed, 123)),
                 "settings application reports an audio exclusion timeout");
             mgstc::app::EditorSnapshot unchanged;
             a.editorPopulateOutputSnapshot(unchanged);
@@ -5924,8 +6176,8 @@ void testProcessorHardwareRoutingWithMockRpc() {
                 && unchanged.hardware_owned && unchanged.hardware_connected
                 && !unchanged.output_switch_pending,
                 "failed settings application retains output selection and ownership");
-            require(!a.editorReconnectHardware(), "reconnect times out safely while audio is admitted");
-            require(!b.editorRequestHardwareMode(true), "another Processor cannot stop an admitted old owner");
+            require(!finishHardware(a, a.editorReconnectHardware()), "reconnect times out safely while audio is admitted");
+            require(!finishHardware(b, b.editorRequestHardwareMode(true)), "another Processor cannot stop an admitted old owner");
             const auto scope_start = std::chrono::steady_clock::now();
             a.editorRetainCompositeScope();
             require(Access::scopeEnabled(a), "first scope retain is remembered while audio is admitted");
@@ -5939,8 +6191,8 @@ void testProcessorHardwareRoutingWithMockRpc() {
             require(sameBlock(original, stateBytes(a)), "control timeouts leave Plugin State unchanged");
         }
         settings.unit_no = 1;
-        require(a.editorApplyHardwareSettings(settings, 20), "settings retry succeeds after audio returns");
-        require(a.editorReconnectHardware(), "reconnect retry succeeds after audio returns");
+        require(finishHardware(a, a.editorApplyHardwareSettings(settings, 20)), "settings retry succeeds after audio returns");
+        require(finishHardware(a, a.editorReconnectHardware()), "reconnect retry succeeds after audio returns");
         processEmpty(a, 512); // finish route-edge cleanup before starting PCM preview
         auto pcm = std::make_shared<SourcePcm>();
         pcm->sample_rate = 48000; pcm->channels = 2;
@@ -5970,7 +6222,7 @@ void testProcessorHardwareRoutingWithMockRpc() {
         require(sameBlock(original, stateBytes(a)), "hardware and offline state never enter Plugin State");
         a.setNonRealtime(false);
         processEmpty(a, 512); // physical reset independent of host transport
-        require(b.editorRequestHardwareMode(true), "second Processor manually takes hardware");
+        require(finishHardware(b, b.editorRequestHardwareMode(true)), "second Processor manually takes hardware");
         a.editorPopulateOutputSnapshot(snap);
         require(!snap.hardware_output && !snap.hardware_owned, "previous Processor returns to emulator");
         midi.addEvent(juce::MidiMessage::noteOn(1, 64, static_cast<juce::uint8>(100)), 0);
@@ -5989,11 +6241,11 @@ void testProcessorHardwareRoutingWithMockRpc() {
             auto temporary = std::make_unique<MgstcAudioProcessor>();
             temporary->prepareToPlay(48'000.0, 512);
             settings.unit_no = 3;
-            require(temporary->editorApplyHardwareSettings(settings, 20), "temporary Processor configures hardware");
-            require(temporary->editorRequestHardwareMode(true), "temporary Processor takes hardware before destruction");
+            require(finishHardware(*temporary, temporary->editorApplyHardwareSettings(settings, 20)), "temporary Processor configures hardware");
+            require(finishHardware(*temporary, temporary->editorRequestHardwareMode(true)), "temporary Processor takes hardware before destruction");
         }
-        require(b.editorRequestHardwareMode(true), "destroyed Processor releases its output lease normally");
-        require(b.editorRequestHardwareMode(false), "explicit release closes hardware safely");
+        require(finishHardware(b, b.editorRequestHardwareMode(true)), "destroyed Processor releases its output lease normally");
+        require(finishHardware(b, b.editorRequestHardwareMode(false)), "explicit release closes hardware safely");
         require(writes.load(std::memory_order_acquire) > 0, "realtime processor reaches mock RPC server");
     }
     server.stop();
@@ -6025,8 +6277,8 @@ void testProcessorHardwareCongestionWithMockRpc() {
         mgstc::app::HardwareOutputSettings settings;
         settings.host = "127.0.0.1"; settings.port = port;
         settings.waveform_monitor = true;
-        require(processor->editorApplyHardwareSettings(settings, 20), "configure recovery mock");
-        require(processor->editorRequestHardwareMode(true), "select hardware for recovery mock");
+        require(finishHardware(*processor, processor->editorApplyHardwareSettings(settings, 20)), "configure recovery mock");
+        require(finishHardware(*processor, processor->editorRequestHardwareMode(true)), "select hardware for recovery mock");
         processEmpty(*processor, 512);
         auto& host = processor->editorEngineForAnalysis();
         auto edit = host.beginProgramEdit();
@@ -6079,7 +6331,7 @@ void testProcessorHardwareCongestionWithMockRpc() {
         require(writes.load(std::memory_order_acquire) > silenced, "fresh note reaches RPC route");
         require(processor->editorHardwareStatus().find("queue is full") == std::string::npos,
             "successful resynchronization clears congestion status");
-        require(processor->editorRequestHardwareMode(false), "release recovered hardware");
+        require(finishHardware(*processor, processor->editorRequestHardwareMode(false)), "release recovered hardware");
     }
     server.stop();
 }
@@ -8992,6 +9244,7 @@ int main() {
             testProcessorOfflineAndTransport();
             LibraryManagerListTabTestAccess::run();
             testLibraryPreviewsPreserveCommittedPluginState();
+            testProcessorHardwarePendingUiAndFailureContracts();
             testProcessorHardwareRoutingWithMockRpc();
             testProcessorHardwareCongestionWithMockRpc();
             testOpllKeyoffSilenceDeadline();
@@ -9084,6 +9337,7 @@ int main() {
         testProcessorOfflineAndTransport();
         LibraryManagerListTabTestAccess::run();
         testLibraryPreviewsPreserveCommittedPluginState();
+        testProcessorHardwarePendingUiAndFailureContracts();
         testProcessorHardwareRoutingWithMockRpc();
         testProcessorHardwareCongestionWithMockRpc();
         testOpllKeyoffSilenceDeadline();

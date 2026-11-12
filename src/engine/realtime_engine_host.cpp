@@ -193,6 +193,8 @@ RealtimeEngineHost::RealtimeEngineHost()
       programs_(std::make_unique<ProgramSlot[]>(kProgramSlotCount)),
       mamidi_(std::make_unique<MAmidiMemoSoundOutput>()),
       spectrum_capture_(std::make_unique<SpectrumCapture>()) {
+    // Initialise the process coordinator before any UI try-read can reach it.
+    static_cast<void>(outputLease());
     programs_[0].state.store(
         ProgramSlotState::Active,
         std::memory_order_relaxed);
@@ -565,6 +567,41 @@ std::string RealtimeEngineHost::soundOutputLastError() const {
         return {};
     }
     return mamidi_->lastError();
+}
+
+OutputSnapshotResult RealtimeEngineHost::trySoundOutputSnapshot(
+    SoundOutputSnapshot& snapshot) const {
+    LeaseLock lease(std::chrono::steady_clock::now());
+    if (!lease.locked) return lease.lease.state == nullptr
+        ? OutputSnapshotResult::Unavailable : OutputSnapshotResult::Busy;
+    std::unique_lock control(output_control_mutex_, std::try_to_lock);
+    if (!control.owns_lock()) return OutputSnapshotResult::Busy;
+
+    SoundOutputSnapshot copied;
+    if (mamidi_ != nullptr && !mamidi_->tryStatusText(copied.status, copied.error))
+        return OutputSnapshotResult::Busy;
+    copied.kind = output_kind_.load(std::memory_order_acquire);
+    copied.desired_kind = desired_output_kind_.load(std::memory_order_acquire);
+    copied.owned = hardware_owned_.load(std::memory_order_acquire);
+    copied.connected = mamidi_ != nullptr
+        && mamidi_->connectionState() == MAmidiConnectionState::Connected;
+    copied.switching = output_switch_pending_.load(std::memory_order_acquire);
+    copied.close_acknowledged = mamidi_ == nullptr || mamidi_->closeAcknowledged();
+    copied.routing_revision = output_routing_revision_.load(std::memory_order_acquire);
+    copied.settings = mamidi_settings_;
+    if (const auto error = outputControlErrorText()) {
+        copied.status = error;
+        copied.error = error;
+    } else if (!output_error_.empty()) {
+        copied.status = output_error_;
+        copied.error = output_error_;
+    } else if (copied.kind == SoundOutputKind::Emulator) {
+        copied.status = "Output: Emulator";
+    } else if (mamidi_ == nullptr) {
+        copied.status = "Output: MAmidiMEmo (unavailable)";
+    }
+    snapshot = std::move(copied);
+    return OutputSnapshotResult::Ready;
 }
 
 void RealtimeEngineHost::setRealtimeOfflineRendering(bool enabled) noexcept {

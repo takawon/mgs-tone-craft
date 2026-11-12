@@ -1349,9 +1349,12 @@ private:
             "\n手動で実機使用権を取得します。波形は内蔵エミュによるモニタです。"));
         juce::String caption;
         if (pending) caption = juce::String::fromUTF8("切替中…");
+        else if (snap.output_silence_unconfirmed)
+            caption = juce::String::fromUTF8("消音未確認");
         else if (snap.hardware_output && !snap.hardware_connected)
             caption = juce::String::fromUTF8("接続断");
-        else if (failed_) caption = juce::String::fromUTF8("切替失敗");
+        else if (failed_ || snap.output_operation_failed)
+            caption = juce::String::fromUTF8("切替失敗");
         status_.setText(caption, juce::dontSendNotification);
         status_.setTooltip(detail);
     }
@@ -1363,7 +1366,8 @@ private:
         juce::Component::SafePointer<SoundOutputSwitch> safe(this);
         juce::MessageManager::callAsync([safe, hardware] {
             if (safe == nullptr) return;
-            safe->failed_ = !safe->session_->output().requestHardwareMode(hardware);
+            const auto receipt = safe->session_->output().requestHardwareMode(hardware);
+            safe->failed_ = !receipt.accepted();
             safe->failed_status_ = statusTextFromUtf8(
                 safe->session_->snapshot().output_status);
             safe->local_pending_ = false;
@@ -1891,8 +1895,7 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
             asio_driver_.setEnabled(
                 pc_audio_kind_.getSelectedId() == 2);
             refreshPcAudioStatus();
-            if (session_.snapshot().capabilities.audio_device_settings)
-                startTimerHz(5);
+            startTimerHz(5);
             applyCapabilityGrey();
 
             mamidi_help_.setText(
@@ -1960,6 +1963,7 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
                     "指定秒数後に強制消音します。0で無効。"
                     "鍵盤演奏と1秒プレビューの両方に適用します。"));
             output_page->addAndMakeVisible(opll_silence_seconds_);
+            displayed_hardware_fields_ = hardwareFieldValues();
 
             apply_output_.setButtonText(
                 juce::String::fromUTF8("適用"));
@@ -2093,8 +2097,53 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
             }
         }
 
+        std::array<juce::String, 6> hardwareFieldValues() const {
+            return {host_.getText(), port_.getText(), unit_.getText(),
+                scc_plus_.getToggleState() ? "1" : "0",
+                waveform_monitor_.getToggleState() ? "1" : "0",
+                opll_silence_seconds_.getText()};
+        }
+
         void refreshOutputStatus() {
-            const auto caps = session_.snapshot().capabilities;
+            const auto snap = session_.snapshot();
+            const auto caps = snap.capabilities;
+            const bool enabled = !snap.output_switch_pending;
+            const auto values = hardwareFieldValues();
+            auto normalized = values;
+            normalized[0] = values[0].trim();
+            if (normalized[0].isEmpty()) normalized[0] = "localhost";
+            normalized[1] = juce::String(juce::jlimit(1, 65535, values[1].getIntValue()));
+            normalized[2] = juce::String(juce::jlimit(0, 255, values[2].getIntValue()));
+            normalized[5] = juce::String(juce::jlimit(0, 9999, values[5].getIntValue()));
+            hardware_fields_edited_ = hardware_fields_edited_
+                || values != displayed_hardware_fields_;
+            const auto& settings = snap.hardware_settings;
+            const std::array<juce::String, 6> confirmed{
+                juce::String::fromUTF8(settings.host.c_str()),
+                juce::String(settings.port), juce::String(settings.unit_no),
+                settings.scc_plus ? "1" : "0",
+                settings.waveform_monitor ? "1" : "0",
+                juce::String(snap.opll_keyoff_silence_seconds)};
+            if (enabled && (!hardware_fields_edited_ || normalized == confirmed)) {
+                host_.setText(confirmed[0], false);
+                port_.setText(confirmed[1], false);
+                unit_.setText(confirmed[2], false);
+                scc_plus_.setToggleState(settings.scc_plus, juce::dontSendNotification);
+                waveform_monitor_.setToggleState(settings.waveform_monitor, juce::dontSendNotification);
+                opll_silence_seconds_.setText(confirmed[5], false);
+                displayed_hardware_fields_ = confirmed;
+                hardware_fields_edited_ = false;
+            }
+            if (caps.hardware_output || caps.mamidi || caps.vsif) {
+                host_.setEnabled(enabled);
+                port_.setEnabled(enabled);
+                unit_.setEnabled(enabled);
+                scc_plus_.setEnabled(enabled);
+                waveform_monitor_.setEnabled(enabled);
+                opll_silence_seconds_.setEnabled(enabled);
+                apply_output_.setEnabled(enabled);
+                reconnect_.setEnabled(enabled);
+            }
             output_status_.setText(
                 (caps.hardware_output || caps.mamidi)
                     ? statusTextFromUtf8(
@@ -2141,6 +2190,7 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
             // Asynchronous device completion must update an already-open dialog.
             // Follow a completed fallback unless the user has staged a new choice.
             refreshPcAudioStatus();
+            refreshOutputStatus();
         }
 
         void applyCapabilityGrey() {
@@ -2198,6 +2248,8 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
         juce::TextButton reconnect_;
         juce::Label output_status_;
         juce::TextButton close_;
+        std::array<juce::String, 6> displayed_hardware_fields_;
+        bool hardware_fields_edited_{};
         EditorSession& session_;
     };
 
@@ -2352,11 +2404,8 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
                 .getIntValue());
         static_cast<void>(session->output().applyHardwareSettings(
             std::move(settings), silence_seconds));
-        safe_content->opll_silence_seconds_.setText(
-            juce::String(
-                session->snapshot()
-                    .opll_keyoff_silence_seconds),
-            false);
+        // Keep the submitted draft while the accepted operation is pending.
+        // Its completion must not overwrite edits made in another window.
         safe_content->refreshOutputStatus();
         if (midi_changed) midi_changed();
     };
@@ -2377,7 +2426,7 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
             return;
         }
         MGSTC_UI_ACTIVITY(
-            "settings: MAmidiMEmo reconnect (blocking)");
+            "settings: MAmidiMEmo reconnect");
         static_cast<void>(
             session->output().reconnectHardware());
         safe_content->refreshOutputStatus();

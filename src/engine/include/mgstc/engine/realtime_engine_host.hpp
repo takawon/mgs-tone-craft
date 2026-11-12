@@ -42,6 +42,21 @@ struct MAmidiOutputSettings {
     bool waveform_monitor{false};
 };
 
+enum class OutputSnapshotResult : std::uint8_t { Ready, Busy, Unavailable };
+
+struct SoundOutputSnapshot {
+    SoundOutputKind kind{SoundOutputKind::Emulator};
+    SoundOutputKind desired_kind{SoundOutputKind::Emulator};
+    bool owned{};
+    bool connected{};
+    bool switching{};
+    bool close_acknowledged{true};
+    std::uint64_t routing_revision{};
+    MAmidiOutputSettings settings{};
+    std::string status{};
+    std::string error{};
+};
+
 class RealtimeEngineHost {
 public:
     static constexpr std::size_t kCommandCapacity = 256;
@@ -83,6 +98,13 @@ public:
     [[nodiscard]] bool reconnectMAmidi();
     [[nodiscard]] std::string soundOutputStatus() const;
     [[nodiscard]] std::string soundOutputLastError() const;
+    // UI/control value copy. All lock layers are attempted once without
+    // waiting; Busy/Unavailable leave the previous snapshot unchanged.
+    [[nodiscard]] OutputSnapshotResult trySoundOutputSnapshot(
+        SoundOutputSnapshot& snapshot) const;
+    [[nodiscard]] bool hardwareCloseAcknowledged() const noexcept {
+        return mamidi_->closeAcknowledged();
+    }
     [[nodiscard]] SoundOutputKind desiredSoundOutputKind() const noexcept {
         return desired_output_kind_.load(std::memory_order_acquire);
     }
