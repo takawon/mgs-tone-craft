@@ -94,6 +94,18 @@ struct ApplicationTestAccess {
     static juce::AlertWindow* shutdownNotice(Application& app) noexcept {
         return app.audio_shutdown_notice_.get();
     }
+    static void showLauncher(Application& app) {
+        app.midi_service_ = std::make_unique<SharedMidiInputService>(false);
+        app.editor_session_ = std::make_unique<StandaloneEditorContext>(
+            *app.audio_service_, *app.midi_service_);
+        app.showLauncher();
+    }
+    static bool launcherVisible(const Application& app) noexcept {
+        return app.launcher_window_ != nullptr && app.launcher_window_->isVisible();
+    }
+    static void closeLauncher(Application& app) {
+        app.launcher_window_->closeButtonPressed();
+    }
     static void requestQuit(Application& app) { app.requestApplicationQuit(); }
     static void timer(Application& app) { app.timerCallback(); }
     static void shutdown(Application& app) { app.shutdown(); }
@@ -299,6 +311,97 @@ void testCancelShutdownDoesNotResumeClosedGeneration() {
         "Canceled shutdown changed the service Host address");
 }
 
+void testSettingsFollowFallbackAndPreserveUnappliedSelection() {
+    require(mgstcUseIsolatedApplicationDataDirectory(),
+        "Could not isolate settings integration test data");
+    juce::ScopedJuceInitialiser_GUI gui;
+    StageBarrier barrier;
+    WasapiTestHooks hooks;
+    hooks.context = &barrier;
+    hooks.at = stageCallback;
+    SharedAudioService service(true);
+    SharedAudioServiceTestAccess::installHooks(service, &hooks);
+    HookGuard hook_cleanup{barrier};
+    SharedMidiInputService midi(false);
+    StandaloneEditorContext session(service, midi);
+    juce::Component owner;
+    static_cast<void>(service.applyPcAudioSettings(PcAudioBackend::Wasapi, {}));
+    require(pumpUntil(service, [&] {
+        return SharedAudioServiceTestAccess::wasapiActive(service);
+    }), "Settings test could not start fake WASAPI output");
+    require(mgstc::app::showAppSettings(session, owner, 2)
+            == mgstc::app::SnapshotResult::Success,
+        "Could not open the real Output settings dialog");
+    std::unique_ptr<juce::Component> dialog(
+        juce::Component::getCurrentlyModalComponent());
+    require(dialog != nullptr, "Settings dialog did not enter modal state");
+    juce::ComboBox* backend = nullptr;
+    const auto find_backend = [&](auto&& self, juce::Component& component) -> void {
+        if (auto* combo = dynamic_cast<juce::ComboBox*>(&component);
+            combo != nullptr && combo->getNumItems() == 2
+            && combo->getItemText(1) == "ASIO") backend = combo;
+        for (auto* child : component.getChildren()) self(self, *child);
+    };
+    find_backend(find_backend, *dialog);
+    require(backend != nullptr, "Output backend selector was not found");
+    juce::ComboBox* driver = nullptr;
+    juce::TextButton* apply = nullptr;
+    for (auto* child : backend->getParentComponent()->getChildren()) {
+        if (auto* combo = dynamic_cast<juce::ComboBox*>(child);
+            combo != nullptr && combo != backend) driver = combo;
+        if (auto* button = dynamic_cast<juce::TextButton*>(child);
+            button != nullptr && button->getButtonText() == juce::String::fromUTF8("適用"))
+            apply = button;
+    }
+    require(driver != nullptr && apply != nullptr,
+        "Output driver selector or Apply button was not found");
+    // Select a deliberately absent driver: no real ASIO stream is opened.
+    driver->clear(juce::dontSendNotification);
+    driver->addItem("MGSTC absent integration-test ASIO driver", 1);
+    driver->setSelectedId(1, juce::sendNotificationSync);
+    const auto apply_asio_while_exit_pending = [&] {
+        barrier.arm(WasapiTestStage::AfterExitSignal);
+        backend->setSelectedId(2, juce::sendNotificationSync);
+        apply->onClick();
+        require(barrier.waitEntered(),
+            "Applied ASIO request did not wait for the old WASAPI generation");
+        require(backend->getSelectedId() == 2
+                && SharedAudioServiceTestAccess::transitionPending(service),
+            "Applied backend selection did not remain visible while pending");
+    };
+    apply_asio_while_exit_pending();
+    barrier.release();
+    require(pumpUntil(service, [&] {
+        return SharedAudioServiceTestAccess::wasapiActive(service)
+            && backend->getSelectedId() == 1;
+    }), "Completed ASIO failure did not update the applied selection to WASAPI");
+
+    // User ComboBox values change before their asynchronous onChange arrives.
+    // Force the due settings timer to run in that gap, without pumping messages.
+    std::this_thread::sleep_for(350ms);
+    backend->setSelectedId(2, juce::sendNotificationAsync);
+    juce::Timer::callPendingTimersSynchronously();
+    require(backend->getSelectedId() == 2,
+        "Status timer overwrote a user selection before its asynchronous notification");
+
+    apply_asio_while_exit_pending();
+    // An edit after Apply is new user intent, not a stale applied selection.
+    backend->setSelectedId(1, juce::sendNotificationSync);
+    backend->setSelectedId(2, juce::sendNotificationSync);
+    barrier.release();
+    require(pumpUntil(service, [&] {
+        return SharedAudioServiceTestAccess::wasapiActive(service)
+            && service.pcAudioBackend() == PcAudioBackend::Wasapi;
+    }), "Second failed ASIO request did not fall back to WASAPI");
+    static_cast<void>(juce::MessageManager::getInstance()->runDispatchLoopUntil(300));
+    require(backend->getSelectedId() == 2,
+        "Asynchronous status refresh overwrote an unapplied backend edit");
+    dialog.reset();
+    service.requestAudioShutdown();
+    require(pumpUntil(service, [&] { return service.audioShutdownReady(); }),
+        "Settings test did not join its final WASAPI generation");
+}
+
 void testApplicationQuitRemainsPendingThenShutsDownSafely() {
     require(mgstcUseIsolatedApplicationDataDirectory(),
         "Could not create isolated application data for app shutdown test");
@@ -327,8 +430,11 @@ void testApplicationQuitRemainsPendingThenShutsDownSafely() {
             && SharedAudioServiceTestAccess::busy(service);
     }),
         "Initial engine borrow did not reach the shutdown barrier");
+    ApplicationTestAccess::showLauncher(*app);
     const auto initial_quit_request = std::chrono::steady_clock::now();
-    ApplicationTestAccess::requestQuit(*app);
+    ApplicationTestAccess::closeLauncher(*app);
+    require(pumpUntil(service, [&] { return ApplicationTestAccess::quitPending(*app); }),
+        "Closing the launcher bypassed the pending application quit route");
     const auto pending_reply = std::chrono::steady_clock::now();
     require(ApplicationTestAccess::quitPending(*app)
             && ApplicationTestAccess::hasService(*app)
@@ -336,8 +442,18 @@ void testApplicationQuitRemainsPendingThenShutsDownSafely() {
         "Application treated an unjoined worker as a completed quit");
     require(SharedAudioServiceTestAccess::hostAddress(service) == host_address,
         "Application released its Host while the quit was pending");
-    require(ApplicationTestAccess::shutdownNotice(*app) != nullptr,
-        "Application did not keep its pending-quit notice available");
+    require(ApplicationTestAccess::launcherVisible(*app),
+        "Closing the launcher removed the usable window before shutdown was safe");
+    require(ApplicationTestAccess::shutdownNotice(*app) == nullptr,
+        "Pending-quit notice appeared before its one-second delay");
+    ApplicationTestAccess::timer(*app);
+    require(ApplicationTestAccess::shutdownNotice(*app) == nullptr,
+        "Early timer dispatch displayed the pending-quit notice");
+    require(pumpUntil(service, [&] {
+        return ApplicationTestAccess::shutdownNotice(*app) != nullptr;
+    }, 2s), "Application did not display its delayed pending-quit notice");
+    require(std::chrono::steady_clock::now() - initial_quit_request >= 1s,
+        "Pending-quit notice was shown less than one second after closing");
     {
         auto* notice = ApplicationTestAccess::shutdownNotice(*app);
         const auto image = notice->createComponentSnapshot(notice->getLocalBounds());
@@ -358,8 +474,9 @@ void testApplicationQuitRemainsPendingThenShutsDownSafely() {
     while (ApplicationTestAccess::quitPending(*app)
         && std::chrono::steady_clock::now() < cancel_deadline)
         static_cast<void>(manager->runDispatchLoopUntil(1));
-    require(!ApplicationTestAccess::quitPending(*app),
-        "Cancel did not return control to the application");
+    require(!ApplicationTestAccess::quitPending(*app)
+            && ApplicationTestAccess::launcherVisible(*app),
+        "Cancel did not return control to the retained launcher");
     const auto* cancelled_notice = ApplicationTestAccess::shutdownNotice(*app);
     require(cancelled_notice == nullptr || !cancelled_notice->isVisible(),
         "Cancel left the stale shutdown-pending notice visible");
@@ -395,6 +512,8 @@ void testApplicationQuitRemainsPendingThenShutsDownSafely() {
     require(ApplicationTestAccess::quitPending(*app)
             && ApplicationTestAccess::hasService(*app),
         "Retry shutdown released application resources before worker exit");
+    require(ApplicationTestAccess::shutdownNotice(*app) == nullptr,
+        "Retry reused the canceled notice instead of waiting a new second");
     barrier.release();
     require(pumpUntil(service, [&] { return service.audioShutdownReady(); }),
         "Retried generation did not become safe to close");
@@ -425,6 +544,7 @@ struct Case { const wchar_t* name; Test run; };
 constexpr Case cases[] = {
     {L"pending-switch", testPendingSwitchRetargetAndSafeShutdown},
     {L"cancel-close", testCancelShutdownDoesNotResumeClosedGeneration},
+    {L"settings-fallback", testSettingsFollowFallbackAndPreserveUnappliedSelection},
     {L"application-quit", testApplicationQuitRemainsPendingThenShutsDownSafely},
 };
 

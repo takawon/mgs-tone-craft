@@ -2665,8 +2665,11 @@ private:
                 });
             }, [this] {
                 juce::MessageManager::callAsync([this] {
-                    launcher_window_.reset();
-                    if (!anyEditorVisible()) quit();
+                    if (!anyEditorVisible()) {
+                        requestApplicationQuit();
+                    } else {
+                        launcher_window_.reset();
+                    }
                 });
             });
     }
@@ -3595,7 +3598,13 @@ private:
         audio_service_->requestAudioShutdown();
         if (audio_service_->audioShutdownReady()) { quit(); return; }
         audio_shutdown_pending_ = true;
+        audio_shutdown_notice_.reset();
+        audio_shutdown_notice_due_ = std::chrono::steady_clock::now()
+            + std::chrono::seconds(1);
         startTimerHz(10);
+    }
+
+    void showAudioShutdownNotice() {
         audio_shutdown_notice_ = std::make_unique<juce::AlertWindow>(
             juce::String::fromUTF8("終了待ち"),
             juce::String::fromUTF8(
@@ -3691,9 +3700,13 @@ private:
             if (audio_service_->audioShutdownReady()) {
                 audio_shutdown_pending_ = false;
                 stopTimer();
-                audio_shutdown_notice_->exitModalState(0);
+                if (audio_shutdown_notice_ != nullptr)
+                    audio_shutdown_notice_->exitModalState(0);
                 audio_shutdown_notice_.reset();
                 quit();
+            } else if (audio_shutdown_notice_ == nullptr
+                && std::chrono::steady_clock::now() >= audio_shutdown_notice_due_) {
+                showAudioShutdownNotice();
             }
             return;
         }
@@ -3851,6 +3864,7 @@ private:
     std::unique_ptr<SharedAudioService> audio_service_;
     std::unique_ptr<juce::AlertWindow> audio_shutdown_notice_;
     bool audio_shutdown_pending_{};
+    std::chrono::steady_clock::time_point audio_shutdown_notice_due_{};
     std::unique_ptr<SharedMidiInputService> midi_service_;
     std::unique_ptr<StandaloneEditorContext> editor_session_;
     mgstc::app::EditorLink editor_link_;

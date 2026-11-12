@@ -564,14 +564,15 @@ void configureAudibleNote(mgstc::engine::RealtimeEngineHost& host,
     host.drainPendingCommands(drain);
 }
 
-void testMockPerformanceAndLifecycleMeasurements() {
+void testMockPerformanceAndLifecycleMeasurements(bool submit_note = true) {
     using namespace mgstc::engine;
     RealtimeEngineHost host;
     std::uint8_t track{};
     configureAudibleNote(host, track);
     const auto note_on_time = std::chrono::steady_clock::now();
-    require(host.submit(EngineCommand::noteOn(track, 60)),
-        "Could not queue mock performance Note On");
+    if (submit_note)
+        require(host.submit(EngineCommand::noteOn(track, 60)),
+            "Could not queue mock performance Note On");
 
     StageBarrier barrier;
     WasapiTestHooks hooks;
@@ -588,13 +589,15 @@ void testMockPerformanceAndLifecycleMeasurements() {
     require(waitFor([&] { return snapshot(sink).loop_renders >= 8; }),
         "Mock performance stream did not produce enough periods");
     auto state = snapshot(sink);
-    const auto note_latency_ns = state.first_nonzero_pcm_ns
-        - std::chrono::duration_cast<std::chrono::nanoseconds>(
-            note_on_time.time_since_epoch()).count();
+    const auto note_on_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            note_on_time.time_since_epoch()).count());
     require(state.render_runtime_errors == 0,
         "Healthy mock performance stream returned a Runtime error");
-    require(note_latency_ns > 0,
+    require(state.first_nonzero_pcm_ns != 0
+            && state.first_nonzero_pcm_ns >= note_on_ns,
         "Queued Note On did not produce observable nonzero PCM in the mock stream");
+    const auto note_latency_ns = state.first_nonzero_pcm_ns - note_on_ns;
     const auto first_stream_metrics = state;
 
     RealtimeEngineHost direct_host;
@@ -831,6 +834,14 @@ int wmain(int argc, wchar_t** argv) {
 #if defined(MGSTC_WASAPI_TEST_ASAN)
         std::cout << "performance_measurement_skipped=asan_build\n";
 #else
+        bool silence_rejected = false;
+        try {
+            testMockPerformanceAndLifecycleMeasurements(false);
+        } catch (const std::runtime_error& error) {
+            silence_rejected = std::string(error.what())
+                == "Queued Note On did not produce observable nonzero PCM in the mock stream";
+        }
+        require(silence_rejected, "A silent mock stream passed the Note On to PCM measurement");
         testMockPerformanceAndLifecycleMeasurements();
 #endif
         return 0;

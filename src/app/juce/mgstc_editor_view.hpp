@@ -1879,9 +1879,14 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
             pc_audio_status_.setJustificationType(
                 juce::Justification::topLeft);
             output_page->addAndMakeVisible(pc_audio_status_);
+            acceptPcAudioSelection();
             pc_audio_kind_.onChange = [this] {
+                observePcAudioSelectionEdit();
                 const auto asio = pc_audio_kind_.getSelectedId() == 2;
                 asio_driver_.setEnabled(asio);
+            };
+            asio_driver_.onChange = [this] {
+                observePcAudioSelectionEdit();
             };
             asio_driver_.setEnabled(
                 pc_audio_kind_.getSelectedId() == 2);
@@ -2098,7 +2103,28 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
                 juce::dontSendNotification);
         }
 
+        void acceptPcAudioSelection() {
+            pc_audio_selection_edited_ = false;
+            pc_audio_displayed_kind_id_ = pc_audio_kind_.getSelectedId();
+            pc_audio_displayed_driver_ = asio_driver_.getText();
+        }
+
+        void observePcAudioSelectionEdit() {
+            // ComboBox updates its value before delivering its asynchronous onChange.
+            pc_audio_selection_edited_ = pc_audio_selection_edited_
+                || pc_audio_kind_.getSelectedId() != pc_audio_displayed_kind_id_
+                || asio_driver_.getText() != pc_audio_displayed_driver_;
+        }
+
         void refreshPcAudioStatus() {
+            observePcAudioSelectionEdit();
+            if (!pc_audio_selection_edited_) {
+                pc_audio_kind_.setSelectedId(
+                    session_.snapshot().pc_audio_backend == PcAudioBackend::Asio ? 2 : 1,
+                    juce::dontSendNotification);
+                pc_audio_displayed_kind_id_ = pc_audio_kind_.getSelectedId();
+                asio_driver_.setEnabled(pc_audio_kind_.getSelectedId() == 2);
+            }
             pc_audio_status_.setText(
                 statusTextFromUtf8(
                     session_.snapshot().pc_audio_status),
@@ -2113,7 +2139,7 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
 
         void timerCallback() override {
             // Asynchronous device completion must update an already-open dialog.
-            // Do not overwrite the user's not-yet-applied driver/backend choice.
+            // Follow a completed fallback unless the user has staged a new choice.
             refreshPcAudioStatus();
         }
 
@@ -2155,6 +2181,9 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
         juce::Label pc_audio_help_;
         juce::ComboBox pc_audio_kind_;
         juce::ComboBox asio_driver_;
+        bool pc_audio_selection_edited_{false};
+        int pc_audio_displayed_kind_id_{1};
+        juce::String pc_audio_displayed_driver_;
         juce::TextButton asio_settings_;
         juce::Label pc_audio_status_;
         juce::Label mamidi_help_;
@@ -2290,13 +2319,11 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
             : PcAudioBackend::Wasapi;
         const auto driver_name = utf8String(
             safe_content->asio_driver_.getText());
-        if (caps.audio_device_settings
-            && !session->output().applyPcAudio(
+        if (caps.audio_device_settings) {
+            static_cast<void>(session->output().applyPcAudio(
                 pc_backend,
-                driver_name)) {
-            safe_content->pc_audio_kind_.setSelectedId(
-                session->snapshot().pc_audio_backend == PcAudioBackend::Asio ? 2 : 1,
-                juce::sendNotificationSync);
+                driver_name));
+            safe_content->acceptPcAudioSelection();
         }
         safe_content->refreshPcAudioStatus();
 
@@ -2339,11 +2366,6 @@ inline [[nodiscard]] SnapshotResult writeComponentPngSnapshot(
         }
         static_cast<void>(
             session->output().showAsioControlPanel());
-        if (session->snapshot().pc_audio_backend
-            != PcAudioBackend::Asio) {
-            safe_content->pc_audio_kind_.setSelectedId(
-                1, juce::sendNotificationSync);
-        }
         safe_content->refreshPcAudioStatus();
     };
     content->reconnect_.onClick = [safe, safe_content, session, midi_changed] {
