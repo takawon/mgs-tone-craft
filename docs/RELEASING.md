@@ -38,6 +38,8 @@ Docs Prep後に文書・掲載画像・公開禁止情報を監査し、利用�
 
 GitHubトップのREADMEは既定ブランチの内容です。候補のREADMEが既定ブランチにも反映される手順を確認し、Releaseの作成だけでトップが更新されると扱いません。
 
+公開操作ガイド（`docs/USER_GUIDE.md`）も既定ブランチで常時参照されるため、リリースの間は直近の公開版を説明する状態を保ちます。開発中の機能・操作の変更はガイドへ先行して書かず、CHANGELOGの[Unreleased]節へ記録し、Docs Prepでまとめてガイドへ反映して表題の対象版を引き上げます。実装コミットがガイドの対象版や未公開の挙動を先行して変更していた場合は、Docs Prepで直近の公開版の基準へ戻してから候補を確定します。
+
 Prepare／Stage／PublishはREADME・ガイド・画像を自動変更せず、commit／pushも行いません。不整合ならDocs Prepへ戻します。Stageのタグはdraftと同時でも公開参照可能です。READMEのcommit／push段階とタグ作成段階は別で、StageとPublishにはそれぞれ別の指示・承認が必要です。
 
 ## CHANGELOGとRelease Notesを同じ公開版差分から作る
