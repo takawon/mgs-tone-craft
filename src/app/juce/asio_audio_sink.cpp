@@ -25,6 +25,7 @@ namespace {
 // Keep the resampling refill small so a command does not wait for a large
 // source block. At the native engine rate the converter is bypassed below.
 constexpr int kDefaultSourceChunkFrames = 64;
+constexpr std::int32_t kRenderErrorCodeBase = -100;
 
 [[nodiscard]] double chooseSampleRate(
     juce::AudioIODevice& device,
@@ -82,7 +83,6 @@ struct AsioAudioSink::Impl final : juce::AudioIODeviceCallback {
     std::array<std::atomic<std::int32_t>, 4> status_errors{};
     std::atomic<engine::RealtimeEngineHost*> engine{};
     std::atomic<bool> running{};
-    std::atomic<bool> render_failed{};
     std::atomic<bool> format_changed{};
     std::atomic<std::uint32_t> master_volume_percent{100};
     std::vector<float> direct_interleaved;
@@ -110,12 +110,32 @@ struct AsioAudioSink::Impl final : juce::AudioIODeviceCallback {
             std::memory_order_release);
     }
 
+    // Called only after the previous ASIO callbacks have stopped and before
+    // starting the next stream. Preserve unrelated pending status kinds.
+    void resetDeviceErrorForStart() noexcept {
+        constexpr auto index = static_cast<std::size_t>(AudioSinkStatusType::DeviceError);
+        status_errors[index].store(0, std::memory_order_relaxed);
+        pending_statuses.fetch_and(~(1U << static_cast<std::uint32_t>(index)),
+            std::memory_order_acq_rel);
+    }
+
+    [[nodiscard]] bool renderHost(std::span<float> output) noexcept {
+        auto* host = engine.load(std::memory_order_acquire);
+        if (host == nullptr) return false;
+        const auto result = host->render(output);
+        // Tick-level program errors already silence the remaining frames.
+        // Keep the completed PCM and stream alive, as in the WASAPI path.
+        if (result.ok() || result.error == mgstc::engine::RenderError::Runtime) return true;
+        // Fixed data only: Message-side polling performs recovery and text.
+        push(AudioSinkStatusType::DeviceError,
+            kRenderErrorCodeBase - static_cast<std::int32_t>(result.error));
+        return false;
+    }
+
     [[nodiscard]] static bool renderSource(
         void* context,
         std::span<float> output) noexcept {
-        auto* self = static_cast<Impl*>(context);
-        auto* host = self->engine.load(std::memory_order_acquire);
-        return host != nullptr && host->render(output).ok();
+        return static_cast<Impl*>(context)->renderHost(output);
     }
 
     void audioDeviceIOCallbackWithContext(
@@ -155,11 +175,8 @@ struct AsioAudioSink::Impl final : juce::AudioIODeviceCallback {
         bool rendered = false;
         if (direct_render
             && frames <= direct_interleaved.size() / 2U) {
-            auto* host = engine.load(std::memory_order_acquire);
-            rendered = host != nullptr
-                && host->render(std::span<float>(
-                    direct_interleaved.data(),
-                    frames * 2U)).ok();
+            rendered = renderHost(std::span<float>(
+                direct_interleaved.data(), frames * 2U));
             if (rendered) {
                 for (std::size_t frame = 0; frame < frames; ++frame) {
                     output_channel_data[0][frame]
@@ -396,7 +413,7 @@ bool AsioAudioSink::start(engine::RealtimeEngineHost& engine) {
     }
 
     impl_->converter.reset();
-    impl_->render_failed.store(false, std::memory_order_relaxed);
+    impl_->resetDeviceErrorForStart();
     impl_->format_changed.store(false, std::memory_order_release);
     impl_->engine.store(&engine, std::memory_order_release);
     impl_->device->start(impl_.get());
@@ -504,14 +521,18 @@ std::string AsioAudioSink::statusText() const {
     if (impl_->format_changed.load(std::memory_order_acquire)) {
         return "ASIO format changed; stop and reopen the driver";
     }
-    if (impl_->render_failed.load(std::memory_order_relaxed)) {
-        return "ASIO stopped rendering after an engine error";
-    }
     const std::scoped_lock lock(impl_->text_mutex);
     return impl_->status_text;
 }
 
 std::string AsioAudioSink::lastError() const {
+    const auto native_error = impl_->status_errors[
+        static_cast<std::size_t>(AudioSinkStatusType::DeviceError)]
+        .load(std::memory_order_acquire);
+    if (native_error == kRenderErrorCodeBase - static_cast<std::int32_t>(engine::RenderError::InvalidBuffer))
+        return "ASIO engine rendering received an invalid buffer";
+    if (native_error == kRenderErrorCodeBase - static_cast<std::int32_t>(engine::RenderError::ChipWrite))
+        return "ASIO engine rendering could not write a sound-chip register";
     const std::scoped_lock lock(impl_->text_mutex);
     return impl_->last_error;
 }
@@ -526,5 +547,36 @@ void AsioAudioSink::setMasterVolumePercent(
 std::uint32_t AsioAudioSink::masterVolumePercent() const noexcept {
     return impl_->master_volume_percent.load(std::memory_order_relaxed);
 }
+
+
+#if defined(MGSTC_STANDALONE_AUDIO_TESTING)
+bool detail::AsioAudioSinkTestAccess::prepare(
+    AsioAudioSink& sink, engine::RealtimeEngineHost& host,
+    double sample_rate, std::size_t frames) {
+    auto& impl = *sink.impl_;
+    if (!impl.converter.prepare(sample_rate, kDefaultSourceChunkFrames)) return false;
+    impl.direct_render = std::abs(sample_rate - StereoSampleRateConverter::kSourceSampleRate) <= 0.5;
+    impl.direct_interleaved.assign(frames * 2U, 0.0F);
+    impl.resetDeviceErrorForStart();
+    impl.format_changed.store(false, std::memory_order_release);
+    impl.engine.store(&host, std::memory_order_release);
+    return true;
+}
+
+void detail::AsioAudioSinkTestAccess::callback(
+    AsioAudioSink& sink, float* left, float* right, int frames) {
+    float* channels[]{left, right};
+    sink.impl_->audioDeviceIOCallbackWithContext(nullptr, 0, channels, 2, frames, {});
+}
+
+bool detail::AsioAudioSinkTestAccess::renderSource(
+    AsioAudioSink& sink, std::span<float> samples) {
+    return AsioAudioSink::Impl::renderSource(sink.impl_.get(), samples);
+}
+
+void detail::AsioAudioSinkTestAccess::stopped(AsioAudioSink& sink) {
+    sink.impl_->audioDeviceStopped();
+}
+#endif
 
 }  // namespace mgstc::audio

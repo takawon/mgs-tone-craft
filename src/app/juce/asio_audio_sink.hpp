@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <memory>
+#if defined(MGSTC_STANDALONE_AUDIO_TESTING)
+#include <span>
+#endif
 #include <string>
 #include <string_view>
 #include <vector>
@@ -9,6 +12,9 @@
 #include "mgstc/audio/audio_sink.hpp"
 
 namespace mgstc::audio {
+#if defined(MGSTC_STANDALONE_AUDIO_TESTING)
+namespace detail { struct AsioAudioSinkTestAccess; }
+#endif
 
 class AsioAudioSink final : public AudioSink {
 public:
@@ -43,8 +49,22 @@ public:
     [[nodiscard]] std::uint32_t masterVolumePercent() const noexcept;
 
 private:
+#if defined(MGSTC_STANDALONE_AUDIO_TESTING)
+    friend struct detail::AsioAudioSinkTestAccess;
+#endif
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+#if defined(MGSTC_STANDALONE_AUDIO_TESTING)
+namespace detail {
+struct AsioAudioSinkTestAccess {
+    static bool prepare(AsioAudioSink&, engine::RealtimeEngineHost&, double, std::size_t);
+    static void callback(AsioAudioSink&, float*, float*, int);
+    static bool renderSource(AsioAudioSink&, std::span<float>);
+    static void stopped(AsioAudioSink&);
+};
+}  // namespace detail
+#endif
 
 }  // namespace mgstc::audio

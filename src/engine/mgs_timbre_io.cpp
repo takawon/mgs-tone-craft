@@ -315,6 +315,9 @@ parseMgsSccDefinition(std::string_view text) {
         for (std::size_t offset = 0;
              offset < value.size();
              offset += 2) {
+            if (bytes.size() == 32) {
+                return std::nullopt;
+            }
             std::uint8_t parsed{};
             if (!parseHexByte(
                     std::string_view(value).substr(offset, 2),

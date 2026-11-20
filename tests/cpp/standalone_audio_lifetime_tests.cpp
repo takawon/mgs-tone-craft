@@ -10,6 +10,7 @@
 // and substitutes only the WASAPI device API.
 #include "../../src/app/juce/main.cpp"
 #include "realtime_engine_host_test_access.hpp"
+#include "mgstc/audio/stereo_sample_rate_converter.hpp"
 
 #include <windows.h>
 
@@ -203,6 +204,123 @@ bool pumpUntil(SharedAudioService& service,
     }
     SharedAudioServiceTestAccess::advance(service);
     return predicate();
+}
+
+
+void testAsioRuntimePreservesPcmAndNotifiesOtherRenderErrors() {
+    using namespace mgstc::engine;
+    using mgstc::audio::AsioAudioSink;
+    using mgstc::audio::AudioSinkStatus;
+    using mgstc::audio::AudioSinkStatusType;
+    using mgstc::audio::detail::AsioAudioSinkTestAccess;
+    const auto install_fault = [](RealtimeEngineHost& target) {
+        auto edit = target.beginProgramEdit();
+        require(edit.valid(), "ASIO runtime fixture could not edit a program");
+        require(edit.engine->session().setSequenceEnvelope(0, {0xef, 2, 0x7f}),
+            "ASIO runtime fixture could not set the existing invalid-patch sequence");
+        require(target.submitProgram(edit), "ASIO runtime fixture could not submit a program");
+        require(target.submit(EngineCommand::noteOn(0, 24)), "ASIO runtime fixture could not start the note");
+    };
+    for (const double rate : {48'000.0, 44'100.0}) {
+        auto host = std::make_unique<RealtimeEngineHost>();
+        auto reference = std::make_unique<RealtimeEngineHost>();
+        install_fault(*host);
+        install_fault(*reference);
+        AsioAudioSink sink;
+        constexpr int frames = 4096;
+        require(AsioAudioSinkTestAccess::prepare(sink, *host, rate, frames),
+            "ASIO fixture could not prepare the actual callback buffers");
+        std::array<float, frames> left{}, right{};
+        AsioAudioSinkTestAccess::callback(sink, left.data(), right.data(), frames);
+        struct ReferenceContext {
+            RealtimeEngineHost* host{};
+            unsigned runtime_errors{};
+            bool silent_remainder{true};
+        } reference_context{reference.get()};
+        const auto render_reference = [](void* context, std::span<float> output) noexcept {
+            auto& state = *static_cast<ReferenceContext*>(context);
+            const auto result = state.host->render(output);
+            if (result.error == RenderError::Runtime) {
+                ++state.runtime_errors;
+                state.silent_remainder = state.silent_remainder
+                    && result.frames <= output.size() / 2
+                    && std::all_of(output.begin() + static_cast<std::ptrdiff_t>(
+                        std::min(result.frames * 2, output.size())), output.end(),
+                        [](float sample) { return sample == 0.0F; });
+                return true;
+            }
+            return result.ok();
+        };
+        std::array<float, frames> expected_left{}, expected_right{};
+        if (rate == 48'000.0) {
+            std::array<float, frames * 2> interleaved{};
+            require(render_reference(&reference_context, interleaved), "Direct Runtime reference failed");
+            for (std::size_t frame = 0; frame < expected_left.size(); ++frame) {
+                expected_left[frame] = interleaved[frame * 2];
+                expected_right[frame] = interleaved[frame * 2 + 1];
+            }
+        } else {
+            mgstc::audio::StereoSampleRateConverter converter;
+            require(converter.prepare(rate, 64), "SRC Runtime reference could not prepare");
+            require(converter.process(expected_left.data(), expected_right.data(), frames,
+                {.context = &reference_context, .render = render_reference}), "SRC Runtime reference failed");
+        }
+        require(reference_context.runtime_errors != 0 && reference_context.silent_remainder,
+            "Reference did not preserve the failed Host render's silent remainder");
+        require(std::any_of(left.begin(), left.begin() + 1200,
+            [](float sample) { return std::abs(sample) > 1.0e-6F; }),
+            "ASIO discarded PCM completed before a Runtime failure");
+        require(left == expected_left && right == expected_right,
+            "ASIO Runtime PCM differs from independent Host/standard SRC reference");
+        std::cout << "ASIO Runtime exact PCM rate=" << rate
+            << " failed_source_renders=" << reference_context.runtime_errors << '\n';
+        AudioSinkStatus status;
+        require(!sink.pollStatus(status), "ASIO classified a Runtime failure as a device fault");
+        bool runtime_notice = false;
+        EngineNotice notice;
+        while (host->pollNotice(notice))
+            runtime_notice = runtime_notice || (notice.type == EngineNoticeType::RenderFailure
+                && notice.render_error == RenderError::Runtime);
+        require(runtime_notice, "ASIO fixture did not actually encounter the engine Runtime failure");
+        auto recovered = host->beginProgramEdit();
+        require(recovered.valid(), "ASIO fixture could not edit a recovery program");
+        require(recovered.engine->session().setSequenceEnvelope(0, {0x0f}),
+            "ASIO fixture could not set a valid recovery sequence");
+        require(host->submitProgram(recovered), "ASIO fixture could not submit the recovery program");
+        require(host->submit(EngineCommand::noteOn(0, 24)), "ASIO fixture could not start the recovery note");
+        AsioAudioSinkTestAccess::callback(sink, left.data(), right.data(), frames);
+        require(std::any_of(left.begin(), left.end(), [](float sample) { return std::abs(sample) > 1.0e-6F; }),
+            "ASIO did not render the next valid program after a Runtime failure");
+        require(!sink.pollStatus(status), "ASIO recovery from Runtime published a device fault");
+        // Use the actual host's InvalidBuffer path rather than a mirrored
+        // classification predicate. This source callback is shared by SRC.
+        std::array<float, 3> odd_samples{};
+        require(!AsioAudioSinkTestAccess::renderSource(sink, odd_samples),
+            "ASIO accepted the host's InvalidBuffer failure");
+        require(sink.pollStatus(status) && status.type == AudioSinkStatusType::DeviceError
+            && status.native_error == -100 - static_cast<std::int32_t>(RenderError::InvalidBuffer),
+            "ASIO did not publish the exact non-Runtime failure to the control side");
+        require(sink.lastError().find("invalid buffer") != std::string::npos,
+            "ASIO non-realtime diagnosis lost the render failure kind");
+        // Leave a new fault unpolled, then stop and prepare the next stream.
+        // The real start helper must discard only that old DeviceError bit.
+        require(!AsioAudioSinkTestAccess::renderSource(sink, odd_samples),
+            "ASIO restart fixture did not queue the second render failure");
+        AsioAudioSinkTestAccess::stopped(sink);
+        require(AsioAudioSinkTestAccess::prepare(sink, *host, rate, frames),
+            "ASIO restart fixture could not prepare the next stream");
+        require(sink.lastError().find("invalid buffer") == std::string::npos,
+            "ASIO restart retained the old render failure value");
+        require(sink.pollStatus(status) && status.type == AudioSinkStatusType::Stopped,
+            "ASIO restart erased an unrelated pending status");
+        require(!sink.pollStatus(status),
+            "ASIO restart replayed a stale unpolled DeviceError");
+        AsioAudioSinkTestAccess::callback(sink, left.data(), right.data(), frames);
+        require(std::any_of(left.begin(), left.end(), [](float sample) { return std::abs(sample) > 1.0e-6F; }),
+            "ASIO restart did not preserve rendering of the valid program");
+        require(!sink.pollStatus(status),
+            "ASIO restarted valid callback published a device fault");
+    }
 }
 
 void testPendingSwitchRetargetAndSafeShutdown() {
@@ -736,6 +854,7 @@ constexpr Case cases[] = {
     {L"output-dialog-draft", testOutputDialogFollowsCompletionAndKeepsDraft},
     {L"output-active-destruction", testServiceDestructionWaitsForActiveOutputRequest},
     {L"manual-output", testManualOutputSettingsStayResponsiveAndPersistValues},
+    {L"asio-runtime-pcm", testAsioRuntimePreservesPcmAndNotifiesOtherRenderErrors},
     {L"pending-switch", testPendingSwitchRetargetAndSafeShutdown},
     {L"cancel-close", testCancelShutdownDoesNotResumeClosedGeneration},
     {L"settings-fallback", testSettingsFollowFallbackAndPreserveUnappliedSelection},

@@ -6,6 +6,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -287,17 +288,20 @@ struct MusicUseEvent {
 void applyMusicEnvelopeEvents(
     std::vector<MusicUseEvent>& events,
     bool rhythm_on,
-    std::map<unsigned, tone_import_detail::EnvelopeChipUse>& usage) {
+    std::map<unsigned, tone_import_detail::EnvelopeChipUse>& usage,
+    bool mml_source_order = false) {
     std::sort(
         events.begin(),
         events.end(),
-        [](const MusicUseEvent& left, const MusicUseEvent& right) {
+        [mml_source_order](const MusicUseEvent& left, const MusicUseEvent& right) {
             if (left.tick != right.tick) {
                 return left.tick < right.tick;
             }
             // Rhythm is chip-global. y14 and @e may sit on different of
             // OPLL ch 7/8/9, so apply every y14 at this tick before @e.
-            if (left.kind != right.kind) {
+            if (left.kind != right.kind
+                && (!mml_source_order || left.kind == MusicUseEvent::Kind::Rhythm
+                    || right.kind == MusicUseEvent::Kind::Rhythm)) {
                 return left.kind < right.kind;
             }
             if (left.track != right.track) {
@@ -512,6 +516,7 @@ void collectBinaryMusicEnvelopeUse(
     }
     unsigned value = 0;
     bool digits = false;
+    bool overflow = false;
     while (position < text.size()) {
         const auto character =
             static_cast<unsigned char>(text[position]);
@@ -528,11 +533,16 @@ void collectBinaryMusicEnvelopeUse(
             break;
         }
         digits = true;
-        value = value * static_cast<unsigned>(base)
-            + static_cast<unsigned>(digit);
+        const auto unsigned_digit = static_cast<unsigned>(digit);
+        const auto unsigned_base = static_cast<unsigned>(base);
+        if (!overflow) {
+            if (value > (std::numeric_limits<unsigned>::max() - unsigned_digit) / unsigned_base)
+                overflow = true;
+            else value = value * unsigned_base + unsigned_digit;
+        }
         ++position;
     }
-    if (!digits) {
+    if (!digits || overflow) {
         return std::nullopt;
     }
     return value;
@@ -601,13 +611,17 @@ void collectBinaryMusicEnvelopeUse(
     const auto character = static_cast<unsigned char>(code[position]);
     if (std::isdigit(character)) {
         unsigned track = 0;
+        bool overflow = false;
         while (position < code.size()
                && std::isdigit(static_cast<unsigned char>(code[position]))) {
-            track = track * 10U
-                + static_cast<unsigned>(code[position] - '0');
+            const auto digit = static_cast<unsigned>(code[position] - '0');
+            if (!overflow) {
+                if (track > (std::numeric_limits<unsigned>::max() - digit) / 10U) overflow = true;
+                else track = track * 10U + digit;
+            }
             ++position;
         }
-        return track;
+        return overflow ? std::nullopt : std::optional<unsigned>{track};
     }
     if ((character >= 'A' && character <= 'H')
         || (character >= 'a' && character <= 'h')) {
@@ -619,143 +633,352 @@ void collectBinaryMusicEnvelopeUse(
     return std::nullopt;
 }
 
+// No binary-MGS or public interface changes are required by this reader.
+struct MmlUseTrack {
+    std::string code;
+    std::uint32_t steps{};
+    std::uint32_t default_steps{kMgscQuarterSteps};
+    int seq{};
+    bool uncertain{};
+};
+
+// Compare actual interrupt counts for a fixed supported tempo, including
+// quantisation that can put different score positions on the same tick.
+std::uint32_t mmlUseTick(std::uint32_t steps, unsigned tempo) {
+    const std::uint64_t whole_ticks = 14400U / tempo;
+    return static_cast<std::uint32_t>(
+        (steps / kMgscWholeSteps) * whole_ticks
+        + ((steps % kMgscWholeSteps) * whole_ticks + 96U) / kMgscWholeSteps);
+}
+
+bool readMmlUseLength(std::string_view code, std::size_t& position,
+    std::uint32_t fallback, std::uint32_t& steps, unsigned tempo) {
+    while (position < code.size() && std::isspace(static_cast<unsigned char>(code[position]))) ++position;
+    const bool absolute = position < code.size() && code[position] == '%';
+    if (absolute) ++position;
+    if (position < code.size() && std::isdigit(static_cast<unsigned char>(code[position]))) {
+        const auto value = parseMmlInteger(code, position);
+        if (!value || *value == 0 || *value > 256U) return false;
+        if (!absolute && (*value > std::min<unsigned>(kMgscWholeSteps, 14400U / tempo)
+            || (kMgscWholeSteps % *value) != 0U)) return false;
+        steps = absolute ? *value : kMgscWholeSteps / *value;
+    } else {
+        if (absolute) return false;
+        steps = fallback;
+    }
+    auto dot = steps;
+    while (position < code.size() && code[position] == '.') {
+        // Never invent the compiler's rounding for a fractional score step.
+        if ((dot & 1U) != 0U) return false;
+        dot /= 2U;
+        if (dot == 0 || steps > 256U - dot) return false;
+        steps += dot;
+        ++position;
+    }
+    return steps != 0 && steps <= 256U;
+}
+
 void collectMmlEnvelopeUse(
     std::string_view text,
-    std::map<unsigned, tone_import_detail::EnvelopeChipUse>& usage) {
-    std::vector<MusicUseEvent> events;
+    std::map<unsigned, tone_import_detail::EnvelopeChipUse>& usage,
+    std::vector<ImportWarning>& warnings) {
+    std::array<MmlUseTrack, 18> tracks;
+    unsigned tempo = kMgscDefaultTempo;
+    bool have_tempo = false;
+    bool global_uncertain = false;
+    bool any_uncertain = false;
+    int definition_depth = 0;
+    std::set<std::string> reasons;
+    const auto warn = [&](std::string reason) { reasons.insert(std::move(reason)); };
     std::size_t line_begin = 0;
     while (line_begin <= text.size()) {
         const auto line_end = text.find_first_of("\r\n", line_begin);
-        const auto line = text.substr(
-            line_begin,
-            (line_end == std::string_view::npos ? text.size() : line_end)
-                - line_begin);
-        const auto comment = line.find(';');
-        const auto code = line.substr(
-            0, comment == std::string_view::npos ? line.size() : comment);
+        auto code = text.substr(line_begin,
+            (line_end == std::string_view::npos ? text.size() : line_end) - line_begin);
+        code = code.substr(0, code.find(';'));
         std::size_t position = 0;
-        while (position < code.size()
-               && std::isspace(static_cast<unsigned char>(code[position]))) {
-            ++position;
-        }
-        const auto track = parseMmlTrackNumber(code, position);
-        if (track && sourceForMusicTrack(*track)) {
-            std::uint32_t tick = 0;
-            int seq = 0;
-            while (position < code.size()) {
-                const auto character =
-                    static_cast<unsigned char>(code[position]);
-                if (std::isspace(character)) {
-                    ++position;
-                    continue;
+        while (position < code.size() && std::isspace(static_cast<unsigned char>(code[position]))) ++position;
+        const auto directive = code.substr(position);
+        if (definition_depth != 0 || (!directive.empty() && (directive.front() == '@' || directive.front() == '*'))) {
+            for (const auto character : directive) {
+                if (character == '{') ++definition_depth;
+                if (character == '}') definition_depth = std::max(0, definition_depth - 1);
+            }
+        } else if (lineStartsWithIgnoreCase(directive, "#opll_mode")) {
+            position += 10;
+            const auto mode = parseMmlInteger(code, position);
+            while (position < code.size() && std::isspace(static_cast<unsigned char>(code[position]))) ++position;
+            if (!mode || *mode > 1U || position != code.size()) {
+                global_uncertain = true;
+                warn("invalid OPLL mode directive");
+            }
+        } else if (lineStartsWithIgnoreCase(directive, "#tempo")) {
+            position += 6;
+            const auto value = parseMmlInteger(code, position);
+            while (position < code.size() && std::isspace(static_cast<unsigned char>(code[position]))) ++position;
+            if (!value || *value < kMgscTempoMin || *value > kMgscTempoMax
+                || (have_tempo && *value != tempo) || position != code.size()) {
+                global_uncertain = true;
+                warn("unsupported or ambiguous tempo directive");
+            } else {
+                tempo = *value;
+                have_tempo = true;
+            }
+        } else {
+            const auto selector_end = code.find_first_of(" \t", position);
+            const auto selector = code.substr(position,
+                (selector_end == std::string_view::npos ? code.size() : selector_end) - position);
+            std::set<unsigned> selected;
+            auto numeric_position = position;
+            const auto numeric_track = parseMmlTrackNumber(code, numeric_position);
+            // Keep the existing decimal 10..17 aliases, alongside the source
+            // format's documented adjacent single-character track selectors.
+            if (numeric_track && sourceForMusicTrack(*numeric_track)
+                && numeric_position == position + selector.size()) selected.insert(*numeric_track);
+            else if (numeric_track || numeric_position != position + selector.size()) {
+                for (const auto character : selector) {
+                    std::size_t one = 0;
+                    const auto value = parseMmlTrackNumber(std::string_view(&character, 1), one);
+                    if (!value || !sourceForMusicTrack(*value)) { selected.clear(); break; }
+                    selected.insert(*value);
                 }
-                if (character == 'y' || character == 'Y') {
-                    auto cursor = position + 1;
-                    const auto reg = parseMmlInteger(code, cursor);
-                    while (cursor < code.size()
-                           && std::isspace(
-                               static_cast<unsigned char>(code[cursor]))) {
-                        ++cursor;
-                    }
-                    if (reg && cursor < code.size() && code[cursor] == ',') {
-                        ++cursor;
-                        if (const auto data = parseMmlInteger(code, cursor)) {
-                            if (isOpllRhythmControlWrite(*track, *reg)) {
-                                events.push_back({
-                                    .tick = tick,
-                                    .track = static_cast<int>(*track),
-                                    .seq = seq++,
-                                    .kind = MusicUseEvent::Kind::Rhythm,
-                                    .rhythm_on =
-                                        (*data & kOpllRhythmModeBit) != 0,
-                                });
-                            }
-                            position = cursor;
-                            continue;
-                        }
-                    }
-                    ++position;
-                    continue;
+            }
+            if (!selected.empty() && selector_end != std::string_view::npos)
+                for (const auto track : selected) {
+                    tracks[track].code.append(code.substr(selector_end));
+                    tracks[track].code.push_back(' ');
                 }
-                if (character == '@') {
-                    auto cursor = position + 1;
-                    if (cursor < code.size()
-                        && (code[cursor] == 'e' || code[cursor] == 'E'
-                            || code[cursor] == 'r' || code[cursor] == 'R')) {
-                        ++cursor;
-                        unsigned number = 0;
-                        bool digits = false;
-                        while (cursor < code.size()
-                               && std::isdigit(
-                                   static_cast<unsigned char>(code[cursor]))) {
-                            digits = true;
-                            number = number * 10U
-                                + static_cast<unsigned>(code[cursor] - '0');
-                            ++cursor;
-                        }
-                        if (digits) {
-                            events.push_back({
-                                .tick = tick,
-                                .track = static_cast<int>(*track),
-                                .seq = seq++,
-                                .kind = MusicUseEvent::Kind::Envelope,
-                                .number = number,
-                            });
-                        }
-                        position = cursor;
-                        continue;
-                    }
-                    if (cursor < code.size()
-                        && (code[cursor] == 'p' || code[cursor] == 'P'
-                            || code[cursor] == 's' || code[cursor] == 'S'
-                            || code[cursor] == 'v' || code[cursor] == 'V'
-                            || code[cursor] == '\\')) {
-                        position = cursor;
-                        continue;
-                    }
-                    unsigned number = 0;
-                    bool digits = false;
-                    while (cursor < code.size()
-                           && std::isdigit(
-                               static_cast<unsigned char>(code[cursor]))) {
-                        digits = true;
-                        number = number * 10U
-                            + static_cast<unsigned>(code[cursor] - '0');
-                        ++cursor;
-                    }
-                    if (digits) {
-                        events.push_back({
-                            .tick = tick,
-                            .track = static_cast<int>(*track),
-                            .seq = seq++,
-                            .kind = MusicUseEvent::Kind::Patch,
-                            .number = number,
-                        });
-                    }
-                    position = cursor;
-                    continue;
-                }
-                const auto note = static_cast<char>(std::tolower(character));
-                if (note == 'c' || note == 'd' || note == 'e' || note == 'f'
-                    || note == 'g' || note == 'a' || note == 'b'
-                    || note == 'r') {
-                    ++tick;
-                }
-                ++position;
+            else if (!directive.empty() && directive.front() == '#'
+                && !lineStartsWithIgnoreCase(directive, "#opll_mode")
+                && !lineStartsWithIgnoreCase(directive, "#title")
+                && !lineStartsWithIgnoreCase(directive, "#composer")
+                && !lineStartsWithIgnoreCase(directive, "#arranger")
+                && !lineStartsWithIgnoreCase(directive, "#memo")
+                && !lineStartsWithIgnoreCase(directive, "#machine_id")
+                && !lineStartsWithIgnoreCase(directive, "#macro_offset")) {
+                global_uncertain = true;
+                warn("unsupported source directive");
+            }
+            else if (selected.empty() && !directive.empty() && directive.front() != '#') {
+                global_uncertain = true;
+                warn("invalid or unsupported track selector");
             }
         }
-        if (line_end == std::string_view::npos) {
-            break;
-        }
+        if (line_end == std::string_view::npos) break;
         line_begin = line_end + 1;
-        if (line_end < text.size()
-            && text[line_end] == '\r'
-            && line_end + 1 < text.size()
-            && text[line_end + 1] == '\n') {
-            line_begin = line_end + 2;
-        }
+        if (text[line_end] == '\r' && line_begin < text.size() && text[line_begin] == '\n') ++line_begin;
     }
-    applyMusicEnvelopeEvents(events, mmlHeaderRhythmMode(text), usage);
+
+    std::vector<MusicUseEvent> events;
+    for (unsigned number = 1; number < tracks.size(); ++number) {
+        auto& track = tracks[number];
+        std::size_t position = 0;
+        std::size_t commands = 0;
+        struct Repeat { std::size_t start, end, after; unsigned remaining; };
+        std::vector<Repeat> repeats;
+        bool track_finished = false;
+        const auto fail = [&](std::string reason) {
+            track.uncertain = true;
+            any_uncertain = true;
+            warn("track " + std::to_string(number) + ": " + std::move(reason));
+        };
+        const auto event = [&](MusicUseEvent::Kind kind, unsigned value, bool rhythm = false) {
+            events.push_back({.tick = mmlUseTick(track.steps, tempo),
+                .track = static_cast<int>(number), .seq = track.seq++,
+                .kind = kind, .number = value, .rhythm_on = rhythm});
+        };
+        while (position < track.code.size() && !track.uncertain) {
+            if (++commands > 100000U) { fail("timing command budget exceeded"); break; }
+            const auto c = static_cast<char>(std::tolower(static_cast<unsigned char>(track.code[position])));
+            if (std::isspace(static_cast<unsigned char>(c))) { ++position; continue; }
+            if (c == '!') { track_finished = true; break; }
+            if (c == '[') {
+                auto start = position + 1;
+                while (start < track.code.size() && std::isspace(static_cast<unsigned char>(track.code[start]))) ++start;
+                std::optional<unsigned> prefix;
+                if (start < track.code.size() && std::isdigit(static_cast<unsigned char>(track.code[start]))) {
+                    prefix = parseMmlInteger(track.code, start);
+                    if (!prefix) { fail("invalid repeat count"); continue; }
+                }
+                std::size_t end = start;
+                unsigned depth = 1;
+                while (end < track.code.size() && depth != 0) {
+                    if (++commands > 100000U) break;
+                    if (track.code[end] == '[') ++depth;
+                    if (track.code[end] == ']') --depth;
+                    if (depth != 0) ++end;
+                }
+                if (depth != 0 || commands > 100000U || repeats.size() >= 16) {
+                    fail("unclosed repeat, nesting limit or timing budget exceeded"); continue;
+                }
+                auto after = end + 1;
+                while (after < track.code.size() && std::isspace(static_cast<unsigned char>(track.code[after]))) ++after;
+                std::optional<unsigned> suffix;
+                if (after < track.code.size() && std::isdigit(static_cast<unsigned char>(track.code[after]))) {
+                    suffix = parseMmlInteger(track.code, after);
+                    if (!suffix) { fail("invalid repeat count"); continue; }
+                }
+                if ((prefix && suffix) || (prefix && *prefix > 255U) || (suffix && *suffix > 255U)) {
+                    fail("invalid repeat count"); continue;
+                }
+                const auto count = prefix.value_or(suffix.value_or(2U));
+                if (count == 0) { fail("infinite repeat is not supported for timing analysis"); continue; }
+                repeats.push_back({start, end, after, count});
+                position = start;
+                continue;
+            }
+            if (c == ']') {
+                if (repeats.empty() || repeats.back().end != position) {
+                    fail("unmatched repeat end"); continue;
+                }
+                if (--repeats.back().remaining != 0) position = repeats.back().start;
+                else { position = repeats.back().after; repeats.pop_back(); }
+                continue;
+            }
+            if (c == '|') {
+                if (repeats.empty()) { fail("repeat break outside a repeat"); continue; }
+                if (repeats.back().remaining == 1) {
+                    position = repeats.back().after;
+                    repeats.pop_back();
+                } else ++position;
+                continue;
+            }
+            if (c == 'y') {
+                ++position;
+                const auto reg = parseMmlInteger(track.code, position);
+                while (position < track.code.size() && std::isspace(static_cast<unsigned char>(track.code[position]))) ++position;
+                if (!reg || *reg > 255U || position >= track.code.size() || track.code[position++] != ',') {
+                    fail("invalid register write"); continue;
+                }
+                const auto value = parseMmlInteger(track.code, position);
+                if (!value || *value > 255U) { fail("invalid register data"); continue; }
+                if (isOpllRhythmControlWrite(number, *reg))
+                    event(MusicUseEvent::Kind::Rhythm, 0, (*value & kOpllRhythmModeBit) != 0);
+                continue;
+            }
+            if (c == '@') {
+                ++position;
+                if (position >= track.code.size()) { fail("incomplete instrument command"); continue; }
+                const auto type = static_cast<char>(std::tolower(static_cast<unsigned char>(track.code[position])));
+                if (type == 'e' || type == 'r') {
+                    ++position;
+                    const auto value = parseMmlInteger(track.code, position);
+                    if (!value || *value > 31U) { fail("invalid envelope selection"); continue; }
+                    event(MusicUseEvent::Kind::Envelope, *value);
+                    continue;
+                }
+                if (std::isdigit(static_cast<unsigned char>(type))) {
+                    const auto value = parseMmlInteger(track.code, position);
+                    if (!value || *value > 31U) { fail("invalid instrument selection"); continue; }
+                    event(MusicUseEvent::Kind::Patch, *value);
+                    continue;
+                }
+                if (type == 'p' || type == '\\' || type == 'l' || type == 'o') {
+                    ++position;
+                    if (position < track.code.size() && (track.code[position] == '+' || track.code[position] == '-')) ++position;
+                    if (!parseMmlInteger(track.code, position)) fail("invalid zero-time instrument parameter");
+                    continue;
+                }
+                if (type == 'f') { ++position; continue; }
+                fail("unsupported instrument command");
+                continue;
+            }
+            if ((c >= 'a' && c <= 'g') || c == 'r') {
+                ++position;
+                if (c != 'r' && position < track.code.size()
+                    && (track.code[position] == '+' || track.code[position] == '-')) ++position;
+                std::uint32_t length{};
+                if (!readMmlUseLength(track.code, position, track.default_steps, length, tempo)
+                    || track.steps > 100000000U - length) {
+                    fail("unsupported or fractional note length"); continue;
+                }
+                while (position < track.code.size()) {
+                    auto tie = position;
+                    while (tie < track.code.size() && std::isspace(static_cast<unsigned char>(track.code[tie]))) ++tie;
+                    if (tie >= track.code.size() || track.code[tie] != '^') break;
+                    position = tie + 1;
+                    std::uint32_t extension{};
+                    if (!readMmlUseLength(track.code, position, track.default_steps, extension, tempo)
+                        || length > 256U - extension) {
+                        fail("unsupported or excessive tied length"); break;
+                    }
+                    length += extension;
+                }
+                if (track.uncertain) continue;
+                const auto next = track.steps + length;
+                if (static_cast<std::uint64_t>(length) * (14400U / tempo) < kMgscWholeSteps
+                    || mmlUseTick(next, tempo) <= mmlUseTick(track.steps, tempo)) {
+                    fail("note length does not advance an interrupt tick"); continue;
+                }
+                track.steps = next;
+                continue;
+            }
+            if (c == 'l') {
+                ++position;
+                std::uint32_t length{};
+                if (!readMmlUseLength(track.code, position, 0, length, tempo)
+                    || static_cast<std::uint64_t>(length) * (14400U / tempo) < kMgscWholeSteps)
+                    fail("unsupported default note length");
+                else track.default_steps = length;
+                continue;
+            }
+            if (c == '&' || c == '<' || c == '>') { ++position; continue; }
+            if ((c == 's' || c == 'k' || c == 'h') && position + 1 < track.code.size()
+                && (std::tolower(static_cast<unsigned char>(track.code[position + 1])) == 'o'
+                    || std::tolower(static_cast<unsigned char>(track.code[position + 1])) == 'f'
+                    || (c == 'h' && std::tolower(static_cast<unsigned char>(track.code[position + 1])) == 'i'))) {
+                position += 2; continue;
+            }
+            if (c == 'h') {
+                ++position;
+                for (int parameter = 0; parameter < 4 && !track.uncertain; ++parameter) {
+                    while (position < track.code.size() && std::isspace(static_cast<unsigned char>(track.code[position]))) ++position;
+                    if (position < track.code.size() && (track.code[position] == '+' || track.code[position] == '-')) ++position;
+                    if (!parseMmlInteger(track.code, position)) { fail("invalid zero-time LFO parameter"); break; }
+                    while (position < track.code.size() && std::isspace(static_cast<unsigned char>(track.code[position]))) ++position;
+                    if (parameter < 3 && (position >= track.code.size() || track.code[position++] != ','))
+                        fail("invalid zero-time LFO parameter separator");
+                }
+                continue;
+            }
+            if (c == '(' || c == ')') {
+                ++position;
+                while (position < track.code.size() && std::isspace(static_cast<unsigned char>(track.code[position]))) ++position;
+                if (position < track.code.size()
+                    && (std::isdigit(static_cast<unsigned char>(track.code[position])) || track.code[position] == '$')) {
+                    const auto value = parseMmlInteger(track.code, position);
+                    if (!value || *value < 1U || *value > 15U) fail("invalid relative volume parameter");
+                }
+                continue;
+            }
+            if (c == 'o' || c == 'v' || c == 'q' || c == 'k' || c == 'p' || c == 's'
+                || c == 'n' || c == 'm' || c == '/' || c == '\\') {
+                ++position;
+                if (position < track.code.size() && (track.code[position] == '+' || track.code[position] == '-')) ++position;
+                if (!parseMmlInteger(track.code, position)) fail("invalid zero-time control parameter");
+                continue;
+            }
+            if (c == 't') global_uncertain = true;
+            fail("unsupported timing syntax");
+        }
+        if (!track_finished && !track.uncertain && !repeats.empty()) fail("unclosed repeat");
+    }
+    const bool rhythm_uncertain = global_uncertain
+        || tracks[15].uncertain || tracks[16].uncertain || tracks[17].uncertain;
+    std::erase_if(events, [&](const MusicUseEvent& event) {
+        return tracks[static_cast<std::size_t>(event.track)].uncertain
+            || (rhythm_uncertain && isOpllRhythmMusicTrack(static_cast<unsigned>(event.track)));
+    });
+    applyMusicEnvelopeEvents(events, mmlHeaderRhythmMode(text), usage, true);
+    if (any_uncertain || global_uncertain) {
+        // Unknown source can hide a use. Do not reinterpret an ambiguous
+        // definition as an unused PSG envelope; independently proved uses stay.
+        for (const auto type : {'e', 'r'})
+            for (const auto& definition : extractMgsSourceDefinitions(text, type))
+                static_cast<void>(usage[definition.number]);
+    }
+    for (const auto& reason : reasons)
+        warnings.push_back({"MML timing analysis skipped ambiguous envelope use: " + reason});
 }
 
 [[nodiscard]] std::optional<tone_import_detail::EnvelopeChipUse>
@@ -775,12 +998,12 @@ usageOrUnusedPsg(
     return psg;
 }
 
-void addEnvelopeCandidate(
+bool addEnvelopeCandidate(
     ToneImportResult& result,
     EnvelopeDef envelope,
     const tone_import_detail::DefinedTones& tones,
     std::string_view source_format,
-    const tone_import_detail::EnvelopeChipUse& usage) {
+    const std::optional<tone_import_detail::EnvelopeChipUse>& usage) {
     CompositeLayer layer;
     layer.source = TimbreSource::Psg;
     layer.channel = 0;
@@ -793,7 +1016,7 @@ void addEnvelopeCandidate(
         bool dropped_psg = false;
         if (!tone_import_detail::envelopeBytecodeToLayer(
                 envelope.bytecode, layer, issues, &dropped_psg)) {
-            return;
+            return false;
         }
         if (dropped_psg) {
             warnings.push_back(
@@ -805,17 +1028,19 @@ void addEnvelopeCandidate(
             warnings.push_back({issue});
         }
     }
+    if (!usage) return true;
     auto timbre = tone_import_detail::makeSelfContainedComposite(
         std::move(layer),
         tones,
         tone_import_detail::paddedImportNumber(envelope.number),
         warnings,
-        usage);
+        *usage);
     auto candidate = tone_import_detail::makeCompositeCandidate(
         std::move(timbre), source_format);
     candidate.warnings = std::move(warnings);
     tone_import_detail::addCandidate(
         result.candidates, std::move(candidate));
+    return true;
 }
 
 }  // namespace
@@ -902,17 +1127,25 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
     }
     tone_import_detail::DefinedTones tones;
     std::vector<EnvelopeDef> envelopes;
+    std::vector<ImportWarning> voice_warnings;
+    bool terminated = false;
+    const auto warn_voice = [&](std::string message) {
+        voice_warnings.push_back({"MGS voice definitions: " + std::move(message)});
+    };
 
     const auto need = [&](std::size_t count) {
-        return position + count <= voice_end;
+        return position <= voice_end && count <= voice_end - position;
     };
     while (position < voice_end) {
+        const auto opcode_position = position;
         const auto opcode = bytes[position++];
         if (opcode == 0xFF) {
+            terminated = true;
             break;
         }
         if (opcode == 0x00) {
             if (!need(9)) {
+                warn_voice("truncated OPLL definition");
                 break;
             }
             const auto number = static_cast<unsigned>(bytes[position++] & 0x1F);
@@ -925,6 +1158,7 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
         }
         if (opcode == 0x01) {
             if (!need(2)) {
+                warn_voice("truncated OPLL parameter definition");
                 break;
             }
             position += 2;
@@ -932,6 +1166,7 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
         }
         if (opcode == 0x02) {
             if (!need(2)) {
+                warn_voice("truncated envelope header");
                 break;
             }
             const auto number = static_cast<unsigned>(bytes[position++] & 0x1F);
@@ -943,6 +1178,7 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
             envelope.rate = (nn & 0x80U) != 0U;
             if (envelope.rate) {
                 if (!need(6)) {
+                    warn_voice("truncated rate envelope definition");
                     break;
                 }
                 envelope.rate_values = clampRateEnvelope({
@@ -958,10 +1194,12 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
                 position += 6;
             } else {
                 if (!need(1)) {
+                    warn_voice("truncated sequence envelope length");
                     break;
                 }
                 const auto length = bytes[position++];
                 if (!need(length)) {
+                    warn_voice("truncated sequence envelope definition");
                     break;
                 }
                 envelope.bytecode.assign(
@@ -975,6 +1213,7 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
         }
         if (opcode == 0x03) {
             if (!need(33)) {
+                warn_voice("truncated SCC definition");
                 break;
             }
             const auto number = static_cast<unsigned>(bytes[position++] & 0x1F);
@@ -987,6 +1226,7 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
         }
         if (opcode == 0x04 || opcode == 0x05) {
             if (!need(24)) {
+                warn_voice("truncated pitch table definition");
                 break;
             }
             position += 24;
@@ -994,6 +1234,7 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
         }
         if (opcode == 0x06) {
             if (!need(2)) {
+                warn_voice("truncated control string definition");
                 break;
             }
             position += 1;
@@ -1003,12 +1244,17 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
             if (position < voice_end) {
                 ++position;
             } else {
+                warn_voice("control string has no NUL terminator");
                 break;
             }
             continue;
         }
+        warn_voice("unknown definition command " + std::to_string(opcode)
+            + " at byte " + std::to_string(opcode_position) + "; remaining definitions were not scanned");
         break;
     }
+    if (!terminated && voice_warnings.empty())
+        warn_voice("missing voice-track terminator");
 
     std::map<unsigned, tone_import_detail::EnvelopeChipUse> usage_by_envelope;
     collectBinaryMusicEnvelopeUse(bytes, *header, usage_by_envelope);
@@ -1032,10 +1278,14 @@ ToneImportResult importMgsBinary(std::span<const std::uint8_t> bytes) {
     for (const auto& envelope : envelopes) {
         const auto usage = usageOrUnusedPsg(
             usage_by_envelope, envelope.number);
-        if (!usage) {
-            continue;
-        }
-        addEnvelopeCandidate(result, envelope, tones, "MGS", *usage);
+        if (!addEnvelopeCandidate(result, envelope, tones, "MGS", usage))
+            warn_voice("broken envelope definition " + std::to_string(envelope.number) + " was skipped");
+    }
+    if (!voice_warnings.empty()) {
+        for (auto& candidate : result.candidates)
+            candidate.warnings.insert(candidate.warnings.end(), voice_warnings.begin(), voice_warnings.end());
+        if (result.candidates.empty())
+            for (const auto& warning : voice_warnings) result.errors.push_back(warning.message);
     }
     return result;
 }
@@ -1076,7 +1326,8 @@ ToneImportResult importMgsMml(std::string_view text) {
                 "MML"));
     }
     std::map<unsigned, tone_import_detail::EnvelopeChipUse> usage_by_envelope;
-    collectMmlEnvelopeUse(text, usage_by_envelope);
+    std::vector<ImportWarning> timing_warnings;
+    collectMmlEnvelopeUse(text, usage_by_envelope, timing_warnings);
     for (const auto& definition : extractMgsSourceDefinitions(text, 'e')) {
         bool stripped = false;
         const auto body = stripPsgModeNoiseTokens(definition.body, stripped);
@@ -1132,6 +1383,12 @@ ToneImportResult importMgsMml(std::string_view text) {
         tone_import_detail::addCandidate(
             result.candidates,
             tone_import_detail::makeCompositeCandidate(std::move(timbre), "MML"));
+    }
+    if (!timing_warnings.empty()) {
+        for (auto& candidate : result.candidates)
+            candidate.warnings.insert(candidate.warnings.end(), timing_warnings.begin(), timing_warnings.end());
+        if (result.candidates.empty())
+            for (const auto& warning : timing_warnings) result.errors.push_back(warning.message);
     }
     return result;
 }

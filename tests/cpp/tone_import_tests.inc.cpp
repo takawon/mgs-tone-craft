@@ -1654,3 +1654,269 @@ void testImportedLibraryEntryKeepsEmptyName() {
     REQUIRE_EQ(entry.name.empty(), true);
     REQUIRE_EQ(entry.category, mgstc::engine::TimbreCategory::Opll);
 }
+
+void requireTimedMmlImport(const mgstc::engine::ToneImportResult& result,
+    std::size_t expected_count, std::string_view source) {
+    const auto expected_errors = expected_count == 0
+        ? std::vector<std::string>{"no complete tones were found"} : std::vector<std::string>{};
+    if (result.errors != expected_errors || result.format != mgstc::engine::ToneImportFormat::MgsMml) {
+        std::cerr << "MML timing input:\n" << source;
+        std::cerr << "MML timing format=" << static_cast<int>(result.format)
+            << " candidates=" << result.candidates.size() << '\n';
+        for (const auto& error : result.errors) std::cerr << "MML timing error: " << error << '\n';
+    }
+    REQUIRE_EQ(result.format, mgstc::engine::ToneImportFormat::MgsMml);
+    REQUIRE_EQ(countImportedType(result, mgstc::engine::ImportedToneType::Composite), expected_count);
+    REQUIRE_EQ(result.errors, expected_errors);
+    REQUIRE_EQ(result.valid(), expected_count != 0);
+    for (const auto& candidate : result.candidates) REQUIRE_EQ(candidate.warnings.empty(), true);
+}
+
+void testToneImportMmlTimedRhythmUse() {
+    const auto check = [](std::string_view tracks, std::size_t count) {
+        const std::string source = "#tempo 120\n@e0 = { f }\n" + std::string(tracks);
+        const std::vector<std::uint8_t> bytes(source.begin(), source.end());
+        const auto result = mgstc::engine::importTones(bytes, "mus");
+        requireTimedMmlImport(result, count, source);
+    };
+    check("15 c1 @e0\n16 c8c8c8c8c8c8c8c8 y14,32\n", 0);
+    check("15 c8 @e0\n16 c1 y14,32\n", 1);
+    check("F l8 c. ^16 @e0\nG r4 y14,32\n", 0);
+    check("F l8.. c @e0\nG r%42 y14,32\n", 0);
+    check("F l8 c^ @e0\nG r4 y14,32\n", 0);
+    check("F c4^8 @e0\nG r4. y14,32\n", 0);
+    check("F l8 c\nF c @e0\nG r4 y14,32\n", 0);
+    check("F c%4 @e0\nG r%5 y14,32\n", 0); // distinct score positions, same interrupt tick
+    check("F r%128^%128 @e0\nG r%256 y14,32\n", 0);
+    check("FG r4\nF @e0\nG y14,32\n", 0);
+    check("F y14,32 c4 y14,0 @e0\n", 1);
+
+    const std::string rate = "@r0 = { 1, 0, 0, 0, 255, 0, 0, 255 }\n"
+        "F c1 @r0\nG [c8]8 y14,32\n";
+    const std::vector<std::uint8_t> rate_bytes(rate.begin(), rate.end());
+    const auto rate_result = mgstc::engine::importTones(rate_bytes, "mus");
+    requireTimedMmlImport(rate_result, 0, rate);
+}
+
+void testToneImportMmlFiniteRepeatTiming() {
+    const auto check = [](std::string_view body, std::string_view peer) {
+        const std::string source = "@e0 = { f }\nF " + std::string(body)
+            + " @e0\nG " + std::string(peer) + " y14,32\n";
+        const std::vector<std::uint8_t> bytes(source.begin(), source.end());
+        const auto result = mgstc::engine::importTones(bytes, "mus");
+        requireTimedMmlImport(result, 0, source);
+    };
+    check("[2 c8]", "r4");
+    check("[c8]2", "r4");
+    check("[c8]", "r4");
+    check("[2 [3 c16]]", "r4.");
+    check("[3 c8|d8]", "r%120");
+    check("[[c16|d16]3]2", "r%120");
+    check("[255 c%2]", "r%256 r%254");
+    std::string nested;
+    for (int depth = 0; depth < 16; ++depth) nested += "[1 ";
+    nested += "c4";
+    nested += std::string(16, ']');
+    check(nested, "r4");
+
+    const std::string continued = "#tempo 120\n@e0 = { f }\nF [2 c8\nF ] @e0\nG r4 y14,32\n";
+    const std::vector<std::uint8_t> bytes(continued.begin(), continued.end());
+    const auto result = mgstc::engine::importTones(bytes, "mus");
+    requireTimedMmlImport(result, 0, continued);
+}
+
+void testToneImportMmlPatchSourceOrder() {
+    const auto source = [](std::string_view track) {
+        const std::string text = "@e0 = { f }\n" + std::string(track);
+        const std::vector<std::uint8_t> bytes(text.begin(), text.end());
+        return mgstc::engine::importTones(bytes, "mus");
+    };
+    const auto result = source("F @1 @e0 @2 c\n");
+    const auto* timbre = firstCompositeTimbre(result);
+    REQUIRE_EQ(timbre != nullptr, true);
+    REQUIRE_EQ(timbre->layers.front().base_opll_rom.has_value(), true);
+    REQUIRE_EQ(*timbre->layers.front().base_opll_rom, 1);
+    const auto across_lines = source("F @1 @e0\nF @2 c\n");
+    const auto* continued = firstCompositeTimbre(across_lines);
+    REQUIRE_EQ(continued != nullptr, true);
+    REQUIRE_EQ(*continued->layers.front().base_opll_rom, 1);
+    const auto later_use = source("F @1 c4 @2 @e0 c\n");
+    REQUIRE_EQ(*firstCompositeTimbre(later_use)->layers.front().base_opll_rom, 2);
+}
+
+void testToneImportMmlUnsupportedTimingWarnings() {
+    const auto ambiguous = [](std::string_view track) {
+        const std::string source = "@e0 = { f }\nF " + std::string(track) + " @e0\n";
+        const std::vector<std::uint8_t> bytes(source.begin(), source.end());
+        const auto result = mgstc::engine::importTones(bytes, "mus");
+        REQUIRE_EQ(countImportedType(result, mgstc::engine::ImportedToneType::Composite), 0);
+        REQUIRE_EQ(result.errors.empty(), false);
+        REQUIRE_EQ(result.errors.front().find("MML timing analysis") != std::string::npos, true);
+    };
+    ambiguous("[0 c4]");
+    ambiguous("[c4]0");
+    ambiguous("*0");
+    ambiguous("t240 c4");
+    ambiguous("c5");
+    ambiguous("c64.");
+    ambiguous("c%256^%1");
+    ambiguous("[2 c4");
+    ambiguous("c4]");
+    ambiguous("|c4");
+    ambiguous("[255 [255 c4]]");
+    std::string nested;
+    for (int depth = 0; depth < 17; ++depth) nested += "[1 ";
+    nested += "c4";
+    nested += std::string(17, ']');
+    ambiguous(nested);
+
+    const std::string partial = "@e0 = { f }\n@e1 = { f }\nF *0 @e0\n1 @e1 c\n";
+    const std::vector<std::uint8_t> bytes(partial.begin(), partial.end());
+    const auto result = mgstc::engine::importTones(bytes, "mus");
+    REQUIRE_EQ(result.valid(), true);
+    REQUIRE_EQ(countImportedType(result, mgstc::engine::ImportedToneType::Composite), 1);
+    REQUIRE_EQ(result.candidates.front().warnings.empty(), false);
+    REQUIRE_EQ(firstCompositeTimbre(result)->layers.front().source, mgstc::engine::TimbreSource::Psg);
+}
+
+void testToneImportMmlIntegerOverflowWarnings() {
+    const auto rejected = [](std::string_view header, std::string_view track) {
+        const std::string source = std::string(header) + "\n@e0 = { f }\n@e1 = { f }\n"
+            + std::string(track) + "\n";
+        const std::vector<std::uint8_t> bytes(source.begin(), source.end());
+        const auto result = mgstc::engine::importTones(bytes, "mus");
+        REQUIRE_EQ(countImportedType(result, mgstc::engine::ImportedToneType::Composite), 0);
+        REQUIRE_EQ(result.errors.empty(), false);
+        REQUIRE_EQ(result.errors.front().find("MML timing analysis") != std::string::npos, true);
+    };
+    rejected("#opll_mode 4294967297", "F @e1 c");
+    rejected("#opll_mode $100000001", "F @e1 c");
+    rejected("#tempo 4294967416", "F @e1 c");
+    rejected("#tempo 120garbage", "F @e1 c");
+    rejected("#tempo 120 240", "F @e1 c");
+    rejected("#opll_mode 0garbage", "F @e1 c");
+    rejected("#opll_mode 0 @e1", "F @e1 c");
+    rejected("", "4294967297 @e1 c");
+    rejected("", "F @e4294967297 c");
+    rejected("", "F @e429496729700000000001 @e1 c");
+    rejected("", "F @r4294967297 @e1 c");
+    rejected("", "F @4294967297 @e1 c");
+    rejected("", "F [4294967297 c4] @e1");
+    rejected("", "F [c4]4294967297 @e1");
+    rejected("", "F c4294967297 @e1");
+    rejected("", "F y14,$100000020 @e1");
+    rejected("", "F @e4294967295 @e1");
+    rejected("", "F @e32 @e1");
+    rejected("", "F y14,256 @e1");
+    rejected("", "F (42949672960 @e1 c");
+    rejected("", "F )42949672960 @e1 c");
+    rejected("", "F ( $100000001 @e1 c");
+    rejected("", "F )0 @e1 c");
+    rejected("", "F (16 @e1 c");
+    rejected("", "F @e" + std::string(4096, '9') + " @e1 c");
+
+    const auto accepted = [](std::string_view header, std::string_view track) {
+        const std::string source = std::string(header) + "\n@e0 = { f }\n"
+            + std::string(track) + "\n";
+        const std::vector<std::uint8_t> bytes(source.begin(), source.end());
+        const auto result = mgstc::engine::importTones(bytes, "mus");
+        REQUIRE_EQ(result.valid(), true);
+        REQUIRE_EQ(countImportedType(result, mgstc::engine::ImportedToneType::Composite), 1);
+        REQUIRE_EQ(result.candidates.front().warnings.empty(), true);
+    };
+    accepted("#tempo 120\n#opll_mode 0", "F (15 )1 @e0 c");
+    accepted("#tempo \t120 \t\n#opll_mode \t0 \t", "F ( 15 ) 1 @e0 c");
+    accepted("#tempo 120; ignored\n#opll_mode 0; ignored", "F ( @e0 c");
+}
+
+void testToneImportMgsVoiceWarningsPreserveCompleteCandidates() {
+    const auto make = [](const std::vector<std::uint8_t>& tail) {
+        std::vector<std::uint8_t> bytes{'M', 'G', 'S', '3', '\r', '\n', 0x1A};
+        const auto header = bytes.size();
+        bytes.resize(header + 0x28, 0);
+        bytes[header + 4] = 0x28;
+        bytes.insert(bytes.end(), {0x00, 0x00, 1, 2, 3, 4, 5, 6, 7, 8});
+        bytes.insert(bytes.end(), {0x03, 0x00});
+        for (int value = 0; value < 32; ++value) bytes.push_back(static_cast<std::uint8_t>(value));
+        bytes.insert(bytes.end(), {0x02, 0x01, 0x00, 0x01, 0x0F});
+        bytes.insert(bytes.end(), tail.begin(), tail.end());
+        appendMgsMusicTrack(bytes, header, 4, {0x80, 0x49, 0x01, 0xFF});
+        return bytes;
+    };
+    const auto has_voice_warning = [](const auto& candidate) {
+        return std::any_of(candidate.warnings.begin(), candidate.warnings.end(), [](const auto& warning) {
+            return warning.message.find("MGS voice definitions:") != std::string::npos;
+        });
+    };
+    const std::vector<std::vector<std::uint8_t>> stopped{
+        {}, // No FF before the next independently addressed music track.
+        {0x00, 0x02}, {0x01, 0x02}, {0x02, 0x02},
+        {0x02, 0x02, 0x80, 1, 2}, {0x02, 0x02, 0x00},
+        {0x02, 0x02, 0x00, 5, 0x0F}, {0x03, 0x02, 0},
+        {0x04, 0}, {0x05, 0}, {0x06, 0}, {0x06, 0, 'a', 'b'},
+        // The apparent OPLL definition after the unknown command is not a
+        // recovery target and must never become a second candidate.
+        {0x7F, 0x00, 0x02, 1, 2, 3, 4, 5, 6, 7, 8, 0xFF},
+    };
+    for (const auto& tail : stopped) {
+        const auto result = mgstc::engine::importTones(make(tail), "mgs");
+        REQUIRE_EQ(result.valid(), true);
+        REQUIRE_EQ(countImportedType(result, mgstc::engine::ImportedToneType::Opll), 1);
+        REQUIRE_EQ(countImportedType(result, mgstc::engine::ImportedToneType::Scc), 1);
+        REQUIRE_EQ(countImportedType(result, mgstc::engine::ImportedToneType::Composite), 1);
+        REQUIRE_EQ(std::all_of(result.candidates.begin(), result.candidates.end(), has_voice_warning), true);
+        const auto* timbre = firstCompositeTimbre(result);
+        REQUIRE_EQ(timbre != nullptr, true);
+        REQUIRE_EQ(timbre->layers.front().source, mgstc::engine::TimbreSource::Scc);
+    }
+    std::vector<std::uint8_t> complete{0x01, 0x00, 0x0F, 0x04};
+    complete.insert(complete.end(), 24, 0);
+    complete.push_back(0x05);
+    complete.insert(complete.end(), 24, 0);
+    complete.insert(complete.end(), {0x06, 0x00, 'a', 0x00, 0xFF});
+    const auto normal = mgstc::engine::importTones(make(complete), "mgs");
+    REQUIRE_EQ(normal.valid(), true);
+    REQUIRE_EQ(std::any_of(normal.candidates.begin(), normal.candidates.end(), has_voice_warning), false);
+}
+
+void testToneImportMgsBrokenEnvelopeSkipsOnlyItsDefinition() {
+    std::vector<std::uint8_t> bytes{'M', 'G', 'S', '3', '\r', '\n', 0x1A};
+    const auto header = bytes.size();
+    bytes.resize(header + 0x28, 0);
+    bytes[header + 4] = 0x28;
+    // A fully delimited but internally truncated @e0 precedes a complete
+    // @e1. Its length gives the exact next definition without guessing.
+    bytes.insert(bytes.end(), {0x02, 0x00, 0x00, 0x01, 0x10});
+    bytes.insert(bytes.end(), {0x02, 0x01, 0x00, 0x01, 0x0F, 0xFF});
+    appendMgsMusicTrack(bytes, header, 1, {0x49, 0x01, 0xFF});
+    const auto result = mgstc::engine::importTones(bytes, "mgs");
+    REQUIRE_EQ(result.valid(), true);
+    REQUIRE_EQ(countImportedType(result, mgstc::engine::ImportedToneType::Composite), 1);
+    REQUIRE_EQ(result.candidates.front().name, std::string("01"));
+    REQUIRE_EQ(std::any_of(result.candidates.front().warnings.begin(), result.candidates.front().warnings.end(),
+        [](const auto& warning) { return warning.message.find("broken envelope definition 0 was skipped") != std::string::npos; }), true);
+
+    auto only_broken = bytes;
+    only_broken.resize(header + 0x28 + 5);
+    only_broken[header + 6] = 0;
+    only_broken[header + 7] = 0;
+    only_broken.push_back(0xFF);
+    const auto rejected = mgstc::engine::importTones(only_broken, "mgs");
+    REQUIRE_EQ(rejected.candidates.empty(), true);
+    REQUIRE_EQ(rejected.errors.empty(), false);
+    REQUIRE_EQ(rejected.errors.front().find("broken envelope definition 0 was skipped") != std::string::npos, true);
+}
+
+void testToneImportSccSourceRejectsOversizedWaveDefinitions() {
+    const auto definition = [](std::size_t count, bool spaced) {
+        std::string source = "@s0={";
+        for (std::size_t index = 0; index < count; ++index) source += spaced ? "00 " : "00";
+        return source + '}';
+    };
+    for (const bool spaced : {false, true}) {
+        REQUIRE_EQ(mgstc::engine::parseMgsSccDefinition(definition(31, spaced)).has_value(), false);
+        REQUIRE_EQ(mgstc::engine::parseMgsSccDefinition(definition(32, spaced)).has_value(), true);
+        REQUIRE_EQ(mgstc::engine::parseMgsSccDefinition(definition(33, spaced)).has_value(), false);
+        REQUIRE_EQ(mgstc::engine::parseMgsSccDefinition(definition(65'536, spaced)).has_value(), false);
+    }
+}
