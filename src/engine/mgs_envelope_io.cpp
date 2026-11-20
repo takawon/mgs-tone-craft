@@ -4,17 +4,20 @@
 #include "mgstc/engine/composite_envelope_compile.hpp"
 #include "mgstc/engine/composite_modulation.hpp"
 #include "mgstc/engine/opll_register_auto.hpp"
+#include "mgstc/engine/scc_morph.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <chrono>
 #include <limits>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
+#include <tuple>
 #include <vector>
 
 namespace mgstc::engine {
@@ -70,6 +73,64 @@ void addIssueOnce(
     if (!result.hasIssue(issue)) {
         result.issues.push_back(issue);
     }
+}
+
+[[nodiscard]] MgsEnvelopeCommandZone commandZone(
+    const EnvelopeTimeline& timeline, std::uint32_t count, bool after) {
+    if (timeline.loop_start_count == count)
+        return after ? MgsEnvelopeCommandZone::AfterLoopStart
+                     : MgsEnvelopeCommandZone::BeforeLoopStart;
+    if (timeline.loop_end_count == count)
+        return after ? MgsEnvelopeCommandZone::BeforeLoopEnd
+                     : MgsEnvelopeCommandZone::AfterLoopEnd;
+    return MgsEnvelopeCommandZone::Count;
+}
+
+using CommandConflictKey = std::tuple<std::uint32_t,
+    MgsEnvelopeCommandType, MgsEnvelopeCommandZone>;
+using CommandOccurrences = std::map<CommandConflictKey, std::pair<unsigned, bool>>;
+
+void recordRestrictedCommand(CommandOccurrences& occurrences,
+    const EnvelopeTimeline& timeline, std::uint32_t count,
+    MgsEnvelopeCommandType type, bool after, bool implicit_base = false) {
+    auto& [amount, has_base] = occurrences[{count, type, commandZone(timeline, count, after)}];
+    ++amount;
+    has_base = has_base || implicit_base;
+}
+
+void appendCommandConflicts(MgsEnvelopeFormatResult& result,
+    const CommandOccurrences& occurrences) {
+    for (const auto& [key, occurrence] : occurrences) {
+        if (occurrence.first < 2) continue;
+        const auto& [count, type, zone] = key;
+        const auto found = std::find_if(result.command_conflicts.begin(),
+            result.command_conflicts.end(), [&](const auto& conflict) {
+                return conflict.count == count && conflict.type == type && conflict.zone == zone;
+            });
+        if (found == result.command_conflicts.end()) {
+            result.command_conflicts.push_back({count, type, zone, occurrence.second});
+        } else {
+            found->includes_automatic_base |= occurrence.second;
+        }
+        addIssueOnce(result, MgsEnvelopeIssue::DuplicateZeroTimeCommand);
+    }
+}
+
+void validateAuthoredRestrictedCommands(const CompositeLayer& layer,
+    MgsEnvelopeFormatResult& result) {
+    CommandOccurrences occurrences;
+    for (const auto& event : layer.timbre_automation) {
+        std::optional<MgsEnvelopeCommandType> type;
+        switch (event.kind) {
+        case EnvelopeEventKind::Noise: type = MgsEnvelopeCommandType::Noise; break;
+        case EnvelopeEventKind::ToneNoiseMode: type = MgsEnvelopeCommandType::ToneNoiseMode; break;
+        case EnvelopeEventKind::Timbre: type = MgsEnvelopeCommandType::Timbre; break;
+        default: break;
+        }
+        if (type) recordRestrictedCommand(occurrences, layer.envelope_timeline,
+            event.count, *type, event.after_loop_start);
+    }
+    appendCommandConflicts(result, occurrences);
 }
 
 [[nodiscard]] char volumeCharacter(std::int32_t value) noexcept {
@@ -387,50 +448,61 @@ void collapseTrailingHold(std::vector<std::string>& tokens) {
     return consumed_time;
 }
 
-[[nodiscard]] std::vector<std::uint8_t> compileEnvelopeTokens(
+[[nodiscard]] std::optional<std::vector<std::uint8_t>> compileEnvelopeTokens(
     const std::vector<std::string>& tokens) {
     std::vector<std::uint8_t> bytes;
     bytes.reserve(compiledEnvelopeBytes(tokens));
-    const auto number = [](std::string_view text) {
+    bool valid_numbers = true;
+    const auto number = [&valid_numbers](std::string_view text, int minimum, int maximum) {
         int value{};
-        std::from_chars(text.data(), text.data() + text.size(), value);
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()
+            || value < minimum || value > maximum) valid_numbers = false;
         return value;
     };
     for (const auto& token : tokens) {
+        if (token.empty()) return std::nullopt;
         if (token == "[") {
             bytes.push_back(0x40);
         } else if (token == "]") {
             bytes.push_back(0x60);
         } else if (token.front() == '@') {
             bytes.insert(bytes.end(), {0x10,
-                static_cast<std::uint8_t>(number(std::string_view(token).substr(1)))});
+                static_cast<std::uint8_t>(number(std::string_view(token).substr(1), 0, 31))});
         } else if (token.front() == '\\') {
             bytes.insert(bytes.end(), {0x12,
-                static_cast<std::uint8_t>(number(std::string_view(token).substr(1)))});
-        } else if (token.front() == 'n') {
-            bytes.push_back(static_cast<std::uint8_t>(0x80 | number(std::string_view(token).substr(1))));
-        } else if (token.front() == '/') {
-            bytes.push_back(static_cast<std::uint8_t>(0xA0 | number(std::string_view(token).substr(1))));
-        } else if (token.front() == 'y') {
+                static_cast<std::uint8_t>(number(std::string_view(token).substr(1), -127, 127))});
+        } else if (token.front() == 'n' || token.front() == 'N') {
+            bytes.push_back(static_cast<std::uint8_t>(0x80 | number(std::string_view(token).substr(1), 0, 31)));
+        } else if (token.front() == '/' || token.front() == '*') {
+            bytes.push_back(static_cast<std::uint8_t>(0xA0 | number(std::string_view(token).substr(1), 0, 3)));
+        } else if (token.front() == 'y' || token.front() == 'Y') {
             const auto comma = token.find(',');
+            if (comma == std::string::npos) return std::nullopt;
             bytes.insert(bytes.end(), {0x11,
-                static_cast<std::uint8_t>(number(std::string_view(token).substr(1, comma - 1))),
-                static_cast<std::uint8_t>(number(std::string_view(token).substr(comma + 1)))});
-        } else {
+                static_cast<std::uint8_t>(number(std::string_view(token).substr(1, comma - 1), 0, 56)),
+                static_cast<std::uint8_t>(number(std::string_view(token).substr(comma + 1), 0, 255))});
+        } else if (std::isxdigit(static_cast<unsigned char>(token.front()))) {
             const auto value = static_cast<std::uint8_t>(
                 std::isdigit(static_cast<unsigned char>(token.front()))
-                    ? token.front() - '0' : token.front() - 'a' + 10);
+                    ? token.front() - '0'
+                    : std::tolower(static_cast<unsigned char>(token.front())) - 'a' + 10);
             const auto separator = token.find_first_of(":=");
             if (separator == std::string::npos) {
+                if (token.size() != 1) return std::nullopt;
                 bytes.push_back(value);
             } else {
+                if (separator != 1) return std::nullopt;
                 bytes.push_back(static_cast<std::uint8_t>(
                     (token[separator] == ':' ? 0xE0 : 0x20) | value));
                 bytes.push_back(static_cast<std::uint8_t>(
-                    number(std::string_view(token).substr(separator + 1))));
+                    number(std::string_view(token).substr(separator + 1), 1, 255)));
             }
+        } else {
+            return std::nullopt;
         }
     }
+    if (!valid_numbers) return std::nullopt;
     return bytes;
 }
 
@@ -572,6 +644,26 @@ bool MgsEnvelopeFormatResult::hasIssue(
     return std::find(issues.begin(), issues.end(), issue) != issues.end();
 }
 
+std::string describeMgsEnvelopeCommandConflict(
+    const MgsEnvelopeCommandConflict& conflict) {
+    const auto command = conflict.type == MgsEnvelopeCommandType::Noise ? "n"
+        : conflict.type == MgsEnvelopeCommandType::ToneNoiseMode ? "/（*）" : "@";
+    const auto zone = [&] {
+        switch (conflict.zone) {
+        case MgsEnvelopeCommandZone::BeforeLoopStart: return "[ より前（初回のみ）";
+        case MgsEnvelopeCommandZone::AfterLoopStart: return "[ より後（毎周）";
+        case MgsEnvelopeCommandZone::BeforeLoopEnd: return "] 直前（ループ内）";
+        case MgsEnvelopeCommandZone::AfterLoopEnd: return "] 以降";
+        default: return "通常カウント";
+        }
+    }();
+    auto text = "ct " + std::to_string(conflict.count) + " / " + zone + " の " + command
+        + " は1件だけ指定できます。重複を解消してください。";
+    if (conflict.includes_automatic_base)
+        text += " 自動追加する先頭の基準音色 @ と衝突しています。";
+    return text;
+}
+
 static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
     const CompositeLayer& source_layer,
     std::uint8_t definition_number,
@@ -580,7 +672,29 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
     const TimbreLibrary* library,
     std::string_view composite_name,
     bool optimize_loop,
-    bool allow_prefix) {
+    bool allow_prefix,
+    bool validate_commands = true) {
+    MgsEnvelopeFormatResult result;
+    if (validate_commands) {
+        if (source_layer.volume_envelope.kind == EnvelopeKind::Sequence) {
+            for (const auto& event : source_layer.volume_envelope.events) {
+                if (event.kind == EnvelopeEventKind::Volume && event.automatic
+                    && event.secondary > 0
+                    && event.count == static_cast<std::uint32_t>(event.secondary - 1)
+                    && std::find(result.ambiguous_imported_automatic_counts.begin(),
+                        result.ambiguous_imported_automatic_counts.end(), event.count)
+                            == result.ambiguous_imported_automatic_counts.end())
+                    result.ambiguous_imported_automatic_counts.push_back(event.count);
+            }
+            if (!result.ambiguous_imported_automatic_counts.empty()) {
+                addIssueOnce(result, MgsEnvelopeIssue::AmbiguousImportedAutomaticVolume);
+                return result;
+            }
+        }
+        // Validate authoring before modulation expansion can replace commands.
+        validateAuthoredRestrictedCommands(source_layer, result);
+        if (!result.valid()) return result;
+    }
     if (source_layer.volume_envelope.kind == EnvelopeKind::Sequence
         && compositeHasModulation(source_layer, CompositeModulationTarget::Volume)) {
         // Tremolo replaces the authored volume events with sampled values.
@@ -596,7 +710,7 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
         const auto base = formatMgsCompositeEnvelopeImpl(
             base_layer, definition_number,
             std::numeric_limits<std::size_t>::max(), numbers, library,
-            composite_name, false, false);
+            composite_name, false, false, validate_commands);
         if (!base.valid()) {
             return base;
         }
@@ -604,7 +718,6 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
     const auto expanded = expandCompositeLayerModulations(
         source_layer, library, optimize_loop);
     const auto& layer = expanded;
-    MgsEnvelopeFormatResult result;
     if (definition_number > 31) {
         result.issues.push_back(MgsEnvelopeIssue::InvalidDefinitionNumber);
     }
@@ -768,6 +881,23 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
             }
         }
     }
+    if (validate_commands) {
+        CommandOccurrences occurrences;
+        for (std::uint32_t count = 0; count < states.size(); ++count) {
+            for (const auto& command : states[count].ordered_commands) {
+                std::optional<MgsEnvelopeCommandType> type;
+                switch (command.token.front()) {
+                case 'n': type = MgsEnvelopeCommandType::Noise; break;
+                case '/': case '*': type = MgsEnvelopeCommandType::ToneNoiseMode; break;
+                case '@': type = MgsEnvelopeCommandType::Timbre; break;
+                default: break;
+                }
+                if (type) recordRestrictedCommand(occurrences, timeline, count,
+                    *type, command.after, command.leading);
+            }
+        }
+        appendCommandConflicts(result, occurrences);
+    }
     if (layer.volume > 15) {
         addIssueOnce(result, MgsEnvelopeIssue::InvalidVolume);
     }
@@ -800,51 +930,35 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
     };
     const auto append_zero_time = [&](std::uint32_t count, bool inside_only = false) {
         setTokenOrigin(tokens, count);
-        if (std::any_of(states[count].ordered_commands.begin(),
-                        states[count].ordered_commands.end(),
-                        [inside_only](const auto& command) {
-                            return command.order != 0 && (!inside_only || command.after);
-                        })) {
-            auto commands = states[count].ordered_commands;
-            if (inside_only) std::erase_if(commands, [](const auto& command) { return !command.after; });
-            const bool anchor = looping && count == *timeline.loop_start_count;
-            std::stable_sort(commands.begin(), commands.end(),
-                [anchor](const auto& a, const auto& b) {
-                    if (anchor && a.after != b.after) return !a.after;
-                    if (a.leading != b.leading) return a.leading;
-                    if (a.order && b.order) return a.order < b.order;
-                    if (a.order != b.order) return a.order != 0;
-                    return a.pitch < b.pitch;
-                });
-            bool bracket = false;
-            for (const auto& command : commands) {
-                if (anchor && command.after && !bracket) {
-                    appendToken(tokens, "[");
-                    bracket = true;
-                }
-                appendToken(tokens, command.token);
+        auto commands = states[count].ordered_commands;
+        if (inside_only) std::erase_if(commands, [](const auto& command) { return !command.after; });
+        const bool anchor = looping && count == *timeline.loop_start_count;
+        const auto default_priority = [](const auto& command) {
+            switch (command.token.front()) {
+            case 'n': return 0;
+            case '/': case '*': return 1;
+            case '\\': return 2;
+            case '@': return 3;
+            default: return 4; // y
             }
-            if (anchor && !bracket) appendToken(tokens, "[");
-            return;
-        }
-        // §6.2.3: before-`[` zero-time commands, then `[`, then after-`[`.
-        if (!inside_only) {
-            for (const auto& token : states[count].before_timbre_tokens) {
-                appendToken(tokens, token);
+        };
+        std::stable_sort(commands.begin(), commands.end(),
+            [anchor, default_priority](const auto& a, const auto& b) {
+                if (anchor && a.after != b.after) return !a.after;
+                if (a.leading != b.leading) return a.leading;
+                if (a.order && b.order) return a.order < b.order;
+                if (a.order != b.order) return a.order != 0;
+                return default_priority(a) < default_priority(b);
+            });
+        bool bracket = false;
+        for (const auto& command : commands) {
+            if (anchor && command.after && !bracket) {
+                appendToken(tokens, "[");
+                bracket = true;
             }
-            for (const auto& token : states[count].before_pitch_tokens) {
-                appendToken(tokens, token);
-            }
+            appendToken(tokens, command.token);
         }
-        if (looping && count == *timeline.loop_start_count) {
-            appendToken(tokens, "[");
-        }
-        for (const auto& token : states[count].after_timbre_tokens) {
-            appendToken(tokens, token);
-        }
-        for (const auto& token : states[count].after_pitch_tokens) {
-            appendToken(tokens, token);
-        }
+        if (anchor && !bracket) appendToken(tokens, "[");
     };
     while (cursor < effective_end) {
         append_zero_time(cursor);
@@ -878,13 +992,13 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
                 if (imported_start && *imported_start >= cursor
                     && *imported_start < *target_count) {
                     if (*target_count - *imported_start > 255
-                        || *target_count - *imported_start == 240
-                        || *target_count - *imported_start == 1) {
+                        || *target_count - *imported_start == 240) {
                         addIssueOnce(result,
                             MgsEnvelopeIssue::InvalidAutomaticVolumeDuration);
                         return result;
                     }
-                    if (precise_span && waypoints.size() > 1) {
+                    if (precise_span && waypoints.size() > 1
+                        && *target_count - *imported_start > 1) {
                         std::vector<std::uint8_t> volumes(
                             *imported_start - cursor,
                             static_cast<std::uint8_t>(origin_value));
@@ -1027,14 +1141,8 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
         }
         if (states[cursor].volume) {
             const auto spec = *states[cursor].volume;
-            if (spec.automatic
-                && automatic_ramp_started[cursor]) {
-                current_volume = spec.value;
-                previous_volume_count = cursor;
-            } else {
-                current_volume = spec.value;
-                previous_volume_count = cursor;
-            }
+            current_volume = spec.value;
+            previous_volume_count = cursor;
         }
 
         std::uint32_t next = cursor + 1;
@@ -1091,13 +1199,13 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
         // can repeat its directional change inside the body.
         const auto finite = formatMgsCompositeEnvelopeImpl(
             source_layer, definition_number, compiled_byte_limit,
-            numbers, library, composite_name, false, false);
+            numbers, library, composite_name, false, false, validate_commands);
         if (finite.compiled_bytes <= result.compiled_bytes) {
             if (allow_prefix
                 && finite.hasIssue(MgsEnvelopeIssue::DefinitionLengthExceeded)) {
                 return formatMgsCompositeEnvelopeImpl(
                     source_layer, definition_number, compiled_byte_limit,
-                    numbers, library, composite_name, false, true);
+                    numbers, library, composite_name, false, true, validate_commands);
             }
             return finite;
         }
@@ -1118,7 +1226,15 @@ static MgsEnvelopeFormatResult formatMgsCompositeEnvelopeImpl(
             + joinTokens(tokens);
         result.compiled_bytes = compiledEnvelopeBytes(tokens);
     }
-    result.bytecode = compileEnvelopeTokens(tokens);
+    auto compiled_tokens = compileEnvelopeTokens(tokens);
+    if (!compiled_tokens) {
+        addIssueOnce(result, MgsEnvelopeIssue::InvalidGeneratedCommand);
+        result.body.clear();
+        result.definition.clear();
+        result.playback_counts.clear();
+        return result;
+    }
+    result.bytecode = std::move(*compiled_tokens);
     result.definition = wrapEnvelopeDefinition(
         definition_number,
         result.body,
@@ -1138,9 +1254,165 @@ MgsEnvelopeFormatResult formatMgsCompositeEnvelope(
         numbers, library, composite_name, true, true);
 }
 
+namespace {
+std::optional<std::string> commandConflictInLayers(
+    const CompositeTimbre& timbre, const TimbreLibrary* library,
+    bool include_ambiguous_import = false) {
+    const auto numbers = resolveTimbreNumbers(timbre);
+    for (std::size_t index = 0; index < timbre.layers.size(); ++index) {
+        const auto& layer = timbre.layers[index];
+        if (!layerUsesSequenceEnvelope(layer)) continue;
+        const auto formatted = formatMgsCompositeEnvelope(layer, layer.envelope_number,
+            std::numeric_limits<std::size_t>::max(), &numbers, library, timbre.name);
+        if (!formatted.command_conflicts.empty()) {
+            return "layer " + std::to_string(index + 1) + ": "
+                + describeMgsEnvelopeCommandConflict(formatted.command_conflicts.front());
+        }
+        if (include_ambiguous_import && !formatted.ambiguous_imported_automatic_counts.empty()) {
+            return "layer " + std::to_string(index + 1) + ": ct "
+                + std::to_string(formatted.ambiguous_imported_automatic_counts.front())
+                + ": imported zero-count volume has ambiguous saved timing; re-enter this volume step";
+        }
+    }
+    return std::nullopt;
+}
+} // namespace
+
+std::optional<std::string> mgsCompositeCommandConflict(
+    const CompositeTimbre& timbre, const TimbreLibrary* library) {
+    if (auto conflict = commandConflictInLayers(timbre, library)) return conflict;
+    const auto morph = compileSccMorphCached(timbre);
+    return morph->valid ? commandConflictInLayers(morph->timbre, library) : std::nullopt;
+}
+
+std::optional<std::string> mgsCompositeAuthoringIssue(
+    const CompositeTimbre& timbre, const TimbreLibrary* library) {
+    if (auto issue = commandConflictInLayers(timbre, library, true)) return issue;
+    const auto morph = compileSccMorphCached(timbre);
+    return morph->valid ? commandConflictInLayers(morph->timbre, library, true) : std::nullopt;
+}
+
+namespace {
+bool hasOnlyRepairableAuthoringIssues(
+    const CompositeTimbre& timbre, const TimbreLibrary* library,
+    bool include_ambiguous_import) {
+    const auto morph = compileSccMorphCached(timbre);
+    if (!morph->valid) return false;
+    bool found_conflict = false;
+    const auto inspect = [&](const CompositeTimbre& candidate, bool authored) {
+        if (!validateCompositeTimbre(candidate).valid()) return false;
+        auto numbering_input = candidate;
+        if (authored) {
+            for (auto& layer : numbering_input.layers) {
+                if (layer.source == TimbreSource::Scc
+                    && layer.scc_output_allocation == SccOutputAllocationMode::Contiguous) {
+                    // Source aliases are relocated by the existing channel allocator.
+                    layer.base_timbre.reset();
+                    layer.timbre_automation.clear();
+                }
+            }
+        }
+        auto numbers = resolveTimbreNumbers(numbering_input);
+        if (!numbers.valid()) return false;
+        if (authored) {
+            for (std::size_t index = 0; index < candidate.layers.size(); ++index) {
+                const auto& layer = candidate.layers[index];
+                if (layer.source != TimbreSource::Scc
+                    || layer.scc_output_allocation != SccOutputAllocationMode::Contiguous) continue;
+                const auto inspect_reference = [&](std::uint64_t id) {
+                    const auto* snapshot = findEmbeddedTimbreSnapshot(candidate, id);
+                    if (!snapshot || snapshot->source != TimbreSource::Scc) return false;
+                    if (!assignedNumberForLibraryId(numbers, id))
+                        numbers.assignments.push_back({index, id, 0, false});
+                    return true;
+                };
+                if (layer.base_timbre && !inspect_reference(layer.base_timbre->library_id)) return false;
+                if (layer.volume_envelope.kind != EnvelopeKind::Sequence) continue;
+                for (const auto& event : layer.timbre_automation) {
+                    if (event.kind == EnvelopeEventKind::Timbre
+                        && event.timbre_pick == TimbrePick::Library && event.target_library_id
+                        && !inspect_reference(event.target_library_id)) return false;
+                }
+            }
+        }
+        // The source-only assignments above validate author values and references;
+        // they are never emitted. The materialized pass validates real numbers,
+        // byte capacity and conflicts after the channel allocator has run.
+        // Number resolution can provision an assignment for an unresolved
+        // library ID. Program compilation still needs its actual snapshot.
+        // Keep this classification gate aligned with its embedded-first,
+        // then supplied-live-library lookup; a dummy number is not a patch.
+        for (const auto& assignment : numbers.assignments) {
+            if (findEmbeddedTimbreSnapshot(candidate, assignment.library_id) != nullptr)
+                continue;
+            if (library == nullptr || library->find(assignment.library_id) == nullptr)
+                return false;
+        }
+        // Inspect inactive layers too: retaining the author model is not an
+        // exception for another invalid layer that is currently inaudible.
+        for (const auto& layer : candidate.layers) {
+            if (!layerUsesSequenceEnvelope(layer)) continue;
+            auto unexpanded = layer;
+            for (const auto target : {CompositeModulationTarget::Pitch,
+                    CompositeModulationTarget::Volume, CompositeModulationTarget::TotalLevel,
+                    CompositeModulationTarget::Feedback, CompositeModulationTarget::Noise})
+                disableCompositeModulation(unexpanded, target);
+            for (const auto target : {OpllRegisterAutoTarget::Noise,
+                    OpllRegisterAutoTarget::TotalLevel, OpllRegisterAutoTarget::Feedback})
+                disableCompositeRegisterAuto(unexpanded, target);
+            // Generated commands may replace or clamp source values. Inspect
+            // the authored values too, without imposing a byte budget on this
+            // non-output preflight (expansion can legitimately change size).
+            const auto authored_checks = formatMgsCompositeEnvelopeImpl(unexpanded,
+                layer.envelope_number, std::numeric_limits<std::size_t>::max(),
+                &numbers, library, candidate.name, false, false, false);
+            if (!authored_checks.valid()) return false;
+            const auto strict = formatMgsCompositeEnvelope(layer, layer.envelope_number,
+                kMgscEnvelopeCompiledByteLimit, &numbers, library, candidate.name);
+            for (const auto issue : strict.issues) {
+                if (issue != MgsEnvelopeIssue::DuplicateZeroTimeCommand
+                    && !(include_ambiguous_import
+                        && issue == MgsEnvelopeIssue::AmbiguousImportedAutomaticVolume)) return false;
+            }
+            found_conflict |= strict.hasIssue(MgsEnvelopeIssue::DuplicateZeroTimeCommand)
+                || (include_ambiguous_import
+                    && strict.hasIssue(MgsEnvelopeIssue::AmbiguousImportedAutomaticVolume));
+            // A strict conflict returns before later checks. Re-run those
+            // checks privately without this one rule so an invalid loop/value
+            // cannot be concealed by an earlier duplicate. Nothing generated
+            // by this classification pass is returned or sent to an engine.
+            const auto other_checks = formatMgsCompositeEnvelopeImpl(layer,
+                layer.envelope_number, kMgscEnvelopeCompiledByteLimit,
+                &numbers, library, candidate.name, true, true, false);
+            if (!other_checks.valid()) return false;
+        }
+        return true;
+    };
+    return inspect(timbre, true) && inspect(morph->timbre, false) && found_conflict;
+}
+} // namespace
+
+bool mgsCompositeHasOnlyCommandConflicts(
+    const CompositeTimbre& timbre, const TimbreLibrary* library) {
+    return hasOnlyRepairableAuthoringIssues(timbre, library, false);
+}
+
+bool mgsCompositeHasOnlyRepairableAuthoringIssues(
+    const CompositeTimbre& timbre, const TimbreLibrary* library) {
+    return hasOnlyRepairableAuthoringIssues(timbre, library, true);
+}
+
 std::string formatMgsCompositeTrackSetup(
     const CompositeLayer& layer,
-    const TimbreNumberResolution* numbers) {
+    const TimbreNumberResolution* numbers,
+    std::string* error) {
+    if (error != nullptr) error->clear();
+    if ((layer.volume_envelope.kind == EnvelopeKind::Rate
+            || layerUsesSequenceEnvelope(layer))
+        && layer.envelope_number > 31) {
+        if (error != nullptr) *error = "invalid envelope definition number";
+        return {};
+    }
     unsigned track_number = 1;
     switch (layer.source) {
     case TimbreSource::Psg:
@@ -1171,8 +1443,7 @@ std::string formatMgsCompositeTrackSetup(
     }
     if (layer.volume_envelope.kind == EnvelopeKind::Rate
         || layerUsesSequenceEnvelope(layer)) {
-        const auto envelope_number = std::min<std::uint8_t>(
-            layer.envelope_number, 31);
+        const auto envelope_number = layer.envelope_number;
         const bool rate =
             layer.volume_envelope.kind == EnvelopeKind::Rate;
         line += rate ? " @r" : " @e";
@@ -1222,6 +1493,7 @@ std::string formatMgsCompositeTrackPreview(
     const CompositeLayer& layer,
     const TimbreNumberResolution* numbers) {
     auto line = formatMgsCompositeTrackSetup(layer, numbers);
+    if (line.empty()) return line;
     char channel = '\0';
     switch (layer.source) {
     case TimbreSource::Psg:
@@ -1258,7 +1530,9 @@ std::uint32_t maxEnvelopeLengthFittingBodyLimit(
     auto fits = [&](std::uint32_t length) {
         probe.envelope_timeline.length_counts = std::max<std::uint32_t>(1, length);
         const auto formatted = formatMgsCompositeEnvelopeImpl(
-            probe, 0, compiled_byte_limit, numbers, library, {}, true, false);
+            // This is a byte-capacity probe, not output: clearing [] above
+            // must not invalidate legal one-per-zone commands at its anchor.
+            probe, 0, compiled_byte_limit, numbers, library, {}, true, false, false);
         if (formatted.body.empty()) {
             return false;
         }

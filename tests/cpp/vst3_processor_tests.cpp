@@ -32,6 +32,8 @@
 #include "mgstc/engine/composite_timbre_library.hpp"
 #include "mgstc/engine/composite_envelope_compile.hpp"
 #include "mgstc/engine/composite_program_compiler.hpp"
+#include "mgstc/engine/mgs_envelope_io.hpp"
+#include "mgstc/engine/mgs_composite_io.hpp"
 #include "mgstc/engine/envelope_sequence.hpp"
 #include "plugin_state.hpp"
 #include "mgstc/engine/dc_blocker.hpp"
@@ -4252,6 +4254,272 @@ void requireRejected(
     require(sameBlock(before, stateBytes(processor)), "rejected state keeps the previous snapshot");
 }
 
+void testPluginConflictedStatePreservesAuthoringAndSilencesProgram() {
+    using namespace mgstc::engine;
+    auto legacy = documentFrom(psgOnlyTimbre(), 74,
+        {.has_selected_layer = true, .selected_layer = 0, .editor_tab = 2});
+    legacy.sound.name = "Legacy duplicate commands";
+    legacy.sound.memo = "Preserve this authoring document";
+    legacy.sound.tags = {"state", "legacy"};
+    auto& layer = legacy.sound.layers.front();
+    layer.volume_envelope.kind = EnvelopeKind::Sequence;
+    layer.volume_envelope.events = {{.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0}};
+    layer.envelope_timeline = {.length_counts = 32};
+    layer.timbre_automation = {
+        {.kind = EnvelopeEventKind::Noise, .value = 2, .count = 0},
+        {.kind = EnvelopeEventKind::Noise, .value = 3, .count = 0},
+    };
+    require(mgsCompositeHasOnlyCommandConflicts(legacy.sound), "fixture has only the acknowledged duplicate restriction");
+    const auto encoded = mgstc::plugin::serializePluginState(legacy);
+    require(!encoded.empty(), "legacy raw State remains serializable despite restricted output");
+    const juce::MemoryBlock expected(encoded.data(), encoded.size());
+
+    auto unresolved = legacy;
+    auto missing_wave = sccOnlyTimbre().layers.front();
+    missing_wave.envelope_number = 1;
+    missing_wave.scc_output_allocation = SccOutputAllocationMode::LegacyBank;
+    missing_wave.base_timbre.reset();
+    missing_wave.timbre_automation = {{.kind = EnvelopeEventKind::Timbre,
+        .value = 0, .count = 1, .target_library_id = 9999,
+        .timbre_pick = TimbrePick::Library}};
+    unresolved.sound.layers.push_back(missing_wave);
+    unresolved.sound.embedded_timbres.clear();
+    require(!mgsCompositeHasOnlyCommandConflicts(unresolved.sound),
+        "duplicate-only State exception requires every Library snapshot to resolve");
+    const auto unresolved_bytes = mgstc::plugin::serializePluginState(unresolved);
+    require(!unresolved_bytes.empty(), "unresolved Library fixture reaches the actual State boundary");
+
+    for (const double sample_rate : {48000.0, 44100.0}) {
+        auto owner = std::make_unique<MgstcAudioProcessor>();
+        auto& processor = *owner;
+        require(processor.replacePluginState(documentFrom(psgOnlyTimbre(), 0, {})), "load audible baseline");
+        processor.prepareToPlay(sample_rate, 128);
+        juce::AudioBuffer<float> buffer(2, 128);
+        juce::MidiBuffer midi;
+        midi.addEvent(juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(110)), 0);
+        double prior_peak = 0;
+        for (int block = 0; block < 16; ++block) {
+            processor.processBlock(buffer, midi);
+            prior_peak = std::max(prior_peak, channelPeak(buffer, 0, 128));
+        }
+        require(prior_peak > 0.001, "baseline genuinely produces audio before conflicting State is restored");
+        processor.setStateInformation(encoded.data(), static_cast<int>(encoded.size()));
+        require(sameBlock(expected, stateBytes(processor)), "actual getStateInformation preserves the raw restored State");
+        require(soundBytes(processor.copyPluginState().sound) == soundBytes(legacy.sound),
+            "restored model retains both conflicting commands in their original order");
+        require(!processor.editorProgramReady(), "Editor reports authoring conflict rather than a playable program");
+        mgstc::app::EditorSnapshot warning;
+        processor.editorPopulateOutputSnapshot(warning);
+        require(warning.output_status.find("作者データに未解決の出力制約") != std::string::npos
+            && warning.output_status.find("ct 0") != std::string::npos,
+            "State restore exposes its conflict warning and count diagnostic");
+        processor.setStateInformation(unresolved_bytes.data(), static_cast<int>(unresolved_bytes.size()));
+        mgstc::app::EditorSnapshot rejected_warning;
+        processor.editorPopulateOutputSnapshot(rejected_warning);
+        require(sameBlock(expected, stateBytes(processor)) && !processor.editorProgramReady()
+            && rejected_warning.output_status == warning.output_status,
+            "unresolved Library State preserves the prior raw document, blocked flag and warning");
+        for (int block = 0; block < 8; ++block) {
+            midi.addEvent(juce::MidiMessage::noteOn(1, 61, static_cast<juce::uint8>(110)), 0);
+            processor.processBlock(buffer, midi);
+            require(channelPeak(buffer, 0, 128) == 0,
+                "conflicting State stops existing audio and new DAW notes including residual SRC PCM");
+        }
+        require(Access::plan(processor).audible_layers.empty(), "the published derived program has no audible layers");
+        require(!processor.editorNoteOn(0, 64), "Editor cannot bypass the conflict with direct Note On");
+        std::uint8_t capacity = 0;
+        require(!processor.previewEditorComposite(psgOnlyTimbre(), true, capacity),
+            "temporary audition cannot bypass the unresolved authoring conflict");
+        auto pcm = std::make_shared<SourcePcm>();
+        pcm->sample_rate = 48000; pcm->channels = 1;
+        pcm->mono_samples.assign(512, 0.25f);
+        require(!processor.editorPlayPcmPreview(pcm, 0, 512, 1),
+            "PCM preview cannot bypass the unresolved authoring conflict");
+        require(!formatMgsComposite(processor.copyPluginState().sound).valid(),
+            "normal MGSC export remains strict for the retained raw model");
+        require(mgsCompositeCommandConflict(processor.copyPluginState().sound).has_value(),
+            "normal file/library save preflight still rejects the retained conflict");
+
+        auto roundtrip = std::make_unique<MgstcAudioProcessor>();
+        const auto saved = stateBytes(processor);
+        roundtrip->setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
+        require(sameBlock(expected, stateBytes(*roundtrip)), "a second actual Processor restores and saves the same raw document");
+        if (sample_rate == 48000) {
+            std::unique_ptr<juce::AudioProcessorEditor> view(roundtrip->createEditor());
+            auto* shared_view = dynamic_cast<mgstc::plugin::MgstcAudioProcessorEditor*>(view.get());
+            require(shared_view != nullptr && soundBytes(shared_view->copyWorkingComposite()) == soundBytes(legacy.sound),
+                "a regenerated Editor receives the raw conflict for repair");
+        }
+
+        auto partial = legacy.sound;
+        partial.memo += " / unfinished repair";
+        partial.layers.front().timbre_automation.back().value = 4;
+        require(processor.replaceEditorComposite(partial, true, capacity, processor.editorStateRestoreRevision()),
+            "an already-blocked document retains an unfinished duplicate-only repair");
+        require(!processor.editorProgramReady(), "unfinished repair remains silent");
+        const auto partial_saved = stateBytes(processor);
+        require(soundBytes(processor.copyPluginState().sound) == soundBytes(partial),
+            "unfinished repair updates the raw authoring model instead of keeping stale commands");
+        roundtrip->setStateInformation(partial_saved.getData(), static_cast<int>(partial_saved.getSize()));
+        require(soundBytes(roundtrip->copyPluginState().sound) == soundBytes(partial)
+            && !roundtrip->editorProgramReady(), "actual State save/reload retains the unfinished repair and its silence");
+        auto invalid_partial = partial;
+        invalid_partial.layers.front().volume_envelope.events.front().value = 99;
+        require(!processor.replaceEditorComposite(invalid_partial, true, capacity, processor.editorStateRestoreRevision()),
+            "blocked editing does not accept an unrelated invalid volume");
+        require(sameBlock(partial_saved, stateBytes(processor)), "rejected unrelated invalid edit preserves the current raw repair");
+
+        auto repaired = partial;
+        repaired.layers.front().timbre_automation.pop_back();
+        require(processor.replaceEditorComposite(repaired, true, capacity, processor.editorStateRestoreRevision()),
+            "a valid authoring repair commits through the original atomic path");
+        require(processor.editorProgramReady(), "successful repair releases the authoring playback restriction");
+        double repaired_peak = 0;
+        midi.addEvent(juce::MidiMessage::noteOn(1, 65, static_cast<juce::uint8>(110)), 0);
+        for (int block = 0; block < 16; ++block) {
+            processor.processBlock(buffer, midi);
+            repaired_peak = std::max(repaired_peak, channelPeak(buffer, 0, 128));
+        }
+        require(repaired_peak > 0.001, "repaired State resumes actual DAW audio");
+        processor.editorPopulateOutputSnapshot(warning);
+        require(warning.output_status.find("作者データに未解決の出力制約") == std::string::npos,
+            "repair clears the State conflict notice");
+    }
+
+    auto guarded = std::make_unique<MgstcAudioProcessor>();
+    const auto original = stateBytes(*guarded);
+    std::uint8_t rejected_capacity = 0;
+    require(!guarded->replaceEditorComposite(legacy.sound, true, rejected_capacity)
+        && sameBlock(original, stateBytes(*guarded)) && guarded->editorProgramReady(),
+        "ordinary editing cannot newly enter the legacy-State duplicate exception");
+    auto invalid = legacy;
+    invalid.sound.layers.front().envelope_timeline.loop_start_count = 1;
+    invalid.sound.layers.front().envelope_timeline.loop_end_count.reset();
+    require(!mgsCompositeHasOnlyCommandConflicts(invalid.sound), "duplicate exception excludes an unrelated incomplete loop");
+    const auto invalid_bytes = mgstc::plugin::serializePluginState(invalid);
+    require(!invalid_bytes.empty(), "mixed-invalid fixture reaches the actual State restore boundary");
+    guarded->setStateInformation(invalid_bytes.data(), static_cast<int>(invalid_bytes.size()));
+    require(sameBlock(original, stateBytes(*guarded)), "mixed-invalid State remains rejected instead of entering the duplicate exception");
+    guarded->setStateInformation(unresolved_bytes.data(), static_cast<int>(unresolved_bytes.size()));
+    mgstc::app::EditorSnapshot valid_warning;
+    guarded->editorPopulateOutputSnapshot(valid_warning);
+    require(sameBlock(original, stateBytes(*guarded)) && guarded->editorProgramReady()
+        && valid_warning.output_status.find("作者データに未解決の出力制約") == std::string::npos,
+        "unresolved Library State also preserves a valid document and its unblocked flag");
+
+    guarded->prepareToPlay(48000, 128);
+    processEmpty(*guarded, 128);
+    auto& engine = guarded->editorEngineForAnalysis();
+    const auto free_slots = engine.freeProgramSlotCount();
+    for (std::size_t index = 0; index < RealtimeEngineHost::kCommandCapacity; ++index)
+        static_cast<void>(engine.submit(EngineCommand::stop()));
+    require(!engine.submit(EngineCommand::stop()), "rollback fixture fills the bounded command queue");
+    const auto before_failed_commit = stateBytes(*guarded);
+    guarded->setStateInformation(encoded.data(), static_cast<int>(encoded.size()));
+    require(sameBlock(before_failed_commit, stateBytes(*guarded)) && guarded->editorProgramReady(),
+        "failed program submission rolls back the raw model and leaves its conflict flag unchanged");
+    require(engine.freeProgramSlotCount() == free_slots, "failed State submission returns its prepared program slot");
+
+    processEmpty(*guarded, 128);
+    guarded->setStateInformation(encoded.data(), static_cast<int>(encoded.size()));
+    processEmpty(*guarded, 128);
+    require(!guarded->editorProgramReady(), "reverse rollback starts with an acknowledged blocked State");
+    const auto blocked_before = stateBytes(*guarded);
+    mgstc::app::EditorSnapshot blocked_warning;
+    guarded->editorPopulateOutputSnapshot(blocked_warning);
+    const auto blocked_free_slots = engine.freeProgramSlotCount();
+    for (std::size_t index = 0; index < RealtimeEngineHost::kCommandCapacity; ++index)
+        static_cast<void>(engine.submit(EngineCommand::stop()));
+    require(!engine.submit(EngineCommand::stop()), "reverse rollback fills the bounded command queue");
+    auto rejected_repair = legacy.sound;
+    rejected_repair.layers.front().timbre_automation.pop_back();
+    require(!guarded->replaceEditorComposite(rejected_repair, true, rejected_capacity),
+        "a valid repair reports failed program submission");
+    mgstc::app::EditorSnapshot rollback_warning;
+    guarded->editorPopulateOutputSnapshot(rollback_warning);
+    require(sameBlock(blocked_before, stateBytes(*guarded)) && !guarded->editorProgramReady()
+        && rollback_warning.output_status == blocked_warning.output_status,
+        "failed repair retains the blocked raw authoring and its exact warning");
+    require(engine.freeProgramSlotCount() == blocked_free_slots,
+        "failed repair returns its prepared program slot");
+
+    auto skipped = std::make_unique<MgstcAudioProcessor>();
+    require(skipped->replacePluginState(documentFrom(psgOnlyTimbre(), 0, {})),
+        "load baseline for skipped-silent-plan SRC regression");
+    skipped->prepareToPlay(44100, 128);
+    juce::AudioBuffer<float> skipped_buffer(2, 128);
+    juce::MidiBuffer skipped_midi;
+    skipped_midi.addEvent(juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(110)), 0);
+    for (int block = 0; block < 16; ++block) skipped->processBlock(skipped_buffer, skipped_midi);
+    require(channelPeak(skipped_buffer, 0, 128) > 0.001,
+        "44.1kHz SRC has actual old-note PCM immediately before the State boundary");
+    skipped->setStateInformation(encoded.data(), static_cast<int>(encoded.size()));
+    require(!skipped->editorProgramReady(), "skipped silent plan is committed without an Audio callback");
+    auto immediate_repair = legacy.sound;
+    immediate_repair.layers.front().timbre_automation.pop_back();
+    require(skipped->replaceEditorComposite(immediate_repair, true, rejected_capacity),
+        "repair can follow the conflict with zero intervening Audio blocks");
+    require(skipped->editorProgramReady(), "immediate repair unblocks the authored program");
+    skipped_midi.clear();
+    skipped->processBlock(skipped_buffer, skipped_midi);
+    require(channelPeak(skipped_buffer, 0, 128) == 0 && channelPeak(skipped_buffer, 1, 128) == 0,
+        "first repaired block cannot replay old SRC PCM when the silent plan was skipped");
+    skipped_midi.addEvent(juce::MidiMessage::noteOn(1, 65, static_cast<juce::uint8>(110)), 0);
+    double resumed_peak = 0;
+    for (int block = 0; block < 16; ++block) {
+        skipped->processBlock(skipped_buffer, skipped_midi);
+        resumed_peak = std::max(resumed_peak, channelPeak(skipped_buffer, 0, 128));
+    }
+    require(resumed_peak > 0.001, "immediate repair still allows new DAW notes after discarding old SRC PCM");
+}
+
+void testPluginLegacyImportedTimingPreservesAuthoring() {
+    using namespace mgstc::engine;
+    auto legacy = documentFrom(psgOnlyTimbre(), 0, {});
+    auto& layer = legacy.sound.layers.front();
+    layer.envelope_timeline = {.length_counts = 32};
+    layer.volume_envelope.kind = EnvelopeKind::Sequence;
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume, .value = 0, .secondary = 2,
+         .count = 1, .automatic = true}};
+    layer.timbre_automation.clear();
+    layer.pitch_envelope.events.clear();
+    require(mgsCompositeHasOnlyRepairableAuthoringIssues(legacy.sound),
+        "legacy zero marker is a recoverable authoring issue, not a playable ramp");
+    const auto encoded = mgstc::plugin::serializePluginState(legacy);
+    require(!encoded.empty(), "raw legacy import authoring remains serializable");
+    const juce::MemoryBlock expected(encoded.data(), encoded.size());
+    auto processor = std::make_unique<MgstcAudioProcessor>();
+    processor->prepareToPlay(44100, 128);
+    processor->setStateInformation(encoded.data(), static_cast<int>(encoded.size()));
+    require(sameBlock(expected, stateBytes(*processor)),
+        "actual Processor preserves legacy marker without guessing its lost timing");
+    require(!processor->editorProgramReady(), "legacy timing issue blocks audition until repaired");
+    juce::AudioBuffer<float> buffer(2, 128);
+    juce::MidiBuffer midi;
+    midi.addEvent(juce::MidiMessage::noteOn(1, 60, static_cast<juce::uint8>(110)), 0);
+    for (int block = 0; block < 8; ++block) {
+        processor->processBlock(buffer, midi);
+        require(channelPeak(buffer, 0, 128) == 0 && channelPeak(buffer, 1, 128) == 0,
+            "retained legacy authoring cannot emit ambiguous audio");
+        midi.clear();
+    }
+    auto roundtrip = std::make_unique<MgstcAudioProcessor>();
+    const auto saved = stateBytes(*processor);
+    roundtrip->setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
+    require(sameBlock(expected, stateBytes(*roundtrip)) && !roundtrip->editorProgramReady(),
+        "actual host State roundtrip retains legacy timing and its warning state");
+    auto repaired = legacy.sound;
+    repaired.layers.front().volume_envelope.events.back().automatic = false;
+    repaired.layers.front().volume_envelope.events.back().secondary = 0;
+    std::uint8_t capacity = 0;
+    require(processor->replaceEditorComposite(repaired, true, capacity),
+        "explicit user replacement of the ambiguous step is accepted");
+    require(processor->editorProgramReady() && !mgsCompositeAuthoringIssue(processor->copyPluginState().sound),
+        "valid repair releases the output restriction without keeping a hidden marker");
+}
+
 void testPluginStateFoundation() {
     // Hosts heap-own processors; keep this multi-instance fixture off the bounded test stack.
     require(std::make_unique<MgstcAudioProcessor>()->hasEditor(), "plugin exposes the shared editor");
@@ -7447,12 +7715,12 @@ void testCompositeLoopVstTransactions() {
             && moved.layers[0].envelope_timeline.loop_end_count == 24,
         "moving loop start preserves the existing END marker");
     require(moved.layers[0].pitch_envelope.events == std::vector<Event>{
-                pitch(4, -2, false, 2), pitch(4, 3, false, 4),
-                pitch(10, 5, true, 2), pitch(10, -7, true, 4)}
+                pitch(4, -2, false, 1), pitch(4, 3, false, 2),
+                pitch(10, 5, true, 1), pitch(10, -7, true, 2)}
             && moved.layers[0].timbre_automation == std::vector<Event>{
-                write(4, 0x20, 0x11, false, 1), write(4, 0x20, 0x12, false, 3),
-                write(10, 0x20, 0x21, true, 1), write(10, 0x20, 0x22, true, 3)},
-        "moving the start puts every destination pitch and y command inside without merging or reordering");
+                write(4, 0x20, 0x11, false, 3), write(4, 0x20, 0x12, false, 4),
+                write(10, 0x20, 0x21, true, 3), write(10, 0x20, 0x22, true, 4)},
+        "moving the start preserves all commands and assigns unspecified pitch before y");
     require(sameAuthoringSound(processor.copyPluginState().sound, moved),
         "moved loop and command zones are published to the VST processor");
     require(EditorAccess::historySize(editor) == history_after_start + 1,
@@ -7479,11 +7747,11 @@ void testCompositeLoopVstTransactions() {
             && !cleared.layers[0].envelope_timeline.loop_end_count,
         "clearing the loop removes both markers");
     require(cleared.layers[0].pitch_envelope.events == std::vector<Event>{
-                pitch(4, -2, false, 2), pitch(4, 3, false, 4),
-                pitch(10, 5, false, 2), pitch(10, -7, false, 4)}
+                pitch(4, -2, false, 1), pitch(4, 3, false, 2),
+                pitch(10, 5, false, 1), pitch(10, -7, false, 2)}
             && cleared.layers[0].timbre_automation == std::vector<Event>{
-                write(4, 0x20, 0x11, false, 1), write(4, 0x20, 0x12, false, 3),
-                write(10, 0x20, 0x21, false, 1), write(10, 0x20, 0x22, false, 3)},
+                write(4, 0x20, 0x11, false, 3), write(4, 0x20, 0x12, false, 4),
+                write(10, 0x20, 0x21, false, 3), write(10, 0x20, 0x22, false, 4)},
         "clearing the loop flattens before/after in order and preserves relative pitch and y commands");
     require(sameAuthoringSound(processor.copyPluginState().sound, cleared),
         "cleared loop and flattened commands are committed to VST Plugin State");
@@ -7689,6 +7957,9 @@ void testVstOpllStepPickerCreatesAndOpensOriginalTimbre() {
             auto* child = root.getChildComponent(index);
             if (auto* bar = dynamic_cast<juce::ScrollBar*>(child);
                 bar != nullptr && bar->isVertical() == vertical) return bar;
+        }
+        for (int index = 0; index < root.getNumChildComponents(); ++index) {
+            auto* child = root.getChildComponent(index);
             if (auto* found = self(*child, vertical, self)) return found;
         }
         return nullptr;
@@ -7700,15 +7971,14 @@ void testVstOpllStepPickerCreatesAndOpensOriginalTimbre() {
 
     parameter->setSelectedId(3, juce::sendNotificationSync);
     const auto step_bounds = step_button->getBounds();
-    const int graph_x = step_bounds.getX() - UiLayout::textButtonH
-        - UiLayout::controlGap * 2 - UiLayout::xs;
-    const int plot_x = graph_x + UiLayout::compositeOverviewLabelW;
-    const int plot_width = vertical->getX() - plot_x;
+    const int plot_x = horizontal->getX() + UiLayout::sm + UiLayout::compositeOverviewLabelW;
+    const int plot_width = vertical->getX() - UiLayout::sm - plot_x;
+    require(plot_width > 0, "timeline graph scroll boundaries form a positive plot width");
     const double count_start = horizontal->getCurrentRangeStart();
     const double visible_counts = juce::jmax(1.0,
         horizontal->getCurrentRangeSize());
     const int x = plot_x + juce::roundToInt(
-        (0.5 - count_start) * plot_width / visible_counts);
+        (1.5 - count_start) * plot_width / visible_counts);
     const int y = step_bounds.getY() - UiLayout::xs
         + UiLayout::commandSummaryH + UiLayout::editMarkerLaneH / 2;
     const auto now = juce::Time::getCurrentTime();
@@ -7745,12 +8015,34 @@ void testVstOpllStepPickerCreatesAndOpensOriginalTimbre() {
     juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
     processEmpty(processor, 512);
     const auto edited = processor.copyPluginState().sound;
+    if (edited.layers.size() != 1 || edited.layers[0].base_opll_rom != 4
+        || edited.layers[0].timbre_automation.size() != 1) {
+        const auto& raw = EditorAccess::sound(editor);
+        const auto issue = mgstc::engine::mgsCompositeAuthoringIssue(raw);
+        std::fprintf(stderr, "step picker raw_layers=%zu state_layers=%zu issue=%s\n",
+            raw.layers.size(), edited.layers.size(), issue ? issue->c_str() : "none");
+        std::fprintf(stderr, "step picker click=%d,%d plot=%d,%d range=%f,%f\n",
+            x, y, plot_x, plot_width, count_start, visible_counts);
+        for (int child_index = 0; child_index < timeline_impl->getNumChildComponents(); ++child_index)
+            if (const auto* label = dynamic_cast<juce::Label*>(timeline_impl->getChildComponent(child_index));
+                label && label->getText().startsWith("ct "))
+                std::fprintf(stderr, "step picker position=%s\n", label->getText().toRawUTF8());
+        for (const auto& raw_layer : raw.layers) {
+            std::fprintf(stderr, "step picker raw_base_rom=%d kind=%u events=%zu\n",
+                raw_layer.base_opll_rom ? static_cast<int>(*raw_layer.base_opll_rom) : -1,
+                static_cast<unsigned>(raw_layer.volume_envelope.kind), raw_layer.timbre_automation.size());
+            for (const auto& raw_event : raw_layer.timbre_automation)
+                std::fprintf(stderr, "step picker kind=%u ct=%u after=%d id=%llu\n",
+                    static_cast<unsigned>(raw_event.kind), raw_event.count, raw_event.after_loop_start,
+                    static_cast<unsigned long long>(raw_event.target_library_id));
+        }
+    }
     require(edited.layers.size() == 1
             && edited.layers[0].base_opll_rom == 4
             && edited.layers[0].timbre_automation.size() == 1,
         "adding a step original keeps the channel base ROM and creates one @ event");
     const auto& event = edited.layers[0].timbre_automation.front();
-    require(event.kind == Kind::Timbre && event.count == 0
+    require(event.kind == Kind::Timbre && event.count == 1
             && event.timbre_pick == mgstc::engine::TimbrePick::Library
             && event.target_library_id != 0,
         "the new original is assigned to the clicked envelope step");
@@ -8527,6 +8819,7 @@ void testWavMorphPlanVstStateAndReediting() {
         [&](const auto& snapshot) { return snapshot.library_id == original_base.library_id; }),
         "old WAV base exists only in its layer before the actual assignment");
     const auto base_history = EditorAccess::historySize(editor);
+    const auto base_state = stateBytes(processor);
     EditorAccess::assignBase(editor, 0, replacement->library_id);
     const auto reassigned = EditorAccess::sound(editor);
     const auto* retained_base = findEmbeddedTimbreSnapshot(reassigned, original_base.library_id);
@@ -8535,13 +8828,36 @@ void testWavMorphPlanVstStateAndReediting() {
         "actual base picker retains the displaced snapshot still referenced by explicit @0");
     require(reassigned.layers.front().timbre_automation == confirmed.layers.front().timbre_automation,
         "base picker preserves explicit @ author intent and unchanged confirmed WAV plans");
-    require(compileSccMorph(reassigned).valid && formatMgsComposite(reassigned).valid()
-            && sameAuthoringSound(processor.copyPluginState().sound, reassigned),
-        "base reassignment keeps all WAV event sources resolvable in common DSP and VST state");
+    const auto conflict = mgsCompositeCommandConflict(reassigned);
+    const auto reassigned_morph = compileSccMorph(reassigned);
+    if (!reassigned_morph.valid || !mgsCompositeHasOnlyCommandConflicts(reassigned)) {
+        std::fprintf(stderr, "WAV reassigned morph=%d error=%s conflict=%s\n",
+            reassigned_morph.valid, reassigned_morph.error.c_str(), conflict ? conflict->c_str() : "none");
+        for (const auto& issue : formatMgsComposite(reassigned).issues)
+            std::fprintf(stderr, "WAV reassigned: %s\n", issue.c_str());
+    }
+    require(reassigned_morph.valid && mgsCompositeHasOnlyCommandConflicts(reassigned),
+        "base reassignment retains every resolvable WAV source and confirmed plan");
+    require(conflict && conflict->find("ct 0") != std::string::npos
+            && conflict->find("@") != std::string::npos
+            && conflict->find("自動追加") != std::string::npos
+            && !formatMgsComposite(reassigned).valid(),
+        "a different implicit base and authored @0 cannot both be emitted in one zone");
+    require(sameAuthoringSound(processor.copyPluginState().sound, picker_source)
+            && sameBlock(base_state, stateBytes(processor)),
+        "a new invalid authoring edit cannot replace the valid Processor snapshot");
     require(EditorAccess::historySize(editor) == base_history + 1,
         "actual base source reassignment creates one author history transaction");
     processEmpty(processor, 512);
-    const auto reassigned_blob = stateBytes(processor);
+    const auto legacy_bytes = mgstc::plugin::serializePluginState(documentFrom(reassigned, 0, {}));
+    auto legacy_processor = std::make_unique<MgstcAudioProcessor>();
+    legacy_processor->prepareToPlay(48'000.0, 512);
+    legacy_processor->setStateInformation(legacy_bytes.data(), static_cast<int>(legacy_bytes.size()));
+    require(sameAuthoringSound(legacy_processor->copyPluginState().sound, reassigned)
+            && !legacy_processor->editorProgramReady()
+            && peakOf(captureHostNotePcm(*legacy_processor, 4096)) == 0,
+        "legacy WAV State retains the displaced base and confirmed plans while blocking audio");
+    const auto reassigned_blob = stateBytes(*legacy_processor);
     const auto reassigned_parse = mgstc::plugin::parsePluginState(
         reassigned_blob.getData(), reassigned_blob.getSize());
     require(reassigned_parse.status == mgstc::plugin::PluginStateStatus::Ok
@@ -8552,8 +8868,9 @@ void testWavMorphPlanVstStateAndReediting() {
         "Undo of base selection removes the retained copy and restores original confirmed WAV state");
     processEmpty(processor, 512);
     EditorAccess::redo(editor);
-    require(sameAuthoringSound(EditorAccess::sound(editor), reassigned) && sameAuthoringSound(processor.copyPluginState().sound, reassigned),
-        "Redo restores the referenced old base snapshot and unchanged plans");
+    require(sameAuthoringSound(EditorAccess::sound(editor), reassigned)
+            && sameAuthoringSound(processor.copyPluginState().sound, picker_source),
+        "Redo retains invalid author data for repair without publishing an invalid program");
     processEmpty(processor, 512);
     EditorAccess::assignBase(editor, 0, replacement->library_id);
     require(sameAuthoringSound(EditorAccess::sound(editor), reassigned)
@@ -8562,11 +8879,15 @@ void testWavMorphPlanVstStateAndReediting() {
     processEmpty(processor, 512);
     EditorAccess::assignBase(editor, 0, {});
     const auto reset_base = EditorAccess::sound(editor);
+    if (const auto reset_issue = mgsCompositeCommandConflict(reset_base))
+        std::fprintf(stderr, "WAV base reset: %s\n", reset_issue->c_str());
     require(!reset_base.layers.front().base_timbre
             && findEmbeddedTimbreSnapshot(reset_base, original_base.library_id)
             && reset_base.layers.front().timbre_automation == confirmed.layers.front().timbre_automation
-            && compileSccMorph(reset_base).valid && sameAuthoringSound(processor.copyPluginState().sound, reset_base),
-        "base reset keeps all explicit WAV keyframe sources and confirmed plans intact in VST state");
+            && compileSccMorph(reset_base).valid && mgsCompositeHasOnlyCommandConflicts(reset_base)
+            && !formatMgsComposite(reset_base).valid()
+            && sameAuthoringSound(processor.copyPluginState().sound, picker_source),
+        "base reset retains explicit WAV sources and plans but rejects the conflicting fallback base");
     processEmpty(processor, 512);
     EditorAccess::undo(editor); // reset -> reassigned
     processEmpty(processor, 512);
@@ -8917,7 +9238,7 @@ void testEnvelopePatchSlideTransactions() {
     layer.volume_envelope.events = {{.kind=EnvelopeEventKind::Volume,.value=12,.count=0},
         {.kind=EnvelopeEventKind::Volume,.value=6,.count=6}};
     layer.pitch_envelope.events = {{.kind=EnvelopeEventKind::Pitch,.value=2,.count=1}};
-    layer.timbre_automation = {{.kind=EnvelopeEventKind::Timbre,.value=3,.count=0,.timbre_pick=TimbrePick::OpllRom},
+    layer.timbre_automation = {{.kind=EnvelopeEventKind::Timbre,.value=3,.count=1,.timbre_pick=TimbrePick::OpllRom},
         {.kind=EnvelopeEventKind::Timbre,.value=8,.count=10,.timbre_pick=TimbrePick::OpllRom},
         {.kind=EnvelopeEventKind::RegisterWrite,.value=12,.secondary=3,.count=1}};
     MgstcAudioProcessor preview_processor, apply_processor;
@@ -8947,6 +9268,12 @@ void testEnvelopePatchSlideTransactions() {
     const auto scope_state = stateBytes(scope_processor);
     const auto scope_history = EditorAccess::historySize(scope_editor);
     EditorAccess::auditionOwnedNote(scope_editor, 60);
+    if (EditorAccess::scheduledAuditionLayers(scope_editor) != std::vector<std::size_t>{2}) {
+        const auto diagnostic = mgstc::engine::mgsCompositeAuthoringIssue(scope_editor.workingTimbre());
+        std::fprintf(stderr, "owned scope ready=%d kind=%u issue=%s\n", scope_processor.editorProgramReady(),
+            static_cast<unsigned>(scope_editor.workingTimbre().layers[2].volume_envelope.kind),
+            diagnostic ? diagnostic->c_str() : "none");
+    }
     require(EditorAccess::scheduledAuditionLayers(scope_editor) == std::vector<std::size_t>{2},
         "owned Mono audition schedules only the exact SCC/OPLL editor target layer");
     EditorAccess::releaseOwnedNote(scope_editor, 60);
@@ -9231,6 +9558,8 @@ int main() {
             return 0;
         }
         if (std::getenv("MGSTC_COMMON_HOST_UI_ONLY")) {
+            testPluginConflictedStatePreservesAuthoringAndSilencesProgram();
+            testPluginLegacyImportedTimingPreservesAuthoring();
             testPluginStateFoundation();
             testPluginProjectRestore();
             testPluginEditor();
@@ -9320,6 +9649,8 @@ int main() {
         testIteratorOverdueIsConsumedInOrder();
         testBlockBoundaryMidiStaysOnItsFrame();
         testHostRateOverdueNoteIsAppliedNow();
+        testPluginConflictedStatePreservesAuthoringAndSilencesProgram();
+        testPluginLegacyImportedTimingPreservesAuthoring();
         testPluginStateFoundation();
         testWideSoftwareLfoMatchesDirectEngineCoreWithPitchEnvelope();
         testSccMorphPluginStateCompatibility();

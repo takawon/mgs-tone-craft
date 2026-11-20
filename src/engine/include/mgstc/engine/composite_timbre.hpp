@@ -146,8 +146,8 @@ struct EnvelopeEvent {
     // instead of restarting `=`). Ignored when automatic is false.
     bool precise{};
     SccMorphTransition scc_morph;
-    // Zero is the legacy canonical @/y then pitch order. A nonzero ordinal
-    // preserves mixed-lane execution order when a bracket is flattened.
+    // Zero requests the default n, mode, pitch, timbre, register order.
+    // A nonzero ordinal preserves explicit mixed-lane execution order.
     std::uint32_t command_order{};
 
     friend bool operator==(const EnvelopeEvent&, const EnvelopeEvent&)

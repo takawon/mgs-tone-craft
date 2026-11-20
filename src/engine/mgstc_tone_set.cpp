@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 #include "mgstc/engine/mgstc_tone_set.hpp"
+#include "mgstc/engine/mgs_envelope_io.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -172,6 +173,10 @@ std::optional<std::string> timbreRecordLine(
 std::optional<std::string> compositeRecordLine(
     const CompositeTimbreLibraryEntry& entry,
     std::string* error) {
+    if (const auto conflict = mgsCompositeAuthoringIssue(entry.timbre)) {
+        setError(error, *conflict);
+        return std::nullopt;
+    }
     CompositeTimbreLibrary library;
     library.installEntries({entry});
     return recordLine(library.serialize(), error);

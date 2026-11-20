@@ -921,7 +921,12 @@ if(MGSTC_BUILD_TESTS)
             add_test(NAME mgstc_composite_wav_${_wav_component}_tests
                 COMMAND mgstc_composite_wav_${_wav_component}_tests)
     endforeach()
-    set_tests_properties(mgstc_composite_wav_patchslide_tests PROPERTIES TIMEOUT 180)
+    # This covers the complete conversion matrix, not one conversion's UI latency.
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set_tests_properties(mgstc_composite_wav_patchslide_tests PROPERTIES TIMEOUT 1800)
+    else()
+        set_tests_properties(mgstc_composite_wav_patchslide_tests PROPERTIES TIMEOUT 180)
+    endif()
 
     add_executable(
         mgstc_composite_wav_improvement_tests

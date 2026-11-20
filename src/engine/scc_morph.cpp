@@ -1398,6 +1398,23 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
     };
     struct Pending { std::size_t layer{}; Node node; };
     std::vector<Pending> pending;
+    const auto isLeadingBaseEvent = [&](const Pending& item) {
+        const auto& layer = input.layers[item.layer];
+        if (!item.node.event_index || !layer.base_timbre
+            || layer.base_timbre->source != TimbreSource::Scc) return false;
+        const auto& event = layer.timbre_automation[*item.node.event_index];
+        const bool boundary = layer.envelope_timeline.loop_start_count == 0
+            || layer.envelope_timeline.loop_end_count == 0;
+        if (event.kind != EnvelopeEventKind::Timbre || event.count != 0
+            || (boundary && event.after_loop_start)) return false;
+        const auto* reference = sourceForEvent(event);
+        if (!reference || reference->library_id != layer.base_timbre->library_id) return false;
+        return std::count_if(layer.timbre_automation.begin(), layer.timbre_automation.end(),
+            [&](const auto& other) {
+                return other.kind == EnvelopeEventKind::Timbre && other.count == 0
+                    && (!boundary || !other.after_loop_start);
+            }) == 1;
+    };
     // Integer event placement below is translation-invariant in start count:
     // rounded and clamp bounds are all start + an integer relative count.
     // Duration therefore uniquely determines the normalized interval vector.
@@ -1578,7 +1595,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
         }
         auto& events = result.timbre.layers[item.layer].timbre_automation;
         const auto& assigned = allocation->second;
-        if (node.base_source) {
+        if (node.base_source || isLeadingBaseEvent(item)) {
             // Phase adjustment affects only the transient key-on snapshot,
             // preserving both the source data and the absence of an authored @0.
             const auto& original = input.layers[item.layer].base_timbre;
@@ -1603,10 +1620,12 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
             }
             node.diagnostic.output_number =
                 *result.timbre.layers[item.layer].base_timbre->manual_number;
-        } else if (node.event_index) {
+        }
+        if (node.event_index) {
             // Byte-identical source nodes retain their existing snapshot ID.
             // Only an actually phase-shifted source needs a derived reference.
             auto& event = events[*node.event_index];
+            if (isLeadingBaseEvent(item)) event.after_loop_start = false;
             const auto* original = sourceForEvent(input.layers[item.layer].timbre_automation[*node.event_index]);
             if (original && sourceWave(*original) == node.wave) {
                 event.target_library_id = original->library_id;
@@ -1617,7 +1636,7 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
             }
             event.timbre_pick = TimbrePick::Library;
             node.diagnostic.output_number = static_cast<std::uint8_t>(event.value);
-        } else {
+        } else if (!node.base_source) {
             EnvelopeEvent event;
             event.kind = EnvelopeEventKind::Timbre;
             event.count = node.diagnostic.count;
@@ -1662,7 +1681,8 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
             auto base_wave = layer.base_timbre ? sourceWave(*layer.base_timbre)
                 : generateSccPreset(SccWavePreset::Sine, SccHarmonic::One);
             for (const auto& item : pending)
-                if (item.layer == layer_index && item.node.base_source)
+                if (item.layer == layer_index
+                    && (item.node.base_source || isLeadingBaseEvent(item)))
                     base_wave = item.node.wave;
             add_wave(base_wave);
             // Final phase-adjusted endpoints replace their authored event
@@ -1803,6 +1823,8 @@ SccMorphCompileResult compileSccMorph(const CompositeTimbre& input,
                 if (item.layer != group.layer) continue;
                 const auto& reference = references[group.offsets.at(item.node.wave)];
                 auto& diagnostic = item.node.diagnostic;
+                if (isLeadingBaseEvent(item))
+                    layer.timbre_automation[*item.node.event_index].after_loop_start = false;
                 if (!item.node.event_index && !item.node.base_source) {
                     EnvelopeEvent event;
                     event.kind = EnvelopeEventKind::Timbre;

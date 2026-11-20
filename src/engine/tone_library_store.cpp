@@ -1,6 +1,7 @@
 #include "mgstc/engine/tone_library_store.hpp"
 
 #include "mgstc/engine/composite_timbre_library.hpp"
+#include "mgstc/engine/mgs_envelope_io.hpp"
 
 #include <sqlite3.h>
 
@@ -812,6 +813,12 @@ bool ToneLibraryDatabase::writeTimbres(
 bool ToneLibraryDatabase::writeComposites(
     const CompositeTimbreLibrary& composites,
     std::string* error) {
+    for (const auto& entry : composites.entries()) {
+        if (const auto conflict = mgsCompositeAuthoringIssue(entry.timbre)) {
+            setError(error, *conflict);
+            return false;
+        }
+    }
     if (!exec(
             "CREATE TEMP TABLE IF NOT EXISTS mgstc_keep_composite_ids("
             "id INTEGER PRIMARY KEY);",

@@ -6086,6 +6086,10 @@ private:
     }
 
     void saveCompositeFile() {
+        if (const auto conflict = mgstc::engine::mgsCompositeAuthoringIssue(timbre_, &timbre_library_)) {
+            showCompositeError(juce::String::fromUTF8(conflict->c_str()));
+            return;
+        }
         const auto validation =
             mgstc::engine::validateCompositeTimbre(timbre_);
         if (!validation.valid()) {
@@ -6616,6 +6620,10 @@ private:
     }
 
     void saveCompositeTimbre(bool save_as) {
+        if (const auto conflict = mgstc::engine::mgsCompositeAuthoringIssue(timbre_, &timbre_library_)) {
+            showCompositeError(juce::String::fromUTF8(conflict->c_str()));
+            return;
+        }
         timbre_.name = utf8String(name_.getText().trim());
         if (timbre_.name.empty()) {
             showCompositeError(
@@ -7509,7 +7517,11 @@ private:
                 envelope_limit_error = true;
                 envelope_limit_notices.add(
                     juce::String::charToString(track)
-                    + juce::String::fromUTF8("ch のエンベロープ設定を@eに変換できません。試聴を停止します"));
+                    + (formatted.command_conflicts.empty()
+                        ? juce::String::fromUTF8("ch のエンベロープ設定を@eに変換できません。試聴を停止します")
+                        : juce::String::fromUTF8("ch: ") + juce::String::fromUTF8(
+                            mgstc::engine::describeMgsEnvelopeCommandConflict(
+                                formatted.command_conflicts.front()).c_str())));
             } else {
                 envelope_limit_notices.add(
                     juce::String::charToString(track)

@@ -323,11 +323,20 @@ private:
     bool background_tasks_shutdown_{};
     mgstc::engine::SequentialVoiceAllocator voices_{kMaxVoices};
     std::array<mgstc::engine::CompositePlaybackPlan, 3> plan_slots_{};
+    // Published with its plan slot. The serialized producer carries a silence
+    // boundary through later repairs even when Audio skips the silent plan.
+    std::array<std::uint64_t, 3> plan_silence_epochs_{};
+    std::uint64_t next_silence_epoch_{}; // state_commit_mu_ producer only
+    std::uint64_t applied_silence_epoch_{}; // Audio consumer only
     std::atomic<std::uint8_t> published_plan_{0};
     std::atomic<std::uint8_t> acknowledged_plan_{0};
     std::uint8_t applied_plan_{0};
     mutable std::mutex state_mu_{};
     mgstc::engine::CompositeTimbre sound_{};
+    // DAW State retains the authored document; only its derived program is
+    // silent while an acknowledged command conflict remains unresolved.
+    std::string authoring_conflict_warning_;
+    std::atomic<bool> authoring_conflict_blocked_{false};
     PluginEditorState editor_{};
     std::uint64_t library_id_{0};
     std::atomic<std::uint64_t> audio_thread_token_{0};

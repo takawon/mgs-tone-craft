@@ -2,6 +2,9 @@
 
 #include "mgstc/engine/composite_wav_renderer.hpp"
 #include "mgstc/engine/composite_program_compiler.hpp"
+#include "mgstc/engine/mgs_composite_io.hpp"
+#include "mgstc/engine/mgs_envelope_io.hpp"
+#include "mgstc/engine/scc_morph.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -125,10 +128,36 @@ void testMorphUsesOrdinaryCompilerWithoutChangingSource() {
     const auto authored = source;
     const auto rendered = renderCompositeWav(
         source, {.key_off_frame = 5'600, .frame_count = 6'401});
+    if (!rendered.ok()) {
+        const auto diagnostic = formatMgsComposite(source);
+        std::fprintf(stderr, "morph render error=%u\n", static_cast<unsigned>(rendered.error));
+        for (const auto& issue : diagnostic.issues) std::fprintf(stderr, "%s\n", issue.c_str());
+    }
     require(rendered.ok(), "morph candidate renders");
     require(rendered.stereo_pcm == directRender(source, 0, 5'600, 6'401),
             "offline uses identical finalized morph commands as normal engine");
     require(source == authored, "morph renderer does not materialize authoring source");
+    for (const auto allocation : {SccOutputAllocationMode::Contiguous,
+                                 SccOutputAllocationMode::LegacyBank}) {
+        for (const bool dormant_side : {false, true}) {
+            auto candidate = source;
+            candidate.layers.front().scc_output_allocation = allocation;
+            candidate.layers.front().timbre_automation.front().after_loop_start = dormant_side;
+            const auto unchanged = candidate;
+            const auto compiled = compileSccMorph(candidate);
+            require(compiled.valid, "leading source morph materializes in both allocations");
+            const auto& generated = compiled.timbre.layers.front();
+            require(generated.base_timbre->library_id
+                        == generated.timbre_automation.front().target_library_id,
+                    "generated key-on base and its authored leading tone remain identical");
+            require(formatMgsComposite(candidate).valid(), "leading source morph exports");
+            require(candidate == unchanged, "leading base alignment preserves every authored field");
+
+            candidate.layers.front().timbre_automation.push_back(
+                candidate.layers.front().timbre_automation.front());
+            require(!formatMgsComposite(candidate).valid(), "manual same-zone duplicates remain invalid");
+        }
+    }
 }
 
 void testFreshStateAndFailures() {

@@ -12268,8 +12268,11 @@ private:
                         mgstc::engine::kMgscEnvelopeCompiledByteLimit))
                     + juce::String::fromUTF8("バイト)。MML出力と試聴を停止します。");
             } else if (!formatted.valid()) {
-                validation_error = juce::String::fromUTF8(
-                    "エンベロープ設定を@eに変換できません。MML出力と試聴を停止します。");
+                validation_error = formatted.command_conflicts.empty()
+                    ? juce::String::fromUTF8(
+                        "エンベロープ設定を@eに変換できません。MML出力と試聴を停止します。")
+                    : juce::String::fromUTF8(mgstc::engine::describeMgsEnvelopeCommandConflict(
+                        formatted.command_conflicts.front()).c_str());
             }
             if (definition.isEmpty()) {
                 definition = validation_error.isNotEmpty()

@@ -226,6 +226,7 @@ void run() {
 } // namespace
 
 int main() {
+    std::cout << std::unitbuf;
     try { run(); return 0; }
     catch (const std::exception& error) { std::cerr << "PatchSlide WAV regression: " << error.what() << '\n'; return 1; }
 }

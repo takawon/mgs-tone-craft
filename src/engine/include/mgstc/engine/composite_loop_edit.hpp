@@ -47,27 +47,30 @@ inline void preserveBoundaryCommandOrder(CompositeLayer& layer,
     struct Slot { bool after; std::uint32_t* order; int priority; };
     std::vector<Slot> commands;
     for (auto& event : layer.timbre_automation)
-        if (event.count == count) commands.push_back({event.after_loop_start, &event.command_order, 0});
+        if (event.count == count) commands.push_back({event.after_loop_start, &event.command_order,
+            event.kind == EnvelopeEventKind::Noise ? 0
+                : event.kind == EnvelopeEventKind::ToneNoiseMode ? 10
+                : event.kind == EnvelopeEventKind::Timbre ? 30 : 40});
     for (auto& event : layer.pitch_envelope.events)
-        if (event.count == count) commands.push_back({event.after_loop_start, &event.command_order, 3});
+        if (event.count == count) commands.push_back({event.after_loop_start, &event.command_order, 20});
     for (auto& profile : layer.register_auto_profiles)
-        if (profile.count == count) commands.push_back({profile.after_loop_start, &profile.command_order, 2});
+        if (profile.count == count) commands.push_back({profile.after_loop_start, &profile.command_order,
+            profile.target == OpllRegisterAutoTarget::Noise ? 2 : 42});
     for (auto& profile : layer.modulation_profiles)
         if (profile.count == count) commands.push_back({profile.after_loop_start, &profile.command_order,
-            profile.target == CompositeModulationTarget::Pitch ? 5
-                : profile.target == CompositeModulationTarget::Volume ? 7 : 2});
+            profile.target == CompositeModulationTarget::Pitch ? 22
+                : profile.target == CompositeModulationTarget::Volume ? 60
+                : profile.target == CompositeModulationTarget::Noise ? 2 : 42});
     for (auto& slot : layer.derived_command_placements)
         if (slot.count == count) commands.push_back({slot.after_loop_start, &slot.command_order,
-            slot.target == CompositeModulationTarget::Pitch ? 4
-                : slot.target == CompositeModulationTarget::Volume ? 6 : 1});
-    const bool explicit_order = std::any_of(commands.begin(), commands.end(),
-        [](const Slot& command) { return *command.order != 0; });
+            slot.target == CompositeModulationTarget::Pitch ? 21
+                : slot.target == CompositeModulationTarget::Volume ? 50
+                : slot.target == CompositeModulationTarget::Noise ? 1 : 41});
     std::stable_sort(commands.begin(), commands.end(),
-        [start, group_sides, explicit_order](const Slot& a, const Slot& b) {
-            // Ordinary legacy counts still serialize before-side first.
-            // Explicit ordinals override these dormant side flags.
-            if ((group_sides || !explicit_order) && a.after != b.after)
-                return group_sides && !start ? a.after : !a.after;
+        [start, group_sides](const Slot& a, const Slot& b) {
+            // Only actual loop boundaries have independent command zones.
+            if (group_sides && a.after != b.after)
+                return !start ? a.after : !a.after;
             if (*a.order && *b.order) return *a.order < *b.order;
             if (*a.order != *b.order) return *a.order != 0;
             return a.priority < b.priority;

@@ -896,6 +896,155 @@ void requireNoImportedTones(const mgstc::engine::ToneImportResult& result) {
         true);
 }
 
+std::vector<std::uint8_t> makeMgsRawEnvelopeVoice(const std::vector<std::uint8_t>& body) {
+    auto bytes = makeMgsEnvelopeOnlyVoice();
+    const auto marker = std::find(bytes.begin(), bytes.end(), 0x1A);
+    const auto header = static_cast<std::size_t>(std::distance(bytes.begin(), marker) + 1);
+    bytes.resize(header + 0x28);
+    REQUIRE_EQ(body.size() <= 255, true);
+    bytes.insert(bytes.end(), {0x02, 0x00, 0x00, static_cast<std::uint8_t>(body.size())});
+    bytes.insert(bytes.end(), body.begin(), body.end());
+    bytes.push_back(0xFF);
+    return bytes;
+}
+
+void testImportedZeroCountRampNormalizesOneTickVolume() {
+    using namespace mgstc::engine;
+    struct Case {
+        std::vector<std::uint8_t> raw;
+        std::vector<std::uint8_t> normalized;
+        std::vector<std::uint8_t> expected_volumes;
+    };
+    const std::vector<Case> cases{
+        {{0x28, 0}, {8}, {8, 8, 8}},
+        {{0x0F, 0x20, 0, 0x12, 3, 8}, {15, 0, 0x12, 3, 8}, {15, 0, 8, 8}},
+        {{0x28, 0, 0x23, 0, 0x12, 1, 15}, {8, 3, 0x12, 1, 15}, {8, 3, 15, 15}},
+        {{0xEF, 3, 0x25, 0}, {0xEF, 3, 5}, {15, 15, 15, 5, 5}},
+    };
+    for (const auto& item : cases) {
+        const auto imported = importTones(makeMgsRawEnvelopeVoice(item.raw), "mgs");
+        REQUIRE_EQ(imported.valid(), true);
+        const auto* timbre = firstCompositeTimbre(imported);
+        REQUIRE_EQ(timbre != nullptr, true);
+        const auto& layer = timbre->layers.front();
+        REQUIRE_EQ(std::all_of(layer.volume_envelope.events.begin(), layer.volume_envelope.events.end(),
+            [](const auto& event) { return !event.automatic && event.secondary == 0; }), true);
+        const auto formatted = formatMgsCompositeEnvelope(layer, 0);
+        REQUIRE_EQ(formatted.valid(), true);
+        REQUIRE_EQ(formatted.bytecode, item.normalized);
+        REQUIRE_EQ(sampleSequenceEnvelopeVolumes(formatted.bytecode, item.expected_volumes.size()), item.expected_volumes);
+        const auto restored = deserializeCompositeSoundPayload(serializeCompositeSoundPayload(*timbre),
+            kCompositeSoundPayloadVersion);
+        REQUIRE_EQ(restored.has_value(), true);
+        REQUIRE_EQ(restored->layers.front().volume_envelope, layer.volume_envelope);
+        REQUIRE_EQ(restored->layers.front().pitch_envelope, layer.pitch_envelope);
+        REQUIRE_EQ(formatMgsCompositeEnvelope(restored->layers.front(), 0).bytecode, item.normalized);
+    }
+    const auto imported = importTones(makeMgsRawEnvelopeVoice({15, 0x20, 0, 0x12, 3, 8}), "mgs");
+    const auto& layer = firstCompositeTimbre(imported)->layers.front();
+    REQUIRE_EQ(layer.volume_envelope.events[1].count, 1U);
+    REQUIRE_EQ(layer.volume_envelope.events[2].count, 2U);
+    REQUIRE_EQ(layer.pitch_envelope.events.front().count, 2U);
+}
+
+void testImportedZeroCountRampKeepsLoopAndBoundaries() {
+    using namespace mgstc::engine;
+    struct Case { std::vector<std::uint8_t> raw, normalized, volumes; std::uint32_t start, end; };
+    const std::vector<Case> cases{
+        {{0x40, 0x28, 0, 3, 0x60}, {0x40, 8, 3, 0x60}, {8, 3, 8, 3, 8}, 0, 2},
+        {{0x2F, 0, 0x40, 0x28, 0, 0x60}, {15, 0x40, 8, 0x60}, {15, 8, 8, 8}, 1, 2},
+        {{0x40, 0x28, 0, 0x60, 0x12, 1, 15}, {0x40, 8, 0x60}, {8, 8, 8}, 0, 1},
+        {{0x40, 8, 0x60, 0x23, 0, 0x12, 1, 15}, {0x40, 8, 0x60}, {8, 8, 8}, 0, 1},
+    };
+    for (const auto& item : cases) {
+        const auto imported = importTones(makeMgsRawEnvelopeVoice(item.raw), "mgs");
+        REQUIRE_EQ(imported.valid(), true);
+        const auto* timbre = firstCompositeTimbre(imported);
+        REQUIRE_EQ(timbre != nullptr, true);
+        const auto& layer = timbre->layers.front();
+        REQUIRE_EQ(layer.envelope_timeline.loop_start_count, std::optional<std::uint32_t>{item.start});
+        REQUIRE_EQ(layer.envelope_timeline.loop_end_count, std::optional<std::uint32_t>{item.end});
+        const auto restored = deserializeCompositeSoundPayload(serializeCompositeSoundPayload(*timbre),
+            kCompositeSoundPayloadVersion);
+        REQUIRE_EQ(restored.has_value(), true);
+        REQUIRE_EQ(restored->layers.front().volume_envelope, layer.volume_envelope);
+        const auto formatted = formatMgsCompositeEnvelope(restored->layers.front(), 0);
+        REQUIRE_EQ(formatted.valid(), true);
+        REQUIRE_EQ(formatted.bytecode, item.normalized);
+        REQUIRE_EQ(sampleSequenceEnvelopeVolumes(formatted.bytecode, item.volumes.size()), item.volumes);
+    }
+    const auto boundary = importTones(makeMgsRawEnvelopeVoice({0xEF, 255, 0xEF, 255, 1, 0x20, 0}), "mgs");
+    REQUIRE_EQ(boundary.valid(), true);
+    const auto* timbre = firstCompositeTimbre(boundary);
+    REQUIRE_EQ(timbre != nullptr, true);
+    REQUIRE_EQ(timbre->layers.front().envelope_timeline.length_counts, 512U);
+    REQUIRE_EQ(timbre->layers.front().volume_envelope.events.back().count, 511U);
+    const auto formatted = formatMgsCompositeEnvelope(timbre->layers.front(), 0);
+    REQUIRE_EQ(formatted.valid(), true);
+    REQUIRE_EQ(sampleSequenceEnvelopeVolumes(formatted.bytecode, 513)[511], std::uint8_t{0});
+    const auto beyond = importTones(makeMgsRawEnvelopeVoice({0xEF, 255, 0xEF, 255, 0xEF, 2, 0x20, 0}), "mgs");
+    // 512 is the editor's UI ceiling, not the imported model's hard limit.
+    REQUIRE_EQ(beyond.valid(), true);
+    const auto* extended = firstCompositeTimbre(beyond);
+    REQUIRE_EQ(extended != nullptr, true);
+    REQUIRE_EQ(extended->layers.front().envelope_timeline.length_counts, 513U);
+    REQUIRE_EQ(extended->layers.front().volume_envelope.events.back().count, 512U);
+    const auto extended_output = formatMgsCompositeEnvelope(extended->layers.front(), 0);
+    REQUIRE_EQ(extended_output.valid(), true);
+    REQUIRE_EQ(sampleSequenceEnvelopeVolumes(extended_output.bytecode, 514)[512], std::uint8_t{0});
+
+    const auto trailing = importTones(makeMgsRawEnvelopeVoice({0x40, 8, 0x60, 0x23, 0, 0x12, 1, 15}), "mgs");
+    REQUIRE_EQ(trailing.valid(), true);
+    const auto* trailing_timbre = firstCompositeTimbre(trailing);
+    REQUIRE_EQ(trailing_timbre != nullptr, true);
+    const auto& trailing_layer = trailing_timbre->layers.front();
+    const auto outside = std::find_if(trailing_layer.volume_envelope.events.begin(),
+        trailing_layer.volume_envelope.events.end(), [](const EnvelopeEvent& event) {
+            return event.count == 1 && event.value == 3 && !event.automatic;
+        });
+    REQUIRE_EQ(outside != trailing_layer.volume_envelope.events.end(), true);
+    REQUIRE_EQ(outside->after_loop_start, false);
+    REQUIRE_EQ(trailing_layer.pitch_envelope.events.front().count, 2U);
+    REQUIRE_EQ(trailing_layer.pitch_envelope.events.front().after_loop_start, false);
+}
+
+void testLegacyImportedZeroSpanPreservesAuthoringAndStopsOutput() {
+    using namespace mgstc::engine;
+    auto timbre = defaultCompositeTimbre();
+    auto& layer = timbre.layers.front();
+    layer.volume_envelope.kind = EnvelopeKind::Sequence;
+    layer.envelope_timeline.length_counts = 2;
+    layer.volume_envelope.events = {
+        {.kind = EnvelopeEventKind::Volume, .value = 15, .count = 0},
+        {.kind = EnvelopeEventKind::Volume, .value = 0, .secondary = 2, .count = 1, .automatic = true},
+        {.kind = EnvelopeEventKind::Volume, .value = 8, .count = 1},
+    };
+    const auto before = layer.volume_envelope;
+    const auto restored = deserializeCompositeSoundPayload(serializeCompositeSoundPayload(timbre),
+        kCompositeSoundPayloadVersion);
+    REQUIRE_EQ(restored.has_value(), true);
+    REQUIRE_EQ(restored->layers.front().volume_envelope, before);
+    const auto rejected = formatMgsCompositeEnvelope(restored->layers.front(), 0);
+    REQUIRE_EQ(rejected.valid(), false);
+    REQUIRE_EQ(rejected.hasIssue(MgsEnvelopeIssue::AmbiguousImportedAutomaticVolume), true);
+    REQUIRE_EQ(rejected.ambiguous_imported_automatic_counts, (std::vector<std::uint32_t>{1}));
+    REQUIRE_EQ(rejected.bytecode.empty(), true);
+    REQUIRE_EQ(rejected.definition.empty(), true);
+    REQUIRE_EQ(layer.volume_envelope, before);
+    // A same-count authored stack has no imported start marker and remains
+    // governed by its established authoring convention, not this guard.
+    layer.volume_envelope.events[1].secondary = 0;
+    REQUIRE_EQ(formatMgsCompositeEnvelope(layer, 0).valid(), true);
+    // A one-count imported ramp marker is not a zero-span legacy marker.
+    layer.volume_envelope.events.resize(2);
+    layer.volume_envelope.events[1].secondary = 1;
+    layer.volume_envelope.events[1].count = 1;
+    REQUIRE_EQ(formatMgsCompositeEnvelope(layer, 0).hasIssue(MgsEnvelopeIssue::AmbiguousImportedAutomaticVolume), false);
+    std::vector<std::string> issues;
+    REQUIRE_EQ(parseMgsSequenceBody(",,f.0=0", layer, issues), false);
+    REQUIRE_EQ(issues.empty(), false);
+}
+
 void testToneImportUnusedEnvelopeAsPsg() {
     const auto binary = mgstc::engine::importTones(
         makeMgsEnvelopeOnlyVoice(), "mgs");

@@ -359,6 +359,18 @@ bool envelopeBytecodeToLayer(
                 return fail("truncated envelope ramp command");
             }
             const auto hold = bytecode[position++];
+            if (hold == 0) {
+                if (count >= EnvelopeTimeline::kMaximumLengthCounts)
+                    return fail("one-tick imported volume exceeds the envelope length limit");
+                volume.push_back({
+                    .kind = EnvelopeEventKind::Volume,
+                    .value = opcode & 0x0F,
+                    .count = count,
+                    .after_loop_start = after_loop_start,
+                });
+                ++count;
+                continue;
+            }
             const auto ramp_start = count;
             count = std::min<std::uint32_t>(
                 EnvelopeTimeline::kMaximumLengthCounts,

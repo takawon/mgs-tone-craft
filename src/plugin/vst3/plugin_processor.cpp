@@ -21,6 +21,7 @@
 #include "mgstc/engine/engine_command.hpp"
 #include "mgstc/engine/opll_patch.hpp"
 #include "mgstc/engine/opll_register_auto.hpp"
+#include "mgstc/engine/mgs_envelope_io.hpp"
 
 namespace mgstc::plugin {
 namespace {
@@ -433,12 +434,14 @@ void MgstcAudioProcessor::processBlock(
         mgstc::engine::RealtimeEngineHost& engine;
         juce::AudioBuffer<float>& buffer;
         bool offline;
+        const std::atomic<bool>& authoring_conflict;
         ~FinalHardwareSilence() {
-            if (!offline && engine.soundOutputKind()
-                == mgstc::engine::SoundOutputKind::MAmidiMemo)
+            if (authoring_conflict.load(std::memory_order_acquire)
+                || (!offline && engine.soundOutputKind()
+                    == mgstc::engine::SoundOutputKind::MAmidiMemo))
                 buffer.clear();
         }
-    } hardware_silence{engine_, buffer, offline};
+    } hardware_silence{engine_, buffer, offline, authoring_conflict_blocked_};
     const auto output_revision = engine_.outputRoutingRevision();
     const bool offline_mode_changed = previous_block_offline_ != offline;
     previous_block_offline_ = offline;
@@ -1398,6 +1401,14 @@ void MgstcAudioProcessor::applyCommittedPlaybackPlan() noexcept {
     const auto index = published_plan_.load(std::memory_order_acquire);
     acknowledged_plan_.store(index, std::memory_order_release);
     engine_.servicePendingControlCommands();
+    const auto silence_epoch = plan_silence_epochs_[index];
+    if (silence_epoch != applied_silence_epoch_) {
+        // Only Audio owns SRC history. A later repaired plan retains this
+        // boundary if no callback consumed the intermediate silent program.
+        src_.reset();
+        if (use_src_ && sample_rate_ok_) src_.primeWithSilence();
+        applied_silence_epoch_ = silence_epoch;
+    }
     if (index == applied_plan_) {
         serviceOpllKeyoffSilence();
         return;
@@ -1434,6 +1445,18 @@ bool MgstcAudioProcessor::commitPluginState(
         return false;
     }
 
+    const auto authoring_issue = mgstc::engine::mgsCompositeAuthoringIssue(document.sound);
+    const bool retain_conflicted_authoring = host_restore
+        || authoring_conflict_blocked_.load(std::memory_order_acquire);
+    const bool preserve_conflicted_state = retain_conflicted_authoring && authoring_issue
+        && mgstc::engine::mgsCompositeHasOnlyRepairableAuthoringIssues(document.sound);
+    if (authoring_issue && !preserve_conflicted_state) return false;
+    // Preserve an older authored State and its unfinished repairs, not an
+    // invalid audible program. Valid documents cannot newly opt into this
+    // exception through ordinary editing; export/save remain strict.
+    const mgstc::engine::CompositeTimbre silent_program;
+    const auto& playback_sound = preserve_conflicted_state ? silent_program : document.sound;
+
     auto edit = engine_.beginProgramEdit();
     if (!edit.valid()) {
         engine_.discardStuckProgramEdits();
@@ -1447,7 +1470,7 @@ bool MgstcAudioProcessor::commitPluginState(
     state_compile_count_.fetch_add(1, std::memory_order_relaxed);
     const bool compiled = mgstc::engine::compileCompositeProgram(
         *edit.engine,
-        document.sound,
+        playback_sound,
         {.polyphonic = polyphonic},
         &plan);
     if (voice_capacity != nullptr) {
@@ -1462,11 +1485,17 @@ bool MgstcAudioProcessor::commitPluginState(
     plan_slots_[slot] = plan;
 
     PluginStateDocument previous = copyPluginState();
+    std::string previous_authoring_warning;
     {
         std::lock_guard<std::mutex> lock(state_mu_);
+        previous_authoring_warning = authoring_conflict_warning_;
         sound_ = document.sound;
         editor_ = document.editor;
         library_id_ = document.library_id;
+        authoring_conflict_warning_ = preserve_conflicted_state
+            ? "作者データに未解決の出力制約があります。修正するまで発音・保存・MGSC出力を停止します。 "
+                + *authoring_issue
+            : std::string{};
     }
     if (!engine_.submitProgram(edit)) {
         static_cast<void>(engine_.discardProgramEdit(edit));
@@ -1474,6 +1503,7 @@ bool MgstcAudioProcessor::commitPluginState(
         sound_ = std::move(previous.sound);
         editor_ = previous.editor;
         library_id_ = previous.library_id;
+        authoring_conflict_warning_ = std::move(previous_authoring_warning);
         return false;
     }
 
@@ -1484,7 +1514,10 @@ bool MgstcAudioProcessor::commitPluginState(
         engine_.drainPendingCommands(drain, 32, true);
     }
 
+    if (preserve_conflicted_state) ++next_silence_epoch_;
+    plan_silence_epochs_[slot] = next_silence_epoch_;
     published_plan_.store(slot, std::memory_order_release);
+    authoring_conflict_blocked_.store(preserve_conflicted_state, std::memory_order_release);
     program_ready_.store(true, std::memory_order_release);
     editor_runtime_program_temporary_ = false;
     const int next_volume = std::clamp(
@@ -1537,6 +1570,7 @@ bool MgstcAudioProcessor::previewEditorComposite(
         return false;
     }
     std::lock_guard<std::mutex> producer_lock(state_commit_mu_);
+    if (authoring_conflict_blocked_.load(std::memory_order_acquire)) return false;
     if (expected_restore_revision && *expected_restore_revision != editorStateRestoreRevision())
         return false;
     // Only the serialized producer consumes Free slots. The audio consumer
@@ -1571,6 +1605,7 @@ bool MgstcAudioProcessor::previewEditorComposite(
         std::array<float, 64> drain{};
         engine_.drainPendingCommands(drain, 32, true);
     }
+    plan_silence_epochs_[slot] = next_silence_epoch_;
     published_plan_.store(slot, std::memory_order_release);
     program_ready_.store(true, std::memory_order_release);
     editor_runtime_program_temporary_ = true;
@@ -1591,6 +1626,9 @@ bool MgstcAudioProcessor::editorSubmitEngine(
         return false;
     }
     std::lock_guard<std::mutex> lock(state_commit_mu_);
+    if (authoring_conflict_blocked_.load(std::memory_order_acquire)
+        && (command.type == mgstc::engine::EngineCommandType::NoteOn
+            || command.type == mgstc::engine::EngineCommandType::LoadProgram)) return false;
     if (expected_restore_revision
         && *expected_restore_revision != editorStateRestoreRevision()) {
         return false;
@@ -1643,6 +1681,8 @@ bool MgstcAudioProcessor::editorPlayPcmPreview(
     std::shared_ptr<const mgstc::engine::SourcePcm> pcm,
     std::size_t begin, std::size_t end, float gain) {
     if (onAudioThread() || !host_prepared_.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> lock(state_commit_mu_);
+    if (authoring_conflict_blocked_.load(std::memory_order_acquire)) return false;
     return pcm_preview_.play(std::move(pcm), begin, end, gain);
 }
 
@@ -1761,7 +1801,8 @@ bool MgstcAudioProcessor::editorSharedProgramActive() const noexcept {
 }
 
 bool MgstcAudioProcessor::editorProgramReady() const noexcept {
-    return program_ready_.load(std::memory_order_acquire);
+    return program_ready_.load(std::memory_order_acquire)
+        && !authoring_conflict_blocked_.load(std::memory_order_acquire);
 }
 
 void MgstcAudioProcessor::editorRetainCompositeScope() noexcept {
@@ -1842,6 +1883,12 @@ void MgstcAudioProcessor::editorPopulateOutputSnapshot(
     snapshot.hardware_settings = {settings.host, settings.port, settings.unit_no,
         settings.scc_plus, settings.waveform_monitor};
     snapshot.opll_keyoff_silence_seconds = opll_keyoff_silence_seconds_.load(std::memory_order_relaxed);
+    if (authoring_conflict_blocked_.load(std::memory_order_acquire)) {
+        std::unique_lock state_lock(state_mu_, std::try_to_lock);
+        snapshot.output_status += " / ";
+        snapshot.output_status += state_lock.owns_lock() && !authoring_conflict_warning_.empty()
+            ? authoring_conflict_warning_ : "作者データの出力制約を修正するまで発音を停止します。";
+    }
 }
 
 void MgstcAudioProcessor::editorArmOpllKeyoffSilence(std::uint8_t track,

@@ -480,6 +480,12 @@ std::string issueName(MgsEnvelopeIssue issue) {
         return "automatic envelope ramp exceeds one-byte duration";
     case MgsEnvelopeIssue::UnrepresentableModulationLoop:
         return "modulation cannot continue exactly across the permanent loop";
+    case MgsEnvelopeIssue::DuplicateZeroTimeCommand:
+        return "more than one envelope command of the same restricted kind in one count/zone";
+    case MgsEnvelopeIssue::InvalidGeneratedCommand:
+        return "invalid generated envelope command";
+    case MgsEnvelopeIssue::AmbiguousImportedAutomaticVolume:
+        return "imported envelope has unresolved automatic-volume timing";
     }
     return "invalid envelope";
 }
@@ -565,6 +571,7 @@ bool parseSequence(
     std::optional<std::uint32_t> loop_start;
     std::optional<std::uint32_t> loop_end;
     bool after_loop_start = false;
+    std::uint32_t command_order = 0;
     std::vector<EnvelopeEvent> volume;
     std::vector<EnvelopeEvent> pitch;
     std::vector<EnvelopeEvent> timbre;
@@ -689,6 +696,7 @@ bool parseSequence(
                 .value = number,
                 .count = count,
                 .after_loop_start = after_loop_start,
+                .command_order = ++command_order,
             });
             continue;
         }
@@ -718,6 +726,7 @@ bool parseSequence(
                 .value = value,
                 .count = count,
                 .after_loop_start = after_loop_start,
+                .command_order = ++command_order,
             });
             continue;
         }
@@ -733,7 +742,8 @@ bool parseSequence(
                 continue;
             }
             timbre.push_back({.kind = noise ? EnvelopeEventKind::Noise : EnvelopeEventKind::ToneNoiseMode,
-                .value = value, .count = count, .after_loop_start = after_loop_start});
+                .value = value, .count = count, .after_loop_start = after_loop_start,
+                .command_order = ++command_order});
             continue;
         }
         if (character == 'y' || character == 'Y') {
@@ -778,6 +788,7 @@ bool parseSequence(
                 .secondary = value,
                 .count = count,
                 .after_loop_start = after_loop_start,
+                .command_order = ++command_order,
             });
             continue;
         }
@@ -1187,7 +1198,12 @@ MgsCompositeIoResult formatMgsComposite(
                 layer, number, kMgscEnvelopeCompiledByteLimit, &numbers, library,
                 timbre.name);
             if (!formatted.valid()) {
+                for (const auto& conflict : formatted.command_conflicts) {
+                    addIssue(result.issues, "layer " + std::to_string(index + 1) + ": "
+                        + describeMgsEnvelopeCommandConflict(conflict));
+                }
                 for (const auto issue : formatted.issues) {
+                    if (issue == MgsEnvelopeIssue::DuplicateZeroTimeCommand) continue;
                     addIssue(
                         result.issues,
                         "layer " + std::to_string(index + 1)
