@@ -5,10 +5,19 @@
 
 #include <sqlite3.h>
 
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <thread>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -292,7 +301,11 @@ CREATE INDEX tone_set_members_composite ON tone_set_members(composite_id);
     const auto now = std::chrono::system_clock::to_time_t(
         std::chrono::system_clock::now());
     std::tm utc{};
+#ifdef _WIN32
     gmtime_s(&utc, &now);
+#else
+    gmtime_r(&now, &utc);
+#endif
     std::ostringstream text;
     text << std::put_time(&utc, "%Y%m%d%H%M%S");
     return text.str();
@@ -310,6 +323,7 @@ public:
 
     [[nodiscard]] bool acquire(const std::string& database_utf8, std::string* error) {
         release();
+#ifdef _WIN32
         const auto wide = utf8ToWide(database_utf8 + ".migrate.lock");
         if (wide.empty()) {
             setError(error, "failed to encode tone library migration lock path");
@@ -329,18 +343,59 @@ public:
             }
             Sleep(50);
         }
+#else
+        const auto lock_path = database_utf8 + ".migrate.lock";
+        if (database_utf8.empty()) {
+            setError(error, "failed to encode tone library migration lock path");
+            return false;
+        }
+        for (int attempt = 0; attempt < 600; ++attempt) {
+            const int fd = ::open(
+                lock_path.c_str(), O_RDWR | O_CREAT, 0666);
+            if (fd >= 0) {
+                if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+                    // The holder unlinks the path when it releases (the
+                    // DELETE_ON_CLOSE counterpart). If the path no longer
+                    // names this inode, the lock belongs to a stale file:
+                    // drop it and retry so all contenders serialise on the
+                    // file the path currently names.
+                    struct stat path_stat {};
+                    struct stat fd_stat {};
+                    if (::stat(lock_path.c_str(), &path_stat) == 0
+                        && ::fstat(fd, &fd_stat) == 0
+                        && path_stat.st_ino == fd_stat.st_ino) {
+                        fd_ = fd;
+                        lock_path_ = lock_path;
+                        return true;
+                    }
+                }
+                ::close(fd);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+#endif
         setError(error, "timed out waiting for tone library migration lock");
         return false;
     }
 
 private:
     void release() noexcept {
+#ifdef _WIN32
         if (handle_ != INVALID_HANDLE_VALUE) {
             CloseHandle(handle_);
             handle_ = INVALID_HANDLE_VALUE;
         }
+#else
+        if (fd_ >= 0) {
+            ::unlink(lock_path_.c_str());
+            ::close(fd_);
+            fd_ = -1;
+            lock_path_.clear();
+        }
+#endif
     }
 
+#ifdef _WIN32
     [[nodiscard]] static std::wstring utf8ToWide(const std::string& utf8) {
         if (utf8.empty()) {
             return {};
@@ -370,6 +425,10 @@ private:
     }
 
     HANDLE handle_{INVALID_HANDLE_VALUE};
+#else
+    int fd_{-1};
+    std::string lock_path_;
+#endif
 };
 
 [[nodiscard]] bool payloadForCategory(

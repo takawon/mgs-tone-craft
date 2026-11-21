@@ -11485,7 +11485,11 @@ CREATE TABLE composite_tags (
     }
     auto occupy = [&](std::time_t when) {
         std::tm utc{};
+#ifdef _WIN32
         gmtime_s(&utc, &when);
+#else
+        gmtime_r(&when, &utc);
+#endif
         std::ostringstream stamp;
         stamp << std::put_time(&utc, "%Y%m%d%H%M%S");
         for (int index = 0; index < 50; ++index) {

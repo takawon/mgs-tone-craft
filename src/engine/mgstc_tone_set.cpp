@@ -4,10 +4,12 @@
 #include "mgstc/engine/mgs_envelope_io.hpp"
 
 #include <algorithm>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <utility>
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -15,6 +17,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace mgstc::engine {
 namespace {
@@ -413,6 +419,7 @@ bool replaceFileBytesAtomically(
         setError(error, "export folder is missing");
         return false;
     }
+#ifdef _WIN32
     const auto temporary =
         destination.parent_path()
         / (destination.filename().wstring() + L".writing");
@@ -466,6 +473,51 @@ bool replaceFileBytesAtomically(
         return false;
     }
     return true;
+#else
+    const auto temporary =
+        destination.parent_path()
+        / (destination.filename().string() + ".writing");
+    {
+        std::ofstream stream(
+            temporary, std::ios::binary | std::ios::trunc);
+        if (!stream) {
+            setError(error, "export temporary file could not be created");
+            return false;
+        }
+        stream.write(
+            bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        stream.flush();
+        if (!stream) {
+            stream.close();
+            std::error_code remove_error;
+            std::filesystem::remove(temporary, remove_error);
+            setError(error, "export temporary file could not be written");
+            return false;
+        }
+    }
+    // Match the Windows path's durability intent (FlushFileBuffers before
+    // the replace): flush the written file to storage before the rename.
+    const int fd = ::open(temporary.c_str(), O_RDONLY);
+    if (fd < 0 || ::fsync(fd) != 0) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        std::error_code remove_error;
+        std::filesystem::remove(temporary, remove_error);
+        setError(error, "export temporary file could not be written");
+        return false;
+    }
+    ::close(fd);
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, destination, rename_error);
+    if (rename_error) {
+        std::error_code remove_error;
+        std::filesystem::remove(temporary, remove_error);
+        setError(error, "export file could not be replaced");
+        return false;
+    }
+    return true;
+#endif
 }
 
 bool writeMgstcToneSetFile(

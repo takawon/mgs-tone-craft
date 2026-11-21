@@ -23,6 +23,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <iconv.h>
 #endif
 
 namespace mgstc::engine {
@@ -233,8 +235,27 @@ std::string decodeCp932Name(std::span<const std::uint8_t> bytes) {
         nullptr);
     return asciiOrUtf8(std::move(utf8));
 #else
-    return trimPaddedName(std::string_view(
-        reinterpret_cast<const char*>(bytes.data()), length));
+    const iconv_t converter = iconv_open("UTF-8", "CP932");
+    if (converter == reinterpret_cast<iconv_t>(-1)) {
+        return trimPaddedName(std::string_view(
+            reinterpret_cast<const char*>(bytes.data()), length));
+    }
+    std::string input(
+        reinterpret_cast<const char*>(bytes.data()), length);
+    std::string utf8(length * 4 + 8, '\0');
+    char* in_cursor = input.data();
+    std::size_t in_left = input.size();
+    char* out_cursor = utf8.data();
+    std::size_t out_left = utf8.size();
+    const std::size_t converted = iconv(
+        converter, &in_cursor, &in_left, &out_cursor, &out_left);
+    iconv_close(converter);
+    if (converted == static_cast<std::size_t>(-1)) {
+        return trimPaddedName(std::string_view(
+            reinterpret_cast<const char*>(bytes.data()), length));
+    }
+    utf8.resize(utf8.size() - out_left);
+    return asciiOrUtf8(std::move(utf8));
 #endif
 }
 
