@@ -73,6 +73,8 @@ public:
 
     ~StandaloneEditorContext() override {
         midi_service_.removeDrainListener(this);
+        for (const auto& task : background_tasks_.tasks) task->cancel();
+        for (const auto& task : background_tasks_.tasks) task->join();
     }
 
     StandaloneEditorContext(const StandaloneEditorContext&) = delete;
@@ -120,6 +122,10 @@ public:
 
     [[nodiscard]] mgstc::app::AuditionBoundary& audition() noexcept override {
         return audition_;
+    }
+
+    [[nodiscard]] mgstc::app::BackgroundTaskBoundary* backgroundTasks() noexcept override {
+        return &background_tasks_;
     }
 
     [[nodiscard]] bool pollOpllScope(
@@ -310,6 +316,17 @@ private:
 
     std::uint64_t composite_scope_cursor_{}, opll_scope_cursor_{};
     std::uint64_t opll_history_cursor_{};
+    struct BackgroundTasks final : mgstc::app::BackgroundTaskBoundary {
+        bool registerTask(std::shared_ptr<mgstc::app::EditorBackgroundTask> task) override {
+            std::erase_if(tasks, [](const auto& previous) { return previous->completed(); });
+            if (!task || tasks.size() >= 4) return false;
+            tasks.push_back(std::move(task));
+            return true;
+        }
+
+        std::vector<std::shared_ptr<mgstc::app::EditorBackgroundTask>> tasks;
+    } background_tasks_;
+
     SharedAudioService& audio_;
     SharedMidiInputService& midi_service_;
     Output output_;

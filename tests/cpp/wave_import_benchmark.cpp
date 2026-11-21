@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -260,9 +261,63 @@ bool runBenchmarkCase(
     return successful;
 }
 
+int runContinuousInitial(const char* file, std::string_view schedule) {
+    namespace engine = mgstc::engine;
+    if (schedule != "1" && schedule != "8" && schedule != "sync") return 2;
+    std::ifstream input(file, std::ios::binary);
+    if (!input) return 2;
+    const std::vector<std::uint8_t> bytes(
+        std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{});
+    engine::WavePcm pcm;
+    std::string error;
+    if (!engine::parseWavePcm(bytes, pcm, &error)) {
+        std::cerr << error << '\n';
+        return 2;
+    }
+    auto hooks = std::make_shared<engine::OpllContinuousTestHooks>();
+    hooks->initial_only = true;
+    hooks->time_limit = std::chrono::hours{2};
+    hooks->force_synchronous_fallback = schedule == "sync";
+    engine::OpllContinuousOptions options;
+    options.max_workers = schedule == "1" ? 1 : 8;
+    options.test_hooks = std::move(hooks);
+    const auto started = Clock::now();
+    const auto result = engine::approximateWavePcmContinuouslyWithOpll(pcm, options);
+    if (result.completion != engine::OpllContinuousCompletion::InitialCompleted
+        || !result.initial_completed || !result.initial_best || result.ranked.empty()) {
+        std::cerr << "Initial exploration did not complete: " << result.error << '\n';
+        return 1;
+    }
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto add = [&](std::uint8_t byte) { hash ^= byte; hash *= 1099511628211ULL; };
+    add(1);
+    add(static_cast<std::uint8_t>(engine::OpllApproximationCompletion::Completed));
+    add(static_cast<std::uint8_t>(result.ranked.size()));
+    for (const auto& candidate : result.ranked)
+        for (const auto byte : candidate->registers) add(byte);
+    std::cout << "{\"hash\":\"" << std::hex << std::setw(16) << std::setfill('0') << hash
+              << std::dec << "\",\"representative\":" << result.representative_evaluations
+              << ",\"short\":" << result.short_evaluations << ",\"full\":" << result.full_evaluations
+              << ",\"seconds\":" << std::chrono::duration<double>(Clock::now() - started).count()
+              << ",\"candidates\":[";
+    for (std::size_t index = 0; index < result.ranked.size(); ++index) {
+        if (index != 0) std::cout << ',';
+        const auto& candidate = result.ranked[index];
+        std::cout << "{\"registers\":\"";
+        for (const auto byte : candidate->registers)
+            std::cout << std::hex << std::setw(2) << static_cast<unsigned>(byte);
+        std::cout << std::dec << "\",\"score\":" << std::setprecision(17)
+                  << candidate->full_score << '}';
+    }
+    std::cout << "]}\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    if (argc == 4 && std::string_view{argv[1]} == "--ga-initial")
+        return runContinuousInitial(argv[2], argv[3]);
     CommandLineOptions command_line;
     std::string error;
     if (!parseCommandLine(argc, argv, command_line, error)) {

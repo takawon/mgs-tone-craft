@@ -5233,6 +5233,45 @@ void testWavePcmProducesDeterministicTimedOpllApproximation() {
     REQUIRE_EQ(first.carrier.release_rate <= 15, true);
 }
 
+void testOpllContinuousTimeoutNeverPublishesPartialCandidates() {
+    using namespace mgstc::engine;
+    using namespace std::chrono_literals;
+    WavePcm pcm;
+    pcm.sample_rate = 48'000;
+    pcm.mono_samples.resize(2'000);
+    for (std::size_t index = 0; index < pcm.mono_samples.size(); ++index) {
+        pcm.mono_samples[index] = static_cast<float>(
+            std::sin(2.0 * std::numbers::pi * static_cast<double>(index) / 200.0));
+    }
+
+    auto hooks = std::make_shared<OpllContinuousTestHooks>();
+    auto now = std::chrono::steady_clock::time_point{};
+    hooks->time_limit = 10ms;
+    hooks->now = [&] { return now; };
+    hooks->batch_completed = [&](OpllApproximationPhase phase, auto rep, auto, auto) {
+        if (phase == OpllApproximationPhase::RepresentativeCycle && rep != 0) now += 10ms;
+    };
+    OpllContinuousOptions options;
+    options.max_workers = 1;
+    options.test_hooks = hooks;
+    options.control = std::make_shared<OpllApproximationControl>();
+    unsigned published{};
+    options.candidate_ready = [&](const auto&) { ++published; };
+    const auto result = approximateWavePcmContinuouslyWithOpll(pcm, options);
+    REQUIRE_EQ(result.completion, OpllContinuousCompletion::TimedOut);
+    REQUIRE_EQ(result.representative_evaluations > 0, true);
+    REQUIRE_EQ(result.representative_evaluations < 48'000, true);
+    REQUIRE_EQ(result.full_evaluations, std::uint64_t{0});
+    REQUIRE_EQ(result.ranked.empty(), true);
+    REQUIRE_EQ(published, 0U);
+
+    options.control->requestCancel();
+    const auto cancelled = approximateWavePcmContinuouslyWithOpll(pcm, options);
+    REQUIRE_EQ(cancelled.completion, OpllContinuousCompletion::Cancelled);
+    REQUIRE_EQ(cancelled.ranked.empty(), true);
+    REQUIRE_EQ(published, 0U);
+}
+
 void testOpllThoroughCompactProgressAndWorkerDeterminism() {
     std::array<float, 64> cycle{};
     for (std::size_t index = 0; index < cycle.size(); ++index) {
@@ -12483,6 +12522,7 @@ int main(int argc, char** argv) {
         {"OpllThoroughCompactProgressAndWorkerDeterminism", testOpllThoroughCompactProgressAndWorkerDeterminism},
         {"OpllControlledCancellationDiscardsCandidates", testOpllControlledCancellationDiscardsCandidates},
         {"DefaultCompositeTimbreHasThreeAudibleSources", testDefaultCompositeTimbreHasThreeAudibleSources},
+        {"OpllContinuousTimeoutNeverPublishesPartialCandidates", testOpllContinuousTimeoutNeverPublishesPartialCandidates},
         {"MgsCompositeSourceRoundTrip", testMgsCompositeSourceRoundTrip},
         {"CompositeLayerRemovalReusesFreedChannel", testCompositeLayerRemovalReusesFreedChannel},
         {"CompositeLayerDuplicateUsesLowestFreeSameSourceChannel",

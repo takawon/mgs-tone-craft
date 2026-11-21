@@ -129,7 +129,7 @@ using mgstc::app::EditorSession;
 using mgstc::app::LibrariesChangedCallback;
 using mgstc::app::LibraryManagerContent;
 using mgstc::app::LibraryManagerWindow;
-using mgstc::app::OpllCandidateCallback;
+using mgstc::app::SccToOpllCallback;
 using mgstc::app::OpllEditorComponent;
 using mgstc::app::SccEditorComponent;
 using mgstc::app::SnapshotResult;
@@ -604,14 +604,6 @@ public:
             return false;
         }
 
-        std::array<std::uint8_t, 32> raw_wave{};
-        std::transform(
-            scc_wave.begin(),
-            scc_wave.end(),
-            raw_wave.begin(),
-            [](std::int8_t sample) {
-                return static_cast<std::uint8_t>(sample);
-            });
         const auto opll_registers =
             mgstc::engine::encodeOpllPatch(opll_patch);
 
@@ -622,9 +614,7 @@ public:
                 kPsgTrack, 1, 0)
             && edit.engine->session().setPsgFixedVolume(
                 kPsgTrack, 15)
-            && edit.engine->session().mapper().defineSccPatch(
-                0, raw_wave)
-                == mgstc::engine::MapError::None
+            && mgstc::app::defineSingleAuditionScc(edit.engine->session(), scc_wave)
             && edit.engine->session().mapper().defineOpllOriginalPatch(
                 16, opll_registers)
                 == mgstc::engine::MapError::None;
@@ -632,9 +622,7 @@ public:
              track < kSccTrack + 5;
              ++track) {
             configured = configured
-                && edit.engine->session().setSequenceEnvelope(
-                    track, {0x10, 0x00, 0x40, 0xEF, 0x01, 0x60})
-                && edit.engine->session().setTrackVolume(track, 15);
+                && mgstc::app::configureSingleAuditionSccTrack(edit.engine->session(), track);
         }
         for (std::uint8_t track = kOpllTrack;
              track < kOpllTrack + 9;
@@ -1792,7 +1780,7 @@ public:
         EditorOpenCallback open_editor,
         SpectrogramOpenCallback open_spectrogram,
         SpectrogramSourceMaskCallback spectrogram_source_mask_changed,
-        OpllCandidateCallback open_opll_candidates,
+        SccToOpllCallback open_opll_candidates,
         TagManagementCallback manage_tags,
         LibrariesChangedCallback libraries_changed,
         EditorCloseCallback close_editor,
@@ -1962,12 +1950,12 @@ public:
         }
     }
 
-    void receiveOpllConversionCandidates(
-        std::vector<mgstc::engine::OpllPatchParameters> candidates) {
+    void startSccConversion(
+        SccWaveform waveform, std::uint8_t note) {
         if (auto* opll =
                 dynamic_cast<OpllEditorComponent*>(
                     getContentComponent())) {
-            opll->receiveConversionCandidates(std::move(candidates));
+            opll->startSccConversion(waveform, note);
         }
     }
 
@@ -3008,12 +2996,9 @@ private:
                             spectrogramAnalysisModeForEditor("main"));
                     }
                 },
-                [this](
-                    std::vector<
-                        mgstc::engine::OpllPatchParameters> candidates) {
+                [this](SccWaveform waveform, std::uint8_t note) {
                     if (auto* opened = showEditor("opll")) {
-                        opened->receiveOpllConversionCandidates(
-                            std::move(candidates));
+                        opened->startSccConversion(waveform, note);
                     }
                 },
                 [this](juce::Component* anchor) {
@@ -3330,6 +3315,10 @@ private:
             },
             [this](bool whole) {
                 if (auto* editor = compositeEditor()) editor->setOwnedEditWholeComposite(whole);
+            },
+            [this](const mgstc::engine::SavedTimbreReference& sound) {
+                if (auto* editor = compositeEditor()) return editor->commitOwnedOpllConversion(sound);
+                return false;
             },
         };
     }

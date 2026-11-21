@@ -1,9 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -55,6 +59,9 @@ struct OpllApproximationProgress {
     std::uint64_t completed{};
     std::uint64_t total{};
     bool cancel_requested{};
+    std::uint64_t elapsed_milliseconds{};
+    std::uint64_t time_limit_milliseconds{};
+    bool initial_completed{};
 };
 
 class OpllApproximationControl {
@@ -72,6 +79,11 @@ private:
             OpllApproximationPhase::Idle};
         std::atomic<std::uint64_t> completed{0};
         std::atomic<std::uint64_t> total{0};
+        std::atomic<std::uint64_t> elapsed_milliseconds{0};
+        std::atomic<std::uint64_t> time_limit_milliseconds{0};
+        std::atomic<bool> initial_completed{false};
+        std::atomic<std::int64_t> continuous_started_ns{0};
+        std::atomic<bool> continuous_running{false};
     };
 
     std::shared_ptr<State> state_;
@@ -90,6 +102,58 @@ struct OpllApproximationResult {
         OpllApproximationCompletion::Completed};
     std::vector<OpllPatchParameters> candidates;
 };
+
+enum class OpllContinuousCompletion : std::uint8_t {
+    TimedOut, Cancelled, InitialCompleted, Failed,
+};
+
+struct OpllContinuousCandidate {
+    std::uint64_t id{};
+    OpllPatchParameters patch;
+    std::array<std::uint8_t, 8> registers{};
+    float full_score{};
+    float fundamental_hz{};
+    std::optional<std::uint8_t> fixed_midi_note;
+    std::size_t key_off_sample{};
+    std::size_t sample_count{};
+    std::uint64_t full_evaluation_index{};
+};
+
+// Deterministic/offline regression controls; normal callers leave this unset.
+struct OpllContinuousTestHooks {
+    bool initial_only{};
+    bool force_synchronous_fallback{};
+    std::chrono::milliseconds time_limit{300'000};
+    OpllApproximationPhase cancel_phase{OpllApproximationPhase::Idle};
+    std::uint64_t cancel_after_evaluations{};
+    std::function<std::chrono::steady_clock::time_point()> now;
+    std::function<void(OpllApproximationPhase, std::uint64_t,
+        std::uint64_t, std::uint64_t)> batch_completed;
+};
+
+struct OpllContinuousOptions {
+    std::size_t max_workers{8};
+    std::shared_ptr<OpllApproximationControl> control;
+    std::optional<std::uint8_t> fixed_midi_note;
+    // Synchronous notification on the non-audio search thread. The receiver
+    // owns any GUI inbox and must not access GUI/audio state here.
+    std::function<void(std::shared_ptr<const OpllContinuousCandidate>)> candidate_ready;
+    std::shared_ptr<const OpllContinuousTestHooks> test_hooks;
+};
+
+struct OpllContinuousResult {
+    OpllContinuousCompletion completion{OpllContinuousCompletion::Failed};
+    std::vector<std::shared_ptr<const OpllContinuousCandidate>> ranked;
+    std::shared_ptr<const OpllContinuousCandidate> initial_best;
+    std::uint64_t representative_evaluations{};
+    std::uint64_t short_evaluations{};
+    std::uint64_t full_evaluations{};
+    bool initial_completed{};
+    std::string error;
+};
+
+[[nodiscard]] OpllContinuousResult approximateWavePcmContinuouslyWithOpll(
+    const WavePcm& pcm, const OpllContinuousOptions& options = {});
 
 [[nodiscard]] bool parseWavePcm(
     std::span<const std::uint8_t> bytes,

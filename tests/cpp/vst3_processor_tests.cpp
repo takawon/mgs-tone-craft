@@ -5215,12 +5215,12 @@ void testOwnedEditorPendingTargetKeepsSnapshot() {
     auto timbre = mgstc::engine::defaultCompositeTimbre();
     const auto open = [](const juce::String&, std::optional<std::uint64_t>) {};
     mgstc::app::SccEditorComponent scc(context, link, open, [] {},
-        [](std::vector<mgstc::engine::OpllPatchParameters>) {},
+        [](mgstc::engine::SccWaveform, std::uint8_t) {},
         [](juce::Component*) {}, true, [] {});
     mgstc::app::OpllEditorComponent opll(context, link, open, [] {},
         [](juce::Component*) {}, true, [] {});
     mgstc::app::SccEditorComponent standalone_scc(context, link, open, [] {},
-        [](std::vector<mgstc::engine::OpllPatchParameters>) {},
+        [](mgstc::engine::SccWaveform, std::uint8_t) {},
         [](juce::Component*) {}, false, [] {});
     mgstc::app::OpllEditorComponent standalone_opll(context, link, open, [] {},
         [](juce::Component*) {}, false, [] {});
@@ -5392,7 +5392,7 @@ void testEditorParityCorrections() {
     {
         const auto open = [](const juce::String&, std::optional<std::uint64_t>) {};
         mgstc::app::SccEditorComponent scc_editor(context, link, open, [] {},
-            [](std::vector<mgstc::engine::OpllPatchParameters>) {}, [](juce::Component*) {}, true, [] {});
+            [](mgstc::engine::SccWaveform, std::uint8_t) {}, [](juce::Component*) {}, true, [] {});
         mgstc::app::SatelliteEditorParityTestAccess::checkNumeric(scc_editor);
         mgstc::app::SatelliteEditorParityTestAccess::checkSccWav(scc_editor);
         mgstc::app::OpllEditorComponent opll_editor(context, link, open, [] {},

@@ -101,6 +101,8 @@
 #include "mgstc/engine/timbre_tags.hpp"
 #include "mgstc/engine/voice_allocator.hpp"
 #include "mgstc/engine/wave_import.hpp"
+#include "opll_conversion_session.hpp"
+#include "scc_single_audition.hpp"
 
 namespace mgstc::app {
 
@@ -148,9 +150,7 @@ using EditorOpenCallback =
     std::function<void(
         const juce::String&,
         std::optional<std::uint64_t>)>;
-using OpllCandidateCallback =
-    std::function<void(
-        std::vector<mgstc::engine::OpllPatchParameters>)>;
+using SccToOpllCallback = std::function<void(engine::SccWaveform, std::uint8_t)>;
 using EditorCloseCallback =
     std::function<void(const juce::String&)>;
 using EditorActivateCallback =
@@ -333,138 +333,6 @@ inline void configureSettingsButton(
         juce::String::fromUTF8("アプリ設定を開きます"));
     button.onClick = std::move(action);
 }
-
-enum class OpllConversionQuality {
-    standard,
-    thorough,
-};
-
-
-// UI type scale — exactly four roles (px heights; face = Windows message font).
-//   title   : window / page title
-//   heading : panel / section header
-//   body    : buttons, labels, combos, dialogs
-//   dense   : timbre params, MGSC preview, keyboard C*, DEC/HEX, graph chrome
-
-
-
-class OpllConversionQualityContent final : public juce::Component {
-public:
-    using ConvertCallback =
-        std::function<void(OpllConversionQuality)>;
-
-    explicit OpllConversionQualityContent(ConvertCallback callback)
-        : callback_(std::move(callback)) {
-        standard_label_.setText(
-            juce::String::fromUTF8("標準"),
-            juce::dontSendNotification);
-        standard_label_.setJustificationType(
-            juce::Justification::centredRight);
-        addAndMakeVisible(standard_label_);
-
-        quality_toggle_.setButtonText(
-            juce::String::fromUTF8("じっくり（最大約2分）"));
-        quality_toggle_.setTitle(juce::String::fromUTF8(
-            "OPLL変換品質：標準（オフ）／じっくり（オン）"));
-        quality_toggle_.setTooltip(juce::String::fromUTF8(
-            "OPLL変換品質を切り替えます。"
-            "オフは標準、オンはじっくり（最大約2分）です"));
-        quality_toggle_.setToggleState(
-            false, juce::dontSendNotification);
-        quality_toggle_.setLookAndFeel(&switch_look_and_feel_);
-        addAndMakeVisible(quality_toggle_);
-
-        convert_.setButtonText(juce::String::fromUTF8("変換"));
-        convert_.onClick = [this] {
-            const auto quality = quality_toggle_.getToggleState()
-                ? OpllConversionQuality::thorough
-                : OpllConversionQuality::standard;
-            auto callback = std::move(callback_);
-            closeDialog(1);
-            if (callback) {
-                callback(quality);
-            }
-        };
-        addAndMakeVisible(convert_);
-
-        cancel_.setButtonText(juce::String::fromUTF8("キャンセル"));
-        cancel_.onClick = [this] { closeDialog(0); };
-        addAndMakeVisible(cancel_);
-        setSize(UiScale::sx(400), UiScale::sx(150));
-    }
-
-    ~OpllConversionQualityContent() override {
-        quality_toggle_.setLookAndFeel(nullptr);
-    }
-
-    void resized() override {
-        auto area = getLocalBounds().reduced(UiScale::sx(18));
-        auto quality = area.removeFromTop(UiScale::sx(34));
-        standard_label_.setBounds(
-            quality.removeFromLeft(UiScale::sx(86)));
-        quality.removeFromLeft(UiScale::sx(8));
-        quality_toggle_.setBounds(quality);
-        auto buttons = area.removeFromBottom(UiScale::sx(36));
-        cancel_.setBounds(buttons.removeFromRight(UiScale::sx(112)));
-        buttons.removeFromRight(UiScale::sx(6));
-        convert_.setBounds(buttons.removeFromRight(UiScale::sx(112)));
-    }
-
-private:
-    void closeDialog(int result) {
-        if (auto* dialog =
-                findParentComponentOfClass<juce::DialogWindow>()) {
-            dialog->exitModalState(result);
-        }
-    }
-
-    ConvertCallback callback_;
-    SwitchLookAndFeel switch_look_and_feel_;
-    juce::Label standard_label_;
-    juce::ToggleButton quality_toggle_;
-    juce::TextButton convert_;
-    juce::TextButton cancel_;
-};
-
-inline juce::Component::SafePointer<ModalDialogWindow> showOpllConversionQualityDialog(
-    juce::Component* anchor,
-    OpllConversionQualityContent::ConvertCallback callback);
-
-[[nodiscard]] inline mgstc::engine::OpllApproximationOptions
-makeOpllApproximationOptions(
-    OpllConversionQuality quality,
-    const ConversionProgressState& progress) {
-    mgstc::engine::OpllApproximationOptions options;
-    options.effort = quality == OpllConversionQuality::thorough
-        ? mgstc::engine::OpllApproximationEffort::Thorough
-        : mgstc::engine::OpllApproximationEffort::Standard;
-    options.control = progress.control;
-    return options;
-}
-
-inline juce::Component::SafePointer<ModalDialogWindow> showOpllConversionQualityDialog(
-    juce::Component* anchor,
-    OpllConversionQualityContent::ConvertCallback callback) {
-    UiScale::forceGlobalForNonEditorUi();
-    auto* dialog = new ModalDialogWindow(
-        juce::String::fromUTF8("OPLL変換品質"),
-        juce::Colour(0xFF1B222C));
-    auto* content =
-        new OpllConversionQualityContent(std::move(callback));
-    dialog->setUsingNativeTitleBar(true);
-    dialog->setResizable(false, false);
-    dialog->setContentOwned(content, true);
-    if (anchor != nullptr) {
-        dialog->centreAroundComponent(
-            anchor, content->getWidth(), content->getHeight() + 32);
-    } else {
-        dialog->centreWithSize(
-            content->getWidth(), content->getHeight() + 32);
-    }
-    dialog->enterModalState(true, nullptr, true);
-    return dialog;
-}
-
 
 template <typename Work, typename OnDone>
 inline juce::Component::SafePointer<ConversionBusyDialog> runWithConversionBusyDialog(
@@ -4598,12 +4466,8 @@ public:
             });
         timeline_.setEditorSession(&session_);
         performance_keyboard_.setCallbacks(
-            [this](std::uint8_t note) {
-                startCompositeNote(note, false);
-            },
-            [this](std::uint8_t note) {
-                stopCompositeNote(note);
-            });
+            [this](std::uint8_t note) { startSccOpllPerformanceNote(note); },
+            [this](std::uint8_t note) { stopSccOpllPerformanceNote(note); });
         performance_keyboard_.setModeCallback(
             [this](bool polyphonic) {
                 silenceAuditionNotes();
@@ -4679,6 +4543,8 @@ public:
 
     ~CompositeEditorComponent() override {
         hydrating_ = true;
+        clearSccOpllKeyboardRoute();
+        scc_opll_conversion_.reset();
         timeline_.cancelPendingDialogs();
         // The comparison adapter belongs to the EditorSession. Destroy this
         // owned modal window before the plugin editor destroys its context.
@@ -4710,6 +4576,12 @@ public:
     void restoreHostState(const mgstc::engine::CompositeTimbre& sound) {
         const juce::ScopedValueSetter<bool> guard(hydrating_, true);
         ++host_restore_generation_;
+        if (scc_opll_conversion_) {
+            scc_opll_conversion_->poll();
+            clearSccOpllKeyboardRoute();
+            scc_opll_conversion_.reset();
+            timeline_.setEnabled(true);
+        }
         envelope_patchslide_loop_confirmation_.close();
         if (envelope_patchslide_window_) delete envelope_patchslide_window_.getComponent();
         envelope_patchslide_session_.reset();
@@ -4744,13 +4616,66 @@ public:
         composite_program_stale_ = false;
     }
 
+    void startSccConversion(juce::Component& anchor, SccWaveform waveform, std::uint8_t note) {
+        if (scc_opll_conversion_) {
+            scc_opll_conversion_->dialog().toFront(true);
+            return;
+        }
+        auto* tasks = session_.backgroundTasks();
+        if (!tasks || wave_converter_window_ || envelope_patchslide_window_) return;
+        auto reservation = session_.reserveOpllConversion();
+        if (!reservation) {
+            updateStatus(juce::String::fromUTF8("進行中の音色変換を終了してください"));
+            return;
+        }
+        const juce::Component::SafePointer<juce::Component> source(&anchor);
+        const auto original = workingTimbre();
+        const auto restore = session_.stateRestoreRevision();
+        const auto owned = link_.owned_revision;
+        scc_opll_conversion_ = std::make_unique<OpllConversionSession>(anchor, *tasks,
+            std::move(reservation), prepareSccConversion(waveform, note), note, OpllConversionSession::Target{
+                .valid = [this, source, original, restore, owned] {
+                    return source && source->isShowing() && session_.stateRestoreRevision() == restore
+                        && link_.owned_revision == owned && workingTimbre() == original;
+                },
+                .listen_original = [this](auto pcm) {
+                    if (!scc_opll_pcm_) scc_opll_pcm_ = std::make_unique<CompositeWavPcmPlayer>(session_.pcmPreview());
+                    const auto count = pcm->mono_samples.size();
+                    const auto error = scc_opll_pcm_->play(std::move(pcm), 0, count);
+                    if (error.isNotEmpty()) {
+                        updateStatus(error);
+                        return false;
+                    }
+                    scc_opll_original_end_ = juce::Time::getMillisecondCounterHiRes() + singleAuditionMilliseconds;
+                    return true;
+                },
+                .listen_candidate = [this, note](const auto& candidate) {
+                    if (!session_.snapshot().audio_running) return false;
+                    installSccOpllPreview(candidate, true);
+                    scc_opll_preview_note_ = note;
+                    wave_preview_audition_pending_ = true;
+                    startWaveConversionAuditionIfReady();
+                    return true;
+                },
+                .stop = [this](bool release_keys) { stopSccOpllAudition(true, release_keys); },
+                .apply = [this](const auto& patch) { return applyOpllConversionCandidate(patch); },
+                .status = [this](const auto& message) { updateStatus(message); },
+            });
+        link_.conversion_note_on = [this](std::uint8_t pitch) { startSccOpllPerformanceNote(pitch); };
+        link_.conversion_note_off = [this](std::uint8_t pitch) { stopSccOpllPerformanceNote(pitch); };
+        timeline_.setEnabled(false);
+    }
+
     bool applyOpllConversionCandidate(const mgstc::engine::OpllPatchParameters& patch) {
-        recordHistory();
+        auto original = timbre_;
         if (std::none_of(timbre_.layers.begin(), timbre_.layers.end(),
                 [](const auto& value) { return value.source == mgstc::engine::TimbreSource::Opll; })) {
             const auto channel = mgstc::engine::firstAvailableChannel(
                 timbre_, mgstc::engine::TimbreSource::Opll);
-            if (!channel) return false;
+            if (!channel) {
+                stopSccOpllAudition(true, true);
+                return false;
+            }
             auto added = mgstc::engine::defaultCompositeTimbre().layers[2];
             added.channel = *channel;
             added.envelope_number = mgstc::engine::nextFreeEnvelopeNumber(timbre_);
@@ -4768,13 +4693,40 @@ public:
         base.opll_registers = mgstc::engine::encodeOpllPatch(patch);
         layer->base_timbre = std::move(base);
         layer->base_opll_rom.reset();
+        stopSccOpllAudition(false, true);
+        if (!commitConversionTimbre(std::move(original))) return false;
+        openOwnedLayerTimbreEditor(index);
+        return true;
+    }
+
+    bool commitOwnedOpllConversion(const engine::SavedTimbreReference& snapshot) {
+        if (wave_conversion_preview_ || manual_y_preview_timbre_ || library_manager_saved_timbre_) return false;
+        auto original = workingTimbre();
+        auto replacement = original;
+        if (!engine::replaceOwnedTimbreSnapshot(replacement, snapshot)) return false;
+        silenceAuditionNotes();
+        import_preview_saved_.reset();
+        timbre_ = std::move(replacement);
+        if (!commitConversionTimbre(std::move(original))) return false;
+        link_.publishOwned(snapshot);
+        applied_owned_revision_ = link_.owned_revision;
+        return true;
+    }
+
+    bool commitConversionTimbre(engine::CompositeTimbre original) {
         composite_program_stale_ = true;
+        if (!configureEngine()) {
+            timbre_ = std::move(original);
+            static_cast<void>(configureEngine(true));
+            return false;
+        }
+        std::swap(timbre_, original);
+        recordHistory();
+        std::swap(timbre_, original);
         recordHistory();
         refreshTimbreSelectors();
         syncControlsFromModel();
         syncTimelineTimbre();
-        static_cast<void>(configureEngine());
-        openOwnedLayerTimbreEditor(index);
         return true;
     }
 
@@ -5745,6 +5697,11 @@ private:
     }
 
     void showEnvelopePatchSlide(std::size_t index, std::filesystem::path directory = {}) {
+        if (scc_opll_conversion_) {
+            scc_opll_conversion_->dialog().toFront(true);
+            return;
+        }
+        if (session_.opllConversionReserved()) return;
         if (envelope_patchslide_window_) { envelope_patchslide_window_->toFront(true); return; }
         if (wave_converter_window_ || index >= workingTimbre().layers.size()
             || workingTimbre().layers[index].source != engine::TimbreSource::Opll
@@ -5820,11 +5777,11 @@ private:
     }
 
     void setWaveConversionPreview(const mgstc::engine::CompositeTimbre* candidate,
-        bool restore_authoring = true) {
+        bool restore_authoring = true, bool release_keys = true) {
         if (!candidate && !wave_conversion_preview_) return;
         wave_submission_deferred_ = false;
         wave_preview_audition_pending_ = false;
-        performance_keyboard_.allNotesOff();
+        if (release_keys) performance_keyboard_.allNotesOff();
         silenceAuditionNotes();
         if (candidate) {
             manual_y_preview_timbre_.reset();
@@ -5874,13 +5831,77 @@ private:
             });
     }
 
+    void installSccOpllPreview(const engine::OpllContinuousCandidate& candidate, bool release_keys) {
+        auto preview = engine::defaultCompositeTimbre();
+        auto layer = preview.layers[2];
+        layer.base_opll_rom.reset();
+        engine::SavedTimbreReference base;
+        base.library_id = engine::allocateCompositeOwnedTimbreId(preview);
+        base.source = engine::TimbreSource::Opll;
+        base.name = "OPLL";
+        base.opll_registers = candidate.registers;
+        layer.base_timbre = std::move(base);
+        preview.layers = {std::move(layer)};
+        setWaveConversionPreview(&preview, true, release_keys);
+    }
+
+    void startSccOpllPerformanceNote(std::uint8_t note) {
+        if (scc_opll_conversion_) {
+            if (!scc_opll_conversion_->beginKeyboardAudition()) return;
+            if (!scc_opll_keyboard_patch_) {
+                scc_opll_keyboard_patch_ = scc_opll_conversion_->keyboardCandidate();
+                if (scc_opll_keyboard_patch_) installSccOpllPreview(*scc_opll_keyboard_patch_, false);
+            }
+        }
+        startCompositeNote(note, false);
+    }
+
+    void stopSccOpllPerformanceNote(std::uint8_t note) {
+        stopCompositeNote(note);
+        if (scc_opll_conversion_ && voice_allocator_.activeVoiceCount() == 0) {
+            scc_opll_conversion_->keyboardEnded();
+            scc_opll_keyboard_patch_.reset();
+        }
+    }
+
+    void clearSccOpllKeyboardRoute() {
+        if (!scc_opll_conversion_) return;
+        link_.conversion_note_on = {};
+        link_.conversion_note_off = {};
+    }
+
+    void stopSccOpllAudition(bool restore_authoring, bool release_keys) {
+        if (scc_opll_original_end_ && scc_opll_pcm_) scc_opll_pcm_->stop();
+        scc_opll_original_end_.reset();
+        scc_opll_preview_note_.reset();
+        scc_opll_keyboard_patch_.reset();
+        setWaveConversionPreview(nullptr, restore_authoring, release_keys);
+    }
+
+    void pollSccOpllConversion(double now) {
+        if (!scc_opll_conversion_) return;
+        if ((scc_opll_original_end_ && now >= *scc_opll_original_end_)
+            || (scc_opll_preview_note_ && audition_stop_time_ms_ && now >= *audition_stop_time_ms_))
+            scc_opll_conversion_->auditionEnded();
+        scc_opll_conversion_->poll();
+        if (scc_opll_conversion_->closed()) {
+            clearSccOpllKeyboardRoute();
+            scc_opll_conversion_.reset();
+            timeline_.setEnabled(true);
+        }
+        performance_keyboard_.setInputActiveOverride(satellite_session_ || spectrogram_input_active_
+            || wave_conversion_preview_.has_value()
+            || (scc_opll_conversion_ && scc_opll_conversion_->dialog().isActiveWindow()));
+    }
+
     void startWaveConversionAuditionIfReady() {
         // A queued candidate must never trigger a note on the preceding program.
         // The existing bounded-slot retry completes publication before audition.
         if (!wave_preview_audition_pending_ || !wave_conversion_preview_
             || !engine_ready_ || composite_program_stale_ || wave_submission_deferred_) return;
         wave_preview_audition_pending_ = false;
-        startAudition();
+        if (scc_opll_preview_note_) startCompositeNote(*scc_opll_preview_note_, true);
+        else startAudition();
     }
 
     void applyWaveConversion(const mgstc::engine::CompositeTimbre& converted) {
@@ -5905,6 +5926,11 @@ private:
     }
 
     void showWaveConverter() {
+        if (scc_opll_conversion_) {
+            scc_opll_conversion_->dialog().toFront(true);
+            return;
+        }
+        if (session_.opllConversionReserved()) return;
         if (envelope_patchslide_window_) { envelope_patchslide_window_->toFront(true); return; }
         if (wave_converter_window_) { wave_converter_window_->toFront(true); return; }
         stopAudition();
@@ -8007,6 +8033,7 @@ private:
             master_volume_, master_volume_revision_, session_);
         const double now =
             juce::Time::getMillisecondCounterHiRes();
+        pollSccOpllConversion(now);
         if (wave_submission_deferred_ && wave_conversion_preview_)
             engine_ready_ = configureEngine();
         startWaveConversionAuditionIfReady();
@@ -8134,6 +8161,11 @@ private:
     mgstc::engine::CompositeTimbre timbre_;
     std::optional<mgstc::engine::CompositeTimbre> manual_y_preview_timbre_;
     std::optional<mgstc::engine::CompositeTimbre> wave_conversion_preview_;
+    std::unique_ptr<CompositeWavPcmPlayer> scc_opll_pcm_;
+    std::unique_ptr<OpllConversionSession> scc_opll_conversion_;
+    OpllConversionTask::Candidate scc_opll_keyboard_patch_;
+    std::optional<double> scc_opll_original_end_;
+    std::optional<std::uint8_t> scc_opll_preview_note_;
     bool wave_submission_deferred_{false};
     bool wave_preview_audition_pending_{false};
     juce::Label title_;
@@ -8581,13 +8613,13 @@ public:
         EditorLink& link,
         EditorOpenCallback open_editor,
         SpectrogramOpenCallback open_spectrogram,
-        OpllCandidateCallback open_opll_candidates,
+        SccToOpllCallback convert_scc_to_opll,
         TagManagementCallback manage_tags,
         bool envelope_context = false,
         LibrariesChangedCallback libraries_changed = {})
         : open_editor_(std::move(open_editor)),
           open_spectrogram_(std::move(open_spectrogram)),
-          open_opll_candidates_(std::move(open_opll_candidates)),
+          convert_scc_to_opll_(std::move(convert_scc_to_opll)),
           manage_tags_(std::move(manage_tags)),
           libraries_changed_(std::move(libraries_changed)),
           session_(session),
@@ -9894,10 +9926,6 @@ public:
     }
 
     ~SccEditorComponent() override {
-        if (session_.backgroundTasks()) {
-            delete conversion_quality_dialog_.getComponent();
-            delete conversion_busy_dialog_.getComponent();
-        }
         UiScale::removeGlobalListener(ui_scale_listener_);
         if (standaloneHostPreferences(
                 session_.snapshot().capabilities)) {
@@ -10861,63 +10889,7 @@ private:
     }
 
     void convertToOpll() {
-        juce::Component::SafePointer<SccEditorComponent> safe(this);
-        const auto revision = session_.stateRestoreRevision();
-        const auto waveform = scc_wave_;
-        conversion_quality_dialog_ = showOpllConversionQualityDialog(
-            this,
-            [safe, waveform, revision](OpllConversionQuality quality) {
-                if (safe == nullptr || safe->session_.stateRestoreRevision() != revision) {
-                    return;
-                }
-                safe->updateStatus(juce::String::fromUTF8(
-                    "SCC音色をOPLLへ近似変換しています…"));
-                safe->session_.audition().publishSharedScc(waveform);
-                static_cast<void>(safe->configureEngine(false));
-                safe->conversion_busy_dialog_ = runWithConversionBusyDialog(
-                    safe.getComponent(),
-                    [waveform, quality](
-                        ConversionProgressState& progress) {
-                return mgstc::engine::
-                            approximateSccWaveformWithOpllResult(
-                                waveform,
-                                makeOpllApproximationOptions(
-                                    quality, progress));
-            },
-                    [safe, revision](
-                        mgstc::engine::OpllApproximationResult result,
-                        bool cancellation_requested) {
-                if (safe == nullptr || safe->session_.stateRestoreRevision() != revision) {
-                    return;
-                }
-                        if (cancellation_requested
-                            || result.completion
-                                == mgstc::engine::
-                                    OpllApproximationCompletion::
-                                        Cancelled) {
-                            safe->updateStatus(
-                                juce::String::fromUTF8(
-                                    "OPLL近似変換をキャンセルしました"));
-                            return;
-                        }
-                        if (result.candidates.empty()) {
-                            safe->updateStatus(
-                                juce::String::fromUTF8(
-                        "OPLL近似候補を生成できませんでした"));
-                    return;
-                }
-                if (safe->open_opll_candidates_) {
-                    safe->open_opll_candidates_(
-                        std::move(result.candidates));
-                } else {
-                    safe->open_editor_("opll", std::nullopt);
-                }
-                safe->updateStatus(
-                    juce::String::fromUTF8(
-                        "OPLL近似音色を生成し、"
-                        "OPLLエディタへ送りました"));
-                    }, {}, safe->session_.backgroundTasks());
-            });
+        if (convert_scc_to_opll_) convert_scc_to_opll_(scc_wave_, loadLastAuditionNoteSetting());
     }
 
     void importWaveFile() {
@@ -12579,9 +12551,7 @@ private:
 
     EditorOpenCallback open_editor_;
     SpectrogramOpenCallback open_spectrogram_;
-    OpllCandidateCallback open_opll_candidates_;
-    juce::Component::SafePointer<ConversionBusyDialog> conversion_busy_dialog_;
-    juce::Component::SafePointer<ModalDialogWindow> conversion_quality_dialog_;
+    SccToOpllCallback convert_scc_to_opll_;
     TagManagementCallback manage_tags_;
     LibrariesChangedCallback libraries_changed_;
     EditorSession& session_;
@@ -13074,24 +13044,6 @@ public:
                 "Audacityを操作できるため、信頼できる環境で"
                 "使用してください"),
             [this] { importAudacitySelection(); });
-        configureButton(
-            wave_previous_,
-            juce::String::fromUTF8("◀"),
-            juce::String::fromUTF8("前のOPLL近似候補"),
-            [this] { selectAdjacentWaveCandidate(-1); });
-        configureButton(
-            wave_next_,
-            juce::String::fromUTF8("▶"),
-            juce::String::fromUTF8("次のOPLL近似候補"),
-            [this] { selectAdjacentWaveCandidate(1); });
-        wave_candidate_label_.setText(
-            juce::String::fromUTF8("OPLL候補 --/--"),
-            juce::dontSendNotification);
-        wave_candidate_label_.setJustificationType(
-            juce::Justification::centred);
-        addAndMakeVisible(wave_candidate_label_);
-        updateWaveCandidateControls();
-
         addAndMakeVisible(patch_panel_);
         patch_panel_.setAuditionNote(last_audition_note_);
         patch_panel_.onChange = [this](bool commit) {
@@ -13426,8 +13378,6 @@ public:
                 &redo_,
                 &import_wave_,
                 &import_audacity_,
-                &wave_previous_,
-                &wave_next_,
                 &convert_to_scc_,
                 &rom_preset_,
                 &rom_load_,
@@ -13468,10 +13418,7 @@ public:
     }
 
     ~OpllEditorComponent() override {
-        if (session_.backgroundTasks()) {
-            delete conversion_quality_dialog_.getComponent();
-            delete conversion_busy_dialog_.getComponent();
-        }
+        conversion_.reset();
         UiScale::removeGlobalListener(ui_scale_listener_);
         stopTimer();
         performance_keyboard_.allNotesOff();
@@ -13484,20 +13431,9 @@ public:
         static_cast<void>(auditionOneSecond());
     }
 
-    void receiveConversionCandidates(
-        std::vector<mgstc::engine::OpllPatchParameters> candidates) {
-        if (candidates.empty()) {
-            return;
-        }
-        wave_candidates_ = std::move(candidates);
-        wave_candidate_index_ = 0;
-        commitPatch(wave_candidates_.front(), false);
-        updateWaveCandidateControls();
-        updateStatus(
-            juce::String::fromUTF8("OPLL近似候補 ")
-            + juce::String(
-                static_cast<int>(wave_candidates_.size()))
-            + juce::String::fromUTF8("件を読み込みました"));
+    void startSccConversion(SccWaveform waveform, std::uint8_t note) {
+        beginOpllConversion(prepareSccConversion(waveform, note), note,
+            juce::String::fromUTF8("SCC → OPLL"));
     }
 
     [[nodiscard]] SnapshotResult captureSettingsTab(
@@ -13627,6 +13563,10 @@ public:
     }
 
     void requestLibraryEntry(std::uint64_t id) {
+        if (conversion_) {
+            conversion_->authorChanged();
+            pollOpllConversion();
+        }
         if (tryLoadOwnedSnapshot(id)) {
             return;
         }
@@ -13901,13 +13841,6 @@ public:
         import_audacity_.setBounds(
             toolbar.removeFromLeft(UiScale::sx(154)));
         toolbar.removeFromLeft(md);
-        wave_previous_.setBounds(
-            toolbar.removeFromLeft(iconButton));
-        wave_candidate_label_.setBounds(
-            toolbar.removeFromLeft(UiScale::sx(112)));
-        wave_next_.setBounds(
-            toolbar.removeFromLeft(iconButton));
-        toolbar.removeFromLeft(sm);
         convert_to_scc_.setBounds(
             toolbar.removeFromLeft(iconButton));
         area.removeFromTop(sm);
@@ -14335,99 +14268,134 @@ private:
         return true;
     }
 
-    bool importWaveBytes(
-        const std::vector<std::uint8_t>& bytes,
-        const juce::String& source_name) {
-        juce::Component::SafePointer<OpllEditorComponent> safe(this);
-        conversion_quality_dialog_ = showOpllConversionQualityDialog(
-            this,
-            [safe, bytes, source_name](
-                OpllConversionQuality quality) {
-                if (safe == nullptr) {
-                    return;
-                }
-        mgstc::engine::WavePcm pcm;
-        std::string error;
-        if (!mgstc::engine::parseWavePcm(
-                std::span<const std::uint8_t>(bytes),
-                pcm,
-                &error)) {
-                    safe->showError(
-                source_name,
-                juce::String::fromUTF8(
-                    "WAVを読み込めませんでした。"
-                    "PCM 8/16/24/32bitまたは32bit floatの"
-                    "WAVEを使用してください"));
-                    return;
+    bool importWaveBytes(std::vector<std::uint8_t> bytes, const juce::String& source_name) {
+        return beginOpllConversion(
+            [bytes = std::move(bytes)](auto& pcm, auto& original, auto& error) {
+                return OpllConversionTask::decodeWave(bytes, pcm, original, error);
+            }, {}, source_name);
+    }
+
+    bool beginOpllConversion(OpllConversionTask::Prepare prepare,
+                             std::optional<std::uint8_t> note, const juce::String& source_name) {
+        if (conversion_) {
+            conversion_->dialog().toFront(true);
+            return false;
         }
-        const auto analysis =
-            mgstc::engine::analyzeWaveCycle(pcm);
-        if (analysis.cycle.size() < 2) {
-                    safe->showError(
-                source_name,
-                juce::String::fromUTF8(
-                    "波形の1周期を抽出できませんでした"));
-                    return;
+        auto* tasks = session_.backgroundTasks();
+        if (!tasks) return false;
+        auto reservation = session_.reserveOpllConversion();
+        if (!reservation) {
+            updateStatus(juce::String::fromUTF8("進行中の音色変換を終了してください"));
+            return false;
         }
-                const auto frequency_hz =
-                    analysis.estimated_frequency_hz;
-        safe->conversion_busy_dialog_ = runWithConversionBusyDialog(
-                    safe.getComponent(),
-                    [pcm = std::move(pcm), quality](
-                        ConversionProgressState& progress) {
-                return mgstc::engine::
-                            approximateWavePcmWithOpllResult(
-                                pcm,
-                                makeOpllApproximationOptions(
-                                    quality, progress));
-            },
-            [safe, source_name, frequency_hz](
-                        mgstc::engine::OpllApproximationResult result,
-                        bool cancellation_requested) {
-                if (safe == nullptr) {
-                    return;
-                }
-                        if (cancellation_requested
-                            || result.completion
-                                == mgstc::engine::
-                                    OpllApproximationCompletion::
-                                        Cancelled) {
-                            safe->updateStatus(
-                                source_name
-                                + juce::String::fromUTF8(
-                                    "をキャンセルしました"));
-                            return;
-                        }
-                        if (result.candidates.empty()) {
-                    safe->showError(
-                        source_name,
-                        juce::String::fromUTF8(
-                                    "OPLL近似音色を"
-                                    "生成できませんでした"));
-                    return;
-                }
-                        safe->wave_candidates_ =
-                            std::move(result.candidates);
-                safe->wave_candidate_index_ = 0;
-                safe->commitPatch(
-                    safe->wave_candidates_.front(), false);
-                safe->updateWaveCandidateControls();
-                safe->updateStatus(
-                    source_name
-                    + juce::String::fromUTF8(
-                        "完了: OPLL近似候補 ")
-                    + juce::String(
-                        static_cast<int>(
-                            safe->wave_candidates_.size()))
-                    + juce::String::fromUTF8("件／約 ")
-                    + juce::String(frequency_hz, 1)
-                    + " Hz");
-                    }, {}, safe->session_.backgroundTasks());
+        const auto restore_revision = session_.stateRestoreRevision();
+        const auto author_revision = author_revision_;
+        const auto owned_revision = link_.owned_revision;
+        const auto authored = engine::encodeOpllPatch(patch_);
+        conversion_ = std::make_unique<OpllConversionSession>(*this, *tasks, std::move(reservation), std::move(prepare),
+            note, OpllConversionSession::Target{
+                .valid = [this, restore_revision, author_revision, owned_revision, authored] {
+                    return isShowing() && session_.stateRestoreRevision() == restore_revision
+                        && author_revision_ == author_revision && link_.owned_revision == owned_revision
+                        && engine::encodeOpllPatch(patch_) == authored;
+                },
+                .listen_original = [this](auto original) { return listenConversionOriginal(std::move(original)); },
+                .listen_candidate = [this](const auto& candidate) {
+                    performance_keyboard_.allNotesOff();
+                    return auditionOneSecond(&candidate.patch, candidate.fixed_midi_note);
+                },
+                .stop = [this](bool release_keyboard) { stopConversionAudition(release_keyboard); },
+                .apply = [this](const auto& patch) { return applyConversionPatch(patch); },
+                .status = [this, source_name](const auto& message) { updateStatus(source_name + " — " + message); },
             });
+        conversion_edit_controls_.clear();
+        for (auto* component : conversionEditControls()) {
+            conversion_edit_controls_.emplace_back(component, component->isEnabled());
+            component->setEnabled(false);
+        }
         return true;
     }
 
+    [[nodiscard]] auto conversionEditControls() {
+        return std::array<juce::Component*, 25>{
+            &patch_panel_, &load_, &save_, &paste_, &undo_, &redo_, &rom_preset_, &rom_load_,
+            &import_wave_, &import_audacity_, &convert_to_scc_, &library_list_, &library_load_,
+            &library_new_, &library_save_, &library_save_as_, &library_rename_, &library_delete_,
+            &library_import_, &name_, &memo_, &tags_, &favorite_, &output_number_, &library_ab_,
+        };
+    }
+
+    bool applyConversionPatch(const engine::OpllPatchParameters& patch) {
+        if (!usesCompositeAudition()) {
+            stopConversionAudition();
+            commitPatch(patch, true);
+            return true;
+        }
+        auto replacement = *owned_edit_snapshot_;
+        replacement.opll_registers = engine::encodeOpllPatch(patch);
+        if (!link_.owned_audition.commit_opll_conversion
+            || !link_.owned_audition.commit_opll_conversion(replacement)) {
+            stopConversionAudition();
+            return false;
+        }
+        stopConversionAudition();
+        owned_edit_snapshot_ = std::move(replacement);
+        patch_ = patch;
+        ++author_revision_;
+        syncControls();
+        updateDefinitionPreview();
+        recordHistory(true);
+        if (immediate_audition_.getToggleState())
+            static_cast<void>(auditionOneSecond());
+        return true;
+    }
+
+    bool listenConversionOriginal(OpllConversionTask::Original original) {
+        stopConversionAudition();
+        if (!conversion_pcm_) conversion_pcm_ = std::make_unique<CompositeWavPcmPlayer>(session_.pcmPreview());
+        const auto length = original->mono_samples.size();
+        const auto rate = original->sample_rate;
+        const auto error = conversion_pcm_->play(std::move(original), 0, length);
+        if (error.isNotEmpty()) {
+            updateStatus(error);
+            return false;
+        }
+        conversion_original_end_ = juce::Time::getMillisecondCounterHiRes()
+            + 1000.0 * static_cast<double>(length) / static_cast<double>(rate);
+        return true;
+    }
+
+    void stopConversionAudition(bool release_keyboard = true) {
+        if (conversion_pcm_ && conversion_original_end_) conversion_pcm_->stop();
+        conversion_original_end_.reset();
+        owned_preview_snapshot_.reset();
+        if (release_keyboard) performance_keyboard_.allNotesOff();
+        silenceAllVoices();
+        conversion_keyboard_patch_.reset();
+        if (engine_holds_temporary_program_ && !usesCompositeAudition())
+            static_cast<void>(configureEngine(false));
+    }
+
+    void pollOpllConversion() {
+        if (!conversion_) return;
+        const auto now = juce::Time::getMillisecondCounterHiRes();
+        if ((conversion_original_end_ && now >= *conversion_original_end_)
+            || (audition_stop_time_ms_ && now >= *audition_stop_time_ms_))
+            conversion_->auditionEnded();
+        conversion_->poll();
+        if (!conversion_->closed()) {
+            performance_keyboard_.setInputActiveOverride(conversion_->dialog().isActiveWindow());
+            return;
+        }
+        performance_keyboard_.setInputActiveOverride(false);
+        conversion_.reset();
+        for (const auto& [component, enabled] : conversion_edit_controls_) component->setEnabled(enabled);
+        conversion_edit_controls_.clear();
+        updateHistoryButtons();
+    }
+
     void pasteClipboard() {
+        if (conversion_) return;
         if (const auto wave =
                 mgstc::platform::clipboardWaveBytes()) {
             static_cast<void>(importWaveBytes(
@@ -14459,6 +14427,7 @@ private:
     }
 
     void importWaveFile() {
+        if (conversion_) return;
         juce::FileChooser chooser(
             juce::String::fromUTF8(
                 "WAVからOPLL音色へ近似変換"),
@@ -14467,80 +14436,27 @@ private:
         if (!chooser.browseForFileToOpen()) {
             return;
         }
-        const auto file = chooser.getResult();
-        const auto wave =
-            mgstc::platform::readWaveFileBytes(
-                std::filesystem::path(
-                    file.getFullPathName()
-                        .toWideCharPointer()));
-        if (!wave) {
-            showError(
-                "WAV",
-                juce::String::fromUTF8(
-                    "WAVファイルを読み込めませんでした"));
-            return;
-        }
-        static_cast<void>(
-            importWaveBytes(*wave, "WAV"));
+        const auto file = std::filesystem::path(chooser.getResult().getFullPathName().toWideCharPointer());
+        beginOpllConversion([file](auto& pcm, auto& original, auto& error) {
+            const auto wave = mgstc::platform::readWaveFileBytes(file);
+            if (!wave) {
+                error = "WAVファイルを読み込めませんでした";
+                return false;
+            }
+            return OpllConversionTask::decodeWave(*wave, pcm, original, error);
+        }, {}, "WAV");
     }
 
     void importAudacitySelection() {
-        juce::MouseCursor::showWaitCursor();
-        auto imported =
-            mgstc::platform::
-                exportAudacitySelectionToWave();
-        juce::MouseCursor::hideWaitCursor();
-        if (!imported.wave) {
-            showError(
-                juce::String::fromUTF8(
-                    "Audacityから変換"),
-                juce::String(imported.error.c_str()));
-            return;
-        }
-        static_cast<void>(importWaveBytes(
-            *imported.wave,
-            juce::String::fromUTF8("Audacity変換")));
-    }
-
-    void updateWaveCandidateControls() {
-        const bool multiple = wave_candidates_.size() > 1;
-        wave_previous_.setEnabled(multiple);
-        wave_next_.setEnabled(multiple);
-        wave_candidate_label_.setText(
-            wave_candidates_.empty()
-                ? juce::String::fromUTF8("OPLL候補 --/--")
-                : juce::String::fromUTF8("OPLL候補 ")
-                    + juce::String(
-                        static_cast<int>(
-                            wave_candidate_index_ + 1))
-                    + "/"
-                    + juce::String(
-                        static_cast<int>(
-                            wave_candidates_.size())),
-            juce::dontSendNotification);
-    }
-
-    void selectAdjacentWaveCandidate(int direction) {
-        if (wave_candidates_.size() < 2) {
-            return;
-        }
-        const auto count = wave_candidates_.size();
-        wave_candidate_index_ = direction < 0
-            ? (wave_candidate_index_ + count - 1) % count
-            : (wave_candidate_index_ + 1) % count;
-        patch_ = wave_candidates_[wave_candidate_index_];
-        history_[history_cursor_] = patch_;
-        syncControls();
-        updateDefinitionPreview();
-        auditionAfterEdit();
-        updateWaveCandidateControls();
-        updateStatus(
-            juce::String::fromUTF8("OPLL近似候補 ")
-            + juce::String(
-                static_cast<int>(wave_candidate_index_ + 1))
-            + "/"
-            + juce::String(
-                static_cast<int>(wave_candidates_.size())));
+        if (conversion_) return;
+        beginOpllConversion([](auto& pcm, auto& original, auto& error) {
+            auto imported = mgstc::platform::exportAudacitySelectionToWave();
+            if (!imported.wave) {
+                error = utf8Text(juce::String(imported.error.c_str()));
+                return false;
+            }
+            return OpllConversionTask::decodeWave(*imported.wave, pcm, original, error);
+        }, {}, juce::String::fromUTF8("Audacity変換"));
     }
 
     void loadLibrary() {
@@ -14866,7 +14782,6 @@ private:
         updateTagButtons();
         memo_.clear();
         patch_ = patch;
-        clearWaveCandidates();
         history_.clear();
         history_.push_back(patch_);
         history_cursor_ = 0;
@@ -15335,8 +15250,8 @@ private:
             == mgstc::engine::encodeOpllPatch(right);
     }
 
-    void recordHistory() {
-        if (samePatch(history_[history_cursor_], patch_)) {
+    void recordHistory(bool force = false) {
+        if (!force && samePatch(history_[history_cursor_], patch_)) {
             return;
         }
         history_.erase(
@@ -15353,24 +15268,17 @@ private:
         updateHistoryButtons();
     }
 
-    void clearWaveCandidates() {
-        wave_candidates_.clear();
-        wave_candidate_index_ = 0;
-        updateWaveCandidateControls();
-    }
-
     void commitPatch(
         const mgstc::engine::OpllPatchParameters& patch,
-        bool clear_candidates = true) {
+        bool force_history = false) {
+        if (conversion_ && !force_history) return;
+        ++author_revision_;
         const bool changed = !samePatch(patch_, patch);
         patch_ = patch;
-        if (clear_candidates) {
-            clearWaveCandidates();
-        }
         syncControls();
         updateDefinitionPreview();
-        if (changed) {
-            recordHistory();
+        if (changed || force_history) {
+            recordHistory(force_history);
         }
         auditionAfterEdit();
         publishOwnedSnapshot();
@@ -15378,7 +15286,6 @@ private:
 
     void restoreHistory() {
         patch_ = history_[history_cursor_];
-        clearWaveCandidates();
         syncControls();
         updateDefinitionPreview();
         updateHistoryButtons();
@@ -15389,6 +15296,7 @@ private:
     }
 
     void undo() {
+        if (conversion_) return;
         if (history_cursor_ == 0) {
             return;
         }
@@ -15397,6 +15305,7 @@ private:
     }
 
     void redo() {
+        if (conversion_) return;
         if (history_cursor_ + 1 >= history_.size()) {
             return;
         }
@@ -15469,11 +15378,9 @@ private:
     }
 
     void controlsChanged(bool commit = true) {
-        if (syncing_) {
-            return;
-        }
+        if (syncing_ || conversion_) return;
+        ++author_revision_;
         patch_ = patch_panel_.parameters();
-        clearWaveCandidates();
         if (commit) {
             recordHistory();
         }
@@ -15597,8 +15504,8 @@ private:
 
     bool configureEngine(
         bool retrigger,
-        const mgstc::engine::OpllPatchParameters*
-            preview = nullptr) {
+        const mgstc::engine::OpllPatchParameters* preview = nullptr,
+        std::optional<std::uint8_t> note = {}) {
         if (usesCompositeAudition()) {
             juce::ignoreUnused(retrigger);
             if (preview) return previewOwnedPatch(*preview);
@@ -15617,7 +15524,7 @@ private:
         request.opll = &patch;
         request.retrigger = retrigger;
         request.track = kOpllTrack;
-        request.note = last_audition_note_;
+        request.note = note.value_or(last_audition_note_);
         request.commit_opll = preview == nullptr;
         const auto configured = session_.audition().submitShared(request);
         if (configured && preview == nullptr) {
@@ -15629,6 +15536,18 @@ private:
     }
 
     void startPerformanceNote(std::uint8_t note) {
+        if (link_.conversion_note_on) {
+            link_.conversion_note_on(note);
+            return;
+        }
+        auto candidate = conversion_ ? conversion_->keyboardCandidate() : nullptr;
+        if (candidate && conversion_keyboard_patch_ && performance_keyboard_.hasActiveNote())
+            candidate = conversion_keyboard_patch_;
+        if (conversion_ && !conversion_->beginKeyboardAudition()) return;
+        if (candidate && conversion_keyboard_patch_ != candidate && !usesCompositeAudition()) {
+            if (!configureEngine(false, &candidate->patch)) return;
+            conversion_keyboard_patch_ = candidate;
+        }
         audition_stop_time_ms_.reset();
         performance_keyboard_.clearPreviewNote();
         last_audition_note_ = note;
@@ -15636,11 +15555,15 @@ private:
         updateAuditionNoteLabels();
         pending_envelope_trace_refresh_ = true;
         if (usesCompositeAudition()) {
+            if (candidate) {
+                static_cast<void>(previewOwnedPatch(candidate->patch, note, false));
+                return;
+            }
             if (owned_preview_snapshot_ && link_.owned_audition.preview) {
                 static_cast<void>(link_.owned_audition.preview(*owned_preview_snapshot_, note, false));
                 return;
             }
-            publishOwnedSnapshot();
+            if (!conversion_) publishOwnedSnapshot();
             link_.owned_audition.note_on(note);
             return;
         }
@@ -15648,7 +15571,7 @@ private:
             return;
         }
         // 一時試聴が残っていると鍵盤が未確定音色を鳴らすため、確定へ戻す。
-        if (engine_holds_temporary_program_
+        if (engine_holds_temporary_program_ && !candidate
             && !configureEngine(false)) {
             return;
         }
@@ -15666,7 +15589,15 @@ private:
     }
 
     void stopPerformanceNote(std::uint8_t note) {
+        if (link_.conversion_note_off) {
+            link_.conversion_note_off(note);
+            return;
+        }
         audition_stop_time_ms_.reset();
+        if (conversion_ && !performance_keyboard_.hasActiveNote()) {
+            conversion_->keyboardEnded();
+            conversion_keyboard_patch_.reset();
+        }
         if (usesCompositeAudition()) {
             link_.owned_audition.note_off(note);
             return;
@@ -15682,31 +15613,33 @@ private:
     }
 
     [[nodiscard]] bool auditionOneSecond(
-        const mgstc::engine::OpllPatchParameters*
-            preview = nullptr) {
+        const mgstc::engine::OpllPatchParameters* preview = nullptr,
+        std::optional<std::uint8_t> note = {}) {
+        const auto pitch = note.value_or(last_audition_note_);
         if (usesCompositeAudition()) {
             if (preview) {
-                if (!previewOwnedPatch(*preview, last_audition_note_, true)) return false;
+                if (!previewOwnedPatch(*preview, pitch, true)) return false;
             } else {
                 publishOwnedSnapshot();
                 link_.owned_audition.one_second();
             }
-            performance_keyboard_.showPreviewNote(last_audition_note_);
+            performance_keyboard_.showPreviewNote(pitch);
             audition_stop_time_ms_ =
                 juce::Time::getMillisecondCounterHiRes() + 1000.0;
             return true;
         }
         if (!engine_ready_
-            || !configureEngine(true, preview)) {
+            || !configureEngine(true, preview, note)) {
             return false;
         }
-        performance_keyboard_.showPreviewNote(last_audition_note_);
+        performance_keyboard_.showPreviewNote(pitch);
         audition_stop_time_ms_ =
             juce::Time::getMillisecondCounterHiRes() + 1000.0;
         return true;
     }
 
     void timerCallback() override {
+        pollOpllConversion();
         synchronizeMasterVolumeSlider(
             master_volume_, master_volume_revision_, session_);
         if (pending_envelope_trace_refresh_) {
@@ -15771,12 +15704,13 @@ private:
     mgstc::engine::OpllPatchParameters patch_;
     std::optional<int> ui_scale_session_override_;
     std::vector<mgstc::engine::OpllPatchParameters> history_;
-    juce::Component::SafePointer<ConversionBusyDialog> conversion_busy_dialog_;
-    juce::Component::SafePointer<ModalDialogWindow> conversion_quality_dialog_;
+    std::unique_ptr<CompositeWavPcmPlayer> conversion_pcm_;
+    std::unique_ptr<OpllConversionSession> conversion_;
+    std::vector<std::pair<juce::Component*, bool>> conversion_edit_controls_;
+    OpllConversionTask::Candidate conversion_keyboard_patch_;
+    std::optional<double> conversion_original_end_;
+    std::uint64_t author_revision_{};
     std::size_t history_cursor_{};
-    std::vector<mgstc::engine::OpllPatchParameters>
-        wave_candidates_;
-    std::size_t wave_candidate_index_{};
     OpllPatchParameterPanel patch_panel_;
     juce::Rectangle<int> library_panel_bounds_;
     juce::Label title_;
@@ -15795,9 +15729,6 @@ private:
         "redo", juce::DrawableButton::ImageOnButtonBackground};
     juce::TextButton import_wave_;
     juce::TextButton import_audacity_;
-    juce::TextButton wave_previous_;
-    juce::Label wave_candidate_label_;
-    juce::TextButton wave_next_;
     juce::ComboBox rom_preset_;
     juce::TextButton rom_load_;
     juce::DrawableButton immediate_audition_{

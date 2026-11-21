@@ -229,6 +229,8 @@ public:
     [[nodiscard]] virtual bool registerTask(std::shared_ptr<EditorBackgroundTask> task) = 0;
 };
 
+struct OpllConversionReservation {};
+
 // Thin composition root. No engine() accessor. Scope polls consume frames and
 // are not audition. Independent OPLL scope uses waveform_scope.
 // Composite Editor playback waveform uses composite_playback_waveform.
@@ -262,6 +264,15 @@ public:
     [[nodiscard]] virtual AuditionBoundary& audition() noexcept = 0;
     [[nodiscard]] virtual PcmPreviewBoundary* pcmPreview() noexcept { return nullptr; }
     [[nodiscard]] virtual BackgroundTaskBoundary* backgroundTasks() noexcept { return nullptr; }
+    // Message thread only. The worker retains the reservation until cancellation
+    // reaches its final batch boundary.
+    [[nodiscard]] virtual std::shared_ptr<OpllConversionReservation> reserveOpllConversion() {
+        if (!opll_conversion_.expired()) return {};
+        auto reservation = std::make_shared<OpllConversionReservation>();
+        opll_conversion_ = reservation;
+        return reservation;
+    }
+    [[nodiscard]] virtual bool opllConversionReserved() const { return !opll_conversion_.expired(); }
     [[nodiscard]] virtual bool pollOpllScope(
         mgstc::engine::OpllScopeFrame& frame) = 0;
     [[nodiscard]] virtual bool pollLatestOpllScope(
@@ -273,6 +284,7 @@ public:
     // Failure suppresses the display selection, never the musical event.
     [[nodiscard]] virtual bool setScopeSelection(std::uint32_t, std::uint64_t) { return false; }
 private:
+    std::weak_ptr<OpllConversionReservation> opll_conversion_;
     EditorAuditionPreferences audition_preferences_;
     std::shared_ptr<PatchSlideStock> patchslide_stock_;
 };
@@ -290,6 +302,7 @@ struct OwnedAuditionHooks {
     std::function<bool(const mgstc::engine::SavedTimbreReference&,
         std::optional<std::uint8_t>, bool)> preview;
     std::function<void(bool)> set_whole_composite;
+    std::function<bool(const mgstc::engine::SavedTimbreReference&)> commit_opll_conversion;
 
     [[nodiscard]] bool ready() const noexcept {
         return static_cast<bool>(sync_program)
@@ -305,6 +318,10 @@ struct EditorLink {
     std::optional<mgstc::engine::SavedTimbreReference> owned_published;
     std::uint64_t owned_revision{1};
     OwnedAuditionHooks owned_audition{};
+    // A composite SCC conversion can play through an already-open OPLL
+    // satellite without handing its temporary candidate to authoring.
+    std::function<void(std::uint8_t)> conversion_note_on;
+    std::function<void(std::uint8_t)> conversion_note_off;
 
     void publishOwned(mgstc::engine::SavedTimbreReference snapshot) {
         owned_published = std::move(snapshot);

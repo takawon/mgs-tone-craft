@@ -87,6 +87,12 @@ public:
     [[nodiscard]] mgstc::app::BackgroundTaskBoundary* backgroundTasks() noexcept override {
         return &background_tasks_;
     }
+    [[nodiscard]] std::shared_ptr<mgstc::app::OpllConversionReservation> reserveOpllConversion() override {
+        return processor_.editorReserveOpllConversion();
+    }
+    [[nodiscard]] bool opllConversionReserved() const override {
+        return processor_.editorOpllConversionReserved();
+    }
 
     [[nodiscard]] bool pollOpllScope(
         mgstc::engine::OpllScopeFrame& frame) override {

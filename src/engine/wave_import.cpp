@@ -15,32 +15,105 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <map>
+#include <stdexcept>
 
 #include "emu2413.h"
 #include "mgstc/engine/note_pitch.hpp"
 
 namespace mgstc::engine {
 
+struct OpllContinuousSearchState {
+    using Clock = std::chrono::steady_clock;
+    const OpllContinuousOptions& options;
+    OpllContinuousResult result;
+    Clock::time_point started;
+    Clock::time_point deadline;
+    std::chrono::milliseconds limit;
+    OpllApproximationPhase phase{OpllApproximationPhase::Idle};
+    bool timed_out{};
+    std::uint32_t seed{0x47415043U};
+    std::uint64_t duplicate_cache_hits{}, fallback_candidates{}, generations{};
+    bool ga_used{};
+    float fundamental_hz{};
+    std::size_t key_off_sample{}, sample_count{};
+    std::uint64_t next_id{};
+
+    explicit OpllContinuousSearchState(const OpllContinuousOptions& value)
+        : options(value), started(now()),
+          limit(options.test_hooks ? std::max(std::chrono::milliseconds{0},
+                    options.test_hooks->time_limit) : std::chrono::milliseconds{300'000}) {
+        deadline = started + limit;
+    }
+    Clock::time_point now() const {
+        return options.test_hooks && options.test_hooks->now
+            ? options.test_hooks->now() : Clock::now();
+    }
+    bool stopped() {
+        if (options.control && options.control->cancelRequested()) return true;
+        timed_out = timed_out || now() >= deadline;
+        return timed_out;
+    }
+    std::uint64_t elapsed() const {
+        const auto value = std::chrono::duration_cast<std::chrono::milliseconds>(now() - started);
+        return static_cast<std::uint64_t>(std::clamp(value.count(),
+            std::int64_t{0}, static_cast<std::int64_t>(limit.count())));
+    }
+    void publish(const OpllPatchParameters& patch, float score) {
+        if (!std::isfinite(score) || (options.control && options.control->cancelRequested())) return;
+        const auto registers = encodeOpllPatch(patch);
+        const auto less = [](const auto& left, const auto& right) {
+            return left->full_score != right->full_score
+                ? left->full_score < right->full_score : left->registers < right->registers;
+        };
+        if (std::any_of(result.ranked.begin(), result.ranked.end(),
+                [&](const auto& entry) { return entry->registers == registers; })) return;
+        if (result.ranked.size() == 6) {
+            const auto& last = result.ranked.back();
+            if (score > last->full_score || (score == last->full_score && registers >= last->registers)) return;
+        }
+        auto candidate = std::make_shared<const OpllContinuousCandidate>(OpllContinuousCandidate{
+            ++next_id, patch, registers, score, fundamental_hz,
+            options.fixed_midi_note, key_off_sample, sample_count,
+            result.full_evaluations});
+        result.ranked.push_back(candidate);
+        std::sort(result.ranked.begin(), result.ranked.end(), less);
+        if (result.ranked.size() > 6) result.ranked.resize(6);
+    }
+};
+
 struct OpllApproximationCoordinator {
     explicit OpllApproximationCoordinator(
         const OpllApproximationOptions& options,
-        std::uint64_t total)
+        std::uint64_t total,
+        OpllContinuousSearchState* continuous_state = nullptr)
         : control(options.control
               ? options.control
-              : std::make_shared<OpllApproximationControl>()) {
+              : std::make_shared<OpllApproximationControl>()), continuous(continuous_state) {
         control->state_->completed.store(0, std::memory_order_relaxed);
         control->state_->total.store(total, std::memory_order_release);
         control->state_->phase.store(
             OpllApproximationPhase::Idle,
             std::memory_order_release);
+        control->state_->elapsed_milliseconds.store(0, std::memory_order_relaxed);
+        control->state_->time_limit_milliseconds.store(
+            continuous ? static_cast<std::uint64_t>(continuous->limit.count()) : 0,
+            std::memory_order_relaxed);
+        control->state_->initial_completed.store(false, std::memory_order_relaxed);
+        control->state_->continuous_started_ns.store(continuous
+            ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() : 0,
+            std::memory_order_relaxed);
+        control->state_->continuous_running.store(continuous != nullptr, std::memory_order_release);
     }
 
-    [[nodiscard]] bool cancelled() const noexcept {
-        return control->state_->cancel_requested.load(
-            std::memory_order_acquire);
+    [[nodiscard]] bool cancelled() const {
+        return control->state_->cancel_requested.load(std::memory_order_acquire)
+            || (continuous && continuous->stopped());
     }
 
     void setPhase(OpllApproximationPhase phase) noexcept {
+        if (continuous) continuous->phase = phase;
         control->state_->phase.store(phase, std::memory_order_release);
     }
 
@@ -52,6 +125,25 @@ struct OpllApproximationCoordinator {
         control->state_->completed.store(
             std::min(total, previous + work),
             std::memory_order_release);
+    }
+
+    void updateTime() {
+        if (!continuous) return;
+        control->state_->elapsed_milliseconds.store(continuous->elapsed(), std::memory_order_release);
+        control->state_->initial_completed.store(continuous->result.initial_completed, std::memory_order_release);
+    }
+    bool synchronousFallback() const {
+        return continuous && continuous->options.test_hooks
+            && continuous->options.test_hooks->force_synchronous_fallback;
+    }
+    void setTotal(std::uint64_t total) noexcept {
+        control->state_->total.store(total, std::memory_order_release);
+    }
+    void finishContinuous(bool cancelled) {
+        updateTime();
+        control->state_->continuous_running.store(false, std::memory_order_release);
+        control->state_->phase.store(cancelled ? OpllApproximationPhase::Cancelled
+            : OpllApproximationPhase::Completed, std::memory_order_release);
     }
 
     void finish(bool was_cancelled) noexcept {
@@ -70,6 +162,7 @@ struct OpllApproximationCoordinator {
     }
 
     std::shared_ptr<OpllApproximationControl> control;
+    OpllContinuousSearchState* continuous{};
 };
 
 std::vector<OpllPatchParameters> searchWaveCycleWithOpll(
@@ -416,6 +509,7 @@ struct TimedFeatureWorkspace {
 };
 
 struct OpllFitTarget {
+    std::optional<OpllPitch> fixed_pitch;
     std::vector<float> samples;
     TimedAudioFeatures features;
     float fundamental_hz{261.625565F};
@@ -816,12 +910,15 @@ public:
     OpllTimedRenderer()
         : chip_(OPLL_new(kOpllClock, kOpllFitSampleRate)) {}
 
+    [[nodiscard]] bool valid() const noexcept { return chip_ != nullptr; }
+
     const std::vector<float>& render(
         const OpllPatchParameters& patch,
         float frequency_hz,
         std::size_t sample_count,
         std::size_t key_off_sample,
-        std::size_t render_offset_sample) {
+        std::size_t render_offset_sample,
+        const std::optional<OpllPitch>& fixed_pitch = {}) {
         result_.assign(sample_count, 0.0F);
         if (!chip_) {
             return result_;
@@ -836,7 +933,7 @@ public:
                 static_cast<std::uint32_t>(index),
                 registers[index]);
         }
-        const auto pitch = closestOpllPitch(frequency_hz);
+        const auto pitch = fixed_pitch ? *fixed_pitch : closestOpllPitch(frequency_hz);
         OPLL_writeReg(
             chip_.get(),
             0x10,
@@ -871,9 +968,12 @@ private:
 
 class TimedOpllScoreContext {
 public:
-    explicit TimedOpllScoreContext(const OpllFitTarget& target)
+    explicit TimedOpllScoreContext(const OpllFitTarget& target, bool require_renderer = false)
         : target_(target),
-          fundamental_hz_(target.fundamental_hz) {}
+          fundamental_hz_(target.fundamental_hz) {
+        if (require_renderer && !renderer_.valid())
+            throw std::runtime_error("Could not initialize the OPLL renderer.");
+    }
 
     float score(const OpllPatchParameters& patch) {
         const auto& rendered = renderer_.render(
@@ -881,7 +981,8 @@ public:
             target_.fundamental_hz,
             target_.samples.size(),
             target_.key_off_sample,
-            target_.render_offset_sample);
+            target_.render_offset_sample,
+            target_.fixed_pitch);
         float distance = featureDistance(
             target_.features,
             timedFeatures(
@@ -920,7 +1021,8 @@ class OpllScoreExecutor {
 public:
     using Context = decltype(std::declval<ContextFactory&>()());
 
-    OpllScoreExecutor(ContextFactory make_context, std::size_t max_workers) {
+    OpllScoreExecutor(ContextFactory make_context, std::size_t max_workers,
+        bool synchronous_fallback = false) {
         const unsigned hardware = std::thread::hardware_concurrency();
         worker_capacity_ = std::min<std::size_t>(
             std::clamp<std::size_t>(max_workers, 1, 8),
@@ -933,6 +1035,7 @@ public:
         if (worker_capacity_ == 1) {
             return;
         }
+        if (synchronous_fallback) return;
         workers_.reserve(worker_capacity_);
         try {
             for (std::size_t worker = 0; worker < worker_capacity_; ++worker) {
@@ -1064,8 +1167,18 @@ bool scoreOpllSubBatches(
         if (coordinator && coordinator->cancelled()) {
             return false;
         }
-        const std::size_t count =
-            std::min(batch_size, candidates.size() - begin);
+        std::size_t count = std::min(batch_size, candidates.size() - begin);
+        if (coordinator && coordinator->continuous) {
+            const auto& state = *coordinator->continuous;
+            const auto& hooks = state.options.test_hooks;
+            if (hooks && hooks->cancel_after_evaluations && state.phase == hooks->cancel_phase) {
+                const auto completed = state.phase == OpllApproximationPhase::ShortTimbre
+                    ? state.result.short_evaluations : state.phase == OpllApproximationPhase::FullEnvelope
+                        ? state.result.full_evaluations : state.result.representative_evaluations;
+                if (completed < hooks->cancel_after_evaluations)
+                    count = std::min<std::uint64_t>(count, hooks->cancel_after_evaluations - completed);
+            }
+        }
         executor.score(
             std::span<ScoredOpllPatch>(candidates).subspan(begin, count));
         // A sub-batch is published only after every worker has completed.
@@ -1073,9 +1186,49 @@ bool scoreOpllSubBatches(
             coordinator->advance(
                 static_cast<std::uint64_t>(count) * weight);
         }
+        if (coordinator && coordinator->continuous) {
+            auto& state = *coordinator->continuous;
+            switch (state.phase) {
+            case OpllApproximationPhase::RepresentativeCycle:
+            case OpllApproximationPhase::SteadyTimbre:
+                state.result.representative_evaluations += count; break;
+            case OpllApproximationPhase::ShortTimbre:
+                state.result.short_evaluations += count; break;
+            case OpllApproximationPhase::FullEnvelope: {
+                const auto previous = state.result.ranked.empty()
+                    ? std::shared_ptr<const OpllContinuousCandidate>{} : state.result.ranked.front();
+                state.result.full_evaluations += count;
+                for (const auto& entry : std::span<ScoredOpllPatch>(candidates).subspan(begin, count))
+                    state.publish(entry.patch, entry.distance);
+                if (!state.result.ranked.empty() && state.result.ranked.front() != previous
+                    && state.options.candidate_ready
+                    && !coordinator->control->cancelRequested())
+                    state.options.candidate_ready(state.result.ranked.front());
+                break;
+            }
+            default: break;
+            }
+            coordinator->updateTime();
+            if (state.options.test_hooks && state.options.test_hooks->batch_completed)
+                state.options.test_hooks->batch_completed(state.phase,
+                    state.result.representative_evaluations, state.result.short_evaluations,
+                    state.result.full_evaluations);
+            if (state.options.test_hooks) {
+                const auto& hooks = *state.options.test_hooks;
+                const auto completed = state.phase == OpllApproximationPhase::ShortTimbre
+                    ? state.result.short_evaluations : state.phase == OpllApproximationPhase::FullEnvelope
+                        ? state.result.full_evaluations : state.result.representative_evaluations;
+                if (hooks.cancel_after_evaluations && state.phase == hooks.cancel_phase
+                    && completed >= hooks.cancel_after_evaluations)
+                    coordinator->control->requestCancel();
+            }
+            if (coordinator->cancelled()) return false;
+        }
     }
     return true;
 }
+
+#include "wave_import_ga.inc"
 
 std::size_t detectKeyOff(
     const std::array<float, kEnvelopeBins>& envelope,
@@ -1103,7 +1256,8 @@ std::size_t detectKeyOff(
 
 OpllFitTarget makeFitTarget(
     const WavePcm& pcm,
-    const WaveCycleAnalysis& cycle_analysis) {
+    const WaveCycleAnalysis& cycle_analysis,
+    std::optional<std::uint8_t> fixed_midi_note = {}) {
     OpllFitTarget target{};
     auto resampled = resampleAudio(
         pcm.mono_samples,
@@ -1116,7 +1270,7 @@ OpllFitTarget makeFitTarget(
     }
     std::size_t first_audible{};
     const float threshold = peak * 0.0125F;
-    while (first_audible < resampled.size()
+    while (!fixed_midi_note && first_audible < resampled.size()
            && std::abs(resampled[first_audible]) < threshold) {
         ++first_audible;
     }
@@ -1137,17 +1291,27 @@ OpllFitTarget makeFitTarget(
         cycle_analysis.estimated_frequency_hz > 0.0F
             ? cycle_analysis.estimated_frequency_hz
             : 261.625565F;
+    if (fixed_midi_note) {
+        NotePitch pitch{};
+        if (!notePitch(*fixed_midi_note, pitch))
+            throw std::invalid_argument("Unsupported conversion MIDI note");
+        target.fixed_pitch = pitch.opll;
+        target.fundamental_hz = sccFrequencyHz(pitch.psg_scc_period);
+    }
     target.features = timedFeatures(
         target.samples,
         target.fundamental_hz);
-    target.key_off_sample =
-        detectKeyOff(target.features.envelope, target.samples.size());
+    // Fixed-note input is a complete single-note audition render. Its
+    // release follows the captured interval at the source audition boundary.
+    target.key_off_sample = fixed_midi_note ? target.samples.size()
+        : detectKeyOff(target.features.envelope, target.samples.size());
     return target;
 }
 
 OpllFitTarget makeTimbreTarget(const OpllFitTarget& full_target) {
     OpllFitTarget target{};
     target.fundamental_hz = full_target.fundamental_hz;
+    target.fixed_pitch = full_target.fixed_pitch;
     target.key_off_sample = std::numeric_limits<std::size_t>::max();
     if (full_target.samples.empty()) {
         return target;
@@ -1196,10 +1360,11 @@ std::vector<OpllPatchParameters> searchTimedOpll(
     std::vector<ScoredOpllPatch> short_scored;
     // OPLL_new performs emu2413's one-time table initialization. Complete it
     // on this thread before any worker constructs its private context.
-    TimedOpllScoreContext priming_context(timbre_target);
+    const bool require_renderer = coordinator && coordinator->continuous;
+    TimedOpllScoreContext priming_context(timbre_target, require_renderer);
     static_cast<void>(priming_context);
-    const auto make_context = [&timbre_target] {
-        return TimedOpllScoreContext(timbre_target);
+    const auto make_context = [&timbre_target, require_renderer] {
+        return TimedOpllScoreContext(timbre_target, require_renderer);
     };
     const auto less = [](
                           const ScoredOpllPatch& left,
@@ -1289,7 +1454,8 @@ std::vector<OpllPatchParameters> searchTimedOpll(
     }
     // Do not keep the short-target pool alive during the nested
     // representative-cycle search; each homogeneous phase owns one pool.
-    OpllScoreExecutor short_executor(make_context, options.max_workers);
+    OpllScoreExecutor short_executor(make_context, options.max_workers,
+        coordinator && coordinator->synchronousFallback());
     if (!scoreOpllSubBatches(
             seed_batch,
             short_executor,
@@ -1300,6 +1466,8 @@ std::vector<OpllPatchParameters> searchTimedOpll(
     }
     short_scored.insert(
         short_scored.end(), seed_batch.begin(), seed_batch.end());
+    const auto ga_origin_seeds = coordinator && coordinator->continuous
+        ? seed_batch : std::vector<ScoredOpllPatch>{};
     std::vector<ScoredOpllPatch> beam = retain(std::move(seed_batch));
     const auto run_stage = [&](auto generate) {
         std::vector<ScoredOpllPatch> batch;
@@ -1402,6 +1570,8 @@ std::vector<OpllPatchParameters> searchTimedOpll(
         }
     })) return {};
 
+    auto staged_short_beam = beam;
+    std::vector<ScoredOpllPatch> short_ga_promotions;
     // Thorough uses deterministic full-register restarts after the complete
     // Standard path. Decoding arbitrary register bytes spans the legal patch
     // space and prevents later stages from starving on duplicate mutations.
@@ -1450,7 +1620,18 @@ std::vector<OpllPatchParameters> searchTimedOpll(
             short_scored.end(),
             pair_local_batch.begin(),
             pair_local_batch.end());
-        while (evaluations < evaluation_budget) {
+        if (coordinator && coordinator->continuous) {
+            auto staged = short_scored;
+            std::sort(staged.begin(), staged.end(), less);
+            staged_short_beam = retain(staged);
+            if (!gaResidual(false, evaluation_budget, evaluations,
+                    short_scored, staged, ga_origin_seeds,
+                    short_executor, steady_batch_size, 1, coordinator,
+                    admit, less)) return {};
+            short_ga_promotions = retain(short_scored);
+            beam = staged_short_beam;
+        }
+        while ((!coordinator || !coordinator->continuous) && evaluations < evaluation_budget) {
             std::vector<ScoredOpllPatch> batch;
             batch.reserve(steady_batch_size);
             while (batch.size() < steady_batch_size
@@ -1484,12 +1665,13 @@ std::vector<OpllPatchParameters> searchTimedOpll(
     std::size_t full_evaluations{};
     std::set<std::array<std::uint8_t, 8>> full_seen;
     std::vector<ScoredOpllPatch> full_scored;
-    TimedOpllScoreContext full_priming_context(target);
+    TimedOpllScoreContext full_priming_context(target, require_renderer);
     static_cast<void>(full_priming_context);
-    const auto make_full_context = [&target] {
-        return TimedOpllScoreContext(target);
+    const auto make_full_context = [&target, require_renderer] {
+        return TimedOpllScoreContext(target, require_renderer);
     };
-    OpllScoreExecutor full_executor(make_full_context, options.max_workers);
+    OpllScoreExecutor full_executor(make_full_context, options.max_workers,
+        coordinator && coordinator->synchronousFallback());
     const auto admit_full = [&](
                                 const OpllPatchParameters& patch,
                                 std::vector<ScoredOpllPatch>& batch) {
@@ -1636,7 +1818,21 @@ std::vector<OpllPatchParameters> searchTimedOpll(
         return {};
     }
     if (options.effort == OpllApproximationEffort::Thorough) {
-        while (full_evaluations < full_evaluation_budget) {
+        if (coordinator && coordinator->continuous) {
+            auto staged = full_scored;
+            std::sort(staged.begin(), staged.end(), less);
+            std::vector<ScoredOpllPatch> promoted_ga;
+            for (const auto& candidate : short_ga_promotions)
+                admit_full(candidate.patch, promoted_ga);
+            if (!scoreOpllSubBatches(promoted_ga, full_executor, full_batch_size,
+                    full_weight, coordinator)) return {};
+            full_scored.insert(full_scored.end(), promoted_ga.begin(), promoted_ga.end());
+            if (!gaResidual(true, full_evaluation_budget, full_evaluations,
+                    full_scored, staged, ga_origin_seeds,
+                    full_executor, full_batch_size, full_weight, coordinator,
+                    admit_full, less)) return {};
+        }
+        while ((!coordinator || !coordinator->continuous) && full_evaluations < full_evaluation_budget) {
             std::vector<ScoredOpllPatch> batch;
             batch.reserve(full_batch_size);
             while (batch.size() < full_batch_size
@@ -1660,6 +1856,63 @@ std::vector<OpllPatchParameters> searchTimedOpll(
         }
     }
 
+    if (coordinator && coordinator->continuous) {
+        auto& state = *coordinator->continuous;
+        state.result.initial_completed = true;
+        if (!state.result.ranked.empty()) state.result.initial_best = state.result.ranked.front();
+        coordinator->updateTime();
+        if (!(state.options.test_hooks && state.options.test_hooks->initial_only)) {
+            std::uint32_t epoch{};
+            const auto compact_cache = [&](auto& scored, auto& keys) {
+                if (scored.size() <= 65'536) return;
+                std::sort(scored.begin(), scored.end(), less);
+                scored.resize(64);
+                keys.clear();
+                for (const auto& entry : scored) keys.insert(entry.registers);
+            };
+            while (!coordinator->cancelled()) {
+                state.seed = 0x47415043U ^ (++epoch * 0x9E3779B9U);
+                compact_cache(short_scored, seen);
+                compact_cache(full_scored, full_seen);
+                auto staged_short = short_scored;
+                std::sort(staged_short.begin(), staged_short.end(), less);
+                if (staged_short.size() > 64) staged_short.resize(64);
+                std::size_t additional_short{};
+                const auto admit_short_extra = [&](const auto& patch, auto& batch) {
+                    const auto registers = encodeOpllPatch(patch);
+                    if (additional_short < 1'024 && seen.insert(registers).second) {
+                        ++additional_short;
+                        batch.push_back(ScoredOpllPatch{0, registers, patch});
+                    }
+                };
+                coordinator->setPhase(OpllApproximationPhase::ShortTimbre);
+                if (!gaResidual(false, 1'024, additional_short, short_scored,
+                        staged_short, ga_origin_seeds, short_executor,
+                        steady_batch_size, 1, coordinator, admit_short_extra, less)) break;
+                std::size_t additional_full{};
+                const auto admit_full_extra = [&](const auto& patch, auto& batch) {
+                    const auto registers = encodeOpllPatch(patch);
+                    if (additional_full < 1'024 && full_seen.insert(registers).second) {
+                        ++additional_full;
+                        batch.push_back(ScoredOpllPatch{0, registers, patch});
+                    }
+                };
+                coordinator->setPhase(OpllApproximationPhase::FullEnvelope);
+                std::vector<ScoredOpllPatch> promoted;
+                for (const auto& candidate : retain(short_scored))
+                    admit_full_extra(candidate.patch, promoted);
+                if (!scoreOpllSubBatches(promoted, full_executor, full_batch_size,
+                        full_weight, coordinator)) break;
+                full_scored.insert(full_scored.end(), promoted.begin(), promoted.end());
+                auto staged_full = full_scored;
+                std::sort(staged_full.begin(), staged_full.end(), less);
+                if (staged_full.size() > 64) staged_full.resize(64);
+                if (!gaResidual(true, 1'024, additional_full, full_scored,
+                        staged_full, ga_origin_seeds, full_executor,
+                        full_batch_size, full_weight, coordinator, admit_full_extra, less)) break;
+            }
+        }
+    }
     std::sort(full_scored.begin(), full_scored.end(), less);
     std::vector<OpllPatchParameters> result;
     result.reserve(result_capacity);
@@ -1874,23 +2127,27 @@ std::vector<OpllPatchParameters> searchWaveCycleWithOpll(
     if (normalized.size() < 2) {
         return {defaultOpllPatch()};
     }
+    const auto midi_note = coordinator && coordinator->continuous
+        ? coordinator->continuous->options.fixed_midi_note.value_or(kAuditionMidiNote)
+        : kAuditionMidiNote;
     NotePitch pitch{};
-    if (!notePitch(kAuditionMidiNote, pitch)) {
+    if (!notePitch(midi_note, pitch)) {
         return {defaultOpllPatch()};
     }
     const float fundamental_hz = sccFrequencyHz(pitch.psg_scc_period);
     SameMidiScoreContext priming_context(
         normalized,
         fundamental_hz,
-        kAuditionMidiNote);
+        midi_note);
     static_cast<void>(priming_context);
-    const auto make_context = [&normalized, fundamental_hz] {
+    const auto make_context = [&normalized, fundamental_hz, midi_note] {
         return SameMidiScoreContext(
             normalized,
             fundamental_hz,
-            kAuditionMidiNote);
+            midi_note);
     };
-    OpllScoreExecutor score_executor(make_context, options.max_workers);
+    OpllScoreExecutor score_executor(make_context, options.max_workers,
+        coordinator && coordinator->synchronousFallback());
     const auto prepare = [](OpllPatchParameters patch) {
         patch.modulator.amplitude_modulation = false;
         patch.carrier.amplitude_modulation = false;
@@ -2206,6 +2463,17 @@ OpllApproximationProgress OpllApproximationControl::progress() const noexcept {
     result.total = state_->total.load(std::memory_order_acquire);
     result.cancel_requested =
         state_->cancel_requested.load(std::memory_order_acquire);
+    result.elapsed_milliseconds = state_->elapsed_milliseconds.load(std::memory_order_acquire);
+    result.time_limit_milliseconds = state_->time_limit_milliseconds.load(std::memory_order_acquire);
+    result.initial_completed = state_->initial_completed.load(std::memory_order_acquire);
+    if (state_->continuous_running.load(std::memory_order_acquire)) {
+        const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto start = state_->continuous_started_ns.load(std::memory_order_relaxed);
+        const auto elapsed = std::max<std::int64_t>(0, (now - start) / 1'000'000);
+        result.elapsed_milliseconds = std::min(result.time_limit_milliseconds,
+            static_cast<std::uint64_t>(elapsed));
+    }
     return result;
 }
 
@@ -2328,6 +2596,67 @@ OpllPatchParameters approximateWavePcmWithOpll(
     const WavePcm& pcm) {
     auto candidates = approximateWavePcmCandidatesWithOpll(pcm);
     return candidates.empty() ? defaultOpllPatch() : candidates.front();
+}
+
+OpllContinuousResult approximateWavePcmContinuouslyWithOpll(
+    const WavePcm& pcm, const OpllContinuousOptions& requested_options) {
+    auto options = requested_options;
+    if (!options.control) options.control = std::make_shared<OpllApproximationControl>();
+    OpllContinuousSearchState state(options);
+    OpllApproximationOptions initial_options;
+    initial_options.max_workers = options.max_workers;
+    initial_options.effort = OpllApproximationEffort::Thorough;
+    initial_options.profile = OpllApproximationProfile::Production;
+    initial_options.control = options.control;
+    OpllApproximationCoordinator coordinator(initial_options, 0, &state);
+    try {
+        if (!coordinator.cancelled()) {
+            if (pcm.sample_rate == 0 || pcm.mono_samples.size() < 2
+                || !std::all_of(pcm.mono_samples.begin(), pcm.mono_samples.end(),
+                    [](float value) { return std::isfinite(value); }))
+                throw std::invalid_argument("No valid PCM samples for conversion");
+            const auto analysis = analyzeWaveCycle(pcm);
+            if (!coordinator.cancelled()) {
+                const auto target = makeFitTarget(pcm, analysis, options.fixed_midi_note);
+                if (analysis.cycle.size() < 2 || target.samples.size() < 2)
+                    throw std::invalid_argument("PCM is too short for full evaluation");
+                state.fundamental_hz = target.fundamental_hz;
+                state.key_off_sample = target.key_off_sample;
+                state.sample_count = target.samples.size();
+                const auto budgets = searchBudgets(initial_options);
+                coordinator.setTotal(budgets.representative + budgets.short_timbre
+                    + static_cast<std::uint64_t>(budgets.full_envelope)
+                        * fullWaveWeight(target.samples.size()));
+                if (!coordinator.cancelled())
+                    static_cast<void>(searchTimedOpll(target, analysis.cycle,
+                        initial_options, &coordinator, budgets));
+            }
+        }
+        if (options.control->cancelRequested()) {
+            state.result.completion = OpllContinuousCompletion::Cancelled;
+        } else if (state.stopped()) {
+            state.result.completion = OpllContinuousCompletion::TimedOut;
+            if (state.result.ranked.empty())
+                state.result.error = "Time limit reached before any full candidate evaluation completed";
+        } else if (state.result.initial_completed && options.test_hooks
+            && options.test_hooks->initial_only) {
+            state.result.completion = OpllContinuousCompletion::InitialCompleted;
+        } else {
+            state.result.error = "Conversion stopped without a complete result";
+        }
+    } catch (const std::exception& error) {
+        state.result.error = error.what();
+        state.result.completion = options.control->cancelRequested()
+            ? OpllContinuousCompletion::Cancelled : OpllContinuousCompletion::Failed;
+    } catch (...) {
+        state.result.error = "Unknown conversion failure";
+    }
+    if (state.result.completion == OpllContinuousCompletion::Cancelled) {
+        state.result.ranked.clear();
+        state.result.initial_best.reset();
+    }
+    coordinator.finishContinuous(state.result.completion == OpllContinuousCompletion::Cancelled);
+    return std::move(state.result);
 }
 
 }  // namespace mgstc::engine

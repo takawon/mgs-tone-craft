@@ -117,6 +117,8 @@ public:
     void editorStopPcmPreview() noexcept;
     [[nodiscard]] bool editorRegisterBackgroundTask(
         std::shared_ptr<mgstc::app::EditorBackgroundTask> task);
+    [[nodiscard]] std::shared_ptr<mgstc::app::OpllConversionReservation> editorReserveOpllConversion();
+    [[nodiscard]] bool editorOpllConversionReserved() const;
     void editorSetMasterVolumePercent(int percent);
     [[nodiscard]] int editorMasterVolumePercent() const noexcept;
     [[nodiscard]] std::uint64_t editorMasterVolumeRevision() const noexcept;
@@ -316,10 +318,11 @@ private:
     mutable std::optional<mgstc::app::HardwareControlResult> hardware_last_result_;
     PluginPcmPreview pcm_preview_{};
     // Message/background control only. Never accessed by processBlock.
-    std::mutex background_tasks_mu_;
+    mutable std::mutex background_tasks_mu_;
     // Serializes non-audio program producers; processBlock never takes it.
     std::mutex state_commit_mu_;
     std::vector<std::shared_ptr<mgstc::app::EditorBackgroundTask>> background_tasks_;
+    std::weak_ptr<mgstc::app::OpllConversionReservation> opll_conversion_;
     bool background_tasks_shutdown_{};
     mgstc::engine::SequentialVoiceAllocator voices_{kMaxVoices};
     std::array<mgstc::engine::CompositePlaybackPlan, 3> plan_slots_{};

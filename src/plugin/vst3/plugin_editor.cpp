@@ -101,6 +101,9 @@ MgstcAudioProcessorEditor::MgstcAudioProcessorEditor(
             return composite_ && composite_->previewOwnedTimbre(snapshot, note, one_second);
         },
         [this](bool whole) { if (composite_) composite_->setOwnedEditWholeComposite(whole); },
+        [this](const mgstc::engine::SavedTimbreReference& sound) {
+            return composite_ && composite_->commitOwnedOpllConversion(sound);
+        },
     };
 
     const auto revision = context_.stateRestoreRevision();
@@ -249,25 +252,9 @@ void MgstcAudioProcessorEditor::openSatellite(
                 link_,
                 open_editor,
                 open_spectrum,
-                [this](std::vector<mgstc::engine::OpllPatchParameters> candidates) {
-                    if (candidates.empty()) return;
-                    const auto revision = context_.stateRestoreRevision();
-                    juce::Component::SafePointer<MgstcAudioProcessorEditor> safe(this);
-                    juce::AlertWindow::showAsync(juce::MessageBoxOptions()
-                        .withTitle(juce::String::fromUTF8("SCC → OPLL"))
-                        .withMessage(juce::String::fromUTF8("変換候補を総合音色の最初のOPLLチャンネルのベースへ適用します。OPLLがない場合は追加します。現在のOPLLベースは置き換わります。SCCチャンネルは保持します。"))
-                        .withButton(juce::String::fromUTF8("適用"))
-                        .withButton(juce::String::fromUTF8("キャンセル"))
-                        .withAssociatedComponent(this),
-                        [safe, revision, candidates = std::move(candidates)](int result) mutable {
-                            if (!safe || result != 1
-                                || safe->context_.stateRestoreRevision() != revision) return;
-                            if (!safe->composite_->applyOpllConversionCandidate(candidates.front())) return;
-                            if (safe->opll_window_)
-                                if (auto* editor = dynamic_cast<mgstc::app::OpllEditorComponent*>(
-                                        safe->opll_window_->getContentComponent()))
-                                    editor->receiveConversionCandidates(std::move(candidates));
-                        });
+                [this](mgstc::engine::SccWaveform waveform, std::uint8_t note) {
+                    if (scc_window_ && composite_)
+                        composite_->startSccConversion(*scc_window_, waveform, note);
                 },
                 open_library,
                 true,

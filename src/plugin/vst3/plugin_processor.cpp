@@ -1690,6 +1690,20 @@ void MgstcAudioProcessor::editorStopPcmPreview() noexcept {
     pcm_preview_.stop();
 }
 
+std::shared_ptr<mgstc::app::OpllConversionReservation>
+MgstcAudioProcessor::editorReserveOpllConversion() {
+    std::lock_guard lock(background_tasks_mu_);
+    if (background_tasks_shutdown_ || !opll_conversion_.expired()) return {};
+    auto reservation = std::make_shared<mgstc::app::OpllConversionReservation>();
+    opll_conversion_ = reservation;
+    return reservation;
+}
+
+bool MgstcAudioProcessor::editorOpllConversionReserved() const {
+    std::lock_guard lock(background_tasks_mu_);
+    return !opll_conversion_.expired();
+}
+
 bool MgstcAudioProcessor::editorRegisterBackgroundTask(
     std::shared_ptr<mgstc::app::EditorBackgroundTask> task) {
     if (!task || onAudioThread()) return false;
