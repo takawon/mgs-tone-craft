@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <numbers>
 #include <string>
@@ -261,19 +262,27 @@ bool runBenchmarkCase(
     return successful;
 }
 
+bool loadWaveFixture(const char* file, mgstc::engine::WavePcm& pcm) {
+    std::ifstream input(file, std::ios::binary);
+    if (!input) {
+        std::cerr << "Could not open WAV fixture\n";
+        return false;
+    }
+    const std::vector<std::uint8_t> bytes(
+        std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{});
+    std::string error;
+    if (!mgstc::engine::parseWavePcm(bytes, pcm, &error)) {
+        std::cerr << error << '\n';
+        return false;
+    }
+    return true;
+}
+
 int runContinuousInitial(const char* file, std::string_view schedule) {
     namespace engine = mgstc::engine;
     if (schedule != "1" && schedule != "8" && schedule != "sync") return 2;
-    std::ifstream input(file, std::ios::binary);
-    if (!input) return 2;
-    const std::vector<std::uint8_t> bytes(
-        std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{});
     engine::WavePcm pcm;
-    std::string error;
-    if (!engine::parseWavePcm(bytes, pcm, &error)) {
-        std::cerr << error << '\n';
-        return 2;
-    }
+    if (!loadWaveFixture(file, pcm)) return 2;
     auto hooks = std::make_shared<engine::OpllContinuousTestHooks>();
     hooks->initial_only = true;
     hooks->time_limit = std::chrono::hours{2};
@@ -313,11 +322,155 @@ int runContinuousInitial(const char* file, std::string_view schedule) {
     return 0;
 }
 
+constexpr std::size_t kStationaryPeriod = 182;
+
+mgstc::engine::WavePcm stationaryPcm(std::size_t frames, float amplitude) {
+    mgstc::engine::WavePcm pcm{48'000, {}};
+    pcm.mono_samples.reserve(frames);
+    for (std::size_t frame = 0; frame < frames; ++frame) {
+        const auto position = (frame + 17) % kStationaryPeriod;
+        const double phase = 2.0 * std::numbers::pi * position / kStationaryPeriod;
+        pcm.mono_samples.push_back(amplitude
+            * static_cast<float>(std::sin(phase) + 0.25 * std::sin(2.0 * phase)));
+    }
+    return pcm;
+}
+
+int runStationaryPcmChecks() {
+    namespace engine = mgstc::engine;
+    constexpr std::size_t frames = kStationaryPeriod * 14 + 23;
+    const auto stationary = stationaryPcm(frames, 0.5F);
+    const auto detected = engine::analyzeWaveCycle(stationary);
+    const bool period_ok = detected.cycle.size() == kStationaryPeriod
+        && std::abs(detected.estimated_frequency_hz - 48'000.0F / kStationaryPeriod) < 0.01F;
+    std::cout << (period_ok ? "PASS" : "FAIL") << " ga-stationary-period-detected period="
+              << detected.cycle.size() << " frequency_hz=" << detected.estimated_frequency_hz << '\n';
+
+    const auto expected = engine::analyzeWaveCycle(stationaryPcm(kStationaryPeriod, 0.5F));
+    const bool boundary_ok = std::equal(detected.cycle.begin(), detected.cycle.end(),
+        expected.cycle.begin(), expected.cycle.end(),
+        [](float left, float right) { return std::abs(left - right) < 1.0e-5F; });
+    std::cout << (boundary_ok ? "PASS" : "FAIL") << " ga-cycle-boundary-partial-tail phase_offset=17"
+              << " tail=23 frames=" << frames << '\n';
+
+    const auto quiet = stationaryPcm(frames, 1.0e-9F);
+    const auto fallback = engine::analyzeWaveCycle(quiet);
+    const auto peak = std::max_element(fallback.cycle.begin(), fallback.cycle.end());
+    const bool fallback_ok = fallback.cycle.size() == frames
+        && peak != fallback.cycle.end() && *peak > 0.0F && *peak < 2.0e-9F;
+    std::cout << (fallback_ok ? "PASS" : "FAIL") << " ga-period-detection-low-energy-fallback frames="
+              << fallback.cycle.size() << " expected=" << frames
+              << " peak=" << (peak == fallback.cycle.end() ? 0.0F : *peak) << '\n';
+    if (!period_ok || !boundary_ok || !fallback_ok) return 1;
+
+    auto hooks = std::make_shared<engine::OpllContinuousTestHooks>();
+    hooks->initial_only = true;
+    hooks->time_limit = std::chrono::hours{2};
+    engine::OpllContinuousOptions options;
+    options.fixed_midi_note = 60;
+    options.test_hooks = std::move(hooks);
+    const auto result = engine::approximateWavePcmContinuouslyWithOpll(quiet, options);
+    const bool evaluations_ok = result.completion == engine::OpllContinuousCompletion::InitialCompleted
+        && result.representative_evaluations == 48'000 && result.short_evaluations == 48'000
+        && result.full_evaluations == 6'000 && !result.ranked.empty();
+    const bool quiet_ok = evaluations_ok && std::all_of(result.ranked.begin(), result.ranked.end(),
+        [&](const auto& candidate) {
+            return std::isfinite(candidate->full_score) && candidate->fixed_midi_note == 60
+                && candidate->sample_count == frames && candidate->key_off_sample == frames
+                && candidate->registers == engine::encodeOpllPatch(candidate->patch);
+        });
+    std::cout << (quiet_ok ? "PASS" : "FAIL") << " ga-quiet-fixed-note-60 pcm_frames=" << frames
+              << " candidates=" << result.ranked.size() << '\n';
+    std::cout << (evaluations_ok ? "PASS" : "FAIL") << " ga-short-and-full-evaluation-complete"
+              << " representative=" << result.representative_evaluations
+              << " short=" << result.short_evaluations << " full=" << result.full_evaluations
+              << " error=" << result.error << '\n';
+    return quiet_ok ? 0 : 1;
+}
+
+void printRegisters(const std::array<std::uint8_t, 8>& registers) {
+    for (const auto byte : registers)
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(byte);
+    std::cout << std::dec << std::setfill(' ');
+}
+
+int runRealDeadline(const char* file, std::string_view scenario) {
+    namespace engine = mgstc::engine;
+    if (scenario != "slow" && scenario != "retain") return 2;
+    engine::WavePcm pcm;
+    if (!loadWaveFixture(file, pcm)) return 2;
+
+    engine::OpllContinuousOptions options;
+    options.max_workers = scenario == "slow" ? 1 : 8;
+    options.control = std::make_shared<engine::OpllApproximationControl>();
+    using Candidate = std::shared_ptr<const engine::OpllContinuousCandidate>;
+    std::vector<Candidate> published;
+    std::vector<std::uint64_t> completed_full_batches;
+    const auto started = Clock::now();
+    const auto elapsed = [&] { return std::chrono::duration<double>(Clock::now() - started).count(); };
+    options.candidate_ready = [&](Candidate candidate) {
+        published.push_back(candidate);
+        std::cout << "candidate seconds=" << elapsed()
+                  << " full_batch_end=" << candidate->full_evaluation_index
+                  << " score=" << std::setprecision(17) << candidate->full_score << " registers=";
+        printRegisters(candidate->registers);
+        std::cout << std::endl;
+    };
+    auto hooks = std::make_shared<engine::OpllContinuousTestHooks>();
+    hooks->batch_completed = [&](auto phase, auto, auto, auto full) {
+        if (phase == engine::OpllApproximationPhase::FullEnvelope)
+            completed_full_batches.push_back(full);
+    };
+    options.test_hooks = hooks; // Default 300 s limit and real steady clock.
+
+    const auto result = engine::approximateWavePcmContinuouslyWithOpll(pcm, options);
+    const auto seconds = elapsed();
+    const auto complete = [&](const Candidate& candidate) {
+        return candidate->full_evaluation_index > 0 && std::isfinite(candidate->full_score)
+            && candidate->registers == engine::encodeOpllPatch(candidate->patch)
+            && std::binary_search(completed_full_batches.begin(), completed_full_batches.end(),
+                candidate->full_evaluation_index);
+    };
+    const auto better = [](const Candidate& left, const Candidate& right) {
+        return left->full_score != right->full_score
+            ? left->full_score < right->full_score : left->registers < right->registers;
+    };
+    const bool only_complete = std::all_of(published.begin(), published.end(), complete)
+        && std::all_of(result.ranked.begin(), result.ranked.end(), complete)
+        && (published.empty() ? result.ranked.empty()
+                              : (!result.ranked.empty() && result.ranked.front() == published.back()));
+    const bool initial_ok = scenario == "slow"
+        ? !result.initial_completed && !result.initial_best
+        : result.initial_completed && result.initial_best && !result.ranked.empty()
+            && complete(result.initial_best) && !better(result.initial_best, result.ranked.front());
+    const bool timed_out = result.completion == engine::OpllContinuousCompletion::TimedOut;
+    const bool passed = timed_out && initial_ok && only_complete && seconds >= 299.999;
+    std::cout << (passed ? "PASS" : "FAIL") << " ga-real-deadline-" << scenario
+              << " workers=" << options.max_workers << " limit_ms=" << hooks->time_limit.count()
+              << " elapsed_seconds=" << seconds << " pcm_samples=" << pcm.mono_samples.size()
+              << " timed_out=" << timed_out << " initial_complete=" << result.initial_completed
+              << " representative=" << result.representative_evaluations
+              << " short=" << result.short_evaluations << " full=" << result.full_evaluations
+              << " published=" << published.size() << " ranked=" << result.ranked.size()
+              << " complete_only=" << only_complete << '\n';
+    if (result.initial_best) {
+        std::cout << "initial_best registers=";
+        printRegisters(result.initial_best->registers);
+        std::cout << " score=" << std::setprecision(17) << result.initial_best->full_score
+                  << " full_batch_end=" << result.initial_best->full_evaluation_index << '\n';
+    }
+    return passed ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
     if (argc == 4 && std::string_view{argv[1]} == "--ga-initial")
         return runContinuousInitial(argv[2], argv[3]);
+    if (argc == 2 && std::string_view{argv[1]} == "--ga-pcm-basics")
+        return runStationaryPcmChecks();
+    if (argc == 4 && std::string_view{argv[1]} == "--ga-real-deadline")
+        return runRealDeadline(argv[2], argv[3]);
     CommandLineOptions command_line;
     std::string error;
     if (!parseCommandLine(argc, argv, command_line, error)) {

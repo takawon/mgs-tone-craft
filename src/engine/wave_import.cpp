@@ -2039,7 +2039,8 @@ WaveCycleAnalysis analyzeWaveCycle(const WavePcm& pcm) {
         }
         // Non-integer periods often score 2T slightly better than T (sine).
         // Collapse octave-up locks while the half-period remains competitive.
-        while (period / 2 >= minimum) {
+        while (best < std::numeric_limits<float>::max() && std::isfinite(best)
+            && period / 2 >= minimum) {
             const std::size_t half = period / 2;
             const float half_difference = periodicDifference(probe, half);
             if (half_difference
