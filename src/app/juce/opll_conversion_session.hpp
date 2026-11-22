@@ -10,13 +10,13 @@ class OpllConversionSession final {
 public:
     using Candidate = OpllConversionTask::Candidate;
     using Original = OpllConversionTask::Original;
-    using StockId = OpllConversionDialog::StockId;
     using Audition = OpllConversionDialog::Audition;
 
     struct Target {
         std::function<bool()> valid;
         std::function<bool(Original)> listen_original;
         std::function<bool(const engine::OpllContinuousCandidate&)> listen_candidate;
+        std::function<std::uint8_t()> preview_note;
         std::function<void(bool)> stop;
         std::function<bool(const engine::OpllPatchParameters&)> apply;
         std::function<void(const juce::String&)> status;
@@ -33,9 +33,7 @@ public:
               .listen_original = [this] { listenOriginal(); },
               .listen_candidate = [this] { listenCandidate(); },
               .stop_audition = [this] { stopAudition(); },
-              .add_stock = [this] { addStock(); },
-              .select_stock = [this](auto id) { selectStock(id); },
-              .delete_stock = [this](auto id) { deleteStock(id); },
+              .select_candidate = [this](auto row) { selectCandidate(row); },
               .apply = [this] { apply(); },
               .cancel = [this] { close(juce::String::fromUTF8("変換をキャンセルしました")); },
           }) {
@@ -86,7 +84,7 @@ public:
         if (task_ && !finished_) {
             if (const auto update = task_->poll()) {
                 original_ = update->original;
-                best_ = update->best;
+                acceptCandidate(update->best);
                 started_ = update->started;
                 if (update->completion) finish(*update->completion, update->error);
             }
@@ -95,18 +93,18 @@ public:
     }
 
 private:
-    struct Stock {
-        StockId id{};
-        Candidate candidate;
-        bool same_timbre{};
-    };
+    friend struct OpllConversionSessionTestAccess;
 
     [[nodiscard]] bool active() const { return !closed_ && target_.valid(); }
 
+    [[nodiscard]] std::optional<std::size_t> selectedRow() const {
+        if (history_.empty()) return std::nullopt;
+        return selected_.value_or(history_.size() - 1);
+    }
+
     [[nodiscard]] Candidate selectedCandidate() const {
-        for (const auto& stock : stocks_)
-            if (stock.id == selected_) return stock.candidate;
-        return finished_ ? nullptr : best_;
+        const auto row = selectedRow();
+        return row ? history_[*row] : nullptr;
     }
 
     void start() {
@@ -155,57 +153,36 @@ private:
         refresh();
     }
 
-    void addStock() {
-        if (!active() || finished_ || stocks_.size() >= 16) return;
-        auto candidate = selectedCandidate();
-        if (!candidate || hasRegisters(*candidate)) return;
-        stocks_.push_back({next_id_++, std::move(candidate)});
-        refresh();
+    void acceptCandidate(const Candidate& candidate) {
+        if (finished_ || closed_ || !candidate || candidate == last_received_) return;
+        last_received_ = candidate;
+        if (candidate->full_evaluation_index == 0 || !std::isfinite(candidate->full_score)
+            || std::any_of(history_.begin(), history_.end(), [&](const auto& entry) {
+                return entry->registers == candidate->registers;
+            })) return;
+        history_.push_back(candidate);
     }
 
-    [[nodiscard]] bool hasRegisters(const engine::OpllContinuousCandidate& candidate) const {
-        return std::any_of(stocks_.begin(), stocks_.end(), [&](const auto& stock) {
-            return stock.candidate->registers == candidate.registers;
-        });
-    }
-
-    void selectStock(std::optional<StockId> id) {
-        if (!active() || selected_ == id) return;
-        stopAudition();
-        selected_ = id;
-        refresh();
-    }
-
-    void deleteStock(StockId id) {
-        if (!active()) return;
-        if (selected_ == id) stopAudition();
-        std::erase_if(stocks_, [id](const auto& stock) { return stock.id == id; });
-        if (selected_ == id) {
-            selected_.reset();
-            if (finished_ && !stocks_.empty()) selected_ = stocks_.front().id;
-        }
+    void selectCandidate(std::size_t row) {
+        if (!active() || row >= history_.size() || selected_ == row) return;
+        if (selectedRow() != row) stopAudition();
+        selected_ = row;
         refresh();
     }
 
     void finish(engine::OpllContinuousCompletion completion, const std::string& error) {
         using Completion = engine::OpllContinuousCompletion;
-        if (completion != Completion::TimedOut || !best_) {
+        if (completion != Completion::TimedOut || history_.empty()) {
             auto message = juce::String::fromUTF8("適用できる候補が得られなかったため、元の音色を保持しました");
             if (!error.empty()) message += "\n" + juce::String::fromUTF8(error.c_str());
             close(message);
             return;
         }
-        if (stocks_.empty()) {
+        if (history_.size() == 1) {
             apply();
             return;
         }
-        if (stocks_.size() == 1) {
-            const bool same = hasRegisters(*best_);
-            stocks_.front().same_timbre = same;
-            stocks_.push_back({next_id_++, best_, same});
-        }
         finished_ = true;
-        if (!selected_) selected_ = stocks_.front().id;
     }
 
     void apply() {
@@ -241,21 +218,22 @@ private:
                 std::chrono::steady_clock::now() - started_);
             state.elapsed_seconds = static_cast<double>(std::min(elapsed, std::chrono::seconds{300}).count());
         }
-        state.status = finished_ ? juce::String::fromUTF8("ストックから音色を選んでください")
+        state.status = finished_ ? juce::String::fromUTF8("探索を終了しました。音色を選んでください。")
             : started_ == std::chrono::steady_clock::time_point{}
                 ? juce::String::fromUTF8("原音を準備しています…")
                 : juce::String::fromUTF8("音色を探しています…");
         const auto candidate = selectedCandidate();
         state.original_available = static_cast<bool>(original_);
         state.candidate_available = state.can_apply = static_cast<bool>(candidate);
-        state.can_add_stock = candidate && !finished_ && stocks_.size() < 16 && !hasRegisters(*candidate);
-        state.can_delete_stock = selected_.has_value();
         state.can_stop_audition = audition_ != Audition::None;
         state.audition = audition_;
-        state.selected_stock = selected_;
-        for (const auto& stock : stocks_) {
-            state.stocks.push_back({stock.id, juce::String::fromUTF8("ストック ")
-                + juce::String(static_cast<juce::int64>(stock.id)), {}, stock.same_timbre});
+        state.candidate_count = history_.size();
+        state.selected_row = selectedRow();
+        if (candidate) {
+            const auto audition_note = target_.preview_note ? target_.preview_note()
+                : note_.value_or(60);
+            state.details = OpllConversionDialog::Details{
+                candidate->registers, candidate->fixed_midi_note.value_or(audition_note)};
         }
         if (displayed_ != state) {
             dialog_.setState(state);
@@ -272,10 +250,9 @@ private:
     std::optional<OpllConversionDialog::State> displayed_;
     std::shared_ptr<OpllConversionTask> task_;
     Original original_;
-    Candidate best_;
-    std::vector<Stock> stocks_;
-    std::optional<StockId> selected_;
-    StockId next_id_{1};
+    Candidate last_received_;
+    std::vector<Candidate> history_;
+    std::optional<std::size_t> selected_;
     Audition audition_{Audition::None};
     std::chrono::steady_clock::time_point started_{};
     bool finished_{};

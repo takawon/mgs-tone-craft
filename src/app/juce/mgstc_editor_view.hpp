@@ -14304,6 +14304,7 @@ private:
                     performance_keyboard_.allNotesOff();
                     return auditionOneSecond(&candidate.patch, candidate.fixed_midi_note);
                 },
+                .preview_note = [this] { return last_audition_note_; },
                 .stop = [this](bool release_keyboard) { stopConversionAudition(release_keyboard); },
                 .apply = [this](const auto& patch) { return applyConversionPatch(patch); },
                 .status = [this, source_name](const auto& message) { updateStatus(source_name + " — " + message); },

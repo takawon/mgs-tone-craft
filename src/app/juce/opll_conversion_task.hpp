@@ -118,7 +118,6 @@ private:
             auto result = engine::approximateWavePcmContinuouslyWithOpll(pcm, options);
             {
                 std::lock_guard lock(inbox_mutex_);
-                if (!result.ranked.empty()) update_.best = std::move(result.ranked.front());
                 update_.completion = result.completion;
                 update_.error = std::move(result.error);
             }

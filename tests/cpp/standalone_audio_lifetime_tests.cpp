@@ -24,6 +24,29 @@
 #include <string>
 #include <thread>
 
+namespace mgstc::app {
+struct OpllConversionSessionTestAccess {
+    static void start(OpllConversionSession& session) {
+        session.task_ = std::make_shared<OpllConversionTask>();
+        session.refresh();
+    }
+    static void receive(OpllConversionSession& session, OpllConversionSession::Candidate candidate) {
+        session.acceptCandidate(candidate);
+        session.refresh();
+    }
+    static void select(OpllConversionSession& session, std::size_t row) {
+        session.selectCandidate(row);
+    }
+    static void expire(OpllConversionSession& session) {
+        session.finish(engine::OpllContinuousCompletion::TimedOut, {});
+        if (!session.closed()) session.refresh();
+    }
+    static void apply(OpllConversionSession& session) { session.apply(); }
+    static void listen(OpllConversionSession& session) { session.listenCandidate(); }
+    static const auto& displayed(const OpllConversionSession& session) { return *session.displayed_; }
+};
+} // namespace mgstc::app
+
 namespace {
 using namespace std::chrono_literals;
 using mgstc::audio::detail::WasapiAudioSinkTestAccess;
@@ -848,9 +871,144 @@ void testServiceDestructionWaitsForActiveOutputRequest() {
     require(GetPrivateProfileIntW(L"SoundOutput", L"Port", 0, path.toWideCharPointer()) == 39143,
         "Service destruction lost the active request's value persistence");
 }
+void testOpllConversionCandidateHistory() {
+    using namespace mgstc::app;
+    using namespace mgstc::engine;
+    using Access = OpllConversionSessionTestAccess;
+    juce::ScopedJuceInitialiser_GUI gui;
+    juce::Component anchor;
+    struct TaskOwner final : BackgroundTaskBoundary {
+        bool registerTask(std::shared_ptr<EditorBackgroundTask>) override { return false; }
+    } tasks;
+
+    constexpr std::array<std::uint8_t, 8> display_registers{
+        0xb2, 0x43, 0x52, 0x8c, 0xc7, 0xe8, 0x54, 0x46};
+    const auto candidate = [&display_registers](unsigned index, bool complete = true) {
+        auto result = std::make_shared<OpllContinuousCandidate>();
+        result->patch = defaultOpllPatch();
+        result->patch.modulator.total_level = static_cast<std::uint8_t>(index + 1);
+        if (index == 17) result->patch = decodeOpllPatch(display_registers);
+        result->registers = encodeOpllPatch(result->patch);
+        result->fixed_midi_note = 67;
+        result->full_score = 1.0;
+        result->full_evaluation_index = complete ? index + 1 : 0;
+        return result;
+    };
+    bool valid = true;
+    unsigned applied = 0, auditions = 0;
+    std::optional<OpllPatchParameters> applied_patch;
+    const auto session = [&] {
+        auto result = std::make_unique<OpllConversionSession>(anchor, tasks,
+            std::make_shared<OpllConversionReservation>(), OpllConversionTask::Prepare{},
+            67, OpllConversionSession::Target{
+                .valid = [&] { return valid; },
+                .listen_candidate = [&](const auto&) { ++auditions; return true; },
+                .stop = [](bool) {},
+                .apply = [&](const auto& patch) { ++applied; applied_patch = patch; return true; },
+                .status = [](const auto&) {},
+            });
+        Access::start(*result);
+        return result;
+    };
+
+    for (const unsigned count : {0, 1, 2, 3, 10}) {
+        applied = 0;
+        auditions = 0;
+        auto dialog = session();
+        Access::receive(*dialog, candidate(18, false));
+        require(Access::displayed(*dialog).candidate_count == 0, "partial candidate admitted");
+        for (unsigned i = 0; i < count; ++i) {
+            Access::receive(*dialog, candidate(i));
+            if (i == 0 && count < 3) Access::select(*dialog, 0);
+            if (i == 0 && count == 2) Access::listen(*dialog);
+        }
+        if (count != 0) Access::receive(*dialog, candidate(0));
+        require(Access::displayed(*dialog).candidate_count == count, "history count or dedup failed");
+        if (count != 0) {
+            const unsigned expected_selection = count < 3 ? 0 : count - 1;
+            require(dialog->keyboardCandidate()->registers == candidate(expected_selection)->registers,
+                "candidate selection did not follow the expected history row");
+            const auto& details = Access::displayed(*dialog).details;
+            require(details && details->registers == candidate(expected_selection)->registers
+                    && details->midi_note == 67, "details disagree with keyboard selection");
+        }
+        require(auditions == (count == 2 ? 1U : 0U), "publication retriggered audition");
+        Access::expire(*dialog);
+        require(dialog->closed() == (count < 2), "deadline closed the wrong candidate-count branch");
+        require(applied == (count == 1 ? 1U : 0U), "deadline applied the wrong candidate count");
+        if (count >= 2) {
+            Access::receive(*dialog, candidate(19));
+            require(Access::displayed(*dialog).candidate_count == count, "late candidate changed frozen history");
+            Access::select(*dialog, count - 1);
+            Access::apply(*dialog);
+            Access::apply(*dialog);
+            require(applied == 1 && applied_patch == candidate(count - 1)->patch,
+                "explicit apply did not commit the selected candidate exactly once");
+        }
+    }
+    applied = 0;
+    auto restored = session();
+    Access::receive(*restored, candidate(0));
+    valid = false;
+    restored->poll();
+    Access::expire(*restored);
+    require(restored->closed() && applied == 0, "author invalidation allowed stale auto-apply");
+
+    valid = true;
+    auto layout = session();
+    using Clock = std::chrono::steady_clock;
+    const auto history_started = Clock::now();
+    for (unsigned i = 0; i < 18; ++i) Access::receive(*layout, candidate(i));
+    std::cout << "GA history append18_ms="
+              << std::chrono::duration<double, std::milli>(Clock::now() - history_started).count()
+              << '\n';
+    auto* content = layout->dialog().getContentComponent();
+    juce::ListBox* list = nullptr;
+    for (auto* child : content->getChildren()) {
+        if (auto* candidate_list = dynamic_cast<juce::ListBox*>(child)) list = candidate_list;
+    }
+    require(list != nullptr, "live conversion history list is missing");
+    const auto output_dir = juce::SystemStats::getEnvironmentVariable(
+        "MGSTC_GA_HISTORY_EVIDENCE_DIR", {});
+    const auto previous_scale = UiScale::global_percent;
+    for (const int scale : {75, 100, 125}) {
+        UiScale::setGlobalPercent(scale, false);
+        layout->dialog().setSize(750 * scale / 100, 720 * scale / 100);
+        list->selectRow(0);
+        list->selectRow(17);
+        list->scrollToEnsureRowIsOnscreen(17);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(35);
+        require(list->getSelectedRow() == 17 && list->getViewport()->getViewPositionY() > 0,
+            "18-row history cannot select or scroll to the last candidate");
+        require(Access::displayed(*layout).details->registers == display_registers,
+            "live row selection did not update the details pane");
+        require(Access::displayed(*layout).details->midi_note == 67,
+            "live row selection lost the audition note");
+        if (output_dir.isNotEmpty()) {
+            const auto path = juce::File(output_dir).getChildFile(
+                "history-" + juce::String(scale) + ".png");
+            const auto paint_started = Clock::now();
+            const auto image = content->createComponentSnapshot(content->getLocalBounds());
+            const auto paint_elapsed = Clock::now() - paint_started;
+            std::cout << "GA history scale=" << scale
+                      << " snapshot_ms="
+                      << std::chrono::duration<double, std::milli>(paint_elapsed).count()
+                      << '\n';
+            juce::MemoryOutputStream png;
+            require(juce::PNGImageFormat{}.writeImageToStream(image, png)
+                    && path.replaceWithData(png.getData(), png.getDataSize()),
+                "could not save conversion history evidence image");
+        }
+    }
+    UiScale::setGlobalPercent(previous_scale, false);
+    layout->dialog().closeButtonPressed();
+    require(layout->closed() && applied == 0, "closing unapplied history changed the author tone");
+}
+
 using Test = void (*)();
 struct Case { const wchar_t* name; Test run; };
 constexpr Case cases[] = {
+    {L"opll-conversion-candidate-history", testOpllConversionCandidateHistory},
     {L"output-dialog-draft", testOutputDialogFollowsCompletionAndKeepsDraft},
     {L"output-active-destruction", testServiceDestructionWaitsForActiveOutputRequest},
     {L"manual-output", testManualOutputSettingsStayResponsiveAndPersistValues},
