@@ -4,7 +4,6 @@
 #include "mgstc/engine/mgs_envelope_io.hpp"
 
 #include <algorithm>
-#include <fstream>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -18,6 +17,8 @@
 #endif
 #include <windows.h>
 #else
+#include <atomic>
+#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -474,40 +475,47 @@ bool replaceFileBytesAtomically(
     }
     return true;
 #else
-    const auto temporary =
-        destination.parent_path()
-        / (destination.filename().string() + ".writing");
-    {
-        std::ofstream stream(
-            temporary, std::ios::binary | std::ios::trunc);
-        if (!stream) {
-            setError(error, "export temporary file could not be created");
-            return false;
-        }
-        stream.write(
-            bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        stream.flush();
-        if (!stream) {
-            stream.close();
-            std::error_code remove_error;
-            std::filesystem::remove(temporary, remove_error);
-            setError(error, "export temporary file could not be written");
-            return false;
+    static std::atomic<unsigned long long> next_writer{0};
+    const auto prefix = ".mgstc-writing-" + std::to_string(::getpid()) + "-";
+    std::filesystem::path temporary;
+    int fd = -1;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        temporary = destination.parent_path() / (prefix + std::to_string(
+            next_writer.fetch_add(1, std::memory_order_relaxed)));
+        fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+        if (fd >= 0 || errno != EEXIST) {
+            break;
         }
     }
-    // Match the Windows path's durability intent (FlushFileBuffers before
-    // the replace): flush the written file to storage before the rename.
-    const int fd = ::open(temporary.c_str(), O_RDONLY);
-    if (fd < 0 || ::fsync(fd) != 0) {
-        if (fd >= 0) {
-            ::close(fd);
+    if (fd < 0) {
+        setError(error, "export temporary file could not be created");
+        return false;
+    }
+
+    std::size_t written_total = 0;
+    while (written_total < bytes.size()) {
+        const auto chunk = std::min(bytes.size() - written_total,
+            static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()));
+        const auto written = ::write(fd, bytes.data() + written_total, chunk);
+        if (written > 0) {
+            written_total += static_cast<std::size_t>(written);
+        } else if (written == 0 || errno != EINTR) {
+            break;
         }
+    }
+    int synced = -1;
+    if (written_total == bytes.size()) {
+        do {
+            synced = ::fsync(fd);
+        } while (synced == -1 && errno == EINTR);
+    }
+    const int closed = ::close(fd);
+    if (synced != 0 || closed != 0) {
         std::error_code remove_error;
         std::filesystem::remove(temporary, remove_error);
         setError(error, "export temporary file could not be written");
         return false;
     }
-    ::close(fd);
     std::error_code rename_error;
     std::filesystem::rename(temporary, destination, rename_error);
     if (rename_error) {

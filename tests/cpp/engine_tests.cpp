@@ -2,6 +2,9 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
+#ifndef _WIN32
+#include <barrier>
+#endif
 #include <bit>
 #include <chrono>
 #include <ctime>
@@ -11233,9 +11236,41 @@ void testMgstcToneSetFileRoundTripAndFailedWrite() {
     }
     std::filesystem::create_directory(
         directory / "blocked.mgstc.writing");
+#ifdef _WIN32
     REQUIRE_EQ(
         replaceFileBytesAtomically(blocked, "CHANGED", &error), false);
     REQUIRE_EQ(readBinaryFile(blocked), std::string("ORIGINAL"));
+#else
+    REQUIRE_EQ(replaceFileBytesAtomically(blocked, "CHANGED", &error), true);
+    REQUIRE_EQ(readBinaryFile(blocked), std::string("CHANGED"));
+    REQUIRE_EQ(std::filesystem::is_directory(directory / "blocked.mgstc.writing"), true);
+
+    const auto blocked_destination = directory / "destination_directory";
+    std::filesystem::create_directory(blocked_destination);
+    REQUIRE_EQ(replaceFileBytesAtomically(blocked_destination, "REJECT", &error), false);
+    REQUIRE_EQ(std::filesystem::is_empty(blocked_destination), true);
+
+    const std::string first_payload(1024 * 1024, 'A');
+    const std::string second_payload(1024 * 1024, 'B');
+    std::barrier start_writers(2);
+    bool first_ok = false;
+    bool second_ok = false;
+    {
+        std::jthread first([&] {
+            start_writers.arrive_and_wait();
+            first_ok = replaceFileBytesAtomically(blocked, first_payload);
+        });
+        std::jthread second([&] {
+            start_writers.arrive_and_wait();
+            second_ok = replaceFileBytesAtomically(blocked, second_payload);
+        });
+    }
+    REQUIRE_EQ(first_ok && second_ok, true);
+    const auto concurrent_result = readBinaryFile(blocked);
+    REQUIRE_EQ(concurrent_result == first_payload || concurrent_result == second_payload, true);
+    REQUIRE_EQ(std::distance(std::filesystem::directory_iterator(directory),
+        std::filesystem::directory_iterator{}), std::ptrdiff_t{4});
+#endif
     std::filesystem::remove_all(directory / "blocked.mgstc.writing");
     REQUIRE_EQ(writeMgstcToneSetFile(blocked, document, &error), true);
     auto from_disk = deserializeMgstcToneSet(readBinaryFile(blocked), &error);
