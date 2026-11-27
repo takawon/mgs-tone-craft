@@ -920,7 +920,6 @@ void testOpllConversionCandidateHistory() {
         for (unsigned i = 0; i < count; ++i) {
             Access::receive(*dialog, candidate(i));
             if (i == 0 && count < 3) Access::select(*dialog, 0);
-            if (i == 0 && count == 2) Access::listen(*dialog);
         }
         if (count != 0) Access::receive(*dialog, candidate(0));
         require(Access::displayed(*dialog).candidate_count == count, "history count or dedup failed");
@@ -932,7 +931,7 @@ void testOpllConversionCandidateHistory() {
             require(details && details->registers == candidate(expected_selection)->registers
                     && details->midi_note == 67, "details disagree with keyboard selection");
         }
-        require(auditions == (count == 2 ? 1U : 0U), "publication retriggered audition");
+        require(auditions == (count > 0 && count < 3 ? 1U : 0U), "publication retriggered audition");
         Access::expire(*dialog);
         require(dialog->closed() == (count < 2), "deadline closed the wrong candidate-count branch");
         require(applied == (count == 1 ? 1U : 0U), "deadline applied the wrong candidate count");
@@ -964,16 +963,54 @@ void testOpllConversionCandidateHistory() {
               << '\n';
     auto* content = layout->dialog().getContentComponent();
     juce::ListBox* list = nullptr;
+    juce::Viewport* details = nullptr;
     for (auto* child : content->getChildren()) {
         if (auto* candidate_list = dynamic_cast<juce::ListBox*>(child)) list = candidate_list;
+        if (auto* details_viewport = dynamic_cast<juce::Viewport*>(child)) details = details_viewport;
     }
-    require(list != nullptr, "live conversion history list is missing");
+    require(list != nullptr && details != nullptr, "live conversion history or details are missing");
+    const auto previous_auditions = auditions;
+    Access::select(*layout, 17);
+    Access::select(*layout, 17);
+    require(auditions == previous_auditions + 2, "explicit selection of the same candidate must replay once");
+    const auto clickRow = [&](int row) {
+        list->scrollToEnsureRowIsOnscreen(row);
+        auto* hit = list->getComponentForRowNumber(row);
+        require(hit != nullptr, "mouse row component is visible");
+        const auto mouse_time = juce::Time::getCurrentTime();
+        const juce::MouseEvent click(juce::Desktop::getInstance().getMainMouseSource(),
+            {1.0F, 1.0F}, juce::ModifierKeys::leftButtonModifier, 0, 0, 0, 0, 0,
+            hit, hit, mouse_time, {1.0F, 1.0F}, mouse_time, 1, false);
+        hit->mouseDown(click);
+        hit->mouseUp(click);
+    };
+    auto count_before = auditions;
+    clickRow(2);
+    require(auditions == count_before + 1, "one mouse gesture must play exactly once");
+    clickRow(2);
+    require(auditions == count_before + 2, "a separate click on the selected row must replay");
+    list->selectRow(3);
+    list->selectRow(4);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(35);
+    require(auditions == count_before + 4 && list->getSelectedRow() == 4,
+        "consecutive non-mouse selections must each play once in order");
+    list->scrollToEnsureRowIsOnscreen(5);
+    auto* accessible_row = list->getComponentForRowNumber(5)->getParentComponent();
+    const auto& actions = accessible_row->getAccessibilityHandler()->getActions();
+    require(actions.invoke(juce::AccessibilityActionType::press)
+        && auditions == count_before + 5 && list->getSelectedRow() == 5,
+        "accessibility press must select and play exactly once");
     const auto output_dir = juce::SystemStats::getEnvironmentVariable(
         "MGSTC_GA_HISTORY_EVIDENCE_DIR", {});
     const auto previous_scale = UiScale::global_percent;
     for (const int scale : {75, 100, 125}) {
         UiScale::setGlobalPercent(scale, false);
-        layout->dialog().setSize(750 * scale / 100, 720 * scale / 100);
+        std::cout << "GA history dimensions scale=" << scale
+                  << " window=" << layout->dialog().getWidth() << 'x' << layout->dialog().getHeight()
+                  << " details=" << details->getHeight()
+                  << " content=" << details->getViewedComponent()->getHeight() << '\n';
+        require(details->getViewedComponent()->getHeight() <= details->getHeight() + 2,
+            "the default layout must show the whole EG without scrolling");
         list->selectRow(0);
         list->selectRow(17);
         list->scrollToEnsureRowIsOnscreen(17);

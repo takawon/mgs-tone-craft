@@ -107,6 +107,30 @@ enum class OpllContinuousCompletion : std::uint8_t {
     TimedOut, Cancelled, InitialCompleted, Failed,
 };
 
+enum class OpllPeriodicWindowStatus : std::uint8_t {
+    ReferenceTooShort, ReferenceQuiet, ReferenceUnstable,
+    CandidateTooShort, CandidateQuiet, CandidateUnstable, Compared,
+};
+
+struct OpllFullScoreBreakdown {
+    float total{};
+    float spectrum{};
+    float harmonics{};
+    std::array<float, 4> stage_envelope{};
+    std::array<float, 4> stage_timbre{};
+    float periodic_shape{};
+    std::uint8_t stage_mask{};
+    std::uint8_t harmonic_count{};
+    std::uint8_t periodic_windows{};
+    std::uint16_t harmonic_fft_size{};
+    float harmonic_radius_bins{};
+    std::array<OpllPeriodicWindowStatus, 3> period_status{};
+};
+
+enum class OpllPublicationDecision : std::uint8_t {
+    Published, NoImprovement, HarmonicsRegressed, StageRegressed,
+};
+
 struct OpllContinuousCandidate {
     std::uint64_t id{};
     OpllPatchParameters patch;
@@ -117,6 +141,7 @@ struct OpllContinuousCandidate {
     std::size_t key_off_sample{};
     std::size_t sample_count{};
     std::uint64_t full_evaluation_index{};
+    OpllFullScoreBreakdown breakdown;
 };
 
 // Deterministic/offline regression controls; normal callers leave this unset.
@@ -129,6 +154,7 @@ struct OpllContinuousTestHooks {
     std::function<std::chrono::steady_clock::time_point()> now;
     std::function<void(OpllApproximationPhase, std::uint64_t,
         std::uint64_t, std::uint64_t)> batch_completed;
+    std::function<void(const OpllContinuousCandidate&, OpllPublicationDecision)> publication_decided;
 };
 
 struct OpllContinuousOptions {
@@ -145,6 +171,7 @@ struct OpllContinuousResult {
     OpllContinuousCompletion completion{OpllContinuousCompletion::Failed};
     std::vector<std::shared_ptr<const OpllContinuousCandidate>> ranked;
     std::shared_ptr<const OpllContinuousCandidate> initial_best;
+    std::shared_ptr<const OpllContinuousCandidate> published_best;
     std::uint64_t representative_evaluations{};
     std::uint64_t short_evaluations{};
     std::uint64_t full_evaluations{};

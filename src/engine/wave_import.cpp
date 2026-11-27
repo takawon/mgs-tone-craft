@@ -1,4 +1,5 @@
 #include "mgstc/engine/wave_import.hpp"
+#include "mgstc/engine/detail/opll_perceptual_test_access.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <numbers>
+#include <numeric>
 #include <set>
 #include <system_error>
 #include <thread>
@@ -59,7 +61,8 @@ struct OpllContinuousSearchState {
         return static_cast<std::uint64_t>(std::clamp(value.count(),
             std::int64_t{0}, static_cast<std::int64_t>(limit.count())));
     }
-    void publish(const OpllPatchParameters& patch, float score) {
+    void rank(const OpllPatchParameters& patch, const OpllFullScoreBreakdown& breakdown) {
+        const auto score = breakdown.total;
         if (!std::isfinite(score) || (options.control && options.control->cancelRequested())) return;
         const auto registers = encodeOpllPatch(patch);
         const auto less = [](const auto& left, const auto& right) {
@@ -75,11 +78,36 @@ struct OpllContinuousSearchState {
         auto candidate = std::make_shared<const OpllContinuousCandidate>(OpllContinuousCandidate{
             ++next_id, patch, registers, score, fundamental_hz,
             options.fixed_midi_note, key_off_sample, sample_count,
-            result.full_evaluations});
+            result.full_evaluations, breakdown});
         result.ranked.push_back(candidate);
         std::sort(result.ranked.begin(), result.ranked.end(), less);
         if (result.ranked.size() > 6) result.ranked.resize(6);
     }
+
+    void publishFront() {
+        if (result.ranked.empty() || (options.control && options.control->cancelRequested())) return;
+        const auto& candidate = result.ranked.front();
+        const auto& previous = result.published_best;
+        auto decision = OpllPublicationDecision::Published;
+        if (previous) {
+            if (candidate->full_score > previous->full_score
+                || (candidate->full_score == previous->full_score
+                    && candidate->registers >= previous->registers)) {
+                decision = OpllPublicationDecision::NoImprovement;
+            } else {
+                decision = publicationDecision(previous->breakdown, candidate->breakdown);
+            }
+        }
+        if (decision == OpllPublicationDecision::Published) {
+            result.published_best = candidate;
+            if (options.candidate_ready) options.candidate_ready(candidate);
+        }
+        if (options.test_hooks && options.test_hooks->publication_decided)
+            options.test_hooks->publication_decided(*candidate, decision);
+    }
+
+    static OpllPublicationDecision publicationDecision(
+        const OpllFullScoreBreakdown&, const OpllFullScoreBreakdown&);
 };
 
 struct OpllApproximationCoordinator {
@@ -508,6 +536,19 @@ struct TimedFeatureWorkspace {
     std::vector<std::complex<float>> fft_values;
 };
 
+constexpr std::size_t kDirectHarmonics = 20;
+
+struct DirectHarmonics {
+    std::array<float, kDirectHarmonics> amplitude{};
+    std::size_t count{};
+    std::size_t fft_size{};
+    float radius{};
+    bool estimate_confidence{};
+    float spectrum_power{};
+    std::size_t harmonic_bins{};
+    std::size_t spectrum_bins{};
+};
+
 struct OpllFitTarget {
     std::optional<OpllPitch> fixed_pitch;
     std::vector<float> samples;
@@ -684,7 +725,8 @@ SpectralDistribution harmonicDistribution(
     std::size_t center,
     std::size_t fft_size,
     float fundamental_hz,
-    TimedFeatureWorkspace& workspace) {
+    TimedFeatureWorkspace& workspace,
+    DirectHarmonics* direct = nullptr) {
     workspace.fft_values.assign(
         fft_size,
         std::complex<float>{});
@@ -698,6 +740,39 @@ SpectralDistribution harmonicDistribution(
         values[index] = sample * window_values[index];
     }
     fft(values);
+
+    if (direct && fft_size >= 1024 && samples.size() >= fft_size
+        && begin <= samples.size() - fft_size
+        && fft_size >= direct->fft_size) {
+        const float spacing = fundamental_hz * static_cast<float>(fft_size)
+            / static_cast<float>(kOpllFitSampleRate);
+        if (std::isfinite(spacing) && spacing >= 5.0F) {
+            const float radius = std::min(2.25F, spacing * 0.42F);
+            if (fft_size > direct->fft_size) {
+                const bool estimate_confidence = direct->estimate_confidence;
+                *direct = {};
+                direct->estimate_confidence = estimate_confidence;
+                direct->fft_size = fft_size;
+                direct->radius = radius;
+            }
+            if (direct->estimate_confidence) {
+                direct->spectrum_bins += half - 1;
+                for (std::size_t bin = 1; bin < half; ++bin)
+                    direct->spectrum_power += std::norm(values[bin]);
+            }
+            for (std::size_t index = 0; index < kDirectHarmonics; ++index) {
+                const auto position = spacing * static_cast<float>(index + 1);
+                if (position + radius >= static_cast<float>(half)) break;
+                const auto first = static_cast<std::size_t>(std::ceil(position - radius));
+                const auto last = static_cast<std::size_t>(std::floor(position + radius));
+                float power = 0.0F;
+                for (auto bin = first; bin <= last; ++bin) power += std::norm(values[bin]);
+                direct->amplitude[index] += power;
+                if (direct->estimate_confidence) direct->harmonic_bins += last - first + 1;
+                direct->count = index + 1;
+            }
+        }
+    }
 
     SpectralDistribution result{};
     constexpr float harmonic_step = 0.25F;
@@ -732,7 +807,8 @@ SpectralDistribution harmonicDistribution(
 TimedAudioFeatures timedFeatures(
     std::span<const float> samples,
     float fundamental_hz,
-    TimedFeatureWorkspace& workspace) {
+    TimedFeatureWorkspace& workspace,
+    DirectHarmonics* direct = nullptr) {
     TimedAudioFeatures result{};
     result.envelope = amplitudeEnvelope(samples);
     std::size_t output{};
@@ -748,7 +824,7 @@ TimedAudioFeatures timedFeatures(
                 center,
                 fft_size,
                 fundamental_hz,
-                workspace);
+                workspace, direct);
         }
     }
     return result;
@@ -775,7 +851,8 @@ float wassersteinDistance(
 
 float featureDistance(
     const TimedAudioFeatures& target,
-    const TimedAudioFeatures& generated) {
+    const TimedAudioFeatures& generated,
+    float* spectrum = nullptr) {
     float spectral{};
     for (std::size_t frame = 0; frame < target.spectra.size(); ++frame) {
         spectral +=
@@ -791,6 +868,7 @@ float featureDistance(
         }
     }
     spectral /= static_cast<float>(target.spectra.size());
+    if (spectrum) *spectrum = spectral;
 
     float envelope{};
     for (std::size_t index = 0; index < target.envelope.size(); ++index) {
@@ -966,16 +1044,39 @@ private:
     std::vector<float> result_;
 };
 
+#include "wave_import_perceptual.inc"
+
+OpllFullScoreBreakdown scoreTimedPcm(std::span<const float> reference,
+    std::span<const float> rendered, const TimedAudioFeatures& reference_features,
+    float fundamental_hz, TimedFeatureWorkspace& workspace, const FullPerceptualTarget* perceptual) {
+    DirectHarmonics direct;
+    OpllFullScoreBreakdown breakdown;
+    const auto generated = timedFeatures(rendered, fundamental_hz, workspace, perceptual ? &direct : nullptr);
+    float distance = featureDistance(reference_features, generated, &breakdown.spectrum);
+    if (!perceptual) {
+        const auto period_samples = std::clamp<std::size_t>(
+            static_cast<std::size_t>(std::llround(static_cast<double>(kOpllFitSampleRate)
+                / std::max(1.0, static_cast<double>(fundamental_hz)))),
+            16, std::max<std::size_t>(16, reference.size() / 2));
+        distance += periodWindowDistance(reference, rendered, period_samples) * 0.35F;
+    }
+    breakdown.total = perceptual ? perceptual->addDistances(
+        rendered, direct, workspace, breakdown, distance) : distance;
+    return breakdown;
+}
+
 class TimedOpllScoreContext {
 public:
-    explicit TimedOpllScoreContext(const OpllFitTarget& target, bool require_renderer = false)
+    explicit TimedOpllScoreContext(const OpllFitTarget& target, bool require_renderer = false,
+        const FullPerceptualTarget* perceptual = nullptr)
         : target_(target),
-          fundamental_hz_(target.fundamental_hz) {
+          fundamental_hz_(target.fundamental_hz),
+          perceptual_(perceptual) {
         if (require_renderer && !renderer_.valid())
             throw std::runtime_error("Could not initialize the OPLL renderer.");
     }
 
-    float score(const OpllPatchParameters& patch) {
+    OpllFullScoreBreakdown scoreWithBreakdown(const OpllPatchParameters& patch) {
         const auto& rendered = renderer_.render(
             patch,
             target_.fundamental_hz,
@@ -983,29 +1084,14 @@ public:
             target_.key_off_sample,
             target_.render_offset_sample,
             target_.fixed_pitch);
-        float distance = featureDistance(
-            target_.features,
-            timedFeatures(
-                rendered,
-                fundamental_hz_,
-                feature_workspace_));
-        const auto period_samples = std::clamp<std::size_t>(
-            static_cast<std::size_t>(std::llround(
-                static_cast<double>(kOpllFitSampleRate)
-                / std::max(1.0, static_cast<double>(fundamental_hz_)))),
-            16,
-            std::max<std::size_t>(16, target_.samples.size() / 2));
-        distance += periodWindowDistance(
-                        target_.samples,
-                        rendered,
-                        period_samples)
-            * 0.35F;
-        return distance;
+        return scoreTimedPcm(target_.samples, rendered, target_.features,
+            fundamental_hz_, feature_workspace_, perceptual_);
     }
 
 private:
     const OpllFitTarget& target_;
     float fundamental_hz_;
+    const FullPerceptualTarget* perceptual_;
     OpllTimedRenderer renderer_;
     TimedFeatureWorkspace feature_workspace_;
 };
@@ -1014,6 +1100,7 @@ struct ScoredOpllPatch {
     float distance{};
     std::array<std::uint8_t, 8> registers{};
     OpllPatchParameters patch{};
+    OpllFullScoreBreakdown breakdown;
 };
 
 template <typename ContextFactory>
@@ -1109,7 +1196,13 @@ private:
         const std::size_t end = std::min(begin + chunk_size, batch.size());
         auto& context = *contexts_[worker];
         for (std::size_t index = begin; index < end; ++index) {
-            batch[index].distance = context.score(batch[index].patch);
+            auto& candidate = batch[index];
+            if constexpr (requires { context.scoreWithBreakdown(candidate.patch); }) {
+                candidate.breakdown = context.scoreWithBreakdown(candidate.patch);
+                candidate.distance = candidate.breakdown.total;
+            } else {
+                candidate.distance = context.score(candidate.patch);
+            }
         }
     }
 
@@ -1199,11 +1292,10 @@ bool scoreOpllSubBatches(
                     ? std::shared_ptr<const OpllContinuousCandidate>{} : state.result.ranked.front();
                 state.result.full_evaluations += count;
                 for (const auto& entry : std::span<ScoredOpllPatch>(candidates).subspan(begin, count))
-                    state.publish(entry.patch, entry.distance);
+                    state.rank(entry.patch, entry.breakdown);
                 if (!state.result.ranked.empty() && state.result.ranked.front() != previous
-                    && state.options.candidate_ready
                     && !coordinator->control->cancelRequested())
-                    state.options.candidate_ready(state.result.ranked.front());
+                    state.publishFront();
                 break;
             }
             default: break;
@@ -1667,8 +1759,11 @@ std::vector<OpllPatchParameters> searchTimedOpll(
     std::vector<ScoredOpllPatch> full_scored;
     TimedOpllScoreContext full_priming_context(target, require_renderer);
     static_cast<void>(full_priming_context);
-    const auto make_full_context = [&target, require_renderer] {
-        return TimedOpllScoreContext(target, require_renderer);
+    std::optional<FullPerceptualTarget> perceptual;
+    if (coordinator && coordinator->continuous)
+        perceptual.emplace(target.samples, target.fundamental_hz, target.key_off_sample);
+    const auto make_full_context = [&target, require_renderer, &perceptual] {
+        return TimedOpllScoreContext(target, require_renderer, perceptual ? &*perceptual : nullptr);
     };
     OpllScoreExecutor full_executor(make_full_context, options.max_workers,
         coordinator && coordinator->synchronousFallback());
@@ -1929,6 +2024,85 @@ std::vector<OpllPatchParameters> searchTimedOpll(
 }
 
 }  // namespace
+
+OpllPublicationDecision OpllContinuousSearchState::publicationDecision(
+    const OpllFullScoreBreakdown& previous, const OpllFullScoreBreakdown& candidate) {
+    constexpr float absolute_harmonic_margin = 0.14F;
+    constexpr float absolute_stage_margin = 0.10F;
+    constexpr float relative_margin = 0.35F;
+    constexpr float relative_floor = 0.10F;
+    const auto regressed = [=](float before, float after, float absolute_margin) {
+        return after - before > std::max(absolute_margin,
+            relative_margin * std::max(relative_floor, before));
+    };
+    if (previous.harmonic_count && candidate.harmonic_count
+        && regressed(previous.harmonics, candidate.harmonics, absolute_harmonic_margin))
+        return OpllPublicationDecision::HarmonicsRegressed;
+    for (std::size_t stage = 0; stage < previous.stage_envelope.size(); ++stage) {
+        if ((previous.stage_mask & candidate.stage_mask & (1U << stage)) != 0
+            && (regressed(previous.stage_envelope[stage], candidate.stage_envelope[stage], absolute_stage_margin)
+                || regressed(previous.stage_timbre[stage], candidate.stage_timbre[stage], absolute_stage_margin)))
+            return OpllPublicationDecision::StageRegressed;
+    }
+    return OpllPublicationDecision::Published;
+}
+
+OpllFullScoreBreakdown detail::compareOpllFullPcmForRegression(
+    std::span<const float> reference, std::span<const float> candidate,
+    float fundamental_hz, std::size_t key_off) {
+    if (reference.size() != candidate.size() || !std::isfinite(fundamental_hz)
+        || fundamental_hz <= 0.0F) throw std::invalid_argument("Invalid PCM comparison");
+    const FullPerceptualTarget target(reference, fundamental_hz, key_off);
+    TimedFeatureWorkspace workspace;
+    const auto source_features = timedFeatures(reference, fundamental_hz, workspace);
+    return scoreTimedPcm(reference, candidate, source_features, fundamental_hz, workspace, &target);
+}
+
+OpllPublicationDecision detail::checkOpllPerceptualGateForRegression(
+    const OpllFullScoreBreakdown& previous, const OpllFullScoreBreakdown& candidate) {
+    return OpllContinuousSearchState::publicationDecision(previous, candidate);
+}
+
+bool detail::checkOpllPublicationHistoryForRegression() {
+    OpllContinuousOptions options;
+    options.control = std::make_shared<OpllApproximationControl>();
+    unsigned notifications = 0;
+    options.candidate_ready = [&](const auto&) { ++notifications; };
+    OpllContinuousSearchState state(options);
+    const auto submit = [&](std::uint8_t level, float score, float harmonic_error) {
+        auto patch = defaultOpllPatch();
+        patch.modulator.total_level = level;
+        const auto before = state.result.ranked.empty() ? nullptr : state.result.ranked.front();
+        state.result.full_evaluations += 32;
+        state.rank(patch, {.total = score, .harmonics = harmonic_error, .harmonic_count = 20});
+        if (!state.result.ranked.empty() && state.result.ranked.front() != before) state.publishFront();
+    };
+    submit(0, 1.0F, 0.2F);
+    const auto first = state.result.published_best;
+    if (!first || notifications != 1) return false;
+    for (std::uint8_t i = 1; i < 8; ++i) submit(i, 1.0F - i * 0.05F, 0.6F);
+    if (state.result.ranked.size() != 6 || state.result.published_best != first || notifications != 1
+        || std::find(state.result.ranked.begin(), state.result.ranked.end(), first) != state.result.ranked.end())
+        return false;
+    state.result.initial_best = state.result.ranked.front();
+    submit(9, 0.4F, 0.21F);
+    const auto improved = state.result.published_best;
+    if (notifications != 2 || improved != state.result.ranked.front()
+        || state.result.initial_best == improved) return false;
+    submit(9, 0.4F, 0.21F);
+    submit(8, 0.4F, 0.21F);
+    if (notifications != 3 || state.result.published_best->registers >= improved->registers) return false;
+    options.control->requestCancel();
+    submit(10, 0.1F, 0.0F);
+    return notifications == 3 && state.result.published_best->full_score == 0.4F;
+}
+
+std::vector<float> detail::renderOpllFullPcmForRegression(
+    const OpllPatchParameters& patch, float fundamental_hz, std::size_t frames, std::size_t key_off) {
+    OpllTimedRenderer renderer;
+    if (!renderer.valid()) throw std::runtime_error("Could not initialize the OPLL renderer.");
+    return renderer.render(patch, fundamental_hz, frames, key_off, 0);
+}
 
 bool parseWavePcm(
     std::span<const std::uint8_t> bytes,
@@ -2655,6 +2829,7 @@ OpllContinuousResult approximateWavePcmContinuouslyWithOpll(
     if (state.result.completion == OpllContinuousCompletion::Cancelled) {
         state.result.ranked.clear();
         state.result.initial_best.reset();
+        state.result.published_best.reset();
     }
     coordinator.finishContinuous(state.result.completion == OpllContinuousCompletion::Cancelled);
     return std::move(state.result);

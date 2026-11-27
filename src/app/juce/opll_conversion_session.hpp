@@ -164,10 +164,9 @@ private:
     }
 
     void selectCandidate(std::size_t row) {
-        if (!active() || row >= history_.size() || selected_ == row) return;
-        if (selectedRow() != row) stopAudition();
+        if (!active() || row >= history_.size()) return;
         selected_ = row;
-        refresh();
+        listenCandidate();
     }
 
     void finish(engine::OpllContinuousCompletion completion, const std::string& error) {

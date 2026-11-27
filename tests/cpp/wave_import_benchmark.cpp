@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "mgstc/engine/wave_import.hpp"
+#include "mgstc/engine/detail/opll_perceptual_test_access.hpp"
 
 namespace {
 
@@ -278,22 +279,61 @@ bool loadWaveFixture(const char* file, mgstc::engine::WavePcm& pcm) {
     return true;
 }
 
-int runContinuousInitial(const char* file, std::string_view schedule) {
+void printRegisters(const std::array<std::uint8_t, 8>& registers);
+
+void writeCandidateJson(const mgstc::engine::OpllContinuousCandidate& candidate) {
+    const auto& s = candidate.breakdown;
+    std::cout << "{\"registers\":\"";
+    printRegisters(candidate.registers);
+    std::cout << "\",\"score\":" << std::setprecision(17) << candidate.full_score
+              << ",\"full_index\":" << candidate.full_evaluation_index
+              << ",\"f0\":" << candidate.fundamental_hz
+              << ",\"key_off\":" << candidate.key_off_sample << ",\"samples\":" << candidate.sample_count
+              << ",\"spectrum\":" << s.spectrum << ",\"harmonics\":" << s.harmonics
+              << ",\"periodic\":" << s.periodic_shape
+              << ",\"harmonic_count\":" << static_cast<int>(s.harmonic_count)
+              << ",\"fft\":" << s.harmonic_fft_size << ",\"radius\":" << s.harmonic_radius_bins
+              << ",\"periodic_windows\":" << static_cast<int>(s.periodic_windows)
+              << ",\"stage_mask\":" << static_cast<int>(s.stage_mask)
+              << ",\"phase_shifts\":32,\"period_status\":[";
+    for (std::size_t i = 0; i < s.period_status.size(); ++i) {
+        if (i != 0) std::cout << ',';
+        std::cout << static_cast<int>(s.period_status[i]);
+    }
+    std::cout << ']'
+              << ",\"stage_envelope\":[";
+    for (std::size_t i = 0; i < s.stage_envelope.size(); ++i) {
+        if (i != 0) std::cout << ',';
+        std::cout << s.stage_envelope[i];
+    }
+    std::cout << "],\"stage_timbre\":[";
+    for (std::size_t i = 0; i < s.stage_timbre.size(); ++i) {
+        if (i != 0) std::cout << ',';
+        std::cout << s.stage_timbre[i];
+    }
+    std::cout << "]}";
+}
+
+int runContinuousInitial(const char* file, std::string_view schedule, bool timed = false) {
     namespace engine = mgstc::engine;
     if (schedule != "1" && schedule != "8" && schedule != "sync") return 2;
     engine::WavePcm pcm;
     if (!loadWaveFixture(file, pcm)) return 2;
     auto hooks = std::make_shared<engine::OpllContinuousTestHooks>();
-    hooks->initial_only = true;
-    hooks->time_limit = std::chrono::hours{2};
+    hooks->initial_only = !timed;
+    if (!timed) hooks->time_limit = std::chrono::hours{2};
     hooks->force_synchronous_fallback = schedule == "sync";
     engine::OpllContinuousOptions options;
+    std::vector<std::pair<engine::OpllContinuousCandidate, engine::OpllPublicationDecision>> decisions;
+    hooks->publication_decided = [&](const auto& candidate, auto decision) {
+        decisions.emplace_back(candidate, decision);
+    };
     options.max_workers = schedule == "1" ? 1 : 8;
     options.test_hooks = std::move(hooks);
     const auto started = Clock::now();
     const auto result = engine::approximateWavePcmContinuouslyWithOpll(pcm, options);
-    if (result.completion != engine::OpllContinuousCompletion::InitialCompleted
-        || !result.initial_completed || !result.initial_best || result.ranked.empty()) {
+    if (!timed && (result.completion != engine::OpllContinuousCompletion::InitialCompleted
+        || !result.initial_completed || !result.initial_best || result.ranked.empty())) {
         std::cerr << "Initial exploration did not complete: " << result.error << '\n';
         return 1;
     }
@@ -307,19 +347,24 @@ int runContinuousInitial(const char* file, std::string_view schedule) {
     std::cout << "{\"hash\":\"" << std::hex << std::setw(16) << std::setfill('0') << hash
               << std::dec << "\",\"representative\":" << result.representative_evaluations
               << ",\"short\":" << result.short_evaluations << ",\"full\":" << result.full_evaluations
+              << ",\"version\":\"opll-full-perceptual-v1\""
+              << ",\"completion\":" << static_cast<int>(result.completion)
               << ",\"seconds\":" << std::chrono::duration<double>(Clock::now() - started).count()
               << ",\"candidates\":[";
     for (std::size_t index = 0; index < result.ranked.size(); ++index) {
         if (index != 0) std::cout << ',';
         const auto& candidate = result.ranked[index];
-        std::cout << "{\"registers\":\"";
-        for (const auto byte : candidate->registers)
-            std::cout << std::hex << std::setw(2) << static_cast<unsigned>(byte);
-        std::cout << std::dec << "\",\"score\":" << std::setprecision(17)
-                  << candidate->full_score << '}';
+        writeCandidateJson(*candidate);
+    }
+    std::cout << "],\"publication\":[";
+    for (std::size_t i = 0; i < decisions.size(); ++i) {
+        if (i != 0) std::cout << ',';
+        std::cout << "{\"decision\":" << static_cast<int>(decisions[i].second) << ",\"candidate\":";
+        writeCandidateJson(decisions[i].first);
+        std::cout << '}';
     }
     std::cout << "]}\n";
-    return 0;
+    return !timed || result.completion == engine::OpllContinuousCompletion::TimedOut ? 0 : 1;
 }
 
 constexpr std::size_t kStationaryPeriod = 182;
@@ -394,6 +439,146 @@ void printRegisters(const std::array<std::uint8_t, 8>& registers) {
     std::cout << std::dec << std::setfill(' ');
 }
 
+int runPerceptualChecks() {
+    using namespace mgstc::engine;
+    constexpr std::size_t frames = 31'200, key_off = 21'600;
+    constexpr float fundamental = 250.0F;
+    const auto signal = [](float second, float third, double phase_shift,
+                           bool wrong_attack, bool wrong_sustain) {
+        std::vector<float> pcm(frames);
+        for (std::size_t i = 0; i < pcm.size(); ++i) {
+            const double t = static_cast<double>(i) / 48'000;
+            const double phase = t * fundamental * 2.0 * std::numbers::pi + phase_shift;
+            const float envelope = t < 0.05 ? static_cast<float>(t / 0.05)
+                : t < 0.15 ? static_cast<float>(1.0 - 3.0 * (t - 0.05))
+                : t < 0.45 ? 0.7F : static_cast<float>(0.7 * (1.0 - (t - 0.45) / 0.20));
+            const float changed_level = wrong_attack && t < 0.05 ? 0.35F : 1.0F;
+            const float changed_third = wrong_sustain && t >= 0.15 && t < 0.45 ? 0.75F : third;
+            pcm[i] = envelope * changed_level * static_cast<float>(
+                std::sin(phase) + second * std::sin(2.0 * phase) + changed_third * std::sin(3.0 * phase));
+        }
+        return pcm;
+    };
+    const auto reference = signal(0.35F, 0.0F, 0, false, false);
+    const auto score = [&](const auto& pcm, std::size_t off = 21'600) {
+        return detail::compareOpllFullPcmForRegression(reference, pcm, fundamental, off);
+    };
+    const auto identical = score(reference);
+    const auto missing = score(signal(0, 0, 0, false, false));
+    const auto extra = score(signal(0.35F, 0.7F, 0, false, false));
+    const auto shifted = score(signal(0.35F, 0, std::numbers::pi, false, false));
+    const auto attack = score(signal(0.35F, 0, 0, true, false));
+    const auto sustain = score(signal(0.35F, 0, 0, false, true));
+    const auto no_off = score(reference, frames);
+    const std::vector<float> silence(frames, 1.0e-9F);
+    const auto quiet = detail::compareOpllFullPcmForRegression(silence, silence, fundamental, frames);
+    const auto short_note = detail::compareOpllFullPcmForRegression(
+        std::span(reference).first(100), std::span(reference).first(100), fundamental, 100);
+    std::vector<float> noise(3500);
+    std::uint32_t noise_state = 1;
+    for (auto& sample : noise) {
+        noise_state = 1664525U * noise_state + 1013904223U;
+        sample = static_cast<float>(noise_state >> 8U) / 8388608.0F - 1.0F;
+    }
+    const auto noisy = detail::compareOpllFullPcmForRegression(noise, noise, 300.0F, noise.size());
+    std::vector<float> low(48'000), plateau(48'000);
+    for (std::size_t i = 0; i < low.size(); ++i) {
+        const auto t = static_cast<double>(i) / 48'000.0;
+        low[i] = static_cast<float>(std::sin(t * 82.0 * std::numbers::pi));
+        const double level = t < 0.025 ? t / 0.025 : t < 0.06 ? 1.0
+            : t < 0.16 ? 1.0 - 7.0 * (t - 0.06) : 0.3;
+        plateau[i] = static_cast<float>(level * std::sin(t * 440.0 * std::numbers::pi));
+    }
+    const auto low_steady = detail::compareOpllFullPcmForRegression(low, low, 41.0F, low.size());
+    const auto delayed_decay = detail::compareOpllFullPcmForRegression(
+        plateau, plateau, 220.0F, plateau.size());
+    const auto patch = decodeOpllPatch(std::array<std::uint8_t, 8>{0x31,0x21,0x18,0x05,0xa4,0xc6,0x63,0x44});
+    const auto known = detail::renderOpllFullPcmForRegression(patch, fundamental, frames, key_off);
+    const auto known_equal = detail::compareOpllFullPcmForRegression(known, known, fundamental, key_off);
+    constexpr std::size_t early_off = 1756;
+    std::vector<float> short_held(early_off + 4800);
+    for (std::size_t i = 0; i < short_held.size(); ++i) {
+        const auto time = static_cast<double>(i) / 48'000.0;
+        const auto release_time = static_cast<double>(i > early_off ? i - early_off : 0) / 48'000.0;
+        short_held[i] = static_cast<float>(std::sin(time * 82.0 * std::numbers::pi)
+            * std::exp(-40.0 * release_time));
+    }
+    const auto early_release = detail::compareOpllFullPcmForRegression(
+        short_held, short_held, 41.0F, early_off);
+    bool ok = true;
+    const auto check = [&](bool pass, const char* name) {
+        std::cout << (pass ? "PASS " : "FAIL ") << name << '\n';
+        ok &= pass;
+    };
+    check(identical.total < 1.0e-5F && known_equal.total < 1.0e-5F, "full-PCM-and-OPLL-self");
+    check(identical.harmonic_count == 20 && missing.harmonics > 0.15F
+        && extra.harmonics > 0.15F, "full-missing-and-extra-harmonics");
+    check(noisy.harmonic_count == 0 && noisy.periodic_windows == 0
+        && std::isfinite(noisy.total), "full-short-broadband-noise-excludes-harmonics");
+    check(identical.periodic_windows >= 2 && shifted.periodic_windows >= 2
+        && shifted.periodic_shape < 0.01F, "full-half-period-shift");
+    check(identical.stage_mask == 15 && attack.stage_envelope[0] > attack.stage_envelope[2]
+        && sustain.stage_timbre[2] > sustain.stage_timbre[0] + 0.02F,
+        "full-independent-ADSR");
+    check((no_off.stage_mask & 8) == 0 && quiet.harmonic_count == 0
+        && quiet.stage_mask == 0 && quiet.periodic_windows == 0 && std::isfinite(quiet.total)
+        && short_note.periodic_windows == 0 && std::isfinite(short_note.total),
+        "full-absent-release-quiet-short");
+    check(low_steady.stage_mask == 4 && delayed_decay.stage_mask == 7,
+        "full-low-pitch-and-early-plateau-stage-detection");
+    check(early_release.stage_mask == 8 && early_release.total < 1.0e-5F,
+        "full-release-after-short-held-note");
+    check(detail::checkOpllPerceptualGateForRegression(identical, missing)
+            == OpllPublicationDecision::HarmonicsRegressed
+        && detail::checkOpllPerceptualGateForRegression(missing, identical)
+            == OpllPublicationDecision::Published
+        && detail::checkOpllPerceptualGateForRegression(identical, attack)
+            == OpllPublicationDecision::StageRegressed, "full-publish-gate-reject-and-recover");
+    check(detail::checkOpllPublicationHistoryForRegression(),
+        "full-publication-history-independent-of-internal-ranking");
+    std::cout << "stage_mask=" << static_cast<int>(identical.stage_mask)
+              << " attack_error=" << attack.stage_envelope[0]
+              << " sustain_timbre_error=" << sustain.stage_timbre[2]
+              << " periodic=" << shifted.periodic_shape << '\n';
+    return ok ? 0 : 1;
+}
+
+int renderPerceptualFixture(const char* hex, const char* frequency, const char* length,
+    const char* key_off, const char* filename) {
+    namespace engine = mgstc::engine;
+    const std::string_view digits{hex};
+    float fundamental{};
+    std::size_t frames{}, off{};
+    const auto parse = [](std::string_view text, auto& value) {
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+        return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+    };
+    if (digits.size() != 16 || !parse(frequency, fundamental) || !std::isfinite(fundamental)
+        || fundamental < 20 || fundamental > 6000 || !parse(length, frames)
+        || frames == 0 || frames > 96000 || !parse(key_off, off) || off > frames) return 2;
+    std::array<std::uint8_t, 8> registers{};
+    for (std::size_t i = 0; i < registers.size(); ++i) {
+        const auto* first = digits.data() + 2 * i;
+        const auto result = std::from_chars(first, first + 2, registers[i], 16);
+        if (result.ec != std::errc{} || result.ptr != first + 2) return 2;
+    }
+    const auto pcm = engine::detail::renderOpllFullPcmForRegression(
+        engine::decodeOpllPatch(registers), fundamental, frames, off);
+    std::ofstream file(filename, std::ios::binary);
+    const auto number = [&](std::uint32_t value, unsigned bytes) {
+        for (unsigned i = 0; i < bytes; ++i) file.put(static_cast<char>((value >> (8 * i)) & 0xffU));
+    };
+    file.write("RIFF", 4); number(static_cast<std::uint32_t>(36 + frames * 2), 4);
+    file.write("WAVEfmt ", 8); number(16, 4);
+    number(1, 2); number(1, 2); number(48'000, 4); number(96'000, 4); number(2, 2); number(16, 2);
+    file.write("data", 4); number(static_cast<std::uint32_t>(frames * 2), 4);
+    for (float sample : pcm) {
+        const auto signed_sample = static_cast<std::int16_t>(std::lround(std::clamp(sample, -1.0F, 1.0F) * 32767.0F));
+        number(static_cast<std::uint16_t>(signed_sample), 2);
+    }
+    return file ? 0 : 1;
+}
+
 int runRealDeadline(const char* file, std::string_view scenario) {
     namespace engine = mgstc::engine;
     if (scenario != "slow" && scenario != "retain") return 2;
@@ -437,8 +622,8 @@ int runRealDeadline(const char* file, std::string_view scenario) {
     };
     const bool only_complete = std::all_of(published.begin(), published.end(), complete)
         && std::all_of(result.ranked.begin(), result.ranked.end(), complete)
-        && (published.empty() ? result.ranked.empty()
-                              : (!result.ranked.empty() && result.ranked.front() == published.back()));
+        && (published.empty() ? !result.published_best
+                              : result.published_best == published.back());
     const bool initial_ok = scenario == "slow"
         ? !result.initial_completed && !result.initial_best
         : result.initial_completed && result.initial_best && !result.ranked.empty()
@@ -467,8 +652,14 @@ int runRealDeadline(const char* file, std::string_view scenario) {
 int main(int argc, char* argv[]) {
     if (argc == 4 && std::string_view{argv[1]} == "--ga-initial")
         return runContinuousInitial(argv[2], argv[3]);
+    if (argc == 4 && std::string_view{argv[1]} == "--ga-perceptual-deadline")
+        return runContinuousInitial(argv[2], argv[3], true);
     if (argc == 2 && std::string_view{argv[1]} == "--ga-pcm-basics")
         return runStationaryPcmChecks();
+    if (argc == 2 && std::string_view{argv[1]} == "--ga-perceptual-checks")
+        return runPerceptualChecks();
+    if (argc == 7 && std::string_view{argv[1]} == "--ga-render-opll")
+        return renderPerceptualFixture(argv[2], argv[3], argv[4], argv[5], argv[6]);
     if (argc == 4 && std::string_view{argv[1]} == "--ga-real-deadline")
         return runRealDeadline(argv[2], argv[3]);
     CommandLineOptions command_line;

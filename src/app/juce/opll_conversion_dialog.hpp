@@ -78,6 +78,16 @@ private:
 
     class DetailsPane final : public juce::Component, private juce::AsyncUpdater {
     public:
+        static int rowHeight() { return juce::roundToInt(UiFonts::body().getHeight()) + UiLayout::xs; }
+        static int preferredHeight() {
+            return 10 * rowHeight() + UiScale::sx(74) + 2 * UiLayout::sm + UiLayout::xs;
+        }
+        static int minimumWidth() {
+            const auto font = UiFonts::body();
+            const auto label = juce::GlyphArrangement::getStringWidthInt(font, "MULT");
+            const auto value = juce::GlyphArrangement::getStringWidthInt(font, "MOD");
+            return 2 * (label + 2 * value + 4 * UiLayout::xs) + 3 * UiLayout::sm;
+        }
         ~DetailsPane() override { cancelPendingUpdate(); }
 
         void setDetails(const std::optional<Details>& details) {
@@ -104,9 +114,12 @@ private:
                     bounds, juce::Justification::centred, 2);
                 return;
             }
-            const auto valueRow = [&](const char* name, int mod, int car) {
-                auto row = bounds.removeFromTop(UiScale::sx(19));
-                const auto name_width = row.getWidth() / 3;
+            auto tables = bounds.removeFromTop(8 * rowHeight());
+            auto left = tables.removeFromLeft((tables.getWidth() - UiLayout::sm) / 2);
+            tables.removeFromLeft(UiLayout::sm);
+            const auto valueRow = [&](juce::Rectangle<int>& table, const char* name, int mod, int car) {
+                auto row = table.removeFromTop(rowHeight());
+                const auto name_width = row.getWidth() * 38 / 100;
                 graphics.drawText(juce::String(name), row.removeFromLeft(name_width),
                     juce::Justification::centredLeft);
                 const auto mod_cell = row.removeFromLeft(row.getWidth() / 2);
@@ -119,21 +132,22 @@ private:
             };
             const auto& mod = patch_.modulator;
             const auto& car = patch_.carrier;
-            valueRow("FM", -1, -1);
-            valueRow("AM", mod.amplitude_modulation, car.amplitude_modulation);
-            valueRow("PM", mod.pitch_modulation, car.pitch_modulation);
-            valueRow("EG", mod.sustained_tone, car.sustained_tone);
-            valueRow("KR", mod.key_rate_scaling, car.key_rate_scaling);
-            valueRow("MULT", mod.multiplier, car.multiplier);
-            valueRow("KSL", mod.key_scale_level, car.key_scale_level);
-            valueRow("WS", mod.waveform, car.waveform);
-            valueRow("AR", mod.attack_rate, car.attack_rate);
-            valueRow("DR", mod.decay_rate, car.decay_rate);
-            valueRow("SL", mod.sustain_level, car.sustain_level);
-            valueRow("RR", mod.release_rate, car.release_rate);
-            valueRow("TL", mod.total_level, -1);
+            valueRow(left, "FM", -1, -1);
+            valueRow(left, "AM", mod.amplitude_modulation, car.amplitude_modulation);
+            valueRow(left, "PM", mod.pitch_modulation, car.pitch_modulation);
+            valueRow(left, "EG", mod.sustained_tone, car.sustained_tone);
+            valueRow(left, "KR", mod.key_rate_scaling, car.key_rate_scaling);
+            valueRow(left, "MULT", mod.multiplier, car.multiplier);
+            valueRow(left, "KSL", mod.key_scale_level, car.key_scale_level);
+            valueRow(left, "WS", mod.waveform, car.waveform);
+            valueRow(tables, "", -1, -1);
+            valueRow(tables, "AR", mod.attack_rate, car.attack_rate);
+            valueRow(tables, "DR", mod.decay_rate, car.decay_rate);
+            valueRow(tables, "SL", mod.sustain_level, car.sustain_level);
+            valueRow(tables, "RR", mod.release_rate, car.release_rate);
+            valueRow(tables, "TL", mod.total_level, -1);
             graphics.drawText("FB  " + juce::String(static_cast<int>(patch_.feedback)),
-                bounds.removeFromTop(UiScale::sx(19)), juce::Justification::centredLeft);
+                tables.removeFromTop(rowHeight()), juce::Justification::centredLeft);
             bounds.removeFromTop(UiLayout::xs);
             drawEnvelope(graphics, bounds);
         }
@@ -148,7 +162,7 @@ private:
         void drawEnvelope(juce::Graphics& graphics, juce::Rectangle<int> bounds) const {
             const auto carrier = findColour(juce::Label::textColourId);
             const auto modulator = uiHoverAccent();
-            auto legend = bounds.removeFromTop(UiLayout::fieldH);
+            auto legend = bounds.removeFromTop(rowHeight());
             graphics.drawText("EG", legend.removeFromLeft(UiScale::sx(32)),
                 juce::Justification::centredLeft);
             graphics.setColour(modulator);
@@ -157,7 +171,7 @@ private:
             graphics.setColour(carrier);
             graphics.drawText("CAR", legend.removeFromLeft(UiScale::sx(60)),
                 juce::Justification::centred);
-            auto time = bounds.removeFromBottom(UiLayout::fieldH);
+            auto time = bounds.removeFromBottom(rowHeight());
             const auto plot = bounds.toFloat().reduced(1.0F);
             if (plot.isEmpty()) return;
             constexpr auto duration = engine::OpllEnvelopeTrace::kDurationSeconds;
@@ -196,8 +210,33 @@ private:
         engine::OpllEnvelopeTrace trace_{};
     };
 
-    class Content final : public juce::Component,
-                          private juce::ListBoxModel {
+    class Content final : public juce::Component, private juce::ListBoxModel,
+                          private juce::KeyListener, private juce::AsyncUpdater {
+        // A row owns its mouse gesture. The ListBox still owns keyboard and
+        // accessibility navigation, so no mouse event is also a selection event.
+        class HistoryRow final : public juce::Component {
+        public:
+            explicit HistoryRow(Content& owner) : owner_(owner) {
+                setAccessible(false);
+                setMouseCursor(juce::MouseCursor::PointingHandCursor);
+            }
+            void setRow(int row) { if (row_ != row) pressed_ = false; row_ = row; }
+            void mouseDown(const juce::MouseEvent& event) override {
+                pressed_ = event.mods.isLeftButtonDown();
+            }
+            void mouseUp(const juce::MouseEvent& event) override {
+                if (std::exchange(pressed_, false) && !event.mouseWasDraggedSinceMouseDown()
+                    && getLocalBounds().contains(event.getPosition())) {
+                    owner_.history_.grabKeyboardFocus();
+                    owner_.chooseRow(row_);
+                }
+            }
+        private:
+            Content& owner_;
+            int row_{-1};
+            bool pressed_{};
+        };
+
     public:
         explicit Content(Callbacks callbacks)
             : callbacks_(std::move(callbacks)), progress_(elapsed_fraction_) {
@@ -241,6 +280,7 @@ private:
             details_scroll_.setScrollBarsShown(true, false);
             addAndMakeVisible(details_scroll_);
             history_.setModel(this);
+            history_.addKeyListener(this);
             history_.setMultipleSelectionEnabled(false);
             history_.setColour(juce::ListBox::backgroundColourId,
                               juce::Colour(UiLayout::panelFill));
@@ -258,7 +298,28 @@ private:
             setState({});
         }
 
-        ~Content() override { history_.setModel(nullptr); }
+        ~Content() override {
+            cancelPendingUpdate();
+            history_.removeKeyListener(this);
+            history_.setModel(nullptr);
+        }
+
+        int historyWidth() {
+            return std::max(UiScale::sx(125), juce::GlyphArrangement::getStringWidthInt(
+                UiFonts::body(true), getNameForRow(std::max(999, getNumRows()) - 1))
+                + 2 * UiLayout::panelPad + history_.getViewport()->getScrollBarThickness());
+        }
+
+        int minimumWidth() {
+            return std::max(UiScale::sx(490), DetailsPane::minimumWidth() + historyWidth()
+                + 2 * UiLayout::panelPad + UiLayout::controlGap + details_scroll_.getScrollBarThickness());
+        }
+
+        int preferredHeight() const {
+            if (state_.confirming) return UiScale::sx(280);
+            return 2 * UiLayout::panelPad + 2 * UiLayout::textButtonH + 3 * UiLayout::sm
+                + UiLayout::fieldH + bannerHeight() + UiLayout::controlGap + DetailsPane::preferredHeight();
+        }
 
         void setState(const State& state) {
             const ScopedGlobalScale scale;
@@ -354,21 +415,21 @@ private:
                 status_.setBounds(area);
                 return;
             }
-            status_.setBounds(area.removeFromTop(UiLayout::fieldH * 2));
+            status_.setBounds(area.removeFromTop(UiLayout::fieldH));
             area.removeFromTop(UiLayout::sm);
-            const int image_height = UiLayout::fieldH * 3;
+            const int image_height = bannerHeight();
             auto banner = area.removeFromTop(image_height);
             if (state_.running && !state_.confirming) {
                 gif_.setBounds(banner.removeFromLeft(image_height));
                 banner.removeFromLeft(UiLayout::panelGap);
             }
-            const int progress_height = UiLayout::fieldH;
+            const int progress_height = DetailsPane::rowHeight();
             const int banner_padding = std::max(0,
-                (banner.getHeight() - progress_height - UiLayout::fieldH - UiLayout::sm) / 2);
+                (banner.getHeight() - progress_height - DetailsPane::rowHeight() - UiLayout::sm) / 2);
             banner.removeFromTop(banner_padding);
             progress_.setBounds(banner.removeFromTop(progress_height));
             banner.removeFromTop(UiLayout::sm);
-            time_.setBounds(banner.removeFromTop(UiLayout::fieldH));
+            time_.setBounds(banner.removeFromTop(DetailsPane::rowHeight()));
             area.removeFromTop(UiLayout::sm);
             auto audition = area.removeFromTop(UiLayout::textButtonH);
             const int audition_width = (audition.getWidth() - UiLayout::controlGap * 2) / 3;
@@ -378,14 +439,15 @@ private:
             audition.removeFromLeft(UiLayout::controlGap);
             stop_.setBounds(audition);
             area.removeFromTop(UiLayout::controlGap);
-            auto left = area.removeFromLeft(area.getWidth() * 55 / 100);
+            auto right = area.removeFromRight(historyWidth());
+            area.removeFromRight(UiLayout::controlGap);
+            auto left = area;
             details_scroll_.setBounds(left);
-            const int pane_height = state_.details ? UiScale::sx(420) : left.getHeight();
+            const int pane_height = state_.details ? DetailsPane::preferredHeight() : left.getHeight();
             details_.setSize(std::max(0, left.getWidth() - details_scroll_.getScrollBarThickness()),
                 std::max(left.getHeight(), pane_height));
-            area.removeFromLeft(UiLayout::controlGap);
-            history_heading_.setBounds(area.removeFromTop(UiLayout::titleH));
-            history_.setBounds(area);
+            history_heading_.setBounds(right.removeFromTop(UiLayout::titleH));
+            history_.setBounds(right);
         }
 
         bool keyPressed(const juce::KeyPress& key) override {
@@ -396,6 +458,8 @@ private:
         }
 
     private:
+        static int bannerHeight() { return 2 * DetailsPane::rowHeight() + UiLayout::sm; }
+
         // Copy before invocation: an owner callback may destroy this window.
         static void invoke(std::function<void()> callback) {
             if (callback) callback();
@@ -434,16 +498,33 @@ private:
                                     juce::Justification::centredLeft, 1);
         }
 
+        juce::Component* refreshComponentForRow(int row, bool, juce::Component* existing) override {
+            auto* component = existing ? static_cast<HistoryRow*>(existing) : new HistoryRow(*this);
+            component->setRow(row);
+            return component;
+        }
+
         void selectedRowsChanged(int row) override {
+            if (updating_selection_ || row < 0) return;
+            // JUCE accessibility Press selects the row, then invokes Return
+            // directly, bypassing the native key listener.
+            accessible_selection_ = row;
+            triggerAsyncUpdate();
             chooseRow(row);
         }
 
-        void listBoxItemClicked(int row, const juce::MouseEvent&) override {
-            // Clicking the already highlighted row makes the selection explicit.
-            chooseRow(row);
+        void returnKeyPressed(int row) override {
+            if (std::exchange(accessible_selection_, std::nullopt) != row) chooseRow(row);
         }
 
-        void returnKeyPressed(int row) override { chooseRow(row); }
+        bool keyPressed(const juce::KeyPress& key, juce::Component*) override {
+            if (key.getKeyCode() != juce::KeyPress::returnKey) return false;
+            accessible_selection_.reset();
+            chooseRow(history_.getSelectedRow());
+            return true;
+        }
+
+        void handleAsyncUpdate() override { accessible_selection_.reset(); }
 
         void chooseRow(int row) {
             if (updating_selection_ || state_.busy || state_.confirming
@@ -455,6 +536,7 @@ private:
         State state_;
         Callbacks callbacks_;
         bool updating_selection_{};
+        std::optional<int> accessible_selection_;
         double elapsed_fraction_{};
         juce::Label status_, time_, history_heading_;
         juce::ProgressBar progress_;
@@ -477,9 +559,9 @@ public:
         setResizable(true, false);
         content_ = new Content(std::move(callbacks));
         setContentOwned(content_, true);
-        setResizeLimits(UiScale::sx(620), UiScale::sx(280),
-                        UiScale::sx(1200), UiScale::sx(1100));
-        centreWithSize(UiScale::sx(700), UiScale::sx(300));
+        fitResizeLimits();
+        preferred_window_height_ = preferredWindowHeight();
+        centreWithSize(content_->minimumWidth(), preferred_window_height_);
         const juce::Component::SafePointer<OpllConversionDialog> safe(this);
         scale_listener_ = UiScale::addGlobalListener([safe] {
             if (safe) safe->refreshScale();
@@ -494,14 +576,17 @@ public:
 
     void setState(const State& state) {
         const ScopedGlobalScale scale;
-        if (confirming_ != state.confirming) {
+        const bool mode_changed = confirming_ != state.confirming;
+        if (mode_changed) {
             confirming_ = state.confirming;
-            setResizeLimits(UiScale::sx(620), UiScale::sx(confirming_ ? 280 : 620),
-                            UiScale::sx(1200), UiScale::sx(1100));
-            setSize(getWidth(), UiScale::sx(confirming_ ? 300 : 700));
-            clampWindowToDisplayWorkArea(*this);
         }
         content_->setState(state);
+        fitResizeLimits();
+        if (mode_changed) {
+            preferred_window_height_ = preferredWindowHeight();
+            setSize(std::max(content_->minimumWidth(), UiScale::sx(530)), preferred_window_height_);
+            clampWindowToDisplayWorkArea(*this);
+        }
     }
 
     void showFor(juce::Component& anchor) {
@@ -533,16 +618,27 @@ public:
     }
 
 private:
+    void fitResizeLimits() {
+        setResizeLimits(content_->minimumWidth(), UiScale::sx(confirming_ ? 230 : 445),
+                        UiScale::sx(1200), UiScale::sx(1100));
+    }
+
+    int preferredWindowHeight() const {
+        return content_->preferredHeight() + getContentComponentBorder().getTopAndBottom();
+    }
+
     void refreshScale() {
         const ScopedGlobalScale scale;
         const auto ratio = static_cast<double>(UiScale::global_percent) / display_scale_percent_;
         const int width = juce::roundToInt(getWidth() * ratio);
-        const int height = juce::roundToInt(getHeight() * ratio);
+        // Font metrics and the window border do not scale by the same ratio.
+        // Scale only the user's deviation from the content's preferred height.
+        const int extra = juce::roundToInt((getHeight() - preferred_window_height_) * ratio);
         display_scale_percent_ = UiScale::global_percent;
         content_->refreshFonts();
-        setResizeLimits(UiScale::sx(620), UiScale::sx(confirming_ ? 280 : 620),
-                        UiScale::sx(1200), UiScale::sx(1100));
-        setSize(width, height);
+        fitResizeLimits();
+        preferred_window_height_ = preferredWindowHeight();
+        setSize(std::max(width, content_->minimumWidth()), preferred_window_height_ + extra);
         clampWindowToDisplayWorkArea(*this);
         resized();
         repaint();
@@ -554,6 +650,7 @@ private:
     std::uint64_t scale_listener_{};
     bool confirming_{true};
     int display_scale_percent_{UiScale::global_percent};
+    int preferred_window_height_{};
 };
 
 } // namespace mgstc::app
