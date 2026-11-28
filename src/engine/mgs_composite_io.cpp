@@ -98,24 +98,7 @@ std::string withoutComments(std::string_view text) {
 std::vector<MgsSourceDefinition> extractMgsSourceDefinitions(
     std::string_view source,
     char wanted_kind) {
-    std::string cleaned;
-    cleaned.reserve(source.size());
-    bool comment = false;
-    for (const char character : source) {
-        if (comment) {
-            if (character == '\r' || character == '\n') {
-                comment = false;
-                cleaned.push_back(character);
-            }
-            continue;
-        }
-        if (character == ';') {
-            comment = true;
-            cleaned.push_back(' ');
-        } else {
-            cleaned.push_back(character);
-        }
-    }
+    const std::string cleaned = withoutComments(source);
     std::vector<MgsSourceDefinition> result;
     for (std::size_t index = 0; index + 3 < cleaned.size(); ++index) {
         if (cleaned[index] != '@'
@@ -548,6 +531,9 @@ bool parseRate(
     if (stream >> extra) {
         return false;
     }
+    if (values[0] > 3 || values[1] > 31) {
+        return false;
+    }
     rate = clampRateEnvelope({
         .tone_mode = static_cast<std::uint8_t>(values[0]),
         .noise = static_cast<std::uint8_t>(values[1]),
@@ -635,7 +621,12 @@ bool parseSequence(
             if (position < body.size() && body[position] == ',') {
                 ++position;
             } else {
-                static_cast<void>(parse_header_number(0, 31, noise));
+                const bool noise_present = position < body.size()
+                    && std::isdigit(static_cast<unsigned char>(
+                           body[position]));
+                if (!parse_header_number(0, 31, noise) && noise_present) {
+                    addIssue(issues, "invalid envelope header noise");
+                }
                 skip_space();
                 if (position < body.size() && body[position] == ',') {
                     ++position;
@@ -835,6 +826,11 @@ bool parseSequence(
                 // Preserve the actual command start. A preceding one-count
                 // letter has already consumed its tick in MGSDRV.
                 const auto ramp_start = count;
+                if (count + hold
+                    > EnvelopeTimeline::kMaximumLengthCounts) {
+                    addIssue(
+                        issues, "envelope length exceeds maximum counts");
+                }
                 count = std::min<std::uint32_t>(
                     EnvelopeTimeline::kMaximumLengthCounts,
                     count + hold);
@@ -859,6 +855,11 @@ bool parseSequence(
                         .value = value,
                         .count = count,
                     });
+                }
+                if (count + hold
+                    > EnvelopeTimeline::kMaximumLengthCounts) {
+                    addIssue(
+                        issues, "envelope length exceeds maximum counts");
                 }
                 count = std::min<std::uint32_t>(
                     EnvelopeTimeline::kMaximumLengthCounts,
@@ -897,6 +898,9 @@ std::optional<ParsedTrack> parseTrackLine(
     std::istringstream stream(code);
     unsigned track{};
     if (!(stream >> track)) {
+        // `code` starts with a digit (checked above), so a failed
+        // extraction means the track number overflowed.
+        addIssue(issues, "track number is outside 1-17");
         return std::nullopt;
     }
     const auto source = sourceForTrack(track);
@@ -985,6 +989,10 @@ std::optional<ParsedTrack> parseTrackLine(
             for (auto& component : parsed) {
                 valid = valid
                     && static_cast<bool>(parameters >> component);
+            }
+            std::string extra;
+            if (parameters >> extra) {
+                valid = false;
             }
             if (!valid || parsed[0] < 0 || parsed[0] > 255
                 || parsed[1] < 0 || parsed[1] > 127

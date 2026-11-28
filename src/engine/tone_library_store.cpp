@@ -195,6 +195,23 @@ private:
     sqlite3_stmt* stmt_{};
 };
 
+[[nodiscard]] bool hasNoTables(
+    sqlite3* db,
+    bool& no_tables,
+    std::string* error) {
+    SqliteStatement stmt;
+    if (!stmt.prepare(db, "SELECT COUNT(*) FROM sqlite_master;", error)) {
+        return false;
+    }
+    bool has_row = false;
+    if (!stmt.stepRow(has_row, db, error) || !has_row) {
+        setError(error, "failed to inspect database schema");
+        return false;
+    }
+    no_tables = sqlite3_column_int64(stmt.get(), 0) == 0;
+    return true;
+}
+
 constexpr const char* kCreateV1Sql = R"SQL(
 CREATE TABLE timbres (
     id INTEGER PRIMARY KEY,
@@ -649,11 +666,14 @@ bool ToneLibraryDatabase::backupExistingV1(std::string* error) {
 bool ToneLibraryDatabase::migrate(std::string* error) {
     int application_id = 0;
     int version = 0;
+    bool no_tables = false;
     if (!readApplicationId(application_id, error)
-        || !readUserVersion(version, error)) {
+        || !readUserVersion(version, error)
+        || !hasNoTables(db_, no_tables, error)) {
         return false;
     }
-    const bool uninitialized = application_id == 0 && version == 0;
+    const bool uninitialized
+        = application_id == 0 && version == 0 && no_tables;
     if (!uninitialized && application_id != kApplicationId) {
         setError(error, "file is not an MGSTC tone library");
         return false;
@@ -676,10 +696,12 @@ bool ToneLibraryDatabase::migrate(std::string* error) {
     if (needs_upgrade) {
         if (!migration_lock.acquire(utf8_path_, error)
             || !readApplicationId(application_id, error)
-            || !readUserVersion(version, error)) {
+            || !readUserVersion(version, error)
+            || !hasNoTables(db_, no_tables, error)) {
             return false;
         }
-        const bool still_uninitialized = application_id == 0 && version == 0;
+        const bool still_uninitialized
+            = application_id == 0 && version == 0 && no_tables;
         if (!still_uninitialized && application_id != kApplicationId) {
             setError(error, "file is not an MGSTC tone library");
             return false;
@@ -703,11 +725,13 @@ bool ToneLibraryDatabase::migrate(std::string* error) {
         return false;
     }
     if (!readApplicationId(application_id, error)
-        || !readUserVersion(version, error)) {
+        || !readUserVersion(version, error)
+        || !hasNoTables(db_, no_tables, error)) {
         rollback();
         return false;
     }
-    const bool still_uninitialized = application_id == 0 && version == 0;
+    const bool still_uninitialized
+        = application_id == 0 && version == 0 && no_tables;
     if (!still_uninitialized && application_id != kApplicationId) {
         rollback();
         setError(error, "file is not an MGSTC tone library");
@@ -802,7 +826,7 @@ bool ToneLibraryDatabase::writeTimbres(
             error)
         || !insert_link.prepare(
             db_,
-            "INSERT INTO timbre_tags(timbre_id, tag_id) VALUES (?, ?);",
+            "INSERT OR IGNORE INTO timbre_tags(timbre_id, tag_id) VALUES (?, ?);",
             error)) {
         return false;
     }
@@ -921,7 +945,7 @@ bool ToneLibraryDatabase::writeComposites(
             error)
         || !insert_link.prepare(
             db_,
-            "INSERT INTO composite_tags(composite_id, tag_id) VALUES (?, ?);",
+            "INSERT OR IGNORE INTO composite_tags(composite_id, tag_id) VALUES (?, ?);",
             error)) {
         return false;
     }
@@ -933,6 +957,12 @@ bool ToneLibraryDatabase::writeComposites(
             return false;
         }
         const auto payload = serializeCompositeSoundPayload(entry.timbre);
+        if (payload.empty()) {
+            setError(
+                error,
+                "composite sound payload string exceeds the size limit");
+            return false;
+        }
         const auto payload_bytes = std::span<const std::uint8_t>(
             reinterpret_cast<const std::uint8_t*>(payload.data()),
             payload.size());
@@ -1053,10 +1083,18 @@ bool ToneLibraryDatabase::loadTimbres(
         entry.updated_unix_seconds = sqlite3_column_int64(select_rows.get(), 6);
         entry.last_used_unix_seconds =
             sqlite3_column_int64(select_rows.get(), 7);
-        entry.use_count = static_cast<std::uint32_t>(
-            sqlite3_column_int64(select_rows.get(), 8));
-        entry.revision = static_cast<std::uint32_t>(
-            sqlite3_column_int64(select_rows.get(), 9));
+        const auto use_count = sqlite3_column_int64(select_rows.get(), 8);
+        const auto revision = sqlite3_column_int64(select_rows.get(), 9);
+        if (use_count < 0 || revision < 0
+            || use_count > std::numeric_limits<std::uint32_t>::max()
+            || revision > std::numeric_limits<std::uint32_t>::max()) {
+            setError(error, "invalid timbre use count or revision");
+            if (!allow_partial) { return false; }
+            complete = false;
+            continue;
+        }
+        entry.use_count = static_cast<std::uint32_t>(use_count);
+        entry.revision = static_cast<std::uint32_t>(revision);
         entry.data_version = 1;
         if (!applyTimbrePayload(
                 entry,
@@ -1158,10 +1196,9 @@ bool ToneLibraryDatabase::loadComposites(
             complete = false;
             continue;
         }
-        if (payload_version != 1 && payload_version != 2 && payload_version != 3
-            && payload_version != 4 && payload_version != 5 && payload_version != 6
-            && payload_version
-                != static_cast<sqlite3_int64>(kCompositeSoundPayloadVersion)) {
+        if (payload_version < 1
+            || payload_version
+                > static_cast<sqlite3_int64>(kCompositeSoundPayloadVersion)) {
             setError(error, "unsupported composite sound payload version");
             if (!allow_partial) { return false; }
             complete = false;
@@ -1191,10 +1228,18 @@ bool ToneLibraryDatabase::loadComposites(
         entry.updated_unix_seconds = sqlite3_column_int64(select_rows.get(), 5);
         entry.last_used_unix_seconds =
             sqlite3_column_int64(select_rows.get(), 6);
-        entry.use_count = static_cast<std::uint32_t>(
-            sqlite3_column_int64(select_rows.get(), 7));
-        entry.revision = static_cast<std::uint32_t>(
-            sqlite3_column_int64(select_rows.get(), 8));
+        const auto use_count = sqlite3_column_int64(select_rows.get(), 7);
+        const auto revision = sqlite3_column_int64(select_rows.get(), 8);
+        if (use_count < 0 || revision < 0
+            || use_count > std::numeric_limits<std::uint32_t>::max()
+            || revision > std::numeric_limits<std::uint32_t>::max()) {
+            setError(error, "invalid composite timbre use count or revision");
+            if (!allow_partial) { return false; }
+            complete = false;
+            continue;
+        }
+        entry.use_count = static_cast<std::uint32_t>(use_count);
+        entry.revision = static_cast<std::uint32_t>(revision);
 
         entry.timbre.tags.clear();
         if (read_tags) {

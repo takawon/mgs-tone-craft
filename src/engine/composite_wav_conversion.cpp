@@ -782,7 +782,7 @@ bool replaceEventWave(CompositeTimbre& tone, std::size_t layerIndex,
         if (!findEmbeddedTimbreSnapshot(tone, previous.library_id))
             tone.embedded_timbres.push_back(previous);
     }
-    else tone.embedded_timbres.push_back(ref);
+    else if (!findEmbeddedTimbreSnapshot(tone, ref.library_id)) tone.embedded_timbres.push_back(ref);
     discardUnusedSnapshots(tone);
     return true;
 }
@@ -2590,6 +2590,11 @@ CompositeWavConversionResult convertCompositeWave(
             + (reusedRender ? 0 : pcmStorage(*rendered)) + (loopProbe ? pcmStorage(*loopProbe) : 0)
             + (heldFinite ? pcmStorage(*heldFinite) : 0) + (originalHeld ? pcmStorage(*originalHeld) : 0)
             + (originalFinite ? wavToneStorage(*originalFinite) : 0));
+        std::size_t events{};
+        for (const auto& layer : candidate.layers)
+            events += layer.volume_envelope.events.size() + layer.timbre_automation.size();
+        quality.complexity += static_cast<double>(events) / 253;
+        quality.total += qualityWeights.complexity * static_cast<double>(events) / 253;
         if (!originalFinite && !reusedRender && std::isfinite(quality.total) && pcmStorage(*rendered) <= renderCacheByteLimit) {
             std::size_t retained = pcmStorage(*rendered);
             for (const auto& entry : renderCache) retained += pcmStorage(*entry.pcm);
@@ -2599,11 +2604,6 @@ CompositeWavConversionResult convertCompositeWave(
             }
             renderCache.push_back({renderKey, rendered, quality});
         }
-        std::size_t events{};
-        for (const auto& layer : candidate.layers)
-            events += layer.volume_envelope.events.size() + layer.timbre_automation.size();
-        quality.complexity += static_cast<double>(events) / 253;
-        quality.total += qualityWeights.complexity * static_cast<double>(events) / 253;
         result.morph_search.evaluation_seconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - evaluationStarted).count();
         if (!std::isfinite(quality.total)) { ++stalled; return reject("Nonfinite WAV objective or cancelled evaluation"); }

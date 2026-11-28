@@ -2385,6 +2385,20 @@ std::vector<OpllPatchParameters> searchWaveCycleWithOpll(
         }
     }
 
+    // Insurance: always evaluate MULTI 1 and 2 with quiet modulator.
+    // These seeds come before the random seeds: the Compact budget (384)
+    // is smaller than the full seed count (402), so seeds admitted last
+    // would be dropped before evaluation.
+    for (const std::uint8_t car_mul :
+         std::array<std::uint8_t, 2>{1, 2}) {
+        auto candidate = prepare(defaultOpllPatch());
+        candidate.modulator.multiplier = 0;
+        candidate.carrier.multiplier = car_mul;
+        candidate.modulator.total_level = 63;
+        candidate.feedback = 0;
+        seed(candidate);
+    }
+
     std::uint32_t random = 0x2413C0DEU;
     auto next_random = [&]() {
         random = random * 1664525U + 1013904223U;
@@ -2414,16 +2428,6 @@ std::vector<OpllPatchParameters> searchWaveCycleWithOpll(
         seed(candidate);
     }
 
-    // Insurance: always evaluate MULTI 1 and 2 with quiet modulator.
-    for (const std::uint8_t car_mul :
-         std::array<std::uint8_t, 2>{1, 2}) {
-        auto candidate = prepare(defaultOpllPatch());
-        candidate.modulator.multiplier = 0;
-        candidate.carrier.multiplier = car_mul;
-        candidate.modulator.total_level = 63;
-        candidate.feedback = 0;
-        seed(candidate);
-    }
     if (coordinator) {
         coordinator->setPhase(phase);
     }

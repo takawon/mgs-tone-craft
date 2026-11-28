@@ -10,6 +10,7 @@
 #include <limits>
 #include <sstream>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 
 namespace mgstc::engine {
@@ -118,6 +119,10 @@ public:
     }
 
     void string(std::string_view value) {
+        if (value.size() > kMaximumStringSize) {
+            failed_ = true;
+            return;
+        }
         unsignedInteger(value.size(), 4);
         data_.append(value);
     }
@@ -336,8 +341,13 @@ public:
         return data_;
     }
 
+    [[nodiscard]] bool failed() const noexcept {
+        return failed_;
+    }
+
 private:
     std::string data_;
+    bool failed_ = false;
 };
 
 class BinaryReader {
@@ -1007,6 +1017,9 @@ private:
 std::string encodeTimbre(const CompositeTimbre& timbre) {
     BinaryWriter writer;
     writer.timbre(timbre);
+    if (writer.failed()) {
+        return {};
+    }
     return encodeHex(writer.data());
 }
 
@@ -1029,6 +1042,9 @@ std::optional<CompositeTimbre> decodeTimbre(
 std::string serializeCompositeSoundPayload(const CompositeTimbre& timbre) {
     BinaryWriter writer;
     writer.soundPayload(timbre);
+    if (writer.failed()) {
+        return {};
+    }
     return writer.data();
 }
 
@@ -1247,6 +1263,7 @@ CompositeTimbreLibrary::deserialize(
     std::string_view text,
     std::string* error) {
     CompositeTimbreLibrary library;
+    std::unordered_set<std::uint64_t> seen_ids;
     std::size_t line_begin = 0;
     std::size_t line_number = 0;
     while (line_begin <= text.size()) {
@@ -1284,7 +1301,8 @@ CompositeTimbreLibrary::deserialize(
                 || !parseInteger(
                     fields[5], entry.last_used_unix_seconds)
                 || !parseInteger(fields[6], entry.use_count)
-                || library.find(entry.id)) {
+                || library.entries_.size() >= kMaximumCollectionSize
+                || !seen_ids.insert(entry.id).second) {
                 setError(
                     error,
                     "invalid composite timbre library metadata");
