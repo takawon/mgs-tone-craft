@@ -261,7 +261,7 @@ void MgstcAudioProcessorEditor::openSatellite(
                 library_changed);
             scc_window_ = std::make_unique<PluginSatelliteWindow>(
                 kind.equalsIgnoreCase("scc-envelope")
-                    ? juce::String::fromUTF8("MGS Tone Craft - 総合音色編集（SCC）")
+                    ? juce::String::fromUTF8("MGS Tone Craft - 複合音色編集（SCC）")
                     : juce::String("MGS Tone Craft - SCC"),
                 editor);
         }
@@ -288,7 +288,7 @@ void MgstcAudioProcessorEditor::openSatellite(
                 library_changed);
             opll_window_ = std::make_unique<PluginSatelliteWindow>(
                 kind.equalsIgnoreCase("opll-envelope")
-                    ? juce::String::fromUTF8("MGS Tone Craft - 総合音色編集（OPLL）")
+                    ? juce::String::fromUTF8("MGS Tone Craft - 複合音色編集（OPLL）")
                     : juce::String("MGS Tone Craft - OPLL"),
                 editor);
         }

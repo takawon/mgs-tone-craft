@@ -800,7 +800,7 @@ private:
         mgstc::engine::ImportRegisterAs register_as) {
         switch (register_as) {
         case mgstc::engine::ImportRegisterAs::Composite:
-            return juce::String::fromUTF8("総合音色として登録");
+            return juce::String::fromUTF8("複合音色として登録");
         case mgstc::engine::ImportRegisterAs::Scc:
             return juce::String::fromUTF8("SCC音色として登録");
         case mgstc::engine::ImportRegisterAs::Opll:

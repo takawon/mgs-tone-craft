@@ -63,7 +63,7 @@ private:
 class LauncherContent final : public juce::Component {
 public:
     LauncherContent(std::function<void(const juce::String&)> open, std::function<void()> settings)
-      : cards_{LauncherCard(0, juce::String::fromUTF8("複合音色エディタ"), "Composite Timbre Editor"),
+      : cards_{LauncherCard(0, juce::String::fromUTF8("総合音色エディタ"), "Composite Timbre Editor"),
                LauncherCard(1, juce::String::fromUTF8("OPLL音色エディタ"), "OPLL Timbre Editor"),
                LauncherCard(2, juce::String::fromUTF8("SCC音色エディタ"), "SCC Timbre Editor")} {
         const std::array<juce::String, 3> targets{"main", "opll", "scc"};

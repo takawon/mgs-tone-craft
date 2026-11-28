@@ -203,7 +203,7 @@ public:
         button(load_, "WAVを開く…", [this] { loadWave(); });
         button(audacity_, "Audacityから変換", [this] { importAudacitySelection(); });
         audacity_.setTooltip(juce::String::fromUTF8(
-            "Audacityの選択範囲から総合音色へ変換します。"
+            "Audacityの選択範囲から複合音色へ変換します。"
             "編集→環境設定→モジュールでmod-script-pipeを有効にし、"
             "Audacityを再起動してください。"
             "有効中は同じPC上の他のプログラムからもAudacityを操作できるため、"
@@ -579,7 +579,7 @@ private:
             }, progress, background_tasks_);
     }
     void loadWave() {
-        juce::FileChooser chooser(juce::String::fromUTF8("WAVから総合音色へ変換"), {}, "*.wav;*.wave");
+        juce::FileChooser chooser(juce::String::fromUTF8("WAVから複合音色へ変換"), {}, "*.wav;*.wave");
         if (!chooser.browseForFileToOpen()) return;
         const auto path = std::filesystem::path(chooser.getResult().getFullPathName().toWideCharPointer());
         loadWaveSource([path] {

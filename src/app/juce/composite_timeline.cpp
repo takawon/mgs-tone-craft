@@ -3506,7 +3506,7 @@ public:
         envelope_number_.setTooltip(juce::String::fromUTF8(
             "@e／@r 仮番号（0～31）。新規は00から連番。"
             "プレビュー定義とトラック @e／@r の両方に反映します。"
-            "同一総合音色内で重複すると警告します"));
+            "同一複合音色内で重複すると警告します"));
         envelope_number_.onValueChange = [this] {
             if (!assigning_ && changed_) {
                 changed_(false);
@@ -3938,10 +3938,10 @@ public:
             edit_.setTooltip(
                 triangle_preset
                     ? juce::String::fromUTF8(
-                        "この総合音色にコピーしたTriangleを編集します。"
+                        "この複合音色にコピーしたTriangleを編集します。"
                         "単音色ライブラリとは独立です")
                     : juce::String::fromUTF8(
-                        "この総合音色にコピーしたオリジナルを編集します。"
+                        "この複合音色にコピーしたオリジナルを編集します。"
                         "単音色ライブラリとは独立です"));
             number_mode_.setTooltip(juce::String::fromUTF8(
                 "MGSC音色番号の割り付け。自動＝空き番号、手動＝右の音色番号を使用"));

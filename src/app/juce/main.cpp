@@ -2253,10 +2253,10 @@ public:
 
     [[nodiscard]] juce::String editorDisplayName() const {
         if (editor_ == "opll-envelope") {
-            return juce::String::fromUTF8("総合音色編集（OPLL）");
+            return juce::String::fromUTF8("複合音色編集（OPLL）");
         }
         if (editor_ == "scc-envelope") {
-            return juce::String::fromUTF8("総合音色編集（SCC）");
+            return juce::String::fromUTF8("複合音色編集（SCC）");
         }
         if (editor_ == "opll") {
             return juce::String::fromUTF8("OPLL音色エディタ");
@@ -2963,9 +2963,9 @@ private:
             UiScale::forceGlobalForNonEditorUi();
             juce::String title = getApplicationName();
             if (editor == "scc-envelope") {
-                title += juce::String::fromUTF8(" - 総合音色編集（SCC）");
+                title += juce::String::fromUTF8(" - 複合音色編集（SCC）");
             } else if (editor == "opll-envelope") {
-                title += juce::String::fromUTF8(" - 総合音色編集（OPLL）");
+                title += juce::String::fromUTF8(" - 複合音色編集（OPLL）");
             } else if (editor == "scc") {
                 title += juce::String::fromUTF8(" - SCC音色エディタ");
             } else if (editor == "opll") {

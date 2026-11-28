@@ -3509,7 +3509,7 @@ private:
                 engine::CompositeTimbreLibrary::deserialize(source, &error);
             if (!imported) {
                 message = juce::String::fromUTF8(
-                    "総合音色ファイルを読み取れませんでした");
+                    "複合音色ファイルを読み取れませんでした");
                 return false;
             }
             for (const auto& entry : imported->entries()) {
@@ -3521,7 +3521,7 @@ private:
             if (saved) {
                 message = juce::String(
                     static_cast<int>(imported->entries().size()))
-                    + juce::String::fromUTF8(" 件の総合音色を追加しました");
+                    + juce::String::fromUTF8(" 件の複合音色を追加しました");
             }
         }
         if (!saved) {
@@ -3627,7 +3627,7 @@ private:
             reloadLibraries();
             juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
                 juce::String::fromUTF8("音色ライブラリ"),
-                juce::String::fromUTF8("総合音色を保存できませんでした。"));
+                juce::String::fromUTF8("複合音色を保存できませんでした。"));
             return;
         }
         list_tab_->reloadFromParent();
@@ -3929,9 +3929,9 @@ public:
                 updateStatus(
                     immediate_audition_.getToggleState()
                         ? juce::String::fromUTF8(
-                              "総合音色の即時発音をONにしました")
+                              "複合音色の即時発音をONにしました")
                         : juce::String::fromUTF8(
-                              "総合音色の即時発音をOFFにしました"));
+                              "複合音色の即時発音をOFFにしました"));
             });
         addAndMakeVisible(immediate_audition_);
         description_.setText(
@@ -3942,12 +3942,12 @@ public:
         addAndMakeVisible(description_);
 
         name_label_.setText(
-            juce::String::fromUTF8("総合音色名"),
+            juce::String::fromUTF8("複合音色名"),
             juce::dontSendNotification);
         name_label_.setVisible(false);
         addChildComponent(name_label_);
         composite_library_title_.setText(
-            juce::String::fromUTF8("総合音色ライブラリ"),
+            juce::String::fromUTF8("複合音色ライブラリ"),
             juce::dontSendNotification);
         composite_library_title_.setFont(UiFonts::heading());
         addAndMakeVisible(composite_library_title_);
@@ -3963,7 +3963,7 @@ public:
         tags_.setButtonText(juce::String::fromUTF8("タグを選択"));
         tags_.setTooltip(
                 juce::String::fromUTF8(
-                "総合音色へ標準タグまたは独自タグを複数設定します"));
+                "複合音色へ標準タグまたは独自タグを複数設定します"));
         tags_.onClick = [this] { showTagEditor(); };
         addAndMakeVisible(tags_);
         favorite_.setButtonText(juce::String::fromUTF8("★お気に入り"));
@@ -3992,7 +3992,7 @@ public:
             juce::String::fromUTF8("Redo (Ctrl+Y)"),
             [this] { redo(); });
         configureButton(import_wave_, juce::String::fromUTF8("WAV変換"),
-            juce::String::fromUTF8("WAVから総合音色へ変換"),
+            juce::String::fromUTF8("WAVから複合音色へ変換"),
             [this] { openWaveConverter(); });
         composite_filter_.setTextToShowWhenEmpty(
             juce::String::fromUTF8("名前・タグ・メモを検索"),
@@ -4053,14 +4053,14 @@ public:
         save_.setButtonText(juce::String::fromUTF8("保存"));
         save_.setTooltip(
             juce::String::fromUTF8(
-                "選択中の総合音色へ上書きします。未保存なら新規保存します"));
+                "選択中の複合音色へ上書きします。未保存なら新規保存します"));
         save_.onClick = [this] { saveCompositeTimbre(false); };
         addAndMakeVisible(save_);
         save_as_.setButtonText(
             juce::String::fromUTF8("別名保存"));
         save_as_.setTooltip(
             juce::String::fromUTF8(
-                "現在の内容を新しい総合音色として保存します"));
+                "現在の内容を新しい複合音色として保存します"));
         save_as_.onClick = [this] {
             saveCompositeTimbre(true);
         };
@@ -4068,7 +4068,7 @@ public:
         duplicate_.setButtonText(juce::String::fromUTF8("複製"));
         duplicate_.setTooltip(
             juce::String::fromUTF8(
-                "選択した保存済み総合音色を複製します"));
+                "選択した保存済み複合音色を複製します"));
         duplicate_.onClick = [this] {
             duplicateSelectedCompositeTimbre();
         };
@@ -4076,20 +4076,20 @@ public:
         rename_.setButtonText(juce::String::fromUTF8("名前変更"));
         rename_.setTooltip(
             juce::String::fromUTF8(
-                "名前欄の内容へ保存済み総合音色の名前だけを変更します"));
+                "名前欄の内容へ保存済み複合音色の名前だけを変更します"));
         rename_.onClick = [this] { renameSelectedCompositeTimbre(); };
         addAndMakeVisible(rename_);
         delete_.setButtonText(juce::String::fromUTF8("削除"));
         delete_.setTooltip(
             juce::String::fromUTF8(
-                "選択した保存済み総合音色を削除します"));
+                "選択した保存済み複合音色を削除します"));
         delete_.onClick = [this] { deleteSelectedCompositeTimbre(); };
         addAndMakeVisible(delete_);
         composite_select_.setTextWhenNothingSelected(
-            juce::String::fromUTF8("保存済み総合音色"));
+            juce::String::fromUTF8("保存済み複合音色"));
         composite_select_.setTooltip(
             juce::String::fromUTF8(
-                "保存済み総合音色を選択して即時試聴します"));
+                "保存済み複合音色を選択して即時試聴します"));
         composite_select_.onChange = [this] {
             selectCompositePreview();
         };
@@ -4097,14 +4097,14 @@ public:
         load_.setButtonText(juce::String::fromUTF8("読込"));
         load_.setTooltip(
             juce::String::fromUTF8(
-                "選択した総合音色を編集値へ読み込みます"));
+                "選択した複合音色を編集値へ読み込みます"));
         load_.onClick = [this] { loadSelectedCompositeTimbre(); };
         addAndMakeVisible(load_);
         composite_ab_.setButtonText("A/B");
         composite_ab_.setEnabled(false);
         composite_ab_.setTooltip(
             juce::String::fromUTF8(
-                "編集中(A)と選択した保存総合音色(B)を交互に試聴します"));
+                "編集中(A)と選択した保存複合音色(B)を交互に試聴します"));
         composite_ab_.onClick = [this] { auditionCompositeAb(); };
         addAndMakeVisible(composite_ab_);
 
@@ -4239,7 +4239,7 @@ public:
                     ? juce::String::fromUTF8(
                           "PSG詳細設定は次の実装段階です")
                     : juce::String::fromUTF8(
-                          "この総合音色にコピーしたオリジナルを編集します。"
+                          "この複合音色にコピーしたオリジナルを編集します。"
                           "単音色ライブラリとは独立です"));
             addAndMakeVisible(edit_[index]);
         }
@@ -5201,7 +5201,7 @@ public:
         if (editing_changed && hasUnsavedChanges()) {
             updateStatus(
                 juce::String::fromUTF8(
-                    "独自タグの変更を編集中の総合音色へ反映しました"
+                    "独自タグの変更を編集中の複合音色へ反映しました"
                     "（未保存）"));
         }
     }
@@ -5344,7 +5344,7 @@ public:
         file_row.removeFromRight(sm);
         file_row.removeFromLeft(sm);
         name_.setBounds(file_row.withHeight(fieldH));
-        name_.setTooltip(juce::String::fromUTF8("編集中の総合音色名"));
+        name_.setTooltip(juce::String::fromUTF8("編集中の複合音色名"));
 
         editor_panel_bounds_ = area;
         auto editor = area.reduced(panelPad);
@@ -5769,7 +5769,7 @@ private:
         juce::AlertWindow::showAsync(juce::MessageBoxOptions()
             .withIconType(juce::MessageBoxIconType::WarningIcon)
             .withTitle(juce::String::fromUTF8("未保存の変更があります"))
-            .withMessage(juce::String::fromUTF8("WAV変換結果を適用すると、現在編集中の総合音色はすべて置き換えられます。未保存の編集内容は失われます。"))
+            .withMessage(juce::String::fromUTF8("WAV変換結果を適用すると、現在編集中の複合音色はすべて置き換えられます。未保存の編集内容は失われます。"))
             .withButton(juce::String::fromUTF8("続行"))
             .withButton(juce::String::fromUTF8("キャンセル"))
             .withAssociatedComponent(this),
@@ -5953,7 +5953,7 @@ private:
                 juce::AlertWindow::showAsync(juce::MessageBoxOptions()
                     .withIconType(juce::MessageBoxIconType::WarningIcon)
                     .withTitle(juce::String::fromUTF8("編集中の音色が変更されました"))
-                    .withMessage(juce::String::fromUTF8("変換開始後に総合音色が変更されています。現在の編集内容をWAV変換結果へ置き換えますか？"))
+                    .withMessage(juce::String::fromUTF8("変換開始後に複合音色が変更されています。現在の編集内容をWAV変換結果へ置き換えますか？"))
                     .withButton(juce::String::fromUTF8("置き換える"))
                     .withButton(juce::String::fromUTF8("キャンセル"))
                     .withAssociatedComponent(safe.getComponent()),
@@ -6017,7 +6017,7 @@ private:
         static_cast<void>(configureEngine());
         updateStatus(
             juce::String::fromUTF8(
-                "履歴から総合音色を復元しました"));
+                "履歴から複合音色を復元しました"));
     }
 
     void undo() {
@@ -6082,7 +6082,7 @@ private:
 
     void openCompositeFile() {
         juce::FileChooser chooser(
-            juce::String::fromUTF8("総合音色を開く"),
+            juce::String::fromUTF8("複合音色を開く"),
             {},
             "*.mgstc");
         if (!chooser.browseForFileToOpen()) {
@@ -6103,12 +6103,12 @@ private:
         if (!loaded) {
             showCompositeError(
                 juce::String::fromUTF8(
-                    "総合音色ファイルを読み取れませんでした"));
+                    "複合音色ファイルを読み取れませんでした"));
             return;
         }
         applyLoadedCompositeProgram(
             std::move(*loaded),
-            juce::String::fromUTF8("総合音色ファイルを開きました"));
+            juce::String::fromUTF8("複合音色ファイルを開きました"));
     }
 
     void saveCompositeFile() {
@@ -6122,12 +6122,12 @@ private:
             showCompositeError(
                 juce::String::fromUTF8(
                     validation.warnings.empty()
-                        ? "総合音色を保存できません"
+                        ? "複合音色を保存できません"
                         : validation.warnings.front().c_str()));
             return;
         }
         juce::FileChooser chooser(
-            juce::String::fromUTF8("総合音色を保存する"),
+            juce::String::fromUTF8("複合音色を保存する"),
             juce::File::getCurrentWorkingDirectory()
                 .getChildFile("composite-timbre.mgstc"),
             "*.mgstc");
@@ -6140,16 +6140,16 @@ private:
         if (!output.replaceWithText(contents)) {
             showCompositeError(
                 juce::String::fromUTF8(
-                    "総合音色ファイルを書き込めませんでした"));
+                    "複合音色ファイルを書き込めませんでした"));
             return;
         }
         updateStatus(
-            juce::String::fromUTF8("総合音色をファイルへ保存しました"));
+            juce::String::fromUTF8("複合音色をファイルへ保存しました"));
     }
 
     void openMgsCompositeFile() {
         juce::FileChooser chooser(
-            juce::String::fromUTF8("MGSC総合音色を開く"),
+            juce::String::fromUTF8("MGSC複合音色を開く"),
             {},
             "*.mgs;*.mus;*.txt");
         if (!chooser.browseForFileToOpen()) {
@@ -6168,7 +6168,7 @@ private:
         applyLoadedCompositeProgram(
             result.timbre,
             juce::String::fromUTF8(
-                "MGSC総合音色を開きました（編集用メタデータは既定値）"));
+                "MGSC複合音色を開きました（編集用メタデータは既定値）"));
     }
 
     void saveMgsCompositeFile() {
@@ -6177,7 +6177,7 @@ private:
             return;
         }
         juce::FileChooser chooser(
-            juce::String::fromUTF8("MGSC総合音色を書き出す"),
+            juce::String::fromUTF8("MGSC複合音色を書き出す"),
             juce::File::getCurrentWorkingDirectory()
                 .getChildFile("composite-timbre.mgs"),
             "*.mgs;*.mus;*.txt");
@@ -6192,7 +6192,7 @@ private:
         }
         updateStatus(
             juce::String::fromUTF8(
-                "総合音色をMGSCソースへ書き出しました"));
+                "複合音色をMGSCソースへ書き出しました"));
     }
 
     void copyCompositeProgram() {
@@ -6206,7 +6206,7 @@ private:
         }
         updateStatus(
             juce::String::fromUTF8(
-                "総合音色をクリップボードへコピーしました"));
+                "複合音色をクリップボードへコピーしました"));
     }
 
     void pasteCompositeProgram() {
@@ -6215,7 +6215,7 @@ private:
         if (text.isEmpty()) {
             showCompositeError(
                 juce::String::fromUTF8(
-                    "クリップボードにMGSC総合音色がありません"));
+                    "クリップボードにMGSC複合音色がありません"));
             return;
         }
         const auto loaded =
@@ -6224,14 +6224,14 @@ private:
             showCompositeError(
                 juce::String::fromUTF8(
                     loaded.issues.empty()
-                        ? "クリップボードのMGSC総合音色を読み取れませんでした"
+                        ? "クリップボードのMGSC複合音色を読み取れませんでした"
                         : loaded.issues.front().c_str()));
             return;
         }
         applyLoadedCompositeProgram(
             loaded.timbre,
             juce::String::fromUTF8(
-                "MGSC総合音色をクリップボードから貼り付けました"));
+                "MGSC複合音色をクリップボードから貼り付けました"));
     }
 
     [[nodiscard]] static std::int64_t unixTimeNow() {
@@ -6242,7 +6242,7 @@ private:
     void showCompositeError(const juce::String& message) {
         juce::AlertWindow::showMessageBoxAsync(
             juce::MessageBoxIconType::WarningIcon,
-            juce::String::fromUTF8("総合音色ライブラリ"),
+            juce::String::fromUTF8("複合音色ライブラリ"),
             message,
             juce::String::fromUTF8("閉じる"),
             this);
@@ -6293,7 +6293,7 @@ private:
             timbre_library_fingerprint_valid_ = false;
             showCompositeError(
                 juce::String::fromUTF8(
-                    "既存の総合音色ライブラリを読み込めませんでした"));
+                    "既存の複合音色ライブラリを読み込めませんでした"));
             return true;
         }
         return true;
@@ -6315,7 +6315,7 @@ private:
         juce::Component::SafePointer<CompositeEditorComponent> safe(this);
         showTagSelectionDialog(
             this,
-            juce::String::fromUTF8("総合音色のタグ"),
+            juce::String::fromUTF8("複合音色のタグ"),
             editorTagChoices(tag_sets, timbre_.tags),
             timbre_.tags,
             true,
@@ -6336,7 +6336,7 @@ private:
         juce::Component::SafePointer<CompositeEditorComponent> safe(this);
         showTagSelectionDialog(
             this,
-            juce::String::fromUTF8("総合音色ライブラリのタグ検索"),
+            juce::String::fromUTF8("複合音色ライブラリのタグ検索"),
             filterTagChoices(tag_sets, composite_filter_tags_),
             composite_filter_tags_,
             false,
@@ -6475,7 +6475,7 @@ private:
         static_cast<void>(configureEngine());
         updateStatus(
             juce::String::fromUTF8(
-                "新しい総合音色を作成しました"));
+                "新しい複合音色を作成しました"));
     }
 
     void performLoadImportedComposite(
@@ -6496,7 +6496,7 @@ private:
         static_cast<void>(configureEngine());
         updateStatus(
             juce::String::fromUTF8(
-                "インポートした総合音色を編集中（未保存）"));
+                "インポートした複合音色を編集中（未保存）"));
     }
 
     void selectCompositePreview() {
@@ -6535,7 +6535,7 @@ private:
             persistCompositeTimbreLibrary(composite_library_));
         updateStatus(
             juce::String::fromUTF8(
-                "B 保存済み総合音色を試聴中。「読込」で編集へ反映します"));
+                "B 保存済み複合音色を試聴中。「読込」で編集へ反映します"));
     }
 
     void auditionCompositeModel(
@@ -6573,8 +6573,8 @@ private:
         composite_ab_.setButtonText(abNextSideButtonText(play_b));
         updateStatus(
             play_b
-                ? juce::String::fromUTF8("B 保存済み総合音色を試聴中")
-                : juce::String::fromUTF8("A 編集中総合音色を試聴中"));
+                ? juce::String::fromUTF8("B 保存済み複合音色を試聴中")
+                : juce::String::fromUTF8("A 編集中複合音色を試聴中"));
     }
 
     void loadSelectedCompositeTimbre() {
@@ -6621,7 +6621,7 @@ private:
             refreshCompositeSelector();
             showCompositeError(
                 juce::String::fromUTF8(
-                    "選択した総合音色は削除されています"));
+                    "選択した複合音色は削除されています"));
             return;
         }
         stopAudition();
@@ -6641,7 +6641,7 @@ private:
         resetHistoryToCurrent();
         static_cast<void>(configureEngine());
         updateStatus(
-            juce::String::fromUTF8("総合音色を読み込みました"));
+            juce::String::fromUTF8("複合音色を読み込みました"));
         auditionAfterEdit();
     }
 
@@ -6654,7 +6654,7 @@ private:
         if (timbre_.name.empty()) {
             showCompositeError(
                 juce::String::fromUTF8(
-                    "保存する総合音色名を入力してください"));
+                    "保存する複合音色名を入力してください"));
             name_.grabKeyboardFocus();
             return;
         }
@@ -6696,13 +6696,13 @@ private:
             refreshCompositeSelector();
             showCompositeError(
                 juce::String::fromUTF8(
-                    "選択中の総合音色は削除されています"));
+                    "選択中の複合音色は削除されています"));
             return;
         }
         if (!persistCompositeTimbreLibrary(composite_library_)) {
             showCompositeError(
                 juce::String::fromUTF8(
-                    "総合音色ライブラリを書き込めませんでした"));
+                    "複合音色ライブラリを書き込めませんでした"));
             return;
         }
         const bool assigned = !creating || !selected_composite_id_
@@ -6717,9 +6717,9 @@ private:
         updateStatus(
             save_as
                 ? juce::String::fromUTF8(
-                    "新しい総合音色として保存しました")
+                    "新しい複合音色として保存しました")
                 : juce::String::fromUTF8(
-                    "総合音色を保存しました"));
+                    "複合音色を保存しました"));
         if (!assigned) {
             showCompositeError(setAssignmentFailedMessage());
         }
@@ -6729,7 +6729,7 @@ private:
         if (!selected_composite_id_) {
             showCompositeError(
                 juce::String::fromUTF8(
-                    "複製する総合音色を選択してください"));
+                    "複製する複合音色を選択してください"));
             return;
         }
         ScopedLibraryIpcLock lock(library_lock_);
@@ -6744,7 +6744,7 @@ private:
         if (!source) {
             showCompositeError(
                 juce::String::fromUTF8(
-                    "選択した総合音色は削除されています"));
+                    "選択した複合音色は削除されています"));
             return;
         }
         auto copy = source->timbre;
@@ -6762,14 +6762,14 @@ private:
         syncControlsFromModel();
         setEditorBaseline();
         updateStatus(
-            juce::String::fromUTF8("総合音色を複製しました"));
+            juce::String::fromUTF8("複合音色を複製しました"));
     }
 
     void renameSelectedCompositeTimbre() {
         if (!selected_composite_id_) {
             showCompositeError(
                 juce::String::fromUTF8(
-                    "名前を変更する総合音色を選択してください"));
+                    "名前を変更する複合音色を選択してください"));
             return;
         }
         const auto requested = utf8String(name_.getText().trim());
@@ -6790,7 +6790,7 @@ private:
         if (!source) {
             showCompositeError(
                 juce::String::fromUTF8(
-                    "選択した総合音色は削除されています"));
+                    "選択した複合音色は削除されています"));
             return;
         }
         auto renamed = source->timbre;
@@ -6809,14 +6809,14 @@ private:
         syncControlsFromModel();
         setEditorBaseline();
         updateStatus(
-            juce::String::fromUTF8("総合音色名を変更しました"));
+            juce::String::fromUTF8("複合音色名を変更しました"));
     }
 
     void deleteSelectedCompositeTimbre() {
         if (!selected_composite_id_) {
             showCompositeError(
                 juce::String::fromUTF8(
-                    "削除する総合音色を選択してください"));
+                    "削除する複合音色を選択してください"));
             return;
         }
         const auto id = *selected_composite_id_;
@@ -6826,10 +6826,10 @@ private:
                 .withIconType(
                     juce::MessageBoxIconType::WarningIcon)
                 .withTitle(
-                    juce::String::fromUTF8("総合音色ライブラリ"))
+                    juce::String::fromUTF8("複合音色ライブラリ"))
                 .withMessage(
                     juce::String::fromUTF8(
-                        "選択した総合音色を削除しますか？"))
+                        "選択した複合音色を削除しますか？"))
                 .withButton(juce::String::fromUTF8("削除"))
                 .withButton(juce::String::fromUTF8("キャンセル"))
                 .withAssociatedComponent(this),
@@ -7687,7 +7687,7 @@ private:
             composite_program_stale_ = true;
             silenceAuditionNotes();
             updateStatus(juce::String::fromUTF8(
-                "総合音色を再生できません。設定を確認してください。試聴を停止します。"));
+                "複合音色を再生できません。設定を確認してください。試聴を停止します。"));
         }
         return result.ok;
     }
@@ -8638,7 +8638,7 @@ public:
         title_.setText(
             juce::String::fromUTF8(
                 envelope_context_
-                    ? "総合音色編集"
+                    ? "複合音色編集"
                     : "SCC音色エディタ"),
             juce::dontSendNotification);
         title_.setFont(UiFonts::title());
@@ -9669,7 +9669,7 @@ public:
         setEditorBaseline();
         updateStatus(
             juce::String::fromUTF8(
-                "総合音色のオリジナルコピーを編集中"));
+                "複合音色のオリジナルコピーを編集中"));
         syncOwnedLibraryActions();
         return true;
     }
@@ -9709,7 +9709,7 @@ public:
         library_delete_.setEnabled(!owned);
         library_save_.setTooltip(juce::String::fromUTF8(
             owned
-                ? "この総合音色のオリジナルへ保存します。"
+                ? "この複合音色のオリジナルへ保存します。"
                   "単音色ライブラリには書きません"
                 : "選択音色を更新します"));
     }
@@ -11439,7 +11439,7 @@ private:
     void saveOwnedCompositeSnapshot() {
         if (utf8Text(name_.getText().trim()).empty()) {
             showError(
-                juce::String::fromUTF8("総合音色"),
+                juce::String::fromUTF8("複合音色"),
                 juce::String::fromUTF8(
                     "保存する音色名を入力してください"));
             name_.grabKeyboardFocus();
@@ -11448,7 +11448,7 @@ private:
         publishOwnedSnapshot();
         setEditorBaseline();
         updateStatus(juce::String::fromUTF8(
-            "総合音色のオリジナルへ保存しました"));
+            "複合音色のオリジナルへ保存しました"));
     }
 
     void saveLibraryEntry(bool save_as) {
@@ -12959,7 +12959,7 @@ public:
         title_.setText(
             juce::String::fromUTF8(
                 envelope_context_
-                    ? "総合音色編集"
+                    ? "複合音色編集"
                     : "OPLL音色エディタ"),
             juce::dontSendNotification);
         title_.setFont(UiFonts::title());
@@ -13523,7 +13523,7 @@ public:
         setEditorBaseline();
         updateStatus(
             juce::String::fromUTF8(
-                "総合音色のオリジナルコピーを編集中"));
+                "複合音色のオリジナルコピーを編集中"));
         syncOwnedLibraryActions();
         return true;
     }
@@ -13557,7 +13557,7 @@ public:
         library_delete_.setEnabled(!owned);
         library_save_.setTooltip(juce::String::fromUTF8(
             owned
-                ? "この総合音色のオリジナルへ保存します。"
+                ? "この複合音色のオリジナルへ保存します。"
                   "単音色ライブラリには書きません"
                 : "選択音色を更新します"));
     }
@@ -14868,7 +14868,7 @@ private:
     void saveOwnedCompositeSnapshot() {
         if (utf8Text(name_.getText().trim()).empty()) {
             showError(
-                juce::String::fromUTF8("総合音色"),
+                juce::String::fromUTF8("複合音色"),
                 juce::String::fromUTF8(
                     "保存する音色名を入力してください"));
             name_.grabKeyboardFocus();
@@ -14877,7 +14877,7 @@ private:
         publishOwnedSnapshot();
         setEditorBaseline();
         updateStatus(juce::String::fromUTF8(
-            "総合音色のオリジナルへ保存しました"));
+            "複合音色のオリジナルへ保存しました"));
     }
 
     void saveLibraryEntry(bool save_as) {

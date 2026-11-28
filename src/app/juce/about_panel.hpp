@@ -37,7 +37,7 @@ public:
 
         detail_.setText(
             juce::String::fromUTF8(
-                "MGSDRV向け複合音色エディタ\n"
+                "MGSDRV向け総合音色エディタ\n"
                 "Version ")
                 + juce::String(MGSTC_DOC_VERSION),
             juce::dontSendNotification);
